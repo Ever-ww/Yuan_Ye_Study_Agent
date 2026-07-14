@@ -1,0 +1,8 @@
+# Local credentials and deployment-specific model settings
+config.ini
+model_choice/.env
+.agents/
+
+# Python bytecode cache
+__pycache__/
+*.py[cod]

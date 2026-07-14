@@ -1,0 +1,41 @@
+; Copy this file to config.ini. config.ini is ignored by Git and may contain local API keys.
+; Environment variables remain recommended: leave api_key empty and use api_key_env.
+
+[model_choice]
+; gpt, claude, deepseek, glm, qwen, kimi, or provider:model
+default_model = deepseek
+; Optional: only used when default_model reaches AgentConfig.max_steps without a final answer.
+; Example: fallback_model = qwen
+fallback_model =
+timeout_seconds = 60
+
+; Fill base_url and api_key for the provider you use. api_key_env is the fallback key name.
+[providers.openai]
+base_url = https://api.openai.com/v1
+api_key =
+api_key_env = OPENAI_API_KEY
+
+[providers.anthropic]
+base_url = https://api.anthropic.com/v1
+api_key =
+api_key_env = ANTHROPIC_API_KEY
+
+[providers.deepseek]
+base_url = https://api.deepseek.com/v1
+api_key =
+api_key_env = DEEPSEEK_API_KEY
+
+[providers.zhipu]
+base_url = https://open.bigmodel.cn/api/paas/v4
+api_key =
+api_key_env = ZHIPU_API_KEY
+
+[providers.qwen]
+base_url = https://dashscope.aliyuncs.com/compatible-mode/v1
+api_key =
+api_key_env = DASHSCOPE_API_KEY
+
+[providers.kimi]
+base_url = https://api.moonshot.cn/v1
+api_key =
+api_key_env = MOONSHOT_API_KEY
