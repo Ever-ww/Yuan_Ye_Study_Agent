@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "shell",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "审查这次 shell 调用。仅在参数明显安全且符合用户请求时返回 JSON：{\"allow\": true}；否则返回 {\"allow\": false, \"message\": \"拒绝原因\"}。",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

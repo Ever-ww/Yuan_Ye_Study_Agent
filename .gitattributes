@@ -1,0 +1,11 @@
+# 统一以 LF 保存文本，避免 Windows 与 Linux CI 之间产生整文件行尾差异。
+* text=auto eol=lf
+
+# 常见二进制资源不参与文本行尾转换。
+*.gif binary
+*.ico binary
+*.jpeg binary
+*.jpg binary
+*.pdf binary
+*.png binary
+*.webp binary

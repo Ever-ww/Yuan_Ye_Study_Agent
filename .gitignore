@@ -1,8 +1,33 @@
-# Local credentials and deployment-specific model settings
+# 本机凭据与当前部署专用的模型设置，不应提交到版本库。
 config.ini
 model_choice/.env
+.env
+.env.*
+!.env.example
 .agents/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.codex
 
-# Python bytecode cache
+# 本地数据库、构建结果和 IDE 元数据均不属于可共享源码。
+*.db
+*.sqlite
+*.sqlite3
+build/
+dist/
+*.egg-info/
+.idea/
+.vscode/
+
+# Yuan Ye 的本机状态；可共享的 .yy 配置仍然允许 Git 跟踪。
+.yy/settings.local.json
+.yy/.state/
+.yy/plugins.lock.local
+AGENT.local.md
+
+# Python 字节码缓存。
 __pycache__/
 *.py[cod]

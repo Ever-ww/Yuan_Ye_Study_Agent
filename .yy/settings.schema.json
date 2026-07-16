@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Yuan Ye Agent project settings",
+  "type": "object",
+  "properties": {
+    "$schema": {"type": "string"},
+    "profile": {"enum": ["general", "study", "code"]},
+    "permission_mode": {"enum": ["plan", "review-all", "risk-based", "accept-sandboxed"]},
+    "model": {"type": ["string", "null"]},
+    "fallback_model": {"type": ["string", "null"]},
+    "vision_model": {"type": ["string", "null"]},
+    "timeout_seconds": {"type": "number", "minimum": 1},
+    "providers": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "base_url": {"type": "string"},
+          "api_key_env": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "max_steps": {"type": "integer", "minimum": 1, "maximum": 200},
+    "temperature": {"type": "number"},
+    "context_event_limit": {"type": "integer", "minimum": 22},
+    "auto_memory": {"type": "boolean"},
+    "max_team_agents": {"type": "integer", "minimum": 1, "maximum": 32},
+    "web_search_url": {
+      "type": ["string", "null"],
+      "description": "HTTP(S) 搜索端点模板；必须包含 {query} 占位符。",
+      "pattern": "^https?://.*\\{query\\}.*$"
+    },
+    "sandbox": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "fail_if_unavailable": {"type": "boolean"},
+        "docker_image": {"type": "string"},
+        "allow_unsandboxed_commands": {"type": "boolean"},
+        "allowed_domains": {"type": "array", "items": {"type": "string"}},
+        "deny_read": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}

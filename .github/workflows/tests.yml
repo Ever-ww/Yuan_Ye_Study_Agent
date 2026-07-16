@@ -1,0 +1,30 @@
+name: tests
+
+# push 与 pull_request 使用同一组无密钥测试，避免两个工作流配置逐渐漂移。
+on:
+  push:
+  pull_request:
+
+# 测试只需读取仓库内容，显式收紧自动签发的 GITHUB_TOKEN 权限。
+permissions:
+  contents: read
+
+jobs:
+  test:
+    timeout-minutes: 20
+    strategy:
+      # Windows 是首要平台，同时用 Ubuntu 防止大小写路径和平台 API 造成不可移植问题。
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      # editable install 同时验证 pyproject 的包发现与 yy-agent 入口配置。
+      - run: python -m pip install -e ".[dev]"
+      # 分包列出 coverage，避免把 tests、临时目录或项目配置计入源码覆盖率。
+      - run: python -m pytest --cov=Agent --cov=model_choice --cov=tools --cov=memory --cov=skills --cov=prompt --cov=run_ui --cov-report=term-missing

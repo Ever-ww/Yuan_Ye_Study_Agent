@@ -1,15 +1,17 @@
-; Copy this file to config.ini. config.ini is ignored by Git and may contain local API keys.
-; Environment variables remain recommended: leave api_key empty and use api_key_env.
+; 旧同步模型客户端的配置模板；新 Harness 优先使用 .yy/settings*.json。
+; 已有项目可以继续保留 config.ini，也可以执行 yy-agent migrate 迁移。
+; 请先复制为 config.ini。该文件已被 Git 忽略，但仍不建议在其中保存明文密钥。
+; 推荐让 api_key 保持为空，并通过 api_key_env 指向的环境变量提供密钥。
 
 [model_choice]
-; gpt, claude, deepseek, glm, qwen, kimi, or provider:model
+; 可使用 gpt、claude、deepseek、glm、qwen、kimi，或 provider:model 完整写法。
 default_model = deepseek
-; Optional: only used when default_model reaches AgentConfig.max_steps without a final answer.
-; Example: fallback_model = qwen
+; 可选：仅供旧同步 Agent 在主模型达到 AgentConfig.max_steps 且没有 final 时重新执行。
+; 示例：fallback_model = qwen
 fallback_model =
 timeout_seconds = 60
 
-; Fill base_url and api_key for the provider you use. api_key_env is the fallback key name.
+; 每个 Provider 可覆盖 base_url。api_key_env 是读取密钥的环境变量名；api_key 仅兼容旧用法。
 [providers.openai]
 base_url = https://api.openai.com/v1
 api_key =

@@ -1,0 +1,15 @@
+{
+  "$schema": "./settings.schema.json",
+  "profile": "general",
+  "permission_mode": "risk-based",
+  "max_steps": 20,
+  "auto_memory": true,
+  "max_team_agents": 4,
+  "sandbox": {
+    "enabled": true,
+    "fail_if_unavailable": true,
+    "docker_image": "python:3.12-slim",
+    "allow_unsandboxed_commands": false,
+    "allowed_domains": []
+  }
+}
