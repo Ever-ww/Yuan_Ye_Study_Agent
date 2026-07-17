@@ -70,31 +70,91 @@ class HarnessTests(unittest.TestCase):
         self.env.stop()
         self.temporary.cleanup()
 
-    def test_merged_public_api_keeps_legacy_and_harness_types_distinct(self):
-        """公共懒导出不得混淆新旧同名 Result 与 ToolRegistry。"""
+    def test_sync_api_is_split_by_responsibility_and_keeps_legacy_aliases(self):
+        """同步实现应位于对应模块，同时保留 ``Agent.legacy`` 的对象身份兼容。"""
         from Agent import Agent as LegacyAgent
         from Agent import AgentResult as LegacyAgentResult
         from Agent import AgentRuntime as PublicRuntime
         from Agent import LegacyAgentResult as LegacyResultAlias
         from Agent import RuntimeResult
         from Agent import ToolRegistry as LegacyToolRegistry
+        from Agent.agent import Agent as DirectAgent
+        from Agent.agent import AgentConfig as DirectConfig
+        from Agent.legacy import Agent as LegacyModuleAgent
+        from Agent.legacy import AgentConfig as LegacyModuleConfig
+        from Agent.legacy import AgentResult as LegacyModuleResult
+        from Agent.legacy import REACT_PROTOCOL_PROMPT as LegacyModuleProtocol
+        from Agent.legacy import ReActAgent as LegacyModuleReActAgent
+        from Agent.legacy import Step as LegacyModuleStep
+        from Agent.legacy import ToolRegistry as LegacyModuleToolRegistry
+        from Agent.react_agent import AgentResult as DirectAgentResult
+        from Agent.react_agent import REACT_PROTOCOL_PROMPT as DirectProtocol
+        from Agent.react_agent import ReActAgent as DirectReActAgent
+        from Agent.react_agent import Step as DirectStep
+        from Agent.tool_registry import ToolRegistry as DirectToolRegistry
         from tools import AsyncToolRegistry
 
         self.assertIs(PublicRuntime, AgentRuntime)
-        self.assertEqual(LegacyAgent.__module__, "Agent.legacy")
+        self.assertEqual(LegacyAgent.__module__, "Agent.agent")
+        self.assertEqual(DirectConfig.__module__, "Agent.agent")
+        self.assertEqual(DirectReActAgent.__module__, "Agent.react_agent")
+        self.assertEqual(DirectToolRegistry.__module__, "Agent.tool_registry")
+        self.assertIs(LegacyAgent, DirectAgent)
+        self.assertIs(LegacyAgent, LegacyModuleAgent)
+        self.assertIs(DirectConfig, LegacyModuleConfig)
         self.assertIs(LegacyAgentResult, LegacyResultAlias)
+        self.assertIs(LegacyAgentResult, DirectAgentResult)
+        self.assertIs(LegacyAgentResult, LegacyModuleResult)
+        self.assertIs(DirectReActAgent, LegacyModuleReActAgent)
+        self.assertIs(DirectStep, LegacyModuleStep)
+        self.assertIs(DirectProtocol, LegacyModuleProtocol)
         self.assertIsNot(LegacyAgentResult, RuntimeResult)
         self.assertEqual(AsyncToolRegistry.__module__, "tools.harness")
-        self.assertEqual(LegacyToolRegistry.__module__, "Agent.legacy")
+        self.assertIs(LegacyToolRegistry, DirectToolRegistry)
+        self.assertIs(LegacyToolRegistry, LegacyModuleToolRegistry)
+
+    def test_split_sync_react_modules_keep_execution_behavior(self):
+        """拆分后的 ReAct 循环仍应使用同步工具并返回与旧实现一致的步骤轨迹。"""
+
+        from Agent.react_agent import ReActAgent
+        from Agent.tool_registry import ToolRegistry
+        from tools import CalculatorTool
+
+        class SyncClient:
+            """用两条固定 JSON 响应模拟旧 ``ModelClient.chat`` 接口。"""
+
+            def __init__(self) -> None:
+                """准备先调用计算器、再返回最终答案的同步模型输出。"""
+
+                self.outputs = [
+                    '{"action":"calculator","action_input":{"expression":"2 + 3"}}',
+                    '{"action":"final","final":"计算完成"}',
+                ]
+
+            def chat(self, messages, *, temperature=0):
+                """忽略输入并提供带 ``content`` 属性的最小兼容响应。"""
+
+                del messages, temperature
+                return type("SyncResponse", (), {"content": self.outputs.pop(0)})()
+
+        result = ReActAgent(
+            SyncClient(),
+            ToolRegistry([CalculatorTool()]),
+            max_steps=2,
+        ).run("计算 2 + 3")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.answer, "计算完成")
+        self.assertEqual([(step.index, step.action, step.observation) for step in result.steps], [(1, "calculator", "5")])
 
     def test_merged_packages_are_safe_in_cold_import_orders(self):
         """在全新解释器中验证高风险导入顺序不会产生部分初始化循环。"""
         root = Path(__file__).resolve().parents[1]
         orders = (
-            ("tools.harness", "Agent.runtime", "Agent.legacy", "memory.store", "skills.registry", "model_choice.provider"),
+            ("tools.harness", "Agent.runtime", "Agent.agent", "Agent.react_agent", "Agent.tool_registry", "Agent.legacy", "memory.store", "skills.registry", "model_choice.provider"),
             ("memory.store", "Agent.subagents", "skills.registry", "model_choice.provider", "tools.harness", "Agent.runtime"),
             ("skills.registry", "Agent.teams", "model_choice.provider", "tools.harness", "memory.store", "Agent.runtime"),
-            ("model_choice.provider", "Agent.runtime", "Agent.legacy", "tools.harness", "skills.registry", "memory.store"),
+            ("model_choice.provider", "Agent.runtime", "Agent.agent", "Agent.react_agent", "Agent.tool_registry", "Agent.legacy", "tools.harness", "skills.registry", "memory.store"),
         )
         for modules in orders:
             # 必须使用子进程；同一测试进程已经缓存模块，无法暴露冷启动循环依赖。

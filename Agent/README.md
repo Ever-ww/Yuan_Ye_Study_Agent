@@ -4,7 +4,8 @@
 
 该目录同时保留两套 API，但真实实现已经按职责重新整理：
 
-- `Agent`：原有的同步 ReAct API，真实实现集中在 `legacy.py`，仅用于兼容已有调用方。
+- `Agent`：原有的同步 ReAct API，真实实现按 `agent.py`、`react_agent.py` 与
+  `tool_registry.py` 分层，仅用于兼容已有调用方。
 - `AgentRuntime`：新的异步、事件驱动 Harness，新功能应优先基于它开发。
 
 模型适配器和工具实现并不全部位于本目录。它们分别由 `model_choice/`、`tools/`、`memory/`、`skills/` 和 `prompt/` 提供，`AgentRuntime` 负责组装这些组件。
@@ -124,8 +125,10 @@ assert config.get("trace_enabled") is True
 
 ### 旧模块路径如何兼容
 
-早期代码把组装入口、ReAct 循环和同步工具表分别放在三个文件。重构后，真实代码统一
-位于 `legacy.py`，原文件仅转发公开符号，因此以下导入仍然有效：
+同步 API 现在按实际职责放回对应文件：`agent.py` 负责高层组装、旧配置和备用模型切换；
+`react_agent.py` 负责 ReAct 协议、循环和结果类型；`tool_registry.py` 负责同步工具的
+注册与 Observation 转换。历史的 `legacy.py` 只做兼容聚合，因此以下导入都返回同一个
+类对象：
 
 ```python
 from Agent.agent import Agent, AgentConfig
@@ -133,8 +136,8 @@ from Agent.react_agent import AgentResult, ReActAgent, Step
 from Agent.tool_registry import ToolRegistry
 ```
 
-兼容转发模块不会创建模型或执行工具，导入没有额外副作用。新功能不要继续写入这三个
-文件；若确实需要维护旧同步行为，请修改 `legacy.py` 并同步补充兼容测试。
+`from Agent.legacy import Agent` 也继续有效，但新旧同步功能应修改其真正归属的三个模块，
+而不是把实现重新放回 `legacy.py`。所有聚合入口仅导入符号，不会创建模型或执行工具。
 
 同理，原 `Agent.agents` 曾同时包含子代理发现和团队持久化。现在真实实现分别位于：
 
@@ -203,8 +206,10 @@ Hook 可以拒绝调用、收窄或改写参数、追加 observation，但不能
 | `teams.py` | 团队任务 DAG、原子领取、结果状态和一次性交付邮箱 |
 | `scheduler.py` | 五字段 Cron 解析、SQLite 调度记录和守护循环 |
 | `integrations.py` | 可选 MCP 客户端和 LSP 子进程管理 |
-| `legacy.py` | 原有同步 Agent、ReAct 循环、结果类型和同步工具注册表的真实实现 |
-| `agent.py`、`react_agent.py`、`tool_registry.py` | 对 `legacy.py` 的旧导入路径兼容转发 |
+| `agent.py` | 旧同步 Agent 的高层组装、配置解析与备用模型重试 |
+| `react_agent.py` | 旧 ReAct 协议、同步循环、Step 与 AgentResult |
+| `tool_registry.py` | 旧同步 Tool 协议的注册、查找与 Observation 错误转换 |
+| `legacy.py` | 对上述同步符号的历史兼容聚合出口，不包含业务实现 |
 | `agents.py` | 对 `subagents.py` 和 `teams.py` 的旧聚合路径兼容转发 |
 
 依赖方向可以概括为：
@@ -216,17 +221,19 @@ AgentRuntime (runtime.py)
 ├── 权限 / Hook / 沙箱 / 调度 / 存储
 └── model_choice、tools、memory、skills、prompt
 
-旧 Agent (legacy.py)
-├── 旧 ReActAgent
-└── 旧同步 ToolRegistry → tools.Tool
+旧同步 Agent (agent.py)
+├── ReActAgent (react_agent.py)
+└── ToolRegistry (tool_registry.py) → tools.Tool
+
+legacy.py → 仅兼容聚合上述同步符号
 ```
 
 两条执行链不互相调用。不要为了复用名称把异步 Harness 工具注册到旧同步注册表，也
 不要让旧备用模型重试承担具有不可重复副作用的新任务。
 
 `Agent/__init__.py` 使用懒加载导出公开 API，避免 `Agent`、`tools` 和 `model_choice`
-初始化时产生循环依赖。旧顶层符号直接解析到 `legacy.py`，不会额外穿过兼容 shim；
-调用方仍应优先从 `Agent` 导入公开类型，而不是依赖内部模块的加载顺序。
+初始化时产生循环依赖。旧顶层符号直接解析到各自的职责模块；`legacy.py` 只是在旧路径
+被显式导入时才加载。调用方仍应优先从 `Agent` 导入公开类型，而不是依赖内部模块的加载顺序。
 
 ## 扩展注意事项
 

@@ -11,14 +11,14 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS: dict[str, tuple[str, str]] = {
-    # 原有同步 API：为历史调用方保留，真实实现统一位于 legacy.py。
-    "Agent": (".legacy", "Agent"),
-    "AgentConfig": (".legacy", "AgentConfig"),
-    "AgentResult": (".legacy", "AgentResult"),
-    "LegacyAgentResult": (".legacy", "AgentResult"),
-    "ReActAgent": (".legacy", "ReActAgent"),
-    "Step": (".legacy", "Step"),
-    "ToolRegistry": (".legacy", "ToolRegistry"),
+    # 原有同步 API：真实实现按 Agent、ReAct 循环和工具注册表分别放在对应模块。
+    "Agent": (".agent", "Agent"),
+    "AgentConfig": (".agent", "AgentConfig"),
+    "AgentResult": (".react_agent", "AgentResult"),
+    "LegacyAgentResult": (".react_agent", "AgentResult"),
+    "ReActAgent": (".react_agent", "ReActAgent"),
+    "Step": (".react_agent", "Step"),
+    "ToolRegistry": (".tool_registry", "ToolRegistry"),
     "Tool": ("tools", "Tool"),
     "CalculatorTool": ("tools", "CalculatorTool"),
     "CurrentTimeTool": ("tools", "CurrentTimeTool"),
