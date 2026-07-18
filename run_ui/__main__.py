@@ -1,8 +1,5 @@
-"""支持 ``python -m run_ui`` 的模块执行入口。"""
+"""模块启动入口。"""
 
-from .cli import app
+from .cli import main
 
-
-if __name__ == "__main__":
-    # Typer 会读取 sys.argv 并负责命令分派、帮助文本和退出码。
-    app()
+main()

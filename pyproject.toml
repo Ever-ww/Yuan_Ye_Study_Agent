@@ -1,57 +1,28 @@
-# PEP 517 构建后端。setuptools 68+ 才能稳定读取下面的 PEP 621 项目元数据。
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-# 分发名使用短横线；Python 源码仍按原项目拆分为多个顶层包。
 name = "yy-agent"
-version = "0.2.0"
-description = "Local-first, extensible agent harness for study and software work"
+version = "1.0.0"
+description = "Local-first asynchronous study agent"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
-dependencies = [
-  # Cron 表达式与时区调度。
-  "croniter>=2.0,<7",
-  # 本地 Web UI 及其 ASGI 服务器。
-  "fastapi>=0.110,<1",
-  "httpx>=0.27,<1",
-  "jinja2>=3.1,<4",
-  # 工具参数的完整 JSON Schema 校验；缺失时核心代码仍有最小 required 校验。
-  "jsonschema>=4.21,<5",
-  "pydantic>=2.6,<3",
-  # PDF 学习资料抽取。
-  "pypdf>=4,<7",
-  # Skill frontmatter 和终端界面。
-  "PyYAML>=6,<7",
-  "rich>=13.7,<15",
-  "typer>=0.12,<1",
-  "uvicorn>=0.29,<1",
-  "tzdata>=2024.1; sys_platform == 'win32'",
-]
+dependencies = ["fastapi>=0.110,<1", "httpx>=0.27,<1", "rich>=13.7,<15", "typer>=0.12,<1", "uvicorn>=0.29,<1"]
 
 [project.optional-dependencies]
-# Windows 桌面控制与图像/浏览器相关能力不影响核心无界面运行。
-desktop = ["Pillow>=10,<13", "playwright>=1.44,<2", "pywinauto>=0.6.9,<1; sys_platform == 'win32'"]
-# MCP SDK、向量扩展和系统凭据存储均按需安装，避免扩大默认依赖面。
-mcp = ["mcp>=1.2,<2"]
-vector = ["sqlite-vec>=0.1,<1"]
-keyring = ["keyring>=25,<26"]
-dev = ["pytest>=8,<9", "pytest-asyncio>=0.23,<2", "pytest-cov>=5,<8"]
+dev = ["pytest>=8,<9"]
 
 [project.scripts]
-# 安装后的正式命令直接复用 run_ui.cli 中的 Typer 应用。
-yy-agent = "run_ui.cli:app"
+yy-agent = "run_ui.cli:main"
 
 [tool.setuptools.packages.find]
-# 项目沿用原有顶层目录结构，因此从仓库根发现包，而不是使用单独 src/ 布局。
 where = ["."]
-include = ["Agent*", "model_choice*", "tools*", "memory*", "skills*", "prompt*", "run_ui*"]
-exclude = ["tests*"]
-namespaces = false
+include = ["Agent*", "bootstrap*", "memory*", "prompt*", "tools*", "run_ui*"]
+
+[tool.setuptools.package-data]
+bootstrap = ["templates/*.example"]
+run_ui = ["templates/*.html", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
-# 真实模型、Docker 和桌面测试属于可选 smoke test；默认只发现 tests/ 下的确定性测试。
 testpaths = ["tests"]
-asyncio_mode = "auto"

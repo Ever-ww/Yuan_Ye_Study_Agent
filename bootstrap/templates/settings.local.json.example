@@ -1,0 +1,8 @@
+{
+  "provider": "echo",
+  "model": "echo",
+  "base_url": "",
+  "api_key": "",
+  "stream": false,
+  "max_steps": 8
+}

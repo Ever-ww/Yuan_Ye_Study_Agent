@@ -22,11 +22,11 @@ dist/
 .idea/
 .vscode/
 
-# Yuan Ye 的本机状态；可共享的 .yy 配置仍然允许 Git 跟踪。
-.yy/settings.local.json
-.yy/.state/
-.yy/plugins.lock.local
+# Yuan Ye 的全部本机配置、记忆和运行状态均由初始化命令创建，不提交。
+.yy/
+AGENT.md
 AGENT.local.md
+DEVELOPMENT_REFERENCE.md
 
 # Python 字节码缓存。
 __pycache__/
