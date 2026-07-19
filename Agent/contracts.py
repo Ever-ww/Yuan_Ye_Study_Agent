@@ -34,6 +34,15 @@ class ToolCall:
 
     name: str
     arguments: dict[str, Any]
+    id: str | None = None
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    """模型服务返回的单次请求精确 Token 用量。"""
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +52,7 @@ class ModelReply:
     text: str = ""
     tool_calls: tuple[ToolCall, ...] = ()
     finished: bool = True
+    usage: TokenUsage | None = None
 
 
 class ModelProvider(Protocol):

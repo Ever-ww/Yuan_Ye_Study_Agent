@@ -9,7 +9,19 @@ from typing import Any
 
 import httpx
 
-from Agent.contracts import ModelReply, ToolCall
+from Agent.contracts import ModelReply, TokenUsage, ToolCall
+
+
+def _openai_usage(value: object) -> TokenUsage | None:
+    """兼容 Chat Completions 常见的新旧 usage 字段名。"""
+    if not isinstance(value, dict):
+        return None
+    input_tokens = value.get("prompt_tokens", value.get("input_tokens"))
+    output_tokens = value.get("completion_tokens", value.get("output_tokens"))
+    return TokenUsage(
+        input_tokens=int(input_tokens) if isinstance(input_tokens, (int, float)) else None,
+        output_tokens=int(output_tokens) if isinstance(output_tokens, (int, float)) else None,
+    )
 
 
 class EchoProvider:
@@ -47,16 +59,18 @@ class OpenAICompatibleProvider:
             raise RuntimeError(f"模型服务返回 HTTP {exc.response.status_code}；请检查 model、base_url 与 api_key") from exc
         except httpx.HTTPError as exc:
             raise RuntimeError(f"模型网络请求失败（{type(exc).__name__}）；请检查网络和 base_url") from exc
-        message = response.json()["choices"][0]["message"]
-        calls = tuple(ToolCall(item["function"]["name"], json.loads(item["function"]["arguments"])) for item in message.get("tool_calls", []))
-        return ModelReply(text=message.get("content") or "", tool_calls=calls, finished=not calls)
+        data = response.json()
+        message = data["choices"][0]["message"]
+        calls = tuple(ToolCall(item["function"]["name"], json.loads(item["function"]["arguments"]), item.get("id")) for item in message.get("tool_calls", []))
+        return ModelReply(text=message.get("content") or "", tool_calls=calls, finished=not calls, usage=_openai_usage(data.get("usage")))
 
     async def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> AsyncIterator[ModelReply]:
         """读取 OpenAI-compatible SSE，逐段产出文本并在结束时组装工具调用。"""
-        payload: dict[str, Any] = {"model": self.model, "messages": messages, "temperature": 0, "stream": True}
+        payload: dict[str, Any] = {"model": self.model, "messages": messages, "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}
         if tools:
             payload["tools"] = [{"type": "function", "function": tool} for tool in tools]
         pending_calls: dict[int, dict[str, str]] = {}
+        usage: TokenUsage | None = None
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=15)) as client:
                 async with client.stream("POST", f"{self.base_url}/chat/completions", headers={"Authorization": f"Bearer {self.api_key}"}, json=payload) as response:
@@ -68,6 +82,9 @@ class OpenAICompatibleProvider:
                         if not data or data == "[DONE]":
                             continue
                         packet = json.loads(data)
+                        packet_usage = _openai_usage(packet.get("usage"))
+                        if packet_usage is not None:
+                            usage = packet_usage
                         choices = packet.get("choices", [])
                         if not choices:
                             continue
@@ -76,7 +93,8 @@ class OpenAICompatibleProvider:
                         if content:
                             yield ModelReply(text=str(content), finished=False)
                         for item in delta.get("tool_calls", []):
-                            slot = pending_calls.setdefault(int(item.get("index", 0)), {"name": "", "arguments": ""})
+                            slot = pending_calls.setdefault(int(item.get("index", 0)), {"id": "", "name": "", "arguments": ""})
+                            slot["id"] += item.get("id", "")
                             function = item.get("function", {})
                             slot["name"] += function.get("name", "")
                             slot["arguments"] += function.get("arguments", "")
@@ -87,10 +105,10 @@ class OpenAICompatibleProvider:
         calls: list[ToolCall] = []
         for slot in pending_calls.values():
             try:
-                calls.append(ToolCall(slot["name"], json.loads(slot["arguments"] or "{}")))
+                calls.append(ToolCall(slot["name"], json.loads(slot["arguments"] or "{}"), slot["id"] or None))
             except json.JSONDecodeError as exc:
                 raise RuntimeError(f"模型返回了无效的流式工具参数：{slot['name']}") from exc
-        yield ModelReply(tool_calls=tuple(calls), finished=True)
+        yield ModelReply(tool_calls=tuple(calls), finished=True, usage=usage)
 
 
 class AnthropicProvider:
@@ -112,8 +130,16 @@ class AnthropicProvider:
             raise RuntimeError(f"模型服务返回 HTTP {exc.response.status_code}；请检查 model、base_url 与 api_key") from exc
         except httpx.HTTPError as exc:
             raise RuntimeError(f"模型网络请求失败（{type(exc).__name__}）；请检查网络和 base_url") from exc
-        blocks = response.json().get("content", [])
-        return ModelReply(text="".join(item.get("text", "") for item in blocks if item.get("type") == "text"))
+        data = response.json()
+        blocks = data.get("content", [])
+        raw_usage = data.get("usage")
+        if not isinstance(raw_usage, dict):
+            raw_usage = {}
+        usage = TokenUsage(
+            input_tokens=int(raw_usage["input_tokens"]) if isinstance(raw_usage.get("input_tokens"), (int, float)) else None,
+            output_tokens=int(raw_usage["output_tokens"]) if isinstance(raw_usage.get("output_tokens"), (int, float)) else None,
+        )
+        return ModelReply(text="".join(item.get("text", "") for item in blocks if item.get("type") == "text"), usage=usage)
 
     async def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> AsyncIterator[ModelReply]:
         """在 Anthropic 流式适配完成前，保持统一接口并回退完整响应。"""

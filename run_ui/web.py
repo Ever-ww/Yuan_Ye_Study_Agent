@@ -51,14 +51,16 @@ def create_app(token: str | None = None) -> Any:
             await socket.close(code=1008)
             return
         await socket.accept()
+        runtime = AgentRuntime()
         try:
             while True:
                 payload = await socket.receive_json()
-                runtime = AgentRuntime()
-                async for event in runtime.run_turn(str(payload.get("task", "")), payload.get("session_id")):
+                async for event in runtime.run_task(str(payload.get("task", "")), payload.get("session_id")):
                     await socket.send_json({"type": event.type.value, "payload": event.payload})
         except WebSocketDisconnect:
             return
+        finally:
+            await runtime.close()
 
     app.state.access_token = access_token
     return app

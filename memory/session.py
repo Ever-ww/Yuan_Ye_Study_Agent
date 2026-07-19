@@ -22,11 +22,15 @@ class SessionStore:
         if not self.index_path.exists():
             self._write_index({"version": 1, "sessions": {}})
 
-    def create(self, first_message: str) -> str:
-        """从第一条用户消息时间与内容生成短哈希会话标识。"""
+    def create(self, first_message: str, session_id: str | None = None) -> str:
+        """创建会话；可接收 Runtime 预生成的稳定会话标识。"""
         self.initialize()
         now = datetime.now().astimezone()
-        session_id = hashlib.sha256(f"{now.isoformat()}:{first_message}:{uuid4().hex}".encode("utf-8")).hexdigest()[:16]
+        session_id = session_id or hashlib.sha256(f"{now.isoformat()}:{first_message}:{uuid4().hex}".encode("utf-8")).hexdigest()[:16]
+        if len(session_id) != 16 or any(char not in "0123456789abcdef" for char in session_id):
+            raise ValueError("会话标识必须是 16 位小写十六进制字符串")
+        if self.exists(session_id):
+            raise ValueError(f"会话已存在：{session_id}")
         filename = f"{now:%Y-%m-%d}_{session_id}_001.jsonl"
         index = self._read_index()
         index["sessions"][session_id] = {"created_at": now.strftime("%Y-%m-%d %H:%M:%S"), "latest_file": filename, "files": [filename]}
@@ -34,11 +38,13 @@ class SessionStore:
         (self.directory / filename).touch()
         return session_id
 
-    def append(self, session_id: str, role: str, content: str) -> None:
+    def append(self, session_id: str, role: str, content: str, metadata: dict[str, object] | None = None) -> None:
         """向当前最新 JSONL 分段追加一条带时间戳的对话消息。"""
         if role not in {"user", "assistant"}:
             raise ValueError("会话记录角色只能是 user 或 assistant")
         record = {"role": role, "content": content, "timestamp": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")}
+        if metadata:
+            record.update(metadata)
         path = self._active_path(session_id)
         with path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -51,10 +57,10 @@ class SessionStore:
                 records.append({"role": value["role"], "content": value["content"]})
         return records
 
-    def read_records(self, session_id: str) -> list[dict[str, str]]:
+    def read_records(self, session_id: str) -> list[dict[str, object]]:
         """读取最新分段的原始记录，保留时间戳供 CLI 展示。"""
         path = self._active_path(session_id)
-        records: list[dict[str, str]] = []
+        records: list[dict[str, object]] = []
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if not line.strip():
                 continue

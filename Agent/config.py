@@ -7,7 +7,7 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
-from bootstrap import initialize_project
+from bootstrap import ensure_project_initialized
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 def load_runtime_config(project_root: Path | None = None, **overrides: Any) -> RuntimeConfig:
     """按共享配置、本机配置和显式参数的顺序合并。"""
     root = (project_root or Path.cwd()).resolve()
-    initialize_project(root)
+    ensure_project_initialized(root)
     values: dict[str, Any] = {"project_root": root}
     shared = _read_json(root / ".yy" / "settings.json")
     if "api_key" in shared:

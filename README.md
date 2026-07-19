@@ -66,15 +66,23 @@ uv run python --version
 uv tree
 ```
 
-### 4. 初始化本机 `.yy` 目录
+### 4. 首次启动并自动初始化 `.yy`
 
-仓库不包含 `.yy/`。首次克隆后，在项目根执行：
+仓库不包含 `.yy/`。首次克隆后直接运行入口即可：
+
+```powershell
+uv run python run.py
+```
+
+第一次启动会先创建 `.yy/settings.local.json`、`.yy/.initialized.json`、`.yy/memory/session/index.json`，以及 `.yy/memory/profile/` 下的 `USER.md`、`RESEARCH.md` 和 `OTHERS.md`，然后显示命令帮助。后续执行 `run.py`、`chat`、`run` 或 `serve-ui` 时检测到初始化标记和必要文件齐全，就不会再次初始化。
+
+如果你误删了 `.yy` 中的必要文件，可手动修复初始化：
 
 ```powershell
 uv run python run.py init
 ```
 
-该命令会一次性创建 `.yy/settings.local.json`、`.yy/memory/session/index.json`，以及 `.yy/memory/profile/` 下的 `USER.md`、`RESEARCH.md` 和 `OTHERS.md`。重复执行不会覆盖已有配置或记忆。整个 `.yy/` 都被 Git 忽略。
+初始化和修复都不会覆盖已有配置或记忆。整个 `.yy/` 都被 Git 忽略。
 
 ### 5. 先进行离线启动验证
 
@@ -91,7 +99,7 @@ uv run python run.py chat
 
 ### 1. 创建本机配置文件
 
-`.yy/settings.local.json` 是初始化命令生成的本机模型配置文件，支持直接保存 `base_url` 与 `api_key`。如果尚未初始化，请执行：
+`.yy/settings.local.json` 是首次启动自动生成的本机模型配置文件，支持直接保存 `base_url` 与 `api_key`。如果文件被误删，可执行：
 
 ```powershell
 uv run python run.py init
@@ -126,6 +134,8 @@ uv run python run.py init
 `base_url` 允许接入兼容 OpenAI 或 Anthropic 协议的企业网关；未填写时使用 Provider 内置官方地址。`api_key` 未填写时，程序才尝试读取下表所列环境变量。
 
 `stream` 控制模型文本是否使用 SSE 实时输出，默认 `false`。设为 `true` 后，OpenAI-compatible Provider（包括 DeepSeek）会逐段显示生成文本；设为 `false` 时等待完整响应后再显示最终答案。Anthropic 当前仍采用完整响应模式。
+
+`max_steps` 表示一次用户任务最多允许发起多少次模型 API 调用。
 
 只允许将 Key 写在 `.yy/settings.local.json` 或环境变量中。程序会拒绝 `.yy/settings.json` 中的 `api_key` 字段；整个 `.yy/` 均为本机目录且不会提交。
 
@@ -218,6 +228,35 @@ uv run python run.py run "继续刚才的分析" --session 60c2d464f820db43
 
 不要手工修改 `index.json`。当前恢复只读取索引中的 `latest_file`；未来发生上下文压缩后，新分段会保留同一哈希并使用 `_002.jsonl`、`_003.jsonl` 等编号。
 
+每条助手消息还会记录本轮使用的 Provider、模型、`base_url`、流式设置、整轮时延及逐次模型调用指标。例如：
+
+```json
+{"role":"assistant","content":"你好！","timestamp":"2026-07-19 15:30:15","model":{"provider":"deepseek","name":"deepseek-chat","base_url":"https://api.deepseek.com/v1","stream":false},"model_calls":[{"latency_ms":842.31,"input_tokens":{"context_total":156,"current_question":3,"context_source":"provider","current_question_source":"estimated"},"output_tokens":12,"output_tokens_source":"provider"}],"task_latency_ms":843.02}
+```
+
+`context_total` 和 `output_tokens` 优先使用模型接口返回的精确 usage；接口不返回时使用本地估算并将对应 `source` 标记为 `estimated`。OpenAI-compatible 接口在流式模式下会请求返回 usage。由于常见模型接口不提供“当前问题”独立计数，`current_question` 始终是本地估算值。一次用户任务若因工具结果产生多个模型 Turn，`model_calls` 会逐次记录，避免把多次输出 Token 混成一个数字。记录中绝不会写入 API Key。
+
+## Hook、Turn 与 Session
+
+本项目把 Session 视为逻辑上的完整 Trace，不额外创建 Trace 数据模型。每次真实模型 API 调用严格对应一个 Turn；该模型响应请求的一个或多个工具都在当前 Turn 内执行，工具结果需要再次发送给模型时才开始下一个 Turn。Turn 只表达生命周期边界，不创建实体、不编号，也不向事件或 Session JSONL 写入编号。
+
+统一注册入口是 `Agent/hook.py`，包含以下十个可直接填写代码的异步回调：
+
+```text
+trace_start  trace_end
+turn_start   turn_end
+model_before model_during model_after
+tool_before  tool_during  tool_after
+```
+
+时序固定为 `trace_start → turn_start → model_* → tool_*（可重复）→ turn_end → … → trace_end`。`model_before` 可修改 `event.data["messages"]` 和 `event.data["tools"]`；`tool_before` 可修改工具名称和参数，修改后的参数仍会重新执行 JSON Schema 校验。`during` 在进入真实 Provider 或工具函数前通知一次，不会按流式文本片段重复触发；`after` 同时覆盖成功与失败，并通过 `result/reply/error` 暴露结果。
+
+记忆没有专用的 Memory Hook 类。会话创建、历史与 Profile 注入、用户输入和最终回答落盘均作为普通回调注册到上述阶段；Runtime 和 PromptComposer 不直接读写记忆。自定义 `HookRegistry` 时，调用方需要自行注册希望保留的记忆回调。
+
+Hook 注册方式参考 [PI Agent Extensions](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md) 的事件订阅模式：单一入口、可变事件上下文、按注册顺序执行。为保持本项目的安全边界，工具参数被 Hook 修改后仍会重新校验 Schema，这一点比 PI Agent 当前默认行为更严格。
+
+Runtime 的事件流入口是 `AgentRuntime.run_task()`，表示处理一次用户输入；`AgentRuntime.run()` 返回聚合结果。不要把一次用户任务与模型 Turn 混为一谈。
+
 ### 6. 启动本机 Web UI
 
 ```powershell
@@ -238,7 +277,7 @@ uv run python run.py chat --help
 
 ```powershell
 uv run python -m unittest discover -s tests -v
-uv run python -m compileall -q Agent memory prompt tools run_ui tests run.py
+uv run python -m compileall -q Agent bootstrap memory prompt tools run_ui tests run.py
 uv run python run.py --help
 uv lock --check
 ```
@@ -249,7 +288,7 @@ uv lock --check
 - 本机模型配置：`.yy/settings.local.json`，可放置 `provider`、`model`、`base_url` 与 `api_key`；初始化模板由源码中的 `bootstrap/templates/` 提供。
 - 全部记忆衍生物：`.yy/memory/`。`session/index.json` 指向每个会话最新 JSONL 分段；文件名为 `年月日_会话哈希_分段号.jsonl`。
 - 首次运行自动创建 `profile/USER.md`、`profile/RESEARCH.md`、`profile/OTHERS.md`；Profile 加入新的 `.md` 文件后会自动被读取，不需要修改代码。
-- 新模型实现 `Agent.contracts.ModelProvider`；新工具实现 `tools.AsyncTool`；新 Hook 实现 `Agent.extensions.Hook`。
+- 新模型实现 `Agent.contracts.ModelProvider`；新工具实现 `tools.AsyncTool`；新回调通过 `HookRegistry.register()` 或 `HookRegistry.on()` 注册。
 - 写文件等高风险工具必须通过 Runtime 的审批回调，且文件路径不能越出项目工作区。
 - Web 只监听 `127.0.0.1`，访问令牌随机生成，所有响应禁止缓存。
 

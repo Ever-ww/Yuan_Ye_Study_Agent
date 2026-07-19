@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 import typer
@@ -12,11 +13,11 @@ from rich.panel import Panel
 from rich.table import Table
 
 from Agent import AgentRuntime, EventType, load_runtime_config
-from bootstrap import initialize_project
+from bootstrap import ensure_project_initialized, initialize_project
 from memory import MemoryStore
 from .web import serve
 
-app = typer.Typer(add_completion=False, help="Yuan Ye Study Agent 本地入口")
+app = typer.Typer(add_completion=False, no_args_is_help=True, help="Yuan Ye Study Agent 本地入口")
 session_app = typer.Typer(help="列出、查看和恢复本地会话")
 app.add_typer(session_app, name="session")
 console = Console()
@@ -47,45 +48,56 @@ async def _approve(name: str, arguments: dict[str, object]) -> bool:
     return typer.confirm(f"允许执行 {name} {arguments}？", default=False)
 
 
-async def _render(task: str, session_id: str | None = None) -> str:
+async def _render(runtime: AgentRuntime, task: str, session_id: str | None = None) -> str:
     """边接收事件边刷新面板，避免模型等待期间终端静止。"""
     lines: list[str] = []
     streaming_text = ""
     active_session_id = session_id or ""
     try:
-        runtime = AgentRuntime(approval=_approve)
+        with Live(Panel("正在准备…", title="Yuan Ye Agent"), console=console, refresh_per_second=10) as live:
+            async for event in runtime.run_task(task, session_id):
+                if event.type is EventType.STARTED:
+                    active_session_id = str(event.payload["session_id"])
+                elif event.type is EventType.TEXT:
+                    streaming_text += str(event.payload["content"])
+                elif event.type is EventType.TOOL_REQUESTED:
+                    if streaming_text:
+                        lines.append(streaming_text)
+                        streaming_text = ""
+                    lines.append(f"[cyan]工具请求[/] {event.payload['name']}")
+                elif event.type is EventType.TOOL_COMPLETED:
+                    lines.append(f"[green]工具完成[/] {event.payload['name']}")
+                elif event.type is EventType.ERROR:
+                    lines.append(f"[red]错误[/] {event.payload['message']}")
+                elif event.type is EventType.FINAL:
+                    answer = str(event.payload["answer"])
+                    if answer and not streaming_text and (not lines or answer != lines[-1]):
+                        lines.append(f"[bold green]{answer}[/]")
+                display = lines[-12:] + ([streaming_text] if streaming_text else [])
+                live.update(Panel("\n".join(display) or "正在思考…", title="Yuan Ye Agent"))
     except Exception as exc:
-        message = str(exc) or type(exc).__name__
-        console.print(Panel(f"[red]{message}[/]", title="Yuan Ye Agent 配置错误"))
-        return active_session_id
-    with Live(Panel("正在准备…", title="Yuan Ye Agent"), console=console, refresh_per_second=10) as live:
-        async for event in runtime.run_turn(task, session_id):
-            if event.type is EventType.STARTED:
-                active_session_id = str(event.payload["session_id"])
-            elif event.type is EventType.TEXT:
-                streaming_text += str(event.payload["content"])
-            elif event.type is EventType.TOOL_REQUESTED:
-                if streaming_text:
-                    lines.append(streaming_text)
-                    streaming_text = ""
-                lines.append(f"[cyan]工具请求[/] {event.payload['name']}")
-            elif event.type is EventType.TOOL_COMPLETED:
-                lines.append(f"[green]工具完成[/] {event.payload['name']}")
-            elif event.type is EventType.ERROR:
-                lines.append(f"[red]错误[/] {event.payload['message']}")
-            elif event.type is EventType.FINAL:
-                answer = str(event.payload["answer"])
-                if answer and not streaming_text and (not lines or answer != lines[-1]):
-                    lines.append(f"[bold green]{answer}[/]")
-            display = lines[-12:] + ([streaming_text] if streaming_text else [])
-            live.update(Panel("\n".join(display) or "正在思考…", title="Yuan Ye Agent"))
+        console.print(Panel(f"[red]{str(exc) or type(exc).__name__}[/]", title="Yuan Ye Agent 运行错误"))
     return active_session_id
+
+
+async def _run_once(task: str, session_id: str | None) -> str:
+    """为单次任务创建并可靠关闭一个 Session 运行范围。"""
+    runtime = AgentRuntime(approval=_approve)
+    try:
+        return await _render(runtime, task, session_id)
+    finally:
+        await runtime.close()
 
 
 @app.command()
 def run(task: str, session_id: str | None = typer.Option(None, "--session", "-s", help="继续指定会话哈希")) -> None:
     """运行一次任务。"""
-    active_id = asyncio.run(_render(task, _validate_session(session_id)))
+    session_id = _validate_session(session_id)
+    try:
+        active_id = asyncio.run(_run_once(task, session_id))
+    except Exception as exc:
+        console.print(Panel(f"[red]{str(exc) or type(exc).__name__}[/]", title="Yuan Ye Agent 配置错误"))
+        return
     if active_id:
         console.print(f"[dim]会话哈希：{active_id}[/]")
 
@@ -94,21 +106,33 @@ def run(task: str, session_id: str | None = typer.Option(None, "--session", "-s"
 def chat(session_id: str | None = typer.Option(None, "--session", "-s", help="恢复指定会话哈希")) -> None:
     """启动连续交互会话。"""
     session_id = _validate_session(session_id)
+    try:
+        asyncio.run(_chat(session_id))
+    except Exception as exc:
+        console.print(Panel(f"[red]{str(exc) or type(exc).__name__}[/]", title="Yuan Ye Agent 配置错误"))
+
+
+async def _chat(session_id: str | None) -> None:
+    """在一个 Runtime/Session 中处理多次用户输入，退出时触发 trace_end。"""
     console.print("[bold cyan]Yuan Ye Agent[/]  输入 /help 查看命令，/exit 退出。")
     if session_id:
         console.print(f"[green]已恢复会话[/] {session_id}（{len(_memory().session_records(session_id))} 条消息）")
-    while True:
-        task = console.input("[bold blue]你 > [/]").strip()
-        if task in {"/exit", "/quit"}:
-            return
-        if task == "/help":
-            console.print("/exit 退出；其余内容将发送给 Agent。")
-            continue
-        if task:
-            previous_id = session_id
-            session_id = asyncio.run(_render(task, session_id))
-            if session_id and not previous_id:
-                console.print(f"[dim]会话哈希：{session_id}；下次可使用 chat --session {session_id} 恢复[/]")
+    runtime = AgentRuntime(approval=_approve)
+    try:
+        while True:
+            task = console.input("[bold blue]你 > [/]").strip()
+            if task in {"/exit", "/quit"}:
+                return
+            if task == "/help":
+                console.print("/exit 退出；其余内容将发送给 Agent。")
+                continue
+            if task:
+                previous_id = session_id
+                session_id = await _render(runtime, task, session_id)
+                if session_id and not previous_id:
+                    console.print(f"[dim]会话哈希：{session_id}；下次可使用 chat --session {session_id} 恢复[/]")
+    finally:
+        await runtime.close()
 
 
 @session_app.command("list")
@@ -149,4 +173,9 @@ def serve_ui(port: int = typer.Option(8765, "--port")) -> None:
 
 def main() -> None:
     """供源码入口和打包命令调用。"""
+    if not sys.argv[1:] or sys.argv[1] != "init":
+        result = ensure_project_initialized(Path.cwd())
+        if result.initialized:
+            console.print(f"[green]首次运行初始化完成[/] {result.yy_dir}")
+            console.print("请按需编辑 .yy/settings.local.json；后续启动不会重复初始化。")
     app()
