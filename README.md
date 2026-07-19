@@ -11,6 +11,14 @@ Agent/      模型适配、异步 ReAct、Runtime、Hook 协议与配置
 memory/     记忆领域 Python 服务
 prompt/     System Prompt 分层组合
 tools/      异步工具协议、注册表和受控内置工具
+  contracts.py         AsyncTool 协议与 ToolContext
+  registry.py          Schema 校验、注册与权限审批
+  defaults.py          默认工具装配入口
+  read_file.py         受控文件读取
+  write_file.py        审批后原子写入
+  calculator.py        受限四则运算
+  search_workspace.py  工作区文本搜索
+  current_time.py      本地时间查询
 run_ui/     Rich CLI、FastAPI 路由、模板和静态资源
 tests/      核心行为与 UI 安全测试
 .yy/memory/ 本机会话 JSONL、会话索引与长期 Profile（不提交）

@@ -292,3 +292,34 @@ class CoreTests(unittest.TestCase):
                 with self.assertRaises(PermissionError):
                     await tools.execute("read_file", {"path": "../secret.txt"}, context)
         asyncio.run(check())
+
+    def test_default_tools_are_independent_modules_and_all_execute(self) -> None:
+        async def check() -> None:
+            with tempfile.TemporaryDirectory() as value:
+                root = Path(value)
+
+                async def approve(name, arguments) -> bool:
+                    return True
+
+                registry = default_tools(root)
+                self.assertEqual(
+                    {schema["name"] for schema in registry.schemas()},
+                    {"read_file", "write_file", "calculator", "search_workspace", "current_time"},
+                )
+                context = ToolContext(root, approval=approve)
+                await registry.execute("write_file", {"path": "notes/demo.txt", "content": "独立工具模块"}, context)
+                self.assertEqual(
+                    await registry.execute("read_file", {"path": "notes/demo.txt"}, context),
+                    "独立工具模块",
+                )
+                self.assertEqual(
+                    await registry.execute("calculator", {"expression": "(10 + 20) / 2"}, context),
+                    "15.0",
+                )
+                self.assertIn(
+                    "demo.txt",
+                    await registry.execute("search_workspace", {"query": "独立工具模块"}, context),
+                )
+                self.assertIn("T", await registry.execute("current_time", {}, context))
+
+        asyncio.run(check())
