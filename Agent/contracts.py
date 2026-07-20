@@ -16,6 +16,9 @@ class EventType(str, Enum):
     TOOL_REQUESTED = "tool_requested"
     APPROVAL_REQUESTED = "approval_requested"
     TOOL_COMPLETED = "tool_completed"
+    COMPRESSION_STARTED = "compression_started"
+    CONTEXT_COMPRESSED = "context_compressed"
+    COMPRESSION_FALLBACK = "compression_fallback"
     ERROR = "error"
     FINAL = "final"
 

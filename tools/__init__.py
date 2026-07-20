@@ -7,6 +7,7 @@ from .defaults import default_tools
 from .read_file import ReadFileTool
 from .registry import AsyncToolRegistry
 from .search_workspace import SearchWorkspaceTool
+from .subagent import SubagentRunner, SubagentTool
 from .write_file import WriteFileTool
 
 __all__ = [
@@ -16,6 +17,8 @@ __all__ = [
     "CurrentTimeTool",
     "ReadFileTool",
     "SearchWorkspaceTool",
+    "SubagentRunner",
+    "SubagentTool",
     "ToolContext",
     "WriteFileTool",
     "default_tools",

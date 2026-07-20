@@ -34,3 +34,9 @@ class UiTests(unittest.TestCase):
             self.assertEqual(shown.exit_code, 0)
             self.assertIn("第一答", shown.stdout)
             self.assertNotEqual(missing.exit_code, 0)
+
+    def test_web_client_handles_compression_events(self) -> None:
+        script = (Path(__file__).parents[1] / "run_ui" / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('data.type==="compression_started"', script)
+        self.assertIn('data.type==="context_compressed"', script)
+        self.assertIn('data.type==="compression_fallback"', script)

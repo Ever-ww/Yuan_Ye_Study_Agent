@@ -7,16 +7,22 @@ from .current_time import CurrentTimeTool
 from .read_file import ReadFileTool
 from .registry import AsyncToolRegistry
 from .search_workspace import SearchWorkspaceTool
+from .subagent import SubagentRunner, SubagentTool
 from .write_file import WriteFileTool
 
 
-def default_tools(project_root: Path) -> AsyncToolRegistry:
+def default_tools(project_root: Path, *, subagent_runner: SubagentRunner | None = None) -> AsyncToolRegistry:
     """装配首期默认工具；项目根目录由执行上下文统一传入。"""
     del project_root  # 保留正式构造接口，工具执行时以 ToolContext 为安全边界。
-    return AsyncToolRegistry([
+    builtins = [
         ReadFileTool(),
         WriteFileTool(),
         CalculatorTool(),
         SearchWorkspaceTool(),
         CurrentTimeTool(),
-    ])
+    ]
+    registry = AsyncToolRegistry(builtins)
+    if subagent_runner is not None:
+        risks = {name: registry.risk_of(name) for name in registry.names()}
+        registry.register(SubagentTool(subagent_runner, risks))
+    return registry

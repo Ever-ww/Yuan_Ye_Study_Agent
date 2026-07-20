@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
+    from context_process import ContextProcessor
     from memory.store import MemoryStore
 
 
@@ -128,13 +129,20 @@ _PROJECT_CALLBACKS = {
 }
 
 
-def build_default_hooks(memory_dir: Path, memory: MemoryStore | None = None) -> HookRegistry:
+def build_default_hooks(
+    memory_dir: Path,
+    memory: MemoryStore | None = None,
+    context_processor: ContextProcessor | None = None,
+) -> HookRegistry:
     """组合项目与记忆回调；Memory 仍只是普通回调集合。"""
     from memory.callbacks import register_memory_callbacks
     from memory.store import MemoryStore
 
     registry = HookRegistry()
     register_memory_callbacks(registry, memory or MemoryStore(memory_dir))
+    if context_processor is not None:
+        from context_process import register_context_callbacks
+        register_context_callbacks(registry, context_processor)
     for point, callback in _PROJECT_CALLBACKS.items():
         registry.register(point, callback, priority=-200 if point is HookPoint.TRACE_START else 0)
     return registry

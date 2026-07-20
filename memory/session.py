@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 
@@ -38,10 +40,10 @@ class SessionStore:
         (self.directory / filename).touch()
         return session_id
 
-    def append(self, session_id: str, role: str, content: str, metadata: dict[str, object] | None = None) -> None:
+    def append(self, session_id: str, role: str, content: str | None, metadata: dict[str, object] | None = None) -> None:
         """向当前最新 JSONL 分段追加一条带时间戳的对话消息。"""
-        if role not in {"user", "assistant"}:
-            raise ValueError("会话记录角色只能是 user 或 assistant")
+        if role not in {"user", "assistant", "tool", "summary"}:
+            raise ValueError("会话记录角色必须是 user、assistant、tool 或 summary")
         record = {"role": role, "content": content, "timestamp": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")}
         if metadata:
             record.update(metadata)
@@ -49,12 +51,25 @@ class SessionStore:
         with path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def restore(self, session_id: str) -> list[dict[str, str]]:
-        """只读取索引指定的最新 JSONL，用于恢复当前上下文。"""
-        records: list[dict[str, str]] = []
+    def restore(self, session_id: str) -> list[dict[str, Any]]:
+        """恢复最新分段并移除时间戳、模型指标等审计字段。"""
+        records: list[dict[str, Any]] = []
         for value in self.read_records(session_id):
-            if value.get("role") in {"user", "assistant"} and isinstance(value.get("content"), str):
-                records.append({"role": value["role"], "content": value["content"]})
+            role, content = value.get("role"), value.get("content")
+            if role == "summary" and isinstance(content, str):
+                records.append({"role": "system", "content": f"上一分段压缩摘要：\n{content}"})
+            elif role == "user" and isinstance(content, str):
+                records.append({"role": "user", "content": content})
+            elif role == "assistant" and (isinstance(content, str) or content is None):
+                message: dict[str, Any] = {"role": "assistant", "content": content}
+                if isinstance(value.get("tool_calls"), list):
+                    message["tool_calls"] = value["tool_calls"]
+                if content is not None or "tool_calls" in message:
+                    records.append(message)
+            elif role == "tool" and isinstance(content, str):
+                call_id, name = value.get("tool_call_id"), value.get("name")
+                if isinstance(call_id, str) and isinstance(name, str):
+                    records.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": content})
         return records
 
     def read_records(self, session_id: str) -> list[dict[str, object]]:
@@ -89,6 +104,10 @@ class SessionStore:
 
     def start_new_segment(self, session_id: str) -> Path:
         """为未来上下文压缩创建同哈希的新 JSONL 分段并更新最新索引。"""
+        return self.rollover(session_id, [])
+
+    def rollover(self, session_id: str, initial_records: list[dict[str, Any]]) -> Path:
+        """先完整写入新分段，再原子切换会话索引的 latest_file。"""
         index = self._read_index()
         session = index["sessions"].get(session_id)
         if not session:
@@ -96,12 +115,32 @@ class SessionStore:
         number = len(session["files"]) + 1
         date = session["files"][0].split("_", 1)[0]
         filename = f"{date}_{session_id}_{number:03d}.jsonl"
+        path = self.directory / filename
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        lines = []
+        for record in initial_records:
+            value = dict(record)
+            value.setdefault("timestamp", datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+            lines.append(json.dumps(value, ensure_ascii=False))
+        temporary.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+        temporary.replace(path)
         session["files"].append(filename)
         session["latest_file"] = filename
-        self._write_index(index)
-        path = self.directory / filename
-        path.touch()
+        try:
+            self._write_index(index)
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
         return path
+
+    def active_filename(self, session_id: str) -> str:
+        """返回索引指向的当前分段文件名。"""
+        return self._active_path(session_id).name
+
+    @staticmethod
+    def is_session_hash(value: str) -> bool:
+        """判断是否为 Runtime 使用的 16 位小写十六进制会话标识。"""
+        return re.fullmatch(r"[0-9a-f]{16}", value) is not None
 
     def _active_path(self, session_id: str) -> Path:
         """从索引定位会话最新 JSONL，未知会话明确报错。"""

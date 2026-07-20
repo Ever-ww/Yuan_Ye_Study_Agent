@@ -2,6 +2,16 @@
 
 Yuan Ye Study Agent 是一个本地优先、单一异步 Runtime 驱动的学习与研究 Agent。正式入口始终是 `run.py`；CLI 与 Web UI 消费同一事件流，因此模型等待、工具执行、审批与错误都会即时可见。
 
+<p align="center">
+  <img src="images/harness_evolution.png" alt="Harness 自进化：工坊中的马正在修整自己的挽具" width="760">
+</p>
+
+## Harness 自进化的故事
+
+模型像一匹拥有力量和方向感的马，Harness 则是让这种能力能够被稳定驾驭的整套挽具：Runtime 负责节奏，Prompt 提供方向，Tools 延伸行动能力，Hooks 留出新的连接点，Memory 和上下文压缩让它记住一路上真正重要的东西。
+
+所谓 **Harness 自进化**，不是让模型不受控制地改写自己，而是建立一条可审计的成长闭环：每次 Session 留下完整工具链和运行指标，长期信息被整理为 Profile，过长上下文被压缩为新的可恢复分段，新能力再通过稳定的 Hook、Tool 与测试接入。模型保持可替换，核心 Runtime 保持精简，而承载模型的 Harness 会随着真实使用逐步变得更贴合用户、更可靠，也更容易继续扩展。
+
 > 本文以 Windows PowerShell 为例。项目要求 Python 3.10+；由 uv 管理项目 Python、`.venv` 和依赖，不需要手动使用 `pip` 或激活虚拟环境。
 
 ## 结构
@@ -9,6 +19,7 @@ Yuan Ye Study Agent 是一个本地优先、单一异步 Runtime 驱动的学习
 ```text
 Agent/      模型适配、异步 ReAct、Runtime、Hook 协议与配置
 memory/     记忆领域 Python 服务
+context_process/ Token 阈值压缩、Profile 合并与失败裁剪
 prompt/     System Prompt 分层组合
 tools/      异步工具协议、注册表和受控内置工具
   contracts.py         AsyncTool 协议与 ToolContext
@@ -19,6 +30,7 @@ tools/      异步工具协议、注册表和受控内置工具
   calculator.py        受限四则运算
   search_workspace.py  工作区文本搜索
   current_time.py      本地时间查询
+  subagent.py          受父 Agent 限权的临时子 Agent
 run_ui/     Rich CLI、FastAPI 路由、模板和静态资源
 tests/      核心行为与 UI 安全测试
 .yy/memory/ 本机会话 JSONL、会话索引与长期 Profile（不提交）
@@ -82,7 +94,7 @@ uv tree
 uv run python run.py
 ```
 
-第一次启动会先创建 `.yy/settings.local.json`、`.yy/.initialized.json`、`.yy/memory/session/index.json`，以及 `.yy/memory/profile/` 下的 `USER.md`、`RESEARCH.md` 和 `OTHERS.md`，然后显示命令帮助。后续执行 `run.py`、`chat`、`run` 或 `serve-ui` 时检测到初始化标记和必要文件齐全，就不会再次初始化。
+第一次启动会先创建 `.yy/settings.local.json`、`.yy/.initialized.json`、`.yy/memory/session/index.json`，以及 `.yy/memory/profile/` 下的 `index.json`、`USER.md`、`RESEARCH.md` 和 `OTHERS.md`，然后显示命令帮助。后续执行 `run.py`、`chat`、`run` 或 `serve-ui` 时检测到初始化标记和必要文件齐全，就不会再次初始化。
 
 如果你误删了 `.yy` 中的必要文件，可手动修复初始化：
 
@@ -123,7 +135,8 @@ uv run python run.py init
   "base_url": "https://api.deepseek.com",
   "api_key": "你的 API Key",
   "stream": false,
-  "max_steps": 8
+  "max_steps": 8,
+  "compression_threshold_tokens": 20000
 }
 '@ | Set-Content -Encoding utf8 .yy/settings.local.json
 ```
@@ -144,6 +157,8 @@ uv run python run.py init
 `stream` 控制模型文本是否使用 SSE 实时输出，默认 `false`。设为 `true` 后，OpenAI-compatible Provider（包括 DeepSeek）会逐段显示生成文本；设为 `false` 时等待完整响应后再显示最终答案。Anthropic 当前仍采用完整响应模式。
 
 `max_steps` 表示一次用户任务最多允许发起多少次模型 API 调用。
+
+`compression_threshold_tokens` 默认是 `20000`。最终回答保存后，如果本轮上下文 Token 与输出 Token 之和达到该值，Runtime 会在 `turn_end` 通过 Hook 自动压缩当前分段；设为 `0` 可关闭自动压缩，但仍可手动使用 `/compress`。
 
 只允许将 Key 写在 `.yy/settings.local.json` 或环境变量中。程序会拒绝 `.yy/settings.json` 中的 `api_key` 字段；整个 `.yy/` 均为本机目录且不会提交。
 
@@ -178,6 +193,7 @@ uv run python run.py chat
 
 - 直接输入任务并按 Enter 发送。
 - `/help` 查看帮助；`/exit` 或 `/quit` 退出。
+- 已经开始会话后输入 `/compress`，可立即压缩当前上下文；命令本身不会写入 JSONL。
 - `stream=true` 时，OpenAI-compatible Provider 会通过 SSE 逐段显示文本。
 - 高风险写文件工具会请求一次性确认；输入 `n` 拒绝本次操作。
 
@@ -209,7 +225,7 @@ uv run python run.py chat --session 60c2d464f820db43
 uv run python run.py chat -s 60c2d464f820db43
 ```
 
-程序会从 `session/index.json` 找到该哈希的 `latest_file`，读取最新 JSONL 分段中的历史 `user`/`assistant` 消息，然后把新输入接在同一会话后面。哈希不存在时会在调用模型前直接报错。
+程序会从 `session/index.json` 找到该哈希的 `latest_file`，恢复其中的 `summary`、`user`、`assistant.tool_calls` 和 `tool` 消息，然后把新输入接在同一会话后面。存储角色 `summary` 在发送模型前会转换为 `system`。哈希不存在时会在调用模型前直接报错。
 
 ### 4. 单次任务
 
@@ -234,7 +250,9 @@ uv run python run.py run "继续刚才的分析" --session 60c2d464f820db43
 .yy/memory/session/YYYY-MM-DD_<会话哈希>_001.jsonl
 ```
 
-不要手工修改 `index.json`。当前恢复只读取索引中的 `latest_file`；未来发生上下文压缩后，新分段会保留同一哈希并使用 `_002.jsonl`、`_003.jsonl` 等编号。
+不要手工修改 `index.json`。恢复只读取索引中的 `latest_file`；上下文压缩成功后，新分段保留同一哈希并使用 `_002.jsonl`、`_003.jsonl` 等编号，首行是结构化 `summary`。压缩会同时更新 `profile/<会话哈希>.md` 和 `profile/index.json`，后者记录该 Profile 已整理的源分段、对话数、记录数和工具调用数。
+
+工具调用也使用接近模型输入的格式逐条保存：模型请求写为带 `tool_calls` 的 assistant 记录，工具成功或失败写为带相同 `tool_call_id` 的 tool 记录。这样恢复和压缩都能看到完整工具链。
 
 每条助手消息还会记录本轮使用的 Provider、模型、`base_url`、流式设置、整轮时延及逐次模型调用指标。例如：
 
@@ -261,6 +279,10 @@ tool_before  tool_during  tool_after
 
 记忆没有专用的 Memory Hook 类。会话创建、历史与 Profile 注入、用户输入和最终回答落盘均作为普通回调注册到上述阶段；Runtime 和 PromptComposer 不直接读写记忆。自定义 `HookRegistry` 时，调用方需要自行注册希望保留的记忆回调。
 
+自动压缩检查位于最终回答的 `turn_end`，且在 assistant 落盘之后执行。压缩最多尝试三次；全部失败时不修改 Profile、不切换 JSONL，后续 `model_before` 只在内存中按最旧完整对话块裁剪输入，原始审计记录继续保留。
+
+默认工具还包含 `subagent`。父模型必须明确给出子任务、可选角色说明和工具名称子集；省略工具子集表示无工具，且子 Agent 永远不能再次调用 `subagent`。子 Agent 不创建独立会话记录，最终输出作为父 Agent 的普通 tool 结果保存。委派写能力和实际执行写入分别需要一次批准。
+
 Hook 注册方式参考 [PI Agent Extensions](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md) 的事件订阅模式：单一入口、可变事件上下文、按注册顺序执行。为保持本项目的安全边界，工具参数被 Hook 修改后仍会重新校验 Schema，这一点比 PI Agent 当前默认行为更严格。
 
 Runtime 的事件流入口是 `AgentRuntime.run_task()`，表示处理一次用户输入；`AgentRuntime.run()` 返回聚合结果。不要把一次用户任务与模型 Turn 混为一谈。
@@ -285,7 +307,8 @@ uv run python run.py chat --help
 
 ```powershell
 uv run python -m unittest discover -s tests -v
-uv run python -m compileall -q Agent bootstrap memory prompt tools run_ui tests run.py
+uv run python -m pytest -q
+uv run python -m compileall -q Agent bootstrap context_process memory prompt tools run_ui tests run.py
 uv run python run.py --help
 uv lock --check
 ```
@@ -295,7 +318,7 @@ uv lock --check
 - `.yy/` 是完整的本机目录，由 `uv run python run.py init` 创建，整个目录已被 Git 忽略。
 - 本机模型配置：`.yy/settings.local.json`，可放置 `provider`、`model`、`base_url` 与 `api_key`；初始化模板由源码中的 `bootstrap/templates/` 提供。
 - 全部记忆衍生物：`.yy/memory/`。`session/index.json` 指向每个会话最新 JSONL 分段；文件名为 `年月日_会话哈希_分段号.jsonl`。
-- 首次运行自动创建 `profile/USER.md`、`profile/RESEARCH.md`、`profile/OTHERS.md`；Profile 加入新的 `.md` 文件后会自动被读取，不需要修改代码。
+- 首次运行自动创建 `profile/USER.md`、`profile/RESEARCH.md`、`profile/OTHERS.md` 和索引。普通命名的扩展 Profile 全局加载；16 位会话哈希命名的 Profile 只注入对应 Session，避免跨会话污染。
 - 新模型实现 `Agent.contracts.ModelProvider`；新工具实现 `tools.AsyncTool`；新回调通过 `HookRegistry.register()` 或 `HookRegistry.on()` 注册。
 - 写文件等高风险工具必须通过 Runtime 的审批回调，且文件路径不能越出项目工作区。
 - Web 只监听 `127.0.0.1`，访问令牌随机生成，所有响应禁止缓存。

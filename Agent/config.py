@@ -23,6 +23,7 @@ class RuntimeConfig:
     max_steps: int = 8
     temperature: float = 0.0
     profile: str = "general"
+    compression_threshold_tokens: int = 20000
 
     @property
     def memory_dir(self) -> Path:
@@ -53,5 +54,8 @@ def load_runtime_config(project_root: Path | None = None, **overrides: Any) -> R
     values.update({key: value for key, value in overrides.items() if value is not None})
     if "stream" in values and not isinstance(values["stream"], bool):
         raise ValueError("stream 必须是 true 或 false")
+    threshold = values.get("compression_threshold_tokens", 20000)
+    if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 0:
+        raise ValueError("compression_threshold_tokens 必须是大于等于 0 的整数")
     allowed = {item.name for item in fields(RuntimeConfig)}
     return RuntimeConfig(**{key: value for key, value in values.items() if key in allowed})

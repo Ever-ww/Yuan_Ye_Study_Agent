@@ -83,6 +83,7 @@ class ReactLoop:
                 await self.hooks.emit(HookEvent(HookPoint.TURN_END, session_id, failure))
                 raise
 
+            reply = _ensure_tool_call_ids(reply)
             call_metric = _model_call_metric(
                 round((time.perf_counter() - started_at) * 1000, 2),
                 estimated_context,
@@ -101,12 +102,13 @@ class ReactLoop:
             reply = after.data.get("reply")
             if not isinstance(reply, ModelReply):
                 raise ValueError("model_after 必须保留 ModelReply 类型的 reply")
+            reply = _ensure_tool_call_ids(reply)
             if reply.text and not streamed:
                 yield RunEvent(EventType.TEXT, {"content": reply.text})
 
             if reply.tool_calls:
-                prepared_calls = [(call, call.id or f"call_{uuid4().hex}") for call in reply.tool_calls]
-                messages.append(_assistant_tool_message(reply, prepared_calls))
+                prepared_calls = [(call, str(call.id)) for call in reply.tool_calls]
+                messages.append(_assistant_tool_message(reply))
                 try:
                     async for event in self._execute_tools(prepared_calls, messages, context, task, session_id):
                         yield event
@@ -128,7 +130,21 @@ class ReactLoop:
                 "model_calls": model_calls,
                 "task_latency_ms": round((time.perf_counter() - task_started_at) * 1000, 2),
             }
-            await self.hooks.emit(HookEvent(HookPoint.TURN_END, session_id, completed))
+            ended = await self.hooks.emit(HookEvent(HookPoint.TURN_END, session_id, completed))
+            operation = ended.data.get("compression_operation")
+            if callable(operation):
+                yield RunEvent(EventType.COMPRESSION_STARTED, {"session_id": session_id})
+                try:
+                    result = await operation()
+                    compression = result.payload()
+                except Exception as exc:
+                    compression = {
+                        "status": "fallback",
+                        "session_id": session_id,
+                        "message": f"自动压缩失败，当前回答已保留：{str(exc) or type(exc).__name__}",
+                    }
+                kind = EventType.CONTEXT_COMPRESSED if compression.get("status") == "compressed" else EventType.COMPRESSION_FALLBACK
+                yield RunEvent(kind, compression)
             yield RunEvent(EventType.FINAL, {"answer": reply.text, "completed": True, "model_calls": model_calls})
             return
 
@@ -184,14 +200,22 @@ class ReactLoop:
         }))
 
 
-def _assistant_tool_message(reply: ModelReply, calls: list[tuple[ToolCall, str]]) -> dict[str, Any]:
+def _assistant_tool_message(reply: ModelReply) -> dict[str, Any]:
     """构造可再次发送给 OpenAI-compatible 接口的 assistant 工具消息。"""
     serialized = [{
-        "id": call_id,
+        "id": call.id,
         "type": "function",
         "function": {"name": call.name, "arguments": json.dumps(call.arguments, ensure_ascii=False)},
-    } for call, call_id in calls]
+    } for call in reply.tool_calls]
     return {"role": "assistant", "content": reply.text or None, "tool_calls": serialized}
+
+
+def _ensure_tool_call_ids(reply: ModelReply) -> ModelReply:
+    """在任何 model_after 回调前为工具调用补齐稳定 ID。"""
+    if not reply.tool_calls or all(call.id for call in reply.tool_calls):
+        return reply
+    calls = tuple(ToolCall(call.name, dict(call.arguments), call.id or f"call_{uuid4().hex}") for call in reply.tool_calls)
+    return ModelReply(reply.text, calls, reply.finished, reply.usage)
 
 
 def _model_call_metric(latency_ms: float, context_tokens: int, question_tokens: int, reply: ModelReply) -> dict[str, Any]:

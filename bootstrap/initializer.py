@@ -24,6 +24,7 @@ _REQUIRED_PATHS = (
     "memory/profile/USER.md",
     "memory/profile/RESEARCH.md",
     "memory/profile/OTHERS.md",
+    "memory/profile/index.json",
     ".initialized.json",
 )
 

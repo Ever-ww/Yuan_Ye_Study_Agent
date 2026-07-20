@@ -11,8 +11,12 @@ from Agent.contracts import ApprovalCallback, EventType, RunEvent
 from Agent.hook import HookEvent, HookPoint, HookRegistry, build_default_hooks
 from Agent.models import build_provider
 from Agent.react import ReactLoop
+from context_process import ContextProcessor
+from memory import MemoryStore
 from prompt import PromptComposer
 from tools import AsyncToolRegistry, ToolContext, default_tools
+from tools.subagent import SubagentTool
+from .subagent import RuntimeSubagentRunner
 
 
 @dataclass(frozen=True)
@@ -36,9 +40,13 @@ class AgentRuntime:
         memory=None,
         hooks: HookRegistry | None = None,
         approval: ApprovalCallback | None = None,
+        context_processor: ContextProcessor | None = None,
+        compression_provider_factory=None,
+        subagent_runner=None,
+        enable_context_processing: bool = True,
+        enable_subagent: bool = True,
     ) -> None:
         self.config = config or load_runtime_config()
-        self.tools = tools or default_tools(self.config.project_root)
         self.provider = provider or build_provider(
             self.config.provider,
             self.config.model,
@@ -46,14 +54,35 @@ class AgentRuntime:
             api_key=self.config.api_key,
             stream=self.config.stream,
         )
-        self.hooks = hooks or build_default_hooks(self.config.memory_dir, memory)
         self.approval = approval
+        self.memory = memory or MemoryStore(self.config.memory_dir)
+        if tools is not None:
+            self.tools = tools
+        else:
+            base_tools = default_tools(self.config.project_root)
+            if enable_subagent:
+                runner = subagent_runner or RuntimeSubagentRunner(self.config, base_tools)
+                risks = {name: base_tools.risk_of(name) for name in base_tools.names()}
+                base_tools.register(SubagentTool(runner, risks))
+            self.tools = base_tools
+        self.context_processor = None
+        if enable_context_processing:
+            self.context_processor = context_processor or ContextProcessor(
+                self.config,
+                self.memory,
+                provider_factory=compression_provider_factory,
+            )
+        self.hooks = hooks or build_default_hooks(self.config.memory_dir, self.memory, self.context_processor)
         self.prompts = PromptComposer(self.config.project_root)
         self._session_id: str | None = None
         self._session_open = False
 
     async def run_task(self, task: str, session_id: str | None = None) -> AsyncIterator[RunEvent]:
         """处理一次用户输入；内部每次模型 API 调用各自形成一个 Turn。"""
+        if task.strip() == "/compress":
+            async for event in self._compress_command(session_id):
+                yield event
+            return
         try:
             active_id = await self._ensure_session(task, session_id)
         except Exception as exc:
@@ -75,6 +104,30 @@ class AgentRuntime:
         except Exception as exc:
             message = str(exc) or f"{type(exc).__name__}：运行时发生未提供详情的异常"
             yield RunEvent(EventType.ERROR, {"message": message})
+
+    async def _compress_command(self, session_id: str | None) -> AsyncIterator[RunEvent]:
+        """由主 Runtime 处理手动压缩命令，不把命令写入 Session。"""
+        if self.context_processor is None:
+            yield RunEvent(EventType.ERROR, {"message": "当前 Runtime 未启用上下文压缩"})
+            return
+        requested = session_id or self._session_id
+        if not requested:
+            yield RunEvent(EventType.ERROR, {"message": "当前没有可压缩会话"})
+            return
+        try:
+            active_id = await self._ensure_session("", str(requested))
+        except Exception as exc:
+            yield RunEvent(EventType.ERROR, {"message": str(exc) or type(exc).__name__})
+            return
+        yield RunEvent(EventType.STARTED, {"session_id": active_id})
+        yield RunEvent(EventType.COMPRESSION_STARTED, {"session_id": active_id})
+        result = await self.context_processor.compress(active_id)
+        if result.status == "error":
+            yield RunEvent(EventType.ERROR, {"message": result.message})
+            return
+        event_type = EventType.CONTEXT_COMPRESSED if result.status == "compressed" else EventType.COMPRESSION_FALLBACK
+        yield RunEvent(event_type, result.payload())
+        yield RunEvent(EventType.FINAL, {"answer": result.message, "completed": True})
 
     async def run(self, task: str, session_id: str | None = None) -> RuntimeResult:
         """运行单次用户任务，完成后触发 trace_end 并返回聚合结果。"""

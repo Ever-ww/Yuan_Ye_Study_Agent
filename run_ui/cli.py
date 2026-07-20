@@ -52,6 +52,7 @@ async def _render(runtime: AgentRuntime, task: str, session_id: str | None = Non
     """边接收事件边刷新面板，避免模型等待期间终端静止。"""
     lines: list[str] = []
     streaming_text = ""
+    displayed_status = ""
     active_session_id = session_id or ""
     try:
         with Live(Panel("正在准备…", title="Yuan Ye Agent"), console=console, refresh_per_second=10) as live:
@@ -67,11 +68,19 @@ async def _render(runtime: AgentRuntime, task: str, session_id: str | None = Non
                     lines.append(f"[cyan]工具请求[/] {event.payload['name']}")
                 elif event.type is EventType.TOOL_COMPLETED:
                     lines.append(f"[green]工具完成[/] {event.payload['name']}")
+                elif event.type is EventType.COMPRESSION_STARTED:
+                    lines.append("[cyan]正在压缩上下文…[/]")
+                elif event.type is EventType.CONTEXT_COMPRESSED:
+                    displayed_status = str(event.payload.get("message", "上下文压缩完成"))
+                    lines.append(f"[green]{displayed_status}[/]")
+                elif event.type is EventType.COMPRESSION_FALLBACK:
+                    displayed_status = str(event.payload.get("message", "压缩失败，已启用内存裁剪"))
+                    lines.append(f"[yellow]{displayed_status}[/]")
                 elif event.type is EventType.ERROR:
                     lines.append(f"[red]错误[/] {event.payload['message']}")
                 elif event.type is EventType.FINAL:
                     answer = str(event.payload["answer"])
-                    if answer and not streaming_text and (not lines or answer != lines[-1]):
+                    if answer and answer != displayed_status and not streaming_text and (not lines or answer != lines[-1]):
                         lines.append(f"[bold green]{answer}[/]")
                 display = lines[-12:] + ([streaming_text] if streaming_text else [])
                 live.update(Panel("\n".join(display) or "正在思考…", title="Yuan Ye Agent"))
@@ -124,7 +133,7 @@ async def _chat(session_id: str | None) -> None:
             if task in {"/exit", "/quit"}:
                 return
             if task == "/help":
-                console.print("/exit 退出；其余内容将发送给 Agent。")
+                console.print("/compress 压缩当前上下文；/exit 退出；其余内容将发送给 Agent。")
                 continue
             if task:
                 previous_id = session_id

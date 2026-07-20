@@ -11,6 +11,7 @@ from pathlib import Path
 from Agent import AgentRuntime, EventType, HookEvent, HookPoint, HookRegistry, load_runtime_config
 from Agent.contracts import ModelReply, TokenUsage, ToolCall
 from bootstrap import ensure_project_initialized, is_project_initialized
+from context_process import ContextProcessor
 from memory import MemoryStore
 from prompt import PromptComposer
 from tools import AsyncToolRegistry, ToolContext, default_tools
@@ -39,6 +40,28 @@ class MultiToolProvider:
         return ModelReply("结果为 60")
 
 
+class FailingToolProvider:
+    """请求一个必然失败的文件读取工具。"""
+
+    streaming = False
+
+    async def complete(self, messages, tools):
+        return ModelReply(tool_calls=(ToolCall("read_file", {"path": "missing-file.txt"}),))
+
+
+class SubagentCallingProvider:
+    """请求 subagent，并在收到父级 tool 反馈后完成。"""
+
+    streaming = False
+
+    async def complete(self, messages, tools):
+        if not any(message["role"] == "tool" for message in messages):
+            return ModelReply(tool_calls=(ToolCall("subagent", {
+                "task": "提炼结论", "instructions": "保持简洁",
+            }),))
+        return ModelReply(f"父 Agent 收到：{messages[-1]['content']}")
+
+
 class StreamProvider:
     """逐段输出文本的测试 Provider。"""
 
@@ -60,6 +83,36 @@ class UsageProvider:
 
     async def complete(self, messages, tools):
         return ModelReply("指标已记录", usage=TokenUsage(input_tokens=128, output_tokens=9))
+
+
+class CompressionProvider:
+    """返回可校验双摘要 JSON 的压缩测试模型。"""
+
+    streaming = False
+
+    def __init__(self, *, valid: bool = True) -> None:
+        self.valid = valid
+        self.calls = 0
+        self.messages = []
+
+    async def complete(self, messages, tools):
+        self.calls += 1
+        self.messages = [dict(message) for message in messages]
+        if not self.valid:
+            return ModelReply("不是 JSON")
+        return ModelReply(json.dumps({
+            "profile_markdown": "# 用户特征\n- 偏好中文\n\n# 研究方向\n- Agent",
+            "context_summary_markdown": "# 用户目标\n研究 Agent\n# 已完成任务\n完成存储\n# 未完成任务\n继续压缩\n# 关键决策\n使用 JSONL\n# 必要工具结论\n计算结果为 4",
+        }, ensure_ascii=False))
+
+
+class LargeUsageProvider:
+    """用精确 usage 触发自动压缩。"""
+
+    streaming = False
+
+    async def complete(self, messages, tools):
+        return ModelReply("已完成大上下文回答", usage=TokenUsage(input_tokens=20000, output_tokens=20))
 
 
 class CapturingProvider:
@@ -88,6 +141,7 @@ class CoreTests(unittest.TestCase):
             local = yy / "settings.local.json"
             self.assertTrue(local.exists())
             self.assertTrue((yy / "memory" / "session" / "index.json").exists())
+            self.assertTrue((yy / "memory" / "profile" / "index.json").exists())
             for name in ("USER.md", "RESEARCH.md", "OTHERS.md"):
                 self.assertTrue((yy / "memory" / "profile" / name).exists())
             local.write_text("用户配置", encoding="utf-8")
@@ -125,6 +179,16 @@ class CoreTests(unittest.TestCase):
             (root / ".yy").mkdir()
             (root / ".yy" / "settings.local.json").write_text('{"stream":"yes"}', encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "stream"):
+                load_runtime_config(root)
+
+    def test_compression_threshold_defaults_and_validates(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            self.assertEqual(load_runtime_config(root).compression_threshold_tokens, 20000)
+            (root / ".yy" / "settings.local.json").write_text(
+                '{"compression_threshold_tokens":-1}', encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "compression_threshold_tokens"):
                 load_runtime_config(root)
 
     def test_memory_uses_timestamped_jsonl_and_index(self) -> None:
@@ -188,6 +252,131 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(len(assistant["model_calls"]), 2)
             self.assertTrue(all("turn" not in call for call in assistant["model_calls"]))
             self.assertTrue(all(call["output_tokens_source"] == "estimated" for call in assistant["model_calls"]))
+
+    def test_tool_calls_and_results_are_persisted_and_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(root)
+            memory = MemoryStore(config.memory_dir)
+            result = asyncio.run(AgentRuntime(config, provider=ToolProvider(), memory=memory).run("计算 2 + 2"))
+            records = memory.session_records(result.session_id)
+            self.assertEqual([record["role"] for record in records], ["user", "assistant", "tool", "assistant"])
+            call = records[1]["tool_calls"][0]
+            self.assertEqual(call["function"]["name"], "calculator")
+            self.assertTrue(call["id"].startswith("call_"))
+            self.assertEqual(records[2]["tool_call_id"], call["id"])
+            self.assertEqual(records[2]["status"], "success")
+            restored = memory.restore_messages(result.session_id)
+            self.assertEqual(restored[1]["tool_calls"][0]["id"], restored[2]["tool_call_id"])
+
+    def test_failed_tool_result_is_persisted_before_error_propagates(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(root)
+            memory = MemoryStore(config.memory_dir)
+            result = asyncio.run(AgentRuntime(config, provider=FailingToolProvider(), memory=memory).run("读取缺失文件"))
+            self.assertFalse(result.completed)
+            records = memory.session_records(result.session_id)
+            self.assertEqual([record["role"] for record in records], ["user", "assistant", "tool"])
+            self.assertEqual(records[-1]["status"], "error")
+            self.assertIn("工具执行失败", records[-1]["content"])
+
+    def test_automatic_compression_merges_profile_and_rolls_over(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(root, compression_threshold_tokens=20000)
+            memory = MemoryStore(config.memory_dir)
+            compressor = CompressionProvider()
+            runtime = AgentRuntime(
+                config,
+                provider=LargeUsageProvider(),
+                memory=memory,
+                compression_provider_factory=lambda: compressor,
+            )
+            result = asyncio.run(runtime.run("整理长上下文"))
+            self.assertTrue(result.completed)
+            self.assertEqual(compressor.calls, 1)
+            self.assertTrue(memory.active_filename(result.session_id).endswith("_002.jsonl"))
+            summary = memory.session_records(result.session_id)[0]
+            self.assertEqual(summary["role"], "summary")
+            self.assertEqual(memory.restore_messages(result.session_id)[0]["role"], "system")
+            profile = config.memory_dir / "profile" / f"{result.session_id}.md"
+            self.assertIn("偏好中文", profile.read_text(encoding="utf-8"))
+            index = json.loads((config.memory_dir / "profile" / "index.json").read_text(encoding="utf-8"))
+            metadata = index["profiles"][result.session_id]
+            self.assertEqual(metadata["segments_processed"], 1)
+            self.assertEqual(metadata["conversation_turns"], 1)
+            self.assertEqual(metadata["records_processed"], 2)
+            memory.record_user(result.session_id, "新分段问题")
+            memory.record_assistant(result.session_id, "新分段回答")
+            second_provider = CompressionProvider()
+            second = asyncio.run(ContextProcessor(
+                config, memory, provider_factory=lambda: second_provider,
+            ).compress(result.session_id))
+            self.assertEqual(second.status, "compressed")
+            self.assertTrue(memory.active_filename(result.session_id).endswith("_003.jsonl"))
+            updated = json.loads((config.memory_dir / "profile" / "index.json").read_text(encoding="utf-8"))["profiles"][result.session_id]
+            self.assertEqual(updated["segments_processed"], 2)
+            self.assertEqual(updated["conversation_turns"], 2)
+
+    def test_manual_compress_is_not_recorded_and_only_returns_status(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(root)
+            memory = MemoryStore(config.memory_dir)
+            session_id = memory.create_session("第一句")
+            memory.record_user(session_id, "第一句")
+            memory.record_assistant(session_id, "第一答")
+            compressor = CompressionProvider()
+            runtime = AgentRuntime(
+                config,
+                provider=UsageProvider(),
+                memory=memory,
+                compression_provider_factory=lambda: compressor,
+            )
+            result = asyncio.run(runtime.run("/compress", session_id))
+            self.assertTrue(result.completed)
+            self.assertIn("上下文压缩完成", result.answer)
+            contents = [record.get("content") for record in memory.session_records(session_id)]
+            self.assertNotIn("/compress", contents)
+            self.assertEqual(memory.session_records(session_id)[0]["role"], "summary")
+
+    def test_compression_retries_three_times_then_trims_only_in_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(root, compression_threshold_tokens=80)
+            memory = MemoryStore(config.memory_dir)
+            session_id = memory.create_session("旧问题")
+            memory.record_user(session_id, "旧问题" * 60)
+            memory.record_assistant(session_id, "旧回答" * 60)
+            compressor = CompressionProvider(valid=False)
+            processor = ContextProcessor(config, memory, provider_factory=lambda: compressor)
+            result = asyncio.run(processor.compress(session_id))
+            self.assertEqual(result.status, "fallback")
+            self.assertEqual(compressor.calls, 3)
+            self.assertTrue(memory.active_filename(session_id).endswith("_001.jsonl"))
+            original = memory.session_records(session_id)
+            messages = [
+                {"role": "system", "content": "规则"},
+                {"role": "user", "content": "旧问题" * 60},
+                {"role": "assistant", "content": "旧回答" * 60},
+                {"role": "user", "content": "新问题"},
+            ]
+            self.assertTrue(processor.trim_messages_if_needed(session_id, messages))
+            self.assertEqual([item["role"] for item in messages], ["system", "user"])
+            self.assertEqual(messages[-1]["content"], "新问题")
+            self.assertEqual(memory.session_records(session_id), original)
+
+    def test_hash_profiles_are_isolated_between_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            memory = MemoryStore(Path(value) / ".yy" / "memory")
+            first, second = "a" * 16, "b" * 16
+            (memory.profiles.directory / f"{first}.md").write_text("第一会话特点", encoding="utf-8")
+            (memory.profiles.directory / f"{second}.md").write_text("第二会话特点", encoding="utf-8")
+            context = memory.profile_context(first)
+            self.assertTrue(context.startswith(f"[{first}]"))
+            self.assertIn("第一会话特点", context)
+            self.assertNotIn("第二会话特点", context)
 
     def test_runtime_records_model_latency_tokens_and_identity(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -323,3 +512,69 @@ class CoreTests(unittest.TestCase):
                 self.assertIn("T", await registry.execute("current_time", {}, context))
 
         asyncio.run(check())
+
+    def test_subagent_tool_defaults_to_no_tools_and_uses_two_stage_write_approval(self) -> None:
+        async def check() -> None:
+            with tempfile.TemporaryDirectory() as value:
+                root = Path(value)
+                approvals: list[str] = []
+
+                async def approve(name, arguments) -> bool:
+                    approvals.append(name)
+                    return True
+
+                captured: list[list[str]] = []
+
+                async def runner(task, instructions, names, context) -> str:
+                    captured.append(names)
+                    if "write_file" in names:
+                        selected = default_tools(root).select(names)
+                        return await selected.execute(
+                            "write_file", {"path": "delegated.txt", "content": task}, context,
+                        )
+                    return f"子任务完成：{task}"
+
+                registry = default_tools(root, subagent_runner=runner)
+                context = ToolContext(root, approval=approve)
+                self.assertEqual(
+                    await registry.execute("subagent", {"task": "分析"}, context),
+                    "子任务完成：分析",
+                )
+                self.assertEqual(captured[-1], [])
+                self.assertEqual(approvals, [])
+                await registry.execute(
+                    "subagent",
+                    {"task": "内容", "instructions": "负责写入", "tools": ["write_file"]},
+                    context,
+                )
+                self.assertEqual(approvals, ["subagent", "write_file"])
+                self.assertEqual((root / "delegated.txt").read_text(encoding="utf-8"), "内容")
+                with self.assertRaises(ValueError):
+                    await registry.execute("subagent", {"task": "递归", "tools": ["subagent"]}, context)
+
+        asyncio.run(check())
+
+    def test_subagent_only_persists_as_parent_tool_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(root)
+            memory = MemoryStore(config.memory_dir)
+
+            async def runner(task, instructions, names, context) -> str:
+                self.assertEqual(names, [])
+                return "子 Agent 结论"
+
+            runtime = AgentRuntime(
+                config,
+                provider=SubagentCallingProvider(),
+                memory=memory,
+                subagent_runner=runner,
+            )
+            result = asyncio.run(runtime.run("委派任务"))
+            self.assertTrue(result.completed)
+            records = memory.session_records(result.session_id)
+            self.assertEqual([record["role"] for record in records], ["user", "assistant", "tool", "assistant"])
+            self.assertEqual(records[2]["name"], "subagent")
+            self.assertEqual(records[2]["content"], "子 Agent 结论")
+            session_index = json.loads((config.memory_dir / "session" / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(list(session_index["sessions"]), [result.session_id])

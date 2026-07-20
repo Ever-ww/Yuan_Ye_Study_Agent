@@ -28,13 +28,39 @@ class AsyncToolRegistry:
             for tool in self._tools.values()
         ]
 
+    def names(self) -> tuple[str, ...]:
+        """按注册顺序返回工具名称。"""
+        return tuple(self._tools)
+
+    def select(self, names: Iterable[str]) -> "AsyncToolRegistry":
+        """创建严格子集；未知名称和 subagent 递归调用会被拒绝。"""
+        selected: list[AsyncTool] = []
+        for name in names:
+            if name == "subagent":
+                raise ValueError("子 Agent 不允许递归调用 subagent")
+            tool = self._tools.get(name)
+            if tool is None:
+                raise ValueError(f"未知工具：{name}")
+            if tool not in selected:
+                selected.append(tool)
+        return AsyncToolRegistry(selected)
+
+    def risk_of(self, name: str) -> str:
+        """返回指定工具风险等级，供委派审批使用。"""
+        tool = self._tools.get(name)
+        if tool is None:
+            raise ValueError(f"未知工具：{name}")
+        return tool.risk
+
     async def execute(self, name: str, arguments: dict[str, Any], context: ToolContext) -> str:
         """重新校验 Hook 处理后的参数，获批后执行工具。"""
         tool = self._tools.get(name)
         if tool is None:
             raise ValueError(f"未知工具：{name}")
         self._validate(tool.schema, arguments)
-        if tool.risk != "read":
+        dynamic = getattr(tool, "requires_approval", None)
+        needs_approval = bool(dynamic(arguments)) if callable(dynamic) else tool.risk != "read"
+        if needs_approval:
             if context.approval is None or not await context.approval(name, arguments):
                 raise PermissionError(f"工具调用未获批准：{name}")
         return await tool.run(arguments, context)
@@ -48,5 +74,20 @@ class AsyncToolRegistry:
             if key not in arguments:
                 raise ValueError(f"缺少工具参数：{key}")
         for key, definition in schema.get("properties", {}).items():
-            if key in arguments and definition.get("type") == "string" and not isinstance(arguments[key], str):
+            if key not in arguments:
+                continue
+            value = arguments[key]
+            expected = definition.get("type")
+            if expected == "string" and not isinstance(value, str):
                 raise ValueError(f"参数 {key} 必须是字符串")
+            if expected == "array":
+                if not isinstance(value, list):
+                    raise ValueError(f"参数 {key} 必须是数组")
+                item_schema = definition.get("items", {})
+                if item_schema.get("type") == "string" and any(not isinstance(item, str) for item in value):
+                    raise ValueError(f"参数 {key} 的元素必须是字符串")
+                allowed = item_schema.get("enum")
+                if isinstance(allowed, list):
+                    invalid = [item for item in value if item not in allowed]
+                    if invalid:
+                        raise ValueError(f"参数 {key} 包含未知值：{invalid[0]}")

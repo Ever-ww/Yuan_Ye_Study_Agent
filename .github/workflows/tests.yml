@@ -36,4 +36,4 @@ jobs:
       - name: 运行 unittest
         run: uv run --frozen --extra dev python -m unittest discover -s tests -v
       - name: 编译检查
-        run: uv run --frozen --extra dev python -m compileall -q Agent bootstrap memory prompt tools run_ui tests run.py
+        run: uv run --frozen --extra dev python -m compileall -q Agent bootstrap context_process memory prompt tools run_ui tests run.py
