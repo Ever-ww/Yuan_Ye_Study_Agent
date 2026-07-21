@@ -13,6 +13,7 @@ class EventType(str, Enum):
 
     STARTED = "started"
     TEXT = "text"
+    MODEL_RETRY = "model_retry"
     TOOL_REQUESTED = "tool_requested"
     APPROVAL_REQUESTED = "approval_requested"
     TOOL_COMPLETED = "tool_completed"

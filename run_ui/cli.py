@@ -12,9 +12,10 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
-from Agent import AgentRuntime, EventType, load_runtime_config
+from Agent import AgentRuntime, EventType, ModelRetryPolicy, RuntimeFailure, load_runtime_config
 from bootstrap import ensure_project_initialized, initialize_project
 from memory import MemoryStore
+from .harness_loader import load_harness_module
 from .web import serve
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Yuan Ye Study Agent 本地入口")
@@ -48,7 +49,13 @@ async def _approve(name: str, arguments: dict[str, object]) -> bool:
     return typer.confirm(f"允许执行 {name} {arguments}？", default=False)
 
 
-async def _render(runtime: AgentRuntime, task: str, session_id: str | None = None) -> str:
+async def _render(
+    runtime: AgentRuntime,
+    task: str,
+    session_id: str | None = None,
+    *,
+    propagate_errors: bool = False,
+) -> str:
     """边接收事件边刷新面板，避免模型等待期间终端静止。"""
     lines: list[str] = []
     streaming_text = ""
@@ -61,6 +68,14 @@ async def _render(runtime: AgentRuntime, task: str, session_id: str | None = Non
                     active_session_id = str(event.payload["session_id"])
                 elif event.type is EventType.TEXT:
                     streaming_text += str(event.payload["content"])
+                elif event.type is EventType.MODEL_RETRY:
+                    if streaming_text:
+                        lines.append("[yellow]本次流式片段因网络中断已丢弃[/]")
+                        streaming_text = ""
+                    lines.append(
+                        f"[yellow]模型网络异常，{event.payload['delay_seconds']} 秒后进行 "
+                        f"第 {event.payload['attempt']}/{event.payload['max_attempts']} 次请求[/]"
+                    )
                 elif event.type is EventType.TOOL_REQUESTED:
                     if streaming_text:
                         lines.append(streaming_text)
@@ -85,6 +100,8 @@ async def _render(runtime: AgentRuntime, task: str, session_id: str | None = Non
                 display = lines[-12:] + ([streaming_text] if streaming_text else [])
                 live.update(Panel("\n".join(display) or "正在思考…", title="Yuan Ye Agent"))
     except Exception as exc:
+        if propagate_errors:
+            raise
         console.print(Panel(f"[red]{str(exc) or type(exc).__name__}[/]", title="Yuan Ye Agent 运行错误"))
     return active_session_id
 
@@ -126,7 +143,13 @@ async def _chat(session_id: str | None) -> None:
     console.print("[bold cyan]Yuan Ye Agent[/]  输入 /help 查看命令，/exit 退出。")
     if session_id:
         console.print(f"[green]已恢复会话[/] {session_id}（{len(_memory().session_records(session_id))} 条消息）")
-    runtime = AgentRuntime(approval=_approve)
+    config = load_runtime_config()
+    runtime = AgentRuntime(
+        config,
+        approval=_approve,
+        retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=2),
+        raise_errors=True,
+    )
     try:
         while True:
             task = console.input("[bold blue]你 > [/]").strip()
@@ -137,11 +160,74 @@ async def _chat(session_id: str | None) -> None:
                 continue
             if task:
                 previous_id = session_id
-                session_id = await _render(runtime, task, session_id)
+                try:
+                    session_id = await _render(runtime, task, session_id, propagate_errors=True)
+                except Exception as exc:
+                    active_id = runtime.active_session_id or session_id or ""
+                    failure = runtime.last_failure or RuntimeFailure.capture(exc)
+                    console.print(Panel(
+                        f"[red]{str(exc) or type(exc).__name__}[/]",
+                        title="Yuan Ye Agent 运行错误",
+                    ))
+                    await _handle_chat_failure(config, runtime, task, active_id, failure)
+                    session_id = active_id or session_id
+                    if active_id and not previous_id:
+                        console.print(f"[dim]会话哈希：{active_id}；失败现场已保留，可继续本会话[/]")
+                    continue
                 if session_id and not previous_id:
                     console.print(f"[dim]会话哈希：{session_id}；下次可使用 chat --session {session_id} 恢复[/]")
     finally:
         await runtime.close()
+
+
+async def _handle_chat_failure(config, runtime, task: str, session_id: str, failure: RuntimeFailure) -> None:
+    """保存完整现场，并在明确代码缺陷时由用户决定是否启动 Harness。"""
+    harness = load_harness_module()
+    writer = harness.ErrorSnapshotWriter(
+        config.project_root,
+        secrets=(config.api_key or "",),
+    )
+    try:
+        records = runtime.memory.session_records(session_id) if session_id and runtime.memory.has_session(session_id) else []
+        snapshot = writer.capture(
+            task=task,
+            session_id=session_id,
+            failure=failure,
+            session_records=records,
+            session_file=runtime.memory.active_filename(session_id) if session_id and records else "",
+        )
+    except Exception as snapshot_error:
+        console.print(f"[yellow]错误现场保存失败：{str(snapshot_error) or type(snapshot_error).__name__}[/]")
+        return
+    console.print(f"[dim]错误复现快照：{snapshot}[/]")
+    if not failure.repairable:
+        writer.append_event(snapshot, "decision", repairable=False, confirmed=False)
+        return
+    confirmed = typer.confirm("检测到可诊断的代码/模型格式缺陷，是否启动 Harness 隔离流水线？", default=False)
+    writer.append_event(snapshot, "decision", repairable=True, confirmed=confirmed)
+    if not confirmed:
+        return
+    request = harness.HarnessEvolutionRequest(
+        project_root=config.project_root,
+        incident_id=snapshot.stem,
+        snapshot_path=snapshot,
+        task=task,
+        config=config,
+    )
+    console.print("[cyan]Harness 正在检查主 worktree并准备隔离诊断…[/]")
+    try:
+        result = await harness.HarnessEvolutionRunner(writer).run(request)
+    except Exception as evolution_error:
+        writer.append_event(
+            snapshot,
+            "evolution",
+            status="pipeline_error",
+            message=str(evolution_error) or type(evolution_error).__name__,
+        )
+        console.print(f"[red]Harness 流水线失败：{str(evolution_error) or type(evolution_error).__name__}[/]")
+        return
+    style = "green" if result.merged else "yellow"
+    console.print(f"[{style}]{result.message}[/]")
 
 
 @session_app.command("list")

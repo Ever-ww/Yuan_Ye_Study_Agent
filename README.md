@@ -6,11 +6,13 @@ Yuan Ye Study Agent 是一个本地优先、单一异步 Runtime 驱动的学习
   <img src="images/harness_evolution.png" alt="Harness 自进化：工坊中的马正在修整自己的挽具" width="760">
 </p>
 
-## Harness 自进化的故事
+## Harness 自进化
 
 模型像一匹拥有力量和方向感的马，Harness 则是让这种能力能够被稳定驾驭的整套挽具：Runtime 负责节奏，Prompt 提供方向，Tools 延伸行动能力，Hooks 留出新的连接点，Memory 和上下文压缩让它记住一路上真正重要的东西。
 
-所谓 **Harness 自进化**，不是让模型不受控制地改写自己，而是建立一条可审计的成长闭环：每次 Session 留下完整工具链和运行指标，长期信息被整理为 Profile，过长上下文被压缩为新的可恢复分段，新能力再通过稳定的 Hook、Tool 与测试接入。模型保持可替换，核心 Runtime 保持精简，而承载模型的 Harness 会随着真实使用逐步变得更贴合用户、更可靠，也更容易继续扩展。
+所谓 **Harness 自进化**，不是让模型不受控制地改写自己，而是建立一条可审计的成长闭环：传统框架依赖硬编码固定逻辑，面对长对话、Token 波动、复杂子任务、新增交互场景容易失效，只能靠人工改代码、重启服务来适配。本 Agent 会实时感知运行瓶颈、自动生成并校验代码补丁，通过热更新动态优化自身逻辑，实现无需人工介入的持续自适应迭代。这是对"身体"和"大脑"的共同进化，而不是只优化"大脑"(skill)。
+
+当前实现处于安全的第一阶段：CLI chat 能保存完整错误现场，并在确认后创建隔离 Git worktree，再启动一个复用正式 `AgentRuntime` 类的诊断实例。该实例暂时没有 Tool 或 Skill，因此不会改代码；发现 Git diff 为空后会删除临时 worktree。后续接入 Coding Tool/Skill 后，既有流水线才会执行测试、提交和本地快进合并，新版本在下次启动时生效。Harness 不会静默修改脏工作区，也不会自动推送 GitHub。
 
 > 本文以 Windows PowerShell 为例。项目要求 Python 3.10+；由 uv 管理项目 Python、`.venv` 和依赖，不需要手动使用 `pip` 或激活虚拟环境。
 
@@ -20,6 +22,7 @@ Yuan Ye Study Agent 是一个本地优先、单一异步 Runtime 驱动的学习
 Agent/      模型适配、异步 ReAct、Runtime、Hook 协议与配置
 memory/     记忆领域 Python 服务
 context_process/ Token 阈值压缩、Profile 合并与失败裁剪
+harness-evolution/ 错误快照、隔离 worktree、诊断与验证流水线
 prompt/     System Prompt 分层组合
 tools/      异步工具协议、注册表和受控内置工具
   contracts.py         AsyncTool 协议与 ToolContext
@@ -196,6 +199,8 @@ uv run python run.py chat
 - 已经开始会话后输入 `/compress`，可立即压缩当前上下文；命令本身不会写入 JSONL。
 - `stream=true` 时，OpenAI-compatible Provider 会通过 SSE 逐段显示文本。
 - 高风险写文件工具会请求一次性确认；输入 `n` 拒绝本次操作。
+- CLI chat 的单次模型调用遇到临时网络错误时会等待 2 秒后重试，总计最多 3 次；调用成功或进入工具结果后的下一次模型调用时重新计数。
+- 终止性错误会在 `tests/error/<SHA-256>.jsonl` 保存完整本机复现快照且不建立索引。代码或模型格式缺陷会询问是否启动 Harness，默认拒绝。
 
 ### 2. 查看已有会话
 
@@ -308,7 +313,7 @@ uv run python run.py chat --help
 ```powershell
 uv run python -m unittest discover -s tests -v
 uv run python -m pytest -q
-uv run python -m compileall -q Agent bootstrap context_process memory prompt tools run_ui tests run.py
+uv run python -m compileall -q Agent bootstrap context_process memory prompt tools run_ui tests harness-evolution run.py
 uv run python run.py --help
 uv lock --check
 ```
@@ -316,6 +321,7 @@ uv lock --check
 ## 配置、状态与安全
 
 - `.yy/` 是完整的本机目录，由 `uv run python run.py init` 创建，整个目录已被 Git 忽略。
+- `tests/error/*.jsonl` 保存 chat 终止错误的完整上下文、请求与异常栈，可能包含隐私，只在本机保留并由 Git 忽略。
 - 本机模型配置：`.yy/settings.local.json`，可放置 `provider`、`model`、`base_url` 与 `api_key`；初始化模板由源码中的 `bootstrap/templates/` 提供。
 - 全部记忆衍生物：`.yy/memory/`。`session/index.json` 指向每个会话最新 JSONL 分段；文件名为 `年月日_会话哈希_分段号.jsonl`。
 - 首次运行自动创建 `profile/USER.md`、`profile/RESEARCH.md`、`profile/OTHERS.md` 和索引。普通命名的扩展 Profile 全局加载；16 位会话哈希命名的 Profile 只注入对应 Session，避免跨会话污染。

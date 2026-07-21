@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import math
 import time
@@ -10,15 +12,26 @@ from typing import Any
 from uuid import uuid4
 
 from Agent.contracts import EventType, ModelProvider, ModelReply, RunEvent, ToolCall
+from Agent.errors import AgentExecutionLimitError, AgentInvariantError
 from Agent.hook import HookEvent, HookPoint, HookRegistry
+from Agent.models.errors import is_retryable_model_error
+from Agent.retry import ModelRetryPolicy
 from tools import AsyncToolRegistry, ToolContext
 
 
 class ReactLoop:
     """一次模型调用及其请求的全部工具构成一个无编号 Turn。"""
 
-    def __init__(self, provider: ModelProvider, tools: AsyncToolRegistry, hooks: HookRegistry, max_steps: int) -> None:
+    def __init__(
+        self,
+        provider: ModelProvider,
+        tools: AsyncToolRegistry,
+        hooks: HookRegistry,
+        max_steps: int,
+        retry_policy: ModelRetryPolicy | None = None,
+    ) -> None:
         self.provider, self.tools, self.hooks, self.max_steps = provider, tools, hooks, max_steps
+        self.retry_policy = retry_policy or ModelRetryPolicy(max_attempts=1, delay_seconds=0)
 
     async def run(
         self,
@@ -34,54 +47,89 @@ class ReactLoop:
         question_tokens = _estimate_tokens(task)
         task_started_at = time.perf_counter()
 
-        for model_attempt in range(self.max_steps):
-            await self.hooks.emit(HookEvent(HookPoint.TURN_START, session_id, {"task": task, "messages": messages}))
-            schemas = self.tools.schemas()
-            before = HookEvent(HookPoint.MODEL_BEFORE, session_id, {
-                "task": task,
-                "messages": messages,
-                "tools": schemas,
-                "model": model,
-                "first_model_call": model_attempt == 0,
-            })
-            try:
-                await self.hooks.emit(before)
-                messages = before.data.get("messages")
-                schemas = before.data.get("tools")
-                if not isinstance(messages, list) or not isinstance(schemas, list):
-                    raise ValueError("model_before 必须保留列表形式的 messages 和 tools")
-                estimated_context = _estimate_tokens(json.dumps({"messages": messages, "tools": schemas}, ensure_ascii=False))
-                await self.hooks.emit(HookEvent(HookPoint.MODEL_DURING, session_id, {
-                    "task": task, "messages": messages, "tools": schemas, "model": model,
-                }))
-            except Exception as exc:
-                await self._end_failed_turn(session_id, task, model, model_calls, exc)
-                raise
+        successful_steps = 0
+        context_loaded = False
+        while successful_steps < self.max_steps:
+            attempt = 0
+            retry_history: list[dict[str, Any]] = []
+            while True:
+                attempt += 1
+                schemas = self.tools.schemas()
+                await self.hooks.emit(HookEvent(HookPoint.TURN_START, session_id, {"task": task, "messages": messages}))
+                before = HookEvent(HookPoint.MODEL_BEFORE, session_id, {
+                    "task": task,
+                    "messages": messages,
+                    "tools": schemas,
+                    "model": model,
+                    "first_model_call": not context_loaded,
+                })
+                try:
+                    await self.hooks.emit(before)
+                    messages = before.data.get("messages")
+                    schemas = before.data.get("tools")
+                    if not isinstance(messages, list) or not isinstance(schemas, list):
+                        raise AgentInvariantError("model_before 必须保留列表形式的 messages 和 tools")
+                    context_loaded = True
+                    estimated_context = _estimate_tokens(json.dumps({"messages": messages, "tools": schemas}, ensure_ascii=False))
+                    await self.hooks.emit(HookEvent(HookPoint.MODEL_DURING, session_id, {
+                        "task": task, "messages": messages, "tools": schemas, "model": model,
+                    }))
+                except Exception as exc:
+                    await self._end_failed_turn(session_id, task, model, model_calls, exc)
+                    _attach_failure_context(exc, messages, schemas, model, retry_history)
+                    raise
 
-            started_at = time.perf_counter()
-            streamed = False
-            try:
-                if getattr(self.provider, "streaming", False) and getattr(self.provider, "stream", None):
-                    streamed = True
-                    parts: list[str] = []
-                    calls: tuple[ToolCall, ...] = ()
-                    usage = None
-                    async for chunk in self.provider.stream(messages, schemas):
-                        if chunk.text:
-                            parts.append(chunk.text)
-                            yield RunEvent(EventType.TEXT, {"content": chunk.text})
-                        if chunk.tool_calls:
-                            calls = chunk.tool_calls
-                        if chunk.usage is not None:
-                            usage = chunk.usage
-                    reply = ModelReply("".join(parts), calls, True, usage)
-                else:
-                    reply = await self.provider.complete(messages, schemas)
-            except Exception as exc:
-                failure = {"task": task, "model": model, "error": exc, "completed": False, "model_calls": model_calls}
-                await self.hooks.emit(HookEvent(HookPoint.MODEL_AFTER, session_id, failure))
-                await self.hooks.emit(HookEvent(HookPoint.TURN_END, session_id, failure))
-                raise
+                started_at = time.perf_counter()
+                streamed = False
+                try:
+                    if getattr(self.provider, "streaming", False) and getattr(self.provider, "stream", None):
+                        streamed = True
+                        parts: list[str] = []
+                        calls: tuple[ToolCall, ...] = ()
+                        usage = None
+                        async for chunk in self.provider.stream(messages, schemas):
+                            if chunk.text:
+                                parts.append(chunk.text)
+                                yield RunEvent(EventType.TEXT, {"content": chunk.text})
+                            if chunk.tool_calls:
+                                calls = chunk.tool_calls
+                            if chunk.usage is not None:
+                                usage = chunk.usage
+                        reply = ModelReply("".join(parts), calls, True, usage)
+                    else:
+                        reply = await self.provider.complete(messages, schemas)
+                except Exception as exc:
+                    retry_history.append({
+                        "attempt": attempt,
+                        "error_type": type(exc).__name__,
+                        "message": str(exc) or type(exc).__name__,
+                    })
+                    failure = {
+                        "task": task,
+                        "model": model,
+                        "error": exc,
+                        "completed": False,
+                        "model_calls": model_calls,
+                        "retry_history": list(retry_history),
+                    }
+                    try:
+                        await self.hooks.emit(HookEvent(HookPoint.MODEL_AFTER, session_id, failure))
+                        await self.hooks.emit(HookEvent(HookPoint.TURN_END, session_id, failure))
+                    except Exception as hook_error:
+                        _attach_failure_context(hook_error, messages, schemas, model, retry_history)
+                        raise
+                    if is_retryable_model_error(exc) and attempt < self.retry_policy.max_attempts:
+                        yield RunEvent(EventType.MODEL_RETRY, {
+                            "attempt": attempt + 1,
+                            "max_attempts": self.retry_policy.max_attempts,
+                            "delay_seconds": self.retry_policy.delay_seconds,
+                            "message": str(exc) or type(exc).__name__,
+                        })
+                        await asyncio.sleep(self.retry_policy.delay_seconds)
+                        continue
+                    _attach_failure_context(exc, messages, schemas, model, retry_history)
+                    raise
+                break
 
             reply = _ensure_tool_call_ids(reply)
             call_metric = _model_call_metric(
@@ -98,10 +146,13 @@ class ReactLoop:
                 await self.hooks.emit(after)
             except Exception as exc:
                 await self._end_failed_turn(session_id, task, model, model_calls, exc)
+                _attach_failure_context(exc, messages, schemas, model, [])
                 raise
             reply = after.data.get("reply")
             if not isinstance(reply, ModelReply):
-                raise ValueError("model_after 必须保留 ModelReply 类型的 reply")
+                error = AgentInvariantError("model_after 必须保留 ModelReply 类型的 reply")
+                _attach_failure_context(error, messages, schemas, model, [])
+                raise error
             reply = _ensure_tool_call_ids(reply)
             if reply.text and not streamed:
                 yield RunEvent(EventType.TEXT, {"content": reply.text})
@@ -114,10 +165,12 @@ class ReactLoop:
                         yield event
                 except Exception as exc:
                     await self._end_failed_turn(session_id, task, model, model_calls, exc)
+                    _attach_failure_context(exc, messages, schemas, model, [])
                     raise
                 await self.hooks.emit(HookEvent(HookPoint.TURN_END, session_id, {
                     "task": task, "model": model, "reply": reply, "error": None, "completed": False, "model_calls": model_calls,
                 }))
+                successful_steps += 1
                 continue
 
             completed = {
@@ -148,7 +201,9 @@ class ReactLoop:
             yield RunEvent(EventType.FINAL, {"answer": reply.text, "completed": True, "model_calls": model_calls})
             return
 
-        yield RunEvent(EventType.ERROR, {"message": "模型在最大调用次数内未完成"})
+        error = AgentExecutionLimitError("模型在最大调用次数内未完成")
+        _attach_failure_context(error, messages, self.tools.schemas(), model, [])
+        raise error
 
     async def _execute_tools(
         self,
@@ -241,3 +296,22 @@ def _estimate_tokens(value: str) -> int:
         return 0
     cjk = sum(1 for char in value if "\u3400" <= char <= "\u9fff")
     return cjk + math.ceil((len(value) - cjk) / 4)
+
+
+def _attach_failure_context(
+    error: BaseException,
+    messages: list[dict[str, Any]],
+    schemas: list[dict[str, Any]],
+    model: dict[str, Any],
+    retry_history: list[dict[str, Any]],
+) -> None:
+    """把可复现请求现场附到异常；失败时仍保留原始异常。"""
+    try:
+        setattr(error, "yy_failure_context", {
+            "messages": copy.deepcopy(messages),
+            "tools": copy.deepcopy(schemas),
+            "model": copy.deepcopy(model),
+            "retry_history": copy.deepcopy(retry_history),
+        })
+    except Exception:
+        return

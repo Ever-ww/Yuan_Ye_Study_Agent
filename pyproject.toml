@@ -24,5 +24,8 @@ include = ["Agent*", "bootstrap*", "context_process*", "memory*", "prompt*", "to
 bootstrap = ["templates/*.example"]
 run_ui = ["templates/*.html", "static/*.css", "static/*.js"]
 
+[tool.setuptools.data-files]
+"harness-evolution" = ["harness-evolution/harness.py"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

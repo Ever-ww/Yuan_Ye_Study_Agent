@@ -28,6 +28,10 @@ AGENT.md
 AGENT.local.md
 DEVELOPMENT_REFERENCE.md
 
+# Chat 错误复现快照包含完整用户上下文，仅保留本机说明文件。
+tests/error/*.jsonl
+tests/error/*.log
+
 # Python 字节码缓存。
 __pycache__/
 *.py[cod]

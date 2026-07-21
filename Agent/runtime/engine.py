@@ -11,12 +11,14 @@ from Agent.contracts import ApprovalCallback, EventType, RunEvent
 from Agent.hook import HookEvent, HookPoint, HookRegistry, build_default_hooks
 from Agent.models import build_provider
 from Agent.react import ReactLoop
+from Agent.retry import ModelRetryPolicy
 from context_process import ContextProcessor
 from memory import MemoryStore
 from prompt import PromptComposer
 from tools import AsyncToolRegistry, ToolContext, default_tools
 from tools.subagent import SubagentTool
 from .subagent import RuntimeSubagentRunner
+from .failure import RuntimeFailure
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,8 @@ class AgentRuntime:
         subagent_runner=None,
         enable_context_processing: bool = True,
         enable_subagent: bool = True,
+        retry_policy: ModelRetryPolicy | None = None,
+        raise_errors: bool = False,
     ) -> None:
         self.config = config or load_runtime_config()
         self.provider = provider or build_provider(
@@ -55,6 +59,9 @@ class AgentRuntime:
             stream=self.config.stream,
         )
         self.approval = approval
+        self.retry_policy = retry_policy
+        self.raise_errors = raise_errors
+        self.last_failure: RuntimeFailure | None = None
         self.memory = memory or MemoryStore(self.config.memory_dir)
         if tools is not None:
             self.tools = tools
@@ -77,8 +84,14 @@ class AgentRuntime:
         self._session_id: str | None = None
         self._session_open = False
 
+    @property
+    def active_session_id(self) -> str | None:
+        """返回当前打开的 Session，供 CLI 在失败后保存复现现场。"""
+        return self._session_id
+
     async def run_task(self, task: str, session_id: str | None = None) -> AsyncIterator[RunEvent]:
         """处理一次用户输入；内部每次模型 API 调用各自形成一个 Turn。"""
+        self.last_failure = None
         if task.strip() == "/compress":
             async for event in self._compress_command(session_id):
                 yield event
@@ -86,12 +99,21 @@ class AgentRuntime:
         try:
             active_id = await self._ensure_session(task, session_id)
         except Exception as exc:
+            self.last_failure = RuntimeFailure.capture(exc)
+            if self.raise_errors:
+                raise
             yield RunEvent(EventType.ERROR, {"message": str(exc) or type(exc).__name__})
             return
         yield RunEvent(EventType.STARTED, {"session_id": active_id})
         messages = self.prompts.compose(task)
         context = ToolContext(project_root=self.config.project_root, approval=self.approval)
-        loop = ReactLoop(self.provider, self.tools, self.hooks, self.config.max_steps)
+        loop = ReactLoop(
+            self.provider,
+            self.tools,
+            self.hooks,
+            self.config.max_steps,
+            retry_policy=self.retry_policy,
+        )
         model = {
             "provider": self.config.provider,
             "name": self.config.model,
@@ -102,6 +124,9 @@ class AgentRuntime:
             async for event in loop.run(messages, context, task=task, session_id=active_id, model=model):
                 yield event
         except Exception as exc:
+            self.last_failure = RuntimeFailure.capture(exc)
+            if self.raise_errors:
+                raise
             message = str(exc) or f"{type(exc).__name__}：运行时发生未提供详情的异常"
             yield RunEvent(EventType.ERROR, {"message": message})
 
