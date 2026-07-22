@@ -2,28 +2,38 @@
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, TypeAdapter, ValidationError, field_validator
 
 from bootstrap import ensure_project_initialized
 
 
-@dataclass(frozen=True)
-class RuntimeConfig:
+_JSON_OBJECT = TypeAdapter(dict[str, Any])
+
+
+class RuntimeConfig(BaseModel):
     """核心运行时的最小且明确配置。"""
 
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     project_root: Path
-    model: str = "echo"
-    provider: str = "echo"
+    model: str = Field(default="echo", min_length=1)
+    provider: str = Field(default="echo", min_length=1)
     base_url: str | None = None
     api_key: str | None = None
-    stream: bool = False
-    max_steps: int = 8
-    temperature: float = 0.0
-    profile: str = "general"
-    compression_threshold_tokens: int = 20000
+    stream: StrictBool = False
+    max_steps: StrictInt = Field(default=8, ge=1)
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    profile: str = Field(default="general", min_length=1)
+    compression_threshold_tokens: StrictInt = Field(default=20000, ge=0)
+
+    @field_validator("project_root")
+    @classmethod
+    def _resolve_project_root(cls, value: Path) -> Path:
+        """在配置边界统一工作区为绝对路径。"""
+        return value.resolve()
 
     @property
     def memory_dir(self) -> Path:
@@ -35,10 +45,10 @@ def _read_json(path: Path) -> dict[str, Any]:
     """读取可选 JSON 对象；缺失配置等价于空配置。"""
     if not path.exists():
         return {}
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError(f"配置必须是 JSON 对象：{path}")
-    return value
+    try:
+        return _JSON_OBJECT.validate_json(path.read_text(encoding="utf-8"), strict=True)
+    except ValidationError as exc:
+        raise ValueError(f"配置必须是合法 JSON 对象：{path}\n{exc}") from exc
 
 
 def load_runtime_config(project_root: Path | None = None, **overrides: Any) -> RuntimeConfig:
@@ -52,10 +62,4 @@ def load_runtime_config(project_root: Path | None = None, **overrides: Any) -> R
     values.update(shared)
     values.update(_read_json(root / ".yy" / "settings.local.json"))
     values.update({key: value for key, value in overrides.items() if value is not None})
-    if "stream" in values and not isinstance(values["stream"], bool):
-        raise ValueError("stream 必须是 true 或 false")
-    threshold = values.get("compression_threshold_tokens", 20000)
-    if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 0:
-        raise ValueError("compression_threshold_tokens 必须是大于等于 0 的整数")
-    allowed = {item.name for item in fields(RuntimeConfig)}
-    return RuntimeConfig(**{key: value for key, value in values.items() if key in allowed})
+    return RuntimeConfig.model_validate(values)

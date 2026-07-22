@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from enum import Enum
 from collections.abc import AsyncIterator
 from typing import Any, Protocol
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class EventType(str, Enum):
@@ -24,34 +25,38 @@ class EventType(str, Enum):
     FINAL = "final"
 
 
-@dataclass(frozen=True)
-class RunEvent:
+class RunEvent(BaseModel):
     """一次运行中可串行消费的事件。"""
 
+    model_config = ConfigDict(frozen=True, strict=True)
+
     type: EventType
-    payload: dict[str, Any] = field(default_factory=dict)
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class ToolCall:
+class ToolCall(BaseModel):
     """模型请求的一次工具调用。"""
 
-    name: str
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    name: str = Field(min_length=1)
     arguments: dict[str, Any]
     id: str | None = None
 
 
-@dataclass(frozen=True)
-class TokenUsage:
+class TokenUsage(BaseModel):
     """模型服务返回的单次请求精确 Token 用量。"""
 
-    input_tokens: int | None = None
-    output_tokens: int | None = None
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
 
 
-@dataclass(frozen=True)
-class ModelReply:
+class ModelReply(BaseModel):
     """模型本轮输出的文本和可选工具调用。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
 
     text: str = ""
     tool_calls: tuple[ToolCall, ...] = ()

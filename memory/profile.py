@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from .models import ProfileIndex
 
 
 DEFAULT_PROFILE_FILES = ("USER.md", "RESEARCH.md", "OTHERS.md")
@@ -89,13 +90,13 @@ class ProfileStore:
 
     def _read_index(self) -> dict[str, Any]:
         self.initialize()
-        value = json.loads(self.index_path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict) or not isinstance(value.get("profiles"), dict):
-            raise ValueError(f"Profile 索引格式无效：{self.index_path}")
-        return value
+        return ProfileIndex.model_validate_json(
+            self.index_path.read_text(encoding="utf-8"), strict=True,
+        ).model_dump(mode="python")
 
     def _write_index(self, value: dict[str, Any]) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
+        validated = ProfileIndex.model_validate(value, strict=True)
         temporary = self.index_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.write_text(validated.model_dump_json(indent=2) + "\n", encoding="utf-8")
         temporary.replace(self.index_path)

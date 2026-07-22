@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+from pydantic import BaseModel, ConfigDict
 
 from memory import MemoryStore
 
 
-@dataclass(frozen=True)
-class InitializationResult:
+class InitializationResult(BaseModel):
     """一次启动检查的结果。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
 
     yy_dir: Path
     initialized: bool
@@ -58,5 +60,5 @@ def ensure_project_initialized(project_root: Path) -> InitializationResult:
     root = project_root.resolve()
     yy = root / ".yy"
     if is_project_initialized(root):
-        return InitializationResult(yy, False)
-    return InitializationResult(initialize_project(root), True)
+        return InitializationResult(yy_dir=yy, initialized=False)
+    return InitializationResult(yy_dir=initialize_project(root), initialized=True)

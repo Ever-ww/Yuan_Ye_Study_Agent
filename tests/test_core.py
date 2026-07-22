@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from pydantic import BaseModel, ValidationError
+
 from Agent import AgentRuntime, EventType, HookEvent, HookPoint, HookRegistry, load_runtime_config
 from Agent.contracts import ModelReply, TokenUsage, ToolCall
 from bootstrap import ensure_project_initialized, is_project_initialized
@@ -22,8 +24,8 @@ class ToolProvider:
 
     async def complete(self, messages, tools):
         if not any(message["role"] == "tool" for message in messages):
-            return ModelReply(tool_calls=(ToolCall("calculator", {"expression": "2 + 2"}),), finished=False)
-        return ModelReply("计算完成：4")
+            return ModelReply(tool_calls=(ToolCall(name="calculator", arguments={"expression": "2 + 2"}),), finished=False)
+        return ModelReply(text="计算完成：4")
 
 
 class MultiToolProvider:
@@ -34,10 +36,10 @@ class MultiToolProvider:
     async def complete(self, messages, tools):
         if not any(message["role"] == "tool" for message in messages):
             return ModelReply(tool_calls=(
-                ToolCall("calculator", {"expression": "10 + 20"}, "call_a"),
-                ToolCall("calculator", {"expression": "30 * 2"}, "call_b"),
+                ToolCall(name="calculator", arguments={"expression": "10 + 20"}, id="call_a"),
+                ToolCall(name="calculator", arguments={"expression": "30 * 2"}, id="call_b"),
             ))
-        return ModelReply("结果为 60")
+        return ModelReply(text="结果为 60")
 
 
 class FailingToolProvider:
@@ -46,7 +48,7 @@ class FailingToolProvider:
     streaming = False
 
     async def complete(self, messages, tools):
-        return ModelReply(tool_calls=(ToolCall("read_file", {"path": "missing-file.txt"}),))
+        return ModelReply(tool_calls=(ToolCall(name="read_file", arguments={"path": "missing-file.txt"}),))
 
 
 class SubagentCallingProvider:
@@ -56,10 +58,10 @@ class SubagentCallingProvider:
 
     async def complete(self, messages, tools):
         if not any(message["role"] == "tool" for message in messages):
-            return ModelReply(tool_calls=(ToolCall("subagent", {
+            return ModelReply(tool_calls=(ToolCall(name="subagent", arguments={
                 "task": "提炼结论", "instructions": "保持简洁",
             }),))
-        return ModelReply(f"父 Agent 收到：{messages[-1]['content']}")
+        return ModelReply(text=f"父 Agent 收到：{messages[-1]['content']}")
 
 
 class StreamProvider:
@@ -68,11 +70,11 @@ class StreamProvider:
     streaming = True
 
     async def complete(self, messages, tools):
-        return ModelReply("不应走完整响应")
+        return ModelReply(text="不应走完整响应")
 
     async def stream(self, messages, tools):
-        yield ModelReply("你", finished=False)
-        yield ModelReply("好", finished=False)
+        yield ModelReply(text="你", finished=False)
+        yield ModelReply(text="好", finished=False)
         yield ModelReply(finished=True)
 
 
@@ -82,7 +84,7 @@ class UsageProvider:
     streaming = False
 
     async def complete(self, messages, tools):
-        return ModelReply("指标已记录", usage=TokenUsage(input_tokens=128, output_tokens=9))
+        return ModelReply(text="指标已记录", usage=TokenUsage(input_tokens=128, output_tokens=9))
 
 
 class CompressionProvider:
@@ -99,8 +101,8 @@ class CompressionProvider:
         self.calls += 1
         self.messages = [dict(message) for message in messages]
         if not self.valid:
-            return ModelReply("不是 JSON")
-        return ModelReply(json.dumps({
+            return ModelReply(text="不是 JSON")
+        return ModelReply(text=json.dumps({
             "profile_markdown": "# 用户特征\n- 偏好中文\n\n# 研究方向\n- Agent",
             "context_summary_markdown": "# 用户目标\n研究 Agent\n# 已完成任务\n完成存储\n# 未完成任务\n继续压缩\n# 关键决策\n使用 JSONL\n# 必要工具结论\n计算结果为 4",
         }, ensure_ascii=False))
@@ -112,7 +114,7 @@ class LargeUsageProvider:
     streaming = False
 
     async def complete(self, messages, tools):
-        return ModelReply("已完成大上下文回答", usage=TokenUsage(input_tokens=20000, output_tokens=20))
+        return ModelReply(text="已完成大上下文回答", usage=TokenUsage(input_tokens=20000, output_tokens=20))
 
 
 class CapturingProvider:
@@ -125,11 +127,18 @@ class CapturingProvider:
 
     async def complete(self, messages, tools):
         self.messages = [dict(message) for message in messages]
-        return ModelReply("第二答")
+        return ModelReply(text="第二答")
 
 
 class CoreTests(unittest.TestCase):
     """覆盖配置、Runtime、工具边界与记忆目录。"""
+
+    def test_core_contracts_are_frozen_pydantic_models(self) -> None:
+        """核心数据契约统一由 Pydantic 定义并保持不可变语义。"""
+        reply = ModelReply(text="完成")
+        self.assertIsInstance(reply, BaseModel)
+        with self.assertRaises(ValidationError):
+            reply.text = "被修改"
 
     def test_initializer_creates_complete_yy_without_overwriting(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -181,6 +190,15 @@ class CoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "stream"):
                 load_runtime_config(root)
 
+    def test_configuration_rejects_unknown_fields(self) -> None:
+        """配置拼写错误必须尽早失败，不能被静默忽略。"""
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            (root / ".yy").mkdir()
+            (root / ".yy" / "settings.local.json").write_text('{"streem":false}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "streem"):
+                load_runtime_config(root)
+
     def test_compression_threshold_defaults_and_validates(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
@@ -205,6 +223,19 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(records[0]["role"], "user")
             self.assertIn("timestamp", records[0])
             self.assertEqual(memory.restore_messages(session_id)[1]["content"], "你好，我可以帮助你。")
+
+    def test_memory_rejects_invalid_jsonl_records(self) -> None:
+        """损坏或角色字段非法的持久化记录必须在恢复边界明确失败。"""
+        with tempfile.TemporaryDirectory() as value:
+            memory = MemoryStore(Path(value) / ".yy" / "memory")
+            session_id = memory.create_session("问题")
+            active = memory.sessions.directory / memory.active_filename(session_id)
+            active.write_text(
+                '{"role":"invalid","content":"坏记录","timestamp":"2026-07-23 10:00:00"}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "格式无效"):
+                memory.session_records(session_id)
 
     def test_new_session_segment_keeps_hash_and_updates_index(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -474,7 +505,7 @@ class CoreTests(unittest.TestCase):
     def test_write_tool_requires_approval_and_stays_in_workspace(self) -> None:
         async def check() -> None:
             with tempfile.TemporaryDirectory() as value:
-                context = ToolContext(Path(value))
+                context = ToolContext(project_root=Path(value))
                 tools = default_tools(Path(value))
                 with self.assertRaises(PermissionError):
                     await tools.execute("write_file", {"path": "note.txt", "content": "x"}, context)
@@ -495,7 +526,7 @@ class CoreTests(unittest.TestCase):
                     {schema["name"] for schema in registry.schemas()},
                     {"read_file", "write_file", "calculator", "search_workspace", "current_time"},
                 )
-                context = ToolContext(root, approval=approve)
+                context = ToolContext(project_root=root, approval=approve)
                 await registry.execute("write_file", {"path": "notes/demo.txt", "content": "独立工具模块"}, context)
                 self.assertEqual(
                     await registry.execute("read_file", {"path": "notes/demo.txt"}, context),
@@ -510,6 +541,19 @@ class CoreTests(unittest.TestCase):
                     await registry.execute("search_workspace", {"query": "独立工具模块"}, context),
                 )
                 self.assertIn("T", await registry.execute("current_time", {}, context))
+
+        asyncio.run(check())
+
+    def test_tool_arguments_use_strict_pydantic_validation(self) -> None:
+        """模型工具参数不得被隐式转换，也不得携带 Schema 外字段。"""
+        async def check() -> None:
+            with tempfile.TemporaryDirectory() as value:
+                registry = default_tools(Path(value))
+                context = ToolContext(project_root=Path(value))
+                with self.assertRaisesRegex(ValueError, "工具参数校验失败"):
+                    await registry.execute("calculator", {"expression": 4}, context)
+                with self.assertRaisesRegex(ValueError, "工具参数校验失败"):
+                    await registry.execute("calculator", {"expression": "2+2", "unexpected": True}, context)
 
         asyncio.run(check())
 
@@ -535,7 +579,7 @@ class CoreTests(unittest.TestCase):
                     return f"子任务完成：{task}"
 
                 registry = default_tools(root, subagent_runner=runner)
-                context = ToolContext(root, approval=approve)
+                context = ToolContext(project_root=root, approval=approve)
                 self.assertEqual(
                     await registry.execute("subagent", {"task": "分析"}, context),
                     "子任务完成：分析",

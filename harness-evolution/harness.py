@@ -7,11 +7,12 @@ import hashlib
 import json
 import re
 import sys
-from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from Agent import AgentRuntime, HookRegistry, ModelRetryPolicy, RuntimeConfig, RuntimeFailure
 from tools import AsyncToolRegistry
@@ -137,9 +138,10 @@ class ErrorSnapshotWriter:
             handle.write(json.dumps(_sanitize(record, self.secrets), ensure_ascii=False) + "\n")
 
 
-@dataclass(frozen=True)
-class HarnessEvolutionRequest:
+class HarnessEvolutionRequest(BaseModel):
     """一次经用户确认的隔离诊断请求。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
 
     project_root: Path
     incident_id: str
@@ -148,9 +150,10 @@ class HarnessEvolutionRequest:
     config: RuntimeConfig
 
 
-@dataclass(frozen=True)
-class HarnessEvolutionResult:
+class HarnessEvolutionResult(BaseModel):
     """Harness 流水线的最终状态。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
 
     status: str
     message: str
@@ -165,12 +168,11 @@ class _NoMemory:
 
 def create_coding_runtime(config: RuntimeConfig, worktree_root: Path) -> AgentRuntime:
     """复用正式 AgentRuntime 类创建无 Tool、无 Skill、无 Memory 的诊断实例。"""
-    isolated = replace(
-        config,
-        project_root=worktree_root.resolve(),
-        stream=False,
-        compression_threshold_tokens=0,
-    )
+    isolated = config.model_copy(update={
+        "project_root": worktree_root.resolve(),
+        "stream": False,
+        "compression_threshold_tokens": 0,
+    })
     return AgentRuntime(
         isolated,
         tools=AsyncToolRegistry(),
@@ -201,12 +203,12 @@ class HarnessEvolutionRunner:
         if clean.stdout.strip():
             message = "主 worktree 存在未提交修改，Harness 已停止且不会 stash 用户内容"
             self.writer.append_event(request.snapshot_path, "evolution", status="dirty_worktree", message=message)
-            return HarnessEvolutionResult("dirty_worktree", message)
+            return HarnessEvolutionResult(status="dirty_worktree", message=message)
         branch_result = await self._git(root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
         if branch_result.returncode != 0 or not branch_result.stdout.strip():
             message = "当前不在可识别分支上，Harness 无法安全合并"
             self.writer.append_event(request.snapshot_path, "evolution", status="detached_head", message=message)
-            return HarnessEvolutionResult("detached_head", message)
+            return HarnessEvolutionResult(status="detached_head", message=message)
         base = (await self._git(root, "rev-parse", "HEAD")).stdout.strip()
         branch = f"harness-evolution/{request.incident_id[:16]}"
         worktree = (root / ".yy" / "harness-evolution" / "worktrees" / request.incident_id).resolve()
@@ -249,7 +251,9 @@ class HarnessEvolutionRunner:
                     message=message,
                     worktree_path=str(worktree),
                 )
-                return HarnessEvolutionResult("no_code_changes", message, str(worktree), branch)
+                return HarnessEvolutionResult(
+                    status="no_code_changes", message=message, worktree_path=str(worktree), branch=branch,
+                )
 
             forbidden = _forbidden_changed_paths(changes)
             if forbidden:
@@ -261,13 +265,18 @@ class HarnessEvolutionRunner:
                     message=message,
                     forbidden_paths=forbidden,
                 )
-                return HarnessEvolutionResult("forbidden_changes", message, str(worktree), branch)
+                return HarnessEvolutionResult(
+                    status="forbidden_changes", message=message, worktree_path=str(worktree), branch=branch,
+                )
 
             self.writer.append_event(request.snapshot_path, "evolution", status="changes_detected", git_status=changes)
             await self._git(worktree, "add", "--intent-to-add", "--all")
             tests = await self._run_tests(worktree, request.snapshot_path)
             if not tests:
-                return HarnessEvolutionResult("tests_failed", "新版本测试失败，已丢弃隔离 worktree", str(worktree), branch)
+                return HarnessEvolutionResult(
+                    status="tests_failed", message="新版本测试失败，已丢弃隔离 worktree",
+                    worktree_path=str(worktree), branch=branch,
+                )
             await self._git(worktree, "add", "--all")
             await self._git(
                 worktree,
@@ -279,15 +288,22 @@ class HarnessEvolutionRunner:
                 keep_branch = True
                 message = "验证后主 worktree 发生变化，已拒绝自动合并并保留临时分支"
                 self.writer.append_event(request.snapshot_path, "evolution", status="main_changed", message=message, branch=branch)
-                return HarnessEvolutionResult("main_changed", message, str(worktree), branch)
+                return HarnessEvolutionResult(
+                    status="main_changed", message=message, worktree_path=str(worktree), branch=branch,
+                )
             if (await self._git(root, "rev-parse", "HEAD")).stdout.strip() != base:
                 keep_branch = True
                 message = "验证期间主分支 HEAD 已变化，已拒绝自动合并并保留临时分支"
                 self.writer.append_event(request.snapshot_path, "evolution", status="main_changed", message=message, branch=branch)
-                return HarnessEvolutionResult("main_changed", message, str(worktree), branch)
+                return HarnessEvolutionResult(
+                    status="main_changed", message=message, worktree_path=str(worktree), branch=branch,
+                )
             await self._git(root, "merge", "--ff-only", branch)
             self.writer.append_event(request.snapshot_path, "evolution", status="merged", branch=branch)
-            return HarnessEvolutionResult("merged", "修复已合并，下次启动生效", str(worktree), branch, True)
+            return HarnessEvolutionResult(
+                status="merged", message="修复已合并，下次启动生效",
+                worktree_path=str(worktree), branch=branch, merged=True,
+            )
         finally:
             cleanup = await self._cleanup(root, worktree, branch, keep_branch=keep_branch)
             self.writer.append_event(
@@ -324,7 +340,7 @@ class HarnessEvolutionRunner:
 
     async def _cleanup(self, root: Path, worktree: Path, branch: str, *, keep_branch: bool) -> dict[str, Any]:
         remove = await self._git(root, "worktree", "remove", "--force", str(worktree), check=False)
-        branch_result = _CommandResult(0, "", "")
+        branch_result = _CommandResult(returncode=0, stdout="", stderr="")
         if not keep_branch:
             branch_result = await self._git(root, "branch", "-D", branch, check=False)
         return {
@@ -358,18 +374,21 @@ class HarnessEvolutionRunner:
             await process.communicate()
             raise RuntimeError(f"命令执行超时：{' '.join(command)}")
         result = _CommandResult(
-            process.returncode or 0,
-            stdout.decode("utf-8", errors="replace"),
-            stderr.decode("utf-8", errors="replace"),
+            returncode=process.returncode or 0,
+            stdout=stdout.decode("utf-8", errors="replace"),
+            stderr=stderr.decode("utf-8", errors="replace"),
         )
         if check and result.returncode != 0:
             raise RuntimeError(f"命令执行失败：{' '.join(command)}\n{result.stderr or result.stdout}")
         return result
 
 
-@dataclass(frozen=True)
-class _CommandResult:
-    returncode: int
+class _CommandResult(BaseModel):
+    """隔离命令执行结果。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    returncode: int = Field(ge=0)
     stdout: str
     stderr: str
 

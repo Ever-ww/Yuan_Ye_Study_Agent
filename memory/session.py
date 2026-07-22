@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from pydantic import ValidationError
+
+from .models import SessionIndex, SessionRecord
+
 
 class SessionStore:
     """以日期加会话哈希命名 JSONL，并维护最新分段索引。"""
@@ -42,14 +46,13 @@ class SessionStore:
 
     def append(self, session_id: str, role: str, content: str | None, metadata: dict[str, object] | None = None) -> None:
         """向当前最新 JSONL 分段追加一条带时间戳的对话消息。"""
-        if role not in {"user", "assistant", "tool", "summary"}:
-            raise ValueError("会话记录角色必须是 user、assistant、tool 或 summary")
         record = {"role": role, "content": content, "timestamp": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")}
         if metadata:
             record.update(metadata)
+        validated = SessionRecord.model_validate(record).model_dump(mode="python", exclude_unset=True)
         path = self._active_path(session_id)
         with path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(validated, ensure_ascii=False) + "\n")
 
     def restore(self, session_id: str) -> list[dict[str, Any]]:
         """恢复最新分段并移除时间戳、模型指标等审计字段。"""
@@ -80,11 +83,10 @@ class SessionStore:
             if not line.strip():
                 continue
             try:
-                value = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"会话 {session_id} 第 {number} 行不是合法 JSON") from exc
-            if isinstance(value, dict):
-                records.append(value)
+                value = SessionRecord.model_validate_json(line).model_dump(mode="python", exclude_unset=True)
+            except ValidationError as exc:
+                raise ValueError(f"会话 {session_id} 第 {number} 行格式无效：{exc}") from exc
+            records.append(value)
         return records
 
     def exists(self, session_id: str) -> bool:
@@ -121,7 +123,8 @@ class SessionStore:
         for record in initial_records:
             value = dict(record)
             value.setdefault("timestamp", datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"))
-            lines.append(json.dumps(value, ensure_ascii=False))
+            validated = SessionRecord.model_validate(value).model_dump(mode="python", exclude_unset=True)
+            lines.append(json.dumps(validated, ensure_ascii=False))
         temporary.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
         temporary.replace(path)
         session["files"].append(filename)
@@ -151,12 +154,15 @@ class SessionStore:
         return self.directory / session["latest_file"]
 
     def _read_index(self) -> dict:
-        """读取索引 JSON。"""
+        """读取并校验索引 JSON。"""
         self.initialize()
-        return json.loads(self.index_path.read_text(encoding="utf-8"))
+        return SessionIndex.model_validate_json(
+            self.index_path.read_text(encoding="utf-8"), strict=True,
+        ).model_dump(mode="python")
 
     def _write_index(self, value: dict) -> None:
         """原子替换索引，避免中断留下半个 JSON 文件。"""
+        validated = SessionIndex.model_validate(value, strict=True)
         temporary = self.index_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.write_text(validated.model_dump_json(indent=2) + "\n", encoding="utf-8")
         temporary.replace(self.index_path)

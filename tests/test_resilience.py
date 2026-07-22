@@ -33,7 +33,7 @@ class FlakyProvider:
         self.calls += 1
         if self.calls <= self.failures:
             raise ModelNetworkError(f"临时网络错误 {self.calls}")
-        return ModelReply("成功")
+        return ModelReply(text="成功")
 
 
 class PerStepFlakyProvider:
@@ -50,11 +50,11 @@ class PerStepFlakyProvider:
             self.first_calls += 1
             if self.first_calls == 1:
                 raise ModelNetworkError("第一步网络错误")
-            return ModelReply(tool_calls=(ToolCall("calculator", {"expression": "2+2"}),))
+            return ModelReply(tool_calls=(ToolCall(name="calculator", arguments={"expression": "2+2"}),))
         self.second_calls += 1
         if self.second_calls <= 2:
             raise ModelNetworkError("第二步网络错误")
-        return ModelReply("4")
+        return ModelReply(text="4")
 
 
 def _git(root: Path, *args: str) -> str:
@@ -88,7 +88,7 @@ class ResilienceTests(unittest.TestCase):
                 config,
                 provider=provider,
                 memory=memory,
-                retry_policy=ModelRetryPolicy(3, 0),
+                retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=0),
             )
             points: list[str] = []
 
@@ -111,7 +111,7 @@ class ResilienceTests(unittest.TestCase):
             runtime = AgentRuntime(
                 load_runtime_config(Path(value)),
                 provider=provider,
-                retry_policy=ModelRetryPolicy(3, 0),
+                retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=0),
             )
             result = asyncio.run(runtime.run("计算"))
             self.assertTrue(result.completed)
@@ -123,7 +123,7 @@ class ResilienceTests(unittest.TestCase):
             runtime = AgentRuntime(
                 load_runtime_config(root),
                 provider=FlakyProvider(3),
-                retry_policy=ModelRetryPolicy(3, 0),
+                retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=0),
                 raise_errors=True,
             )
             with self.assertRaises(ModelNetworkError):
@@ -252,7 +252,9 @@ class ResilienceTests(unittest.TestCase):
             writer = harness.ErrorSnapshotWriter(root)
             snapshot = writer.capture(task="问题", session_id="a" * 16, failure=failure, session_records=[])
             (root / "tracked.txt").write_text("dirty\n", encoding="utf-8")
-            request = harness.HarnessEvolutionRequest(root, snapshot.stem, snapshot, "问题", config)
+            request = harness.HarnessEvolutionRequest(
+                project_root=root, incident_id=snapshot.stem, snapshot_path=snapshot, task="问题", config=config,
+            )
             result = asyncio.run(harness.HarnessEvolutionRunner(writer).run(request))
             self.assertEqual(result.status, "dirty_worktree")
             self.assertFalse((root / ".yy" / "harness-evolution" / "worktrees").exists())
@@ -288,7 +290,9 @@ class ResilienceTests(unittest.TestCase):
             failure = RuntimeFailure.capture(RuntimeError("内部缺陷"))
             writer = harness.ErrorSnapshotWriter(root)
             snapshot = writer.capture(task="问题", session_id="b" * 16, failure=failure, session_records=[])
-            request = harness.HarnessEvolutionRequest(root, snapshot.stem, snapshot, "问题", config)
+            request = harness.HarnessEvolutionRequest(
+                project_root=root, incident_id=snapshot.stem, snapshot_path=snapshot, task="问题", config=config,
+            )
             result = asyncio.run(harness.HarnessEvolutionRunner(writer).run(request))
             self.assertEqual(result.status, "no_code_changes")
             self.assertFalse(Path(result.worktree_path).exists())
@@ -324,7 +328,9 @@ class ResilienceTests(unittest.TestCase):
             failure = RuntimeFailure.capture(RuntimeError("内部缺陷"))
             writer = harness.ErrorSnapshotWriter(root)
             snapshot = writer.capture(task="问题", session_id="c" * 16, failure=failure, session_records=[])
-            request = harness.HarnessEvolutionRequest(root, snapshot.stem, snapshot, "问题", config)
+            request = harness.HarnessEvolutionRequest(
+                project_root=root, incident_id=snapshot.stem, snapshot_path=snapshot, task="问题", config=config,
+            )
             runner = PassingRunner(writer, runtime_factory=lambda current, worktree: EditingRuntime(worktree))
             result = asyncio.run(runner.run(request))
             self.assertTrue(result.merged)
@@ -358,7 +364,9 @@ class ResilienceTests(unittest.TestCase):
             failure = RuntimeFailure.capture(RuntimeError("内部缺陷"))
             writer = harness.ErrorSnapshotWriter(root)
             snapshot = writer.capture(task="问题", session_id="d" * 16, failure=failure, session_records=[])
-            request = harness.HarnessEvolutionRequest(root, snapshot.stem, snapshot, "问题", config)
+            request = harness.HarnessEvolutionRequest(
+                project_root=root, incident_id=snapshot.stem, snapshot_path=snapshot, task="问题", config=config,
+            )
             runner = FailingRunner(writer, runtime_factory=lambda current, worktree: EditingRuntime(worktree))
             result = asyncio.run(runner.run(request))
             self.assertEqual(result.status, "tests_failed")

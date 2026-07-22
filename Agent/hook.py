@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import inspect
 from collections import defaultdict
-from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+from pydantic import BaseModel, ConfigDict, Field
 
 if TYPE_CHECKING:
     from context_process import ContextProcessor
@@ -29,13 +30,14 @@ class HookPoint(str, Enum):
     TOOL_AFTER = "tool_after"
 
 
-@dataclass
-class HookEvent:
+class HookEvent(BaseModel):
     """回调共享的 Session 上下文；不持久化 Trace 或 Turn 实体。"""
 
+    model_config = ConfigDict(validate_assignment=True, strict=True)
+
     point: HookPoint
-    session_id: str
-    data: dict[str, Any] = field(default_factory=dict)
+    session_id: str = Field(min_length=1)
+    data: dict[str, Any] = Field(default_factory=dict)
 
 
 HookCallback = Callable[[HookEvent], Awaitable[None] | None]

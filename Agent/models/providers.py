@@ -81,9 +81,9 @@ def _openai_reply(data: object) -> ModelReply:
                 raise TypeError("工具名称缺失")
             call_id = item.get("id")
             calls.append(ToolCall(
-                name,
-                _tool_arguments(function.get("arguments"), data),
-                str(call_id) if call_id else None,
+                name=name,
+                arguments=_tool_arguments(function.get("arguments"), data),
+                id=str(call_id) if call_id else None,
             ))
         return ModelReply(
             text=_content_text(message.get("content")),
@@ -222,7 +222,11 @@ class OpenAICompatibleProvider:
             if not slot["name"]:
                 raise ModelResponseFormatError("模型流式工具调用缺少名称", _response_excerpt(pending_calls))
             try:
-                calls.append(ToolCall(slot["name"], json.loads(slot["arguments"] or "{}"), slot["id"] or None))
+                calls.append(ToolCall(
+                    name=slot["name"],
+                    arguments=json.loads(slot["arguments"] or "{}"),
+                    id=slot["id"] or None,
+                ))
             except json.JSONDecodeError as exc:
                 raise ModelResponseFormatError(
                     f"模型返回了无效的流式工具参数：{slot['name']}",

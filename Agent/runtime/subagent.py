@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 from Agent.config import RuntimeConfig
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models import build_provider
@@ -36,7 +34,7 @@ class RuntimeSubagentRunner:
             event.data["tools"] = selected.schemas()
 
         hooks.register(HookPoint.MODEL_BEFORE, inject_prompt, priority=-100)
-        config = replace(self.config, stream=False, compression_threshold_tokens=0)
+        config = self.config.model_copy(update={"stream": False, "compression_threshold_tokens": 0})
         provider = build_provider(
             config.provider,
             config.model,

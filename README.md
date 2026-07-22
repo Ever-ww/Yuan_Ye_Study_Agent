@@ -320,10 +320,15 @@ uv lock --check
 
 ## 配置、状态与安全
 
+- 核心配置、Runtime 事件、模型回复、Hook 事件、工具上下文、压缩结果和 Harness 请求均使用 Pydantic v2 定义；不可变契约启用冻结语义。
+- 配置文件会严格校验字段类型、数值范围和未知字段。拼错配置名会在启动时明确报错，不再被静默忽略。
+- 工具 JSON Schema 会在注册时编译为严格 Pydantic 参数模型；Hook 改写后的最终参数会再次校验，拒绝类型偷换、未知字段和非法枚举。
+- 上下文压缩模型的 JSON 输出由 Pydantic 校验，必须只包含非空的 `profile_markdown` 与 `context_summary_markdown`。
 - `.yy/` 是完整的本机目录，由 `uv run python run.py init` 创建，整个目录已被 Git 忽略。
-- `tests/error/*.jsonl` 保存 chat 终止错误的完整上下文、请求与异常栈，可能包含隐私，只在本机保留并由 Git 忽略。
+- `tests/error/*.jsonl` 只保存代码类缺陷的完整上下文、请求与异常栈，可能包含隐私，只在本机保留并由 Git 忽略。
 - 本机模型配置：`.yy/settings.local.json`，可放置 `provider`、`model`、`base_url` 与 `api_key`；初始化模板由源码中的 `bootstrap/templates/` 提供。
 - 全部记忆衍生物：`.yy/memory/`。`session/index.json` 指向每个会话最新 JSONL 分段；文件名为 `年月日_会话哈希_分段号.jsonl`。
+- Session JSONL、Session 索引和 Profile 索引读取时均经过 Pydantic 校验；非法角色、损坏的工具链关联或错误索引会明确失败，不会静默污染下一轮上下文。
 - 首次运行自动创建 `profile/USER.md`、`profile/RESEARCH.md`、`profile/OTHERS.md` 和索引。普通命名的扩展 Profile 全局加载；16 位会话哈希命名的 Profile 只注入对应 Session，避免跨会话污染。
 - 新模型实现 `Agent.contracts.ModelProvider`；新工具实现 `tools.AsyncTool`；新回调通过 `HookRegistry.register()` 或 `HookRegistry.on()` 注册。
 - 写文件等高风险工具必须通过 Runtime 的审批回调，且文件路径不能越出项目工作区。

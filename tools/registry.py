@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+import re
+from typing import Any, Iterable, Literal
+
+from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
 from .contracts import AsyncTool, ToolContext
 
@@ -12,6 +15,7 @@ class AsyncToolRegistry:
 
     def __init__(self, tools: Iterable[AsyncTool] = ()) -> None:
         self._tools: dict[str, AsyncTool] = {}
+        self._argument_models: dict[str, type[BaseModel]] = {}
         for tool in tools:
             self.register(tool)
 
@@ -20,6 +24,7 @@ class AsyncToolRegistry:
         if tool.name in self._tools:
             raise ValueError(f"工具名称重复：{tool.name}")
         self._tools[tool.name] = tool
+        self._argument_models[tool.name] = _build_argument_model(tool.name, tool.schema)
 
     def schemas(self) -> list[dict[str, Any]]:
         """返回供模型调用的 OpenAI function Schema 列表。"""
@@ -57,7 +62,7 @@ class AsyncToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             raise ValueError(f"未知工具：{name}")
-        self._validate(tool.schema, arguments)
+        arguments = self._validate(name, arguments)
         dynamic = getattr(tool, "requires_approval", None)
         needs_approval = bool(dynamic(arguments)) if callable(dynamic) else tool.risk != "read"
         if needs_approval:
@@ -65,29 +70,58 @@ class AsyncToolRegistry:
                 raise PermissionError(f"工具调用未获批准：{name}")
         return await tool.run(arguments, context)
 
-    @staticmethod
-    def _validate(schema: dict[str, Any], arguments: dict[str, Any]) -> None:
-        """执行当前工具所需的对象、必填字段和基本类型校验。"""
-        if not isinstance(arguments, dict):
-            raise ValueError("工具参数必须是对象")
-        for key in schema.get("required", []):
-            if key not in arguments:
-                raise ValueError(f"缺少工具参数：{key}")
-        for key, definition in schema.get("properties", {}).items():
-            if key not in arguments:
-                continue
-            value = arguments[key]
-            expected = definition.get("type")
-            if expected == "string" and not isinstance(value, str):
-                raise ValueError(f"参数 {key} 必须是字符串")
-            if expected == "array":
-                if not isinstance(value, list):
-                    raise ValueError(f"参数 {key} 必须是数组")
-                item_schema = definition.get("items", {})
-                if item_schema.get("type") == "string" and any(not isinstance(item, str) for item in value):
-                    raise ValueError(f"参数 {key} 的元素必须是字符串")
-                allowed = item_schema.get("enum")
-                if isinstance(allowed, list):
-                    invalid = [item for item in value if item not in allowed]
-                    if invalid:
-                        raise ValueError(f"参数 {key} 包含未知值：{invalid[0]}")
+    def _validate(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """用工具 Schema 对应的 Pydantic 模型严格校验实际执行参数。"""
+        model = self._argument_models[name]
+        try:
+            return model.model_validate(arguments).model_dump(exclude_unset=True)
+        except ValidationError as exc:
+            raise ValueError(f"工具参数校验失败：{exc}") from exc
+
+
+def _build_argument_model(name: str, schema: dict[str, Any]) -> type[BaseModel]:
+    """把当前项目使用的 JSON Schema 子集编译为严格 Pydantic 模型。"""
+    if schema.get("type", "object") != "object":
+        raise ValueError(f"工具 {name} 的参数 Schema 必须是 object")
+    properties = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    if not isinstance(properties, dict) or not all(isinstance(key, str) for key in properties):
+        raise ValueError(f"工具 {name} 的 properties 必须是对象")
+    unknown_required = required.difference(properties)
+    if unknown_required:
+        raise ValueError(f"工具 {name} 的 required 包含未知字段：{sorted(unknown_required)[0]}")
+
+    fields: dict[str, tuple[Any, Any]] = {}
+    for field_name, definition in properties.items():
+        if not isinstance(definition, dict):
+            raise ValueError(f"工具 {name} 的字段 {field_name} 定义必须是对象")
+        annotation = _schema_type(definition)
+        fields[field_name] = (annotation, ... if field_name in required else None)
+    model_name = "ToolArguments_" + re.sub(r"\W+", "_", name)
+    return create_model(
+        model_name,
+        __config__=ConfigDict(extra="forbid", strict=True),
+        **fields,
+    )
+
+
+def _schema_type(definition: dict[str, Any]) -> Any:
+    """转换工具参数目前支持的字符串、数组、数值、布尔和对象类型。"""
+    kind = definition.get("type")
+    if kind == "string":
+        allowed = definition.get("enum")
+        if isinstance(allowed, list) and allowed:
+            return Literal.__getitem__(tuple(allowed))
+        return str
+    if kind == "array":
+        item_type = _schema_type(definition.get("items", {}))
+        return list[item_type]
+    if kind == "integer":
+        return int
+    if kind == "number":
+        return float
+    if kind == "boolean":
+        return bool
+    if kind == "object":
+        return dict[str, Any]
+    return Any

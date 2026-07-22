@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, replace
-from typing import Any, Callable
+from typing import Any, Callable, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from Agent.config import RuntimeConfig
 from Agent.hook import HookEvent, HookPoint, HookRegistry
@@ -15,32 +16,41 @@ from prompt import compose_compression_messages
 from tools import AsyncToolRegistry
 
 
-@dataclass(frozen=True)
-class CompressionResult:
+class CompressionResult(BaseModel):
     """一次压缩的可审计结果。"""
 
-    status: str
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    status: Literal["compressed", "fallback", "error"]
     session_id: str
-    attempts: int
+    attempts: int = Field(ge=0, le=3)
     source_file: str
     target_file: str | None = None
     profile_file: str | None = None
-    records_processed: int = 0
-    conversation_turns: int = 0
+    records_processed: int = Field(default=0, ge=0)
+    conversation_turns: int = Field(default=0, ge=0)
     message: str = ""
 
     def payload(self) -> dict[str, Any]:
-        return {
-            "status": self.status,
-            "session_id": self.session_id,
-            "attempts": self.attempts,
-            "source_file": self.source_file,
-            "target_file": self.target_file,
-            "profile_file": self.profile_file,
-            "records_processed": self.records_processed,
-            "conversation_turns": self.conversation_turns,
-            "message": self.message,
-        }
+        """输出 Runtime 事件可直接消费的 Python 字典。"""
+        return self.model_dump(mode="python")
+
+
+class _CompressionOutput(BaseModel):
+    """压缩模型必须返回的严格结构。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    profile_markdown: str = Field(min_length=1)
+    context_summary_markdown: str = Field(min_length=1)
+
+    @field_validator("profile_markdown", "context_summary_markdown")
+    @classmethod
+    def _strip_non_empty_markdown(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Markdown 内容不能为空")
+        return value
 
 
 class ContextProcessor:
@@ -63,7 +73,10 @@ class ContextProcessor:
         source_file = self.memory.active_filename(session_id)
         records = self.memory.session_records(session_id)
         if not any(record.get("role") in {"user", "assistant", "tool"} for record in records):
-            return CompressionResult("error", session_id, 0, source_file, message="当前会话没有可压缩内容")
+            return CompressionResult(
+                status="error", session_id=session_id, attempts=0, source_file=source_file,
+                message="当前会话没有可压缩内容",
+            )
         normalized = _normalize_records(records)
         existing = self.memory.profiles.session_profile(session_id)
         validation_error = ""
@@ -89,7 +102,7 @@ class ContextProcessor:
                 )
                 self._fallback_sessions.discard(session_id)
                 return CompressionResult(
-                    "compressed", session_id, attempt, source_file,
+                    status="compressed", session_id=session_id, attempts=attempt, source_file=source_file,
                     target_file=segment.name,
                     profile_file=profile_path.name,
                     records_processed=len(records),
@@ -100,7 +113,7 @@ class ContextProcessor:
                 validation_error = str(exc) or type(exc).__name__
         self._fallback_sessions.add(session_id)
         return CompressionResult(
-            "fallback", session_id, 3, source_file,
+            status="fallback", session_id=session_id, attempts=3, source_file=source_file,
             records_processed=len(records),
             conversation_turns=sum(1 for record in records if record.get("role") == "user"),
             message=f"压缩连续失败 3 次，已启用内存上下文裁剪：{validation_error}",
@@ -137,7 +150,7 @@ class ContextProcessor:
             event.data["tools"] = []
 
         hooks.register(HookPoint.MODEL_BEFORE, inject_prompt, priority=-100)
-        child_config = replace(self.config, stream=False, compression_threshold_tokens=0)
+        child_config = self.config.model_copy(update={"stream": False, "compression_threshold_tokens": 0})
         runtime = AgentRuntime(
             child_config,
             provider=self.provider_factory(),
@@ -180,15 +193,8 @@ def _parse_output(raw: str) -> tuple[str, str]:
         value = "\n".join(lines[1:-1]).strip()
         if value.startswith("json"):
             value = value[4:].lstrip()
-    data = json.loads(value)
-    if not isinstance(data, dict):
-        raise ValueError("压缩输出必须是 JSON 对象")
-    profile, summary = data.get("profile_markdown"), data.get("context_summary_markdown")
-    if not isinstance(profile, str) or not profile.strip():
-        raise ValueError("压缩输出缺少非空 profile_markdown")
-    if not isinstance(summary, str) or not summary.strip():
-        raise ValueError("压缩输出缺少非空 context_summary_markdown")
-    return profile.strip(), summary.strip()
+    output = _CompressionOutput.model_validate_json(value)
+    return output.profile_markdown, output.context_summary_markdown
 
 
 def _conversation_blocks(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:

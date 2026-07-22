@@ -55,8 +55,8 @@ class ReactLoop:
             while True:
                 attempt += 1
                 schemas = self.tools.schemas()
-                await self.hooks.emit(HookEvent(HookPoint.TURN_START, session_id, {"task": task, "messages": messages}))
-                before = HookEvent(HookPoint.MODEL_BEFORE, session_id, {
+                await self.hooks.emit(HookEvent(point=HookPoint.TURN_START, session_id=session_id, data={"task": task, "messages": messages}))
+                before = HookEvent(point=HookPoint.MODEL_BEFORE, session_id=session_id, data={
                     "task": task,
                     "messages": messages,
                     "tools": schemas,
@@ -71,7 +71,7 @@ class ReactLoop:
                         raise AgentInvariantError("model_before 必须保留列表形式的 messages 和 tools")
                     context_loaded = True
                     estimated_context = _estimate_tokens(json.dumps({"messages": messages, "tools": schemas}, ensure_ascii=False))
-                    await self.hooks.emit(HookEvent(HookPoint.MODEL_DURING, session_id, {
+                    await self.hooks.emit(HookEvent(point=HookPoint.MODEL_DURING, session_id=session_id, data={
                         "task": task, "messages": messages, "tools": schemas, "model": model,
                     }))
                 except Exception as exc:
@@ -90,12 +90,12 @@ class ReactLoop:
                         async for chunk in self.provider.stream(messages, schemas):
                             if chunk.text:
                                 parts.append(chunk.text)
-                                yield RunEvent(EventType.TEXT, {"content": chunk.text})
+                                yield RunEvent(type=EventType.TEXT, payload={"content": chunk.text})
                             if chunk.tool_calls:
                                 calls = chunk.tool_calls
                             if chunk.usage is not None:
                                 usage = chunk.usage
-                        reply = ModelReply("".join(parts), calls, True, usage)
+                        reply = ModelReply(text="".join(parts), tool_calls=calls, finished=True, usage=usage)
                     else:
                         reply = await self.provider.complete(messages, schemas)
                 except Exception as exc:
@@ -113,13 +113,13 @@ class ReactLoop:
                         "retry_history": list(retry_history),
                     }
                     try:
-                        await self.hooks.emit(HookEvent(HookPoint.MODEL_AFTER, session_id, failure))
-                        await self.hooks.emit(HookEvent(HookPoint.TURN_END, session_id, failure))
+                        await self.hooks.emit(HookEvent(point=HookPoint.MODEL_AFTER, session_id=session_id, data=failure))
+                        await self.hooks.emit(HookEvent(point=HookPoint.TURN_END, session_id=session_id, data=failure))
                     except Exception as hook_error:
                         _attach_failure_context(hook_error, messages, schemas, model, retry_history)
                         raise
                     if is_retryable_model_error(exc) and attempt < self.retry_policy.max_attempts:
-                        yield RunEvent(EventType.MODEL_RETRY, {
+                        yield RunEvent(type=EventType.MODEL_RETRY, payload={
                             "attempt": attempt + 1,
                             "max_attempts": self.retry_policy.max_attempts,
                             "delay_seconds": self.retry_policy.delay_seconds,
@@ -139,7 +139,7 @@ class ReactLoop:
                 reply,
             )
             model_calls.append(call_metric)
-            after = HookEvent(HookPoint.MODEL_AFTER, session_id, {
+            after = HookEvent(point=HookPoint.MODEL_AFTER, session_id=session_id, data={
                 "task": task, "model": model, "reply": reply, "error": None, "model_call": call_metric,
             })
             try:
@@ -155,7 +155,7 @@ class ReactLoop:
                 raise error
             reply = _ensure_tool_call_ids(reply)
             if reply.text and not streamed:
-                yield RunEvent(EventType.TEXT, {"content": reply.text})
+                yield RunEvent(type=EventType.TEXT, payload={"content": reply.text})
 
             if reply.tool_calls:
                 prepared_calls = [(call, str(call.id)) for call in reply.tool_calls]
@@ -167,7 +167,7 @@ class ReactLoop:
                     await self._end_failed_turn(session_id, task, model, model_calls, exc)
                     _attach_failure_context(exc, messages, schemas, model, [])
                     raise
-                await self.hooks.emit(HookEvent(HookPoint.TURN_END, session_id, {
+                await self.hooks.emit(HookEvent(point=HookPoint.TURN_END, session_id=session_id, data={
                     "task": task, "model": model, "reply": reply, "error": None, "completed": False, "model_calls": model_calls,
                 }))
                 successful_steps += 1
@@ -183,10 +183,10 @@ class ReactLoop:
                 "model_calls": model_calls,
                 "task_latency_ms": round((time.perf_counter() - task_started_at) * 1000, 2),
             }
-            ended = await self.hooks.emit(HookEvent(HookPoint.TURN_END, session_id, completed))
+            ended = await self.hooks.emit(HookEvent(point=HookPoint.TURN_END, session_id=session_id, data=completed))
             operation = ended.data.get("compression_operation")
             if callable(operation):
-                yield RunEvent(EventType.COMPRESSION_STARTED, {"session_id": session_id})
+                yield RunEvent(type=EventType.COMPRESSION_STARTED, payload={"session_id": session_id})
                 try:
                     result = await operation()
                     compression = result.payload()
@@ -197,8 +197,8 @@ class ReactLoop:
                         "message": f"自动压缩失败，当前回答已保留：{str(exc) or type(exc).__name__}",
                     }
                 kind = EventType.CONTEXT_COMPRESSED if compression.get("status") == "compressed" else EventType.COMPRESSION_FALLBACK
-                yield RunEvent(kind, compression)
-            yield RunEvent(EventType.FINAL, {"answer": reply.text, "completed": True, "model_calls": model_calls})
+                yield RunEvent(type=kind, payload=compression)
+            yield RunEvent(type=EventType.FINAL, payload={"answer": reply.text, "completed": True, "model_calls": model_calls})
             return
 
         error = AgentExecutionLimitError("模型在最大调用次数内未完成")
@@ -215,30 +215,30 @@ class ReactLoop:
     ) -> AsyncIterator[RunEvent]:
         """在当前无编号 Turn 内执行模型请求的全部工具。"""
         for call, call_id in calls:
-            before = HookEvent(HookPoint.TOOL_BEFORE, session_id, {
+            before = HookEvent(point=HookPoint.TOOL_BEFORE, session_id=session_id, data={
                 "task": task, "name": call.name, "arguments": dict(call.arguments), "tool_call_id": call_id,
             })
             await self.hooks.emit(before)
             name, arguments = before.data.get("name"), before.data.get("arguments")
             if not isinstance(name, str) or not isinstance(arguments, dict):
                 raise ValueError("tool_before 必须保留字符串 name 和对象 arguments")
-            yield RunEvent(EventType.TOOL_REQUESTED, {"name": name, "arguments": arguments})
-            await self.hooks.emit(HookEvent(HookPoint.TOOL_DURING, session_id, {
+            yield RunEvent(type=EventType.TOOL_REQUESTED, payload={"name": name, "arguments": arguments})
+            await self.hooks.emit(HookEvent(point=HookPoint.TOOL_DURING, session_id=session_id, data={
                 "task": task, "name": name, "arguments": arguments, "tool_call_id": call_id,
             }))
             try:
                 result = await self.tools.execute(name, arguments, context)
             except Exception as exc:
-                await self.hooks.emit(HookEvent(HookPoint.TOOL_AFTER, session_id, {
+                await self.hooks.emit(HookEvent(point=HookPoint.TOOL_AFTER, session_id=session_id, data={
                     "task": task, "name": name, "arguments": arguments, "tool_call_id": call_id, "result": None, "error": exc,
                 }))
                 raise
-            after = HookEvent(HookPoint.TOOL_AFTER, session_id, {
+            after = HookEvent(point=HookPoint.TOOL_AFTER, session_id=session_id, data={
                 "task": task, "name": name, "arguments": arguments, "tool_call_id": call_id, "result": result, "error": None,
             })
             await self.hooks.emit(after)
             result = str(after.data.get("result", result))
-            yield RunEvent(EventType.TOOL_COMPLETED, {"name": name, "content": result})
+            yield RunEvent(type=EventType.TOOL_COMPLETED, payload={"name": name, "content": result})
             messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result})
 
     async def _end_failed_turn(
@@ -250,7 +250,7 @@ class ReactLoop:
         error: Exception,
     ) -> None:
         """确保已开始的 Turn 在失败时仍触发 turn_end。"""
-        await self.hooks.emit(HookEvent(HookPoint.TURN_END, session_id, {
+        await self.hooks.emit(HookEvent(point=HookPoint.TURN_END, session_id=session_id, data={
             "task": task, "model": model, "error": error, "completed": False, "model_calls": model_calls,
         }))
 
@@ -269,8 +269,8 @@ def _ensure_tool_call_ids(reply: ModelReply) -> ModelReply:
     """在任何 model_after 回调前为工具调用补齐稳定 ID。"""
     if not reply.tool_calls or all(call.id for call in reply.tool_calls):
         return reply
-    calls = tuple(ToolCall(call.name, dict(call.arguments), call.id or f"call_{uuid4().hex}") for call in reply.tool_calls)
-    return ModelReply(reply.text, calls, reply.finished, reply.usage)
+    calls = tuple(ToolCall(name=call.name, arguments=dict(call.arguments), id=call.id or f"call_{uuid4().hex}") for call in reply.tool_calls)
+    return ModelReply(text=reply.text, tool_calls=calls, finished=reply.finished, usage=reply.usage)
 
 
 def _model_call_metric(latency_ms: float, context_tokens: int, question_tokens: int, reply: ModelReply) -> dict[str, Any]:

@@ -4,24 +4,26 @@ from __future__ import annotations
 
 import copy
 import traceback
-from dataclasses import dataclass, field
 from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from Agent.models import ModelNetworkError, ModelResponseFormatError, ModelServiceError
 from Agent.errors import AgentExecutionLimitError, AgentInvariantError
 
 
-@dataclass(frozen=True)
-class RuntimeFailure:
+class RuntimeFailure(BaseModel):
     """一次终止性运行错误及其实际模型请求现场。"""
+
+    model_config = ConfigDict(frozen=True, strict=True, arbitrary_types_allowed=True)
 
     error: BaseException
     category: str
     traceback_text: str
-    messages: list[dict[str, Any]] = field(default_factory=list)
-    tools: list[dict[str, Any]] = field(default_factory=list)
-    model: dict[str, Any] = field(default_factory=dict)
-    retry_history: list[dict[str, Any]] = field(default_factory=list)
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+    model: dict[str, Any] = Field(default_factory=dict)
+    retry_history: list[dict[str, Any]] = Field(default_factory=list)
 
     @property
     def repairable(self) -> bool:

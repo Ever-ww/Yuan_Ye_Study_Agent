@@ -106,10 +106,10 @@ class UiTests(unittest.TestCase):
             async def complete(self, messages, tools):
                 if not any(message.get("role") == "tool" for message in messages):
                     return ModelReply(tool_calls=(ToolCall(
-                        "write_file",
-                        {"path": "approval-test.txt", "content": "审批成功"},
+                        name="write_file",
+                        arguments={"path": "approval-test.txt", "content": "审批成功"},
                     ),))
-                return ModelReply("文件已写入")
+                return ModelReply(text="文件已写入")
 
         async def run_case(root: Path) -> None:
             runtime = AgentRuntime(

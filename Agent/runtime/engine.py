@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict
 
 from Agent.config import RuntimeConfig, load_runtime_config
 from Agent.contracts import ApprovalCallback, EventType, RunEvent
@@ -21,9 +22,10 @@ from .subagent import RuntimeSubagentRunner
 from .failure import RuntimeFailure
 
 
-@dataclass(frozen=True)
-class RuntimeResult:
+class RuntimeResult(BaseModel):
     """聚合后的最终运行结果。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
 
     answer: str
     session_id: str
@@ -102,9 +104,9 @@ class AgentRuntime:
             self.last_failure = RuntimeFailure.capture(exc)
             if self.raise_errors:
                 raise
-            yield RunEvent(EventType.ERROR, {"message": str(exc) or type(exc).__name__})
+            yield RunEvent(type=EventType.ERROR, payload={"message": str(exc) or type(exc).__name__})
             return
-        yield RunEvent(EventType.STARTED, {"session_id": active_id})
+        yield RunEvent(type=EventType.STARTED, payload={"session_id": active_id})
         messages = self.prompts.compose(task)
         context = ToolContext(project_root=self.config.project_root, approval=self.approval)
         loop = ReactLoop(
@@ -128,31 +130,31 @@ class AgentRuntime:
             if self.raise_errors:
                 raise
             message = str(exc) or f"{type(exc).__name__}：运行时发生未提供详情的异常"
-            yield RunEvent(EventType.ERROR, {"message": message})
+            yield RunEvent(type=EventType.ERROR, payload={"message": message})
 
     async def _compress_command(self, session_id: str | None) -> AsyncIterator[RunEvent]:
         """由主 Runtime 处理手动压缩命令，不把命令写入 Session。"""
         if self.context_processor is None:
-            yield RunEvent(EventType.ERROR, {"message": "当前 Runtime 未启用上下文压缩"})
+            yield RunEvent(type=EventType.ERROR, payload={"message": "当前 Runtime 未启用上下文压缩"})
             return
         requested = session_id or self._session_id
         if not requested:
-            yield RunEvent(EventType.ERROR, {"message": "当前没有可压缩会话"})
+            yield RunEvent(type=EventType.ERROR, payload={"message": "当前没有可压缩会话"})
             return
         try:
             active_id = await self._ensure_session("", str(requested))
         except Exception as exc:
-            yield RunEvent(EventType.ERROR, {"message": str(exc) or type(exc).__name__})
+            yield RunEvent(type=EventType.ERROR, payload={"message": str(exc) or type(exc).__name__})
             return
-        yield RunEvent(EventType.STARTED, {"session_id": active_id})
-        yield RunEvent(EventType.COMPRESSION_STARTED, {"session_id": active_id})
+        yield RunEvent(type=EventType.STARTED, payload={"session_id": active_id})
+        yield RunEvent(type=EventType.COMPRESSION_STARTED, payload={"session_id": active_id})
         result = await self.context_processor.compress(active_id)
         if result.status == "error":
-            yield RunEvent(EventType.ERROR, {"message": result.message})
+            yield RunEvent(type=EventType.ERROR, payload={"message": result.message})
             return
         event_type = EventType.CONTEXT_COMPRESSED if result.status == "compressed" else EventType.COMPRESSION_FALLBACK
-        yield RunEvent(event_type, result.payload())
-        yield RunEvent(EventType.FINAL, {"answer": result.message, "completed": True})
+        yield RunEvent(type=event_type, payload=result.payload())
+        yield RunEvent(type=EventType.FINAL, payload={"answer": result.message, "completed": True})
 
     async def run(self, task: str, session_id: str | None = None) -> RuntimeResult:
         """运行单次用户任务，完成后触发 trace_end 并返回聚合结果。"""
@@ -165,7 +167,7 @@ class AgentRuntime:
                     answer, completed = str(event.payload["answer"]), True
         finally:
             await self.close()
-        return RuntimeResult(answer, active_id, completed)
+        return RuntimeResult(answer=answer, session_id=active_id, completed=completed)
 
     async def close(self, error: Exception | None = None) -> None:
         """关闭当前 Session 运行范围并且只触发一次 trace_end。"""
@@ -173,7 +175,7 @@ class AgentRuntime:
             return
         session_id = self._session_id
         try:
-            await self.hooks.emit(HookEvent(HookPoint.TRACE_END, session_id, data={"error": error}))
+            await self.hooks.emit(HookEvent(point=HookPoint.TRACE_END, session_id=session_id, data={"error": error}))
         finally:
             self._session_open = False
             self._session_id = None
@@ -191,7 +193,7 @@ class AgentRuntime:
                 raise ValueError("同一个 AgentRuntime 不能在未关闭时切换 Session")
             return str(self._session_id)
         session_id = requested_session_id or uuid4().hex[:16]
-        event = HookEvent(HookPoint.TRACE_START, session_id, data={"task": task, "new_session": requested_session_id is None})
+        event = HookEvent(point=HookPoint.TRACE_START, session_id=session_id, data={"task": task, "new_session": requested_session_id is None})
         await self.hooks.emit(event)
         self._session_id = event.session_id
         self._session_open = True
