@@ -75,21 +75,29 @@ class ErrorSnapshotWriter:
         path = self.directory / f"{digest}.jsonl"
         response_excerpt = getattr(failure.error, "response_excerpt", "")
         source_paths = list(dict.fromkeys(_SOURCE_PATH.findall(failure.traceback_text)))
-        records: list[dict[str, Any]] = [{
+        question_indexes = [
+            index
+            for index, message in enumerate(failure.messages)
+            if message.get("role") == "user" and message.get("content") == task
+        ]
+        incident: dict[str, Any] = {
             "record_type": "incident",
             "incident_id": digest,
             "timestamp": _timestamp(),
             "session_id": session_id,
             "session_file": session_file,
             "project_root": str(self.directory.parents[1]),
-            "user_question": task,
             "model": failure.model,
             "retry_history": failure.retry_history,
+        }
+        if question_indexes:
+            incident["user_question_message_index"] = question_indexes[-1]
+        else:
+            incident["user_question"] = task
+        records: list[dict[str, Any]] = [{
+            **incident,
         }]
-        records.extend({
-            **record,
-            "record_type": "session_record",
-        } for record in session_records)
+        records.extend(_session_audit(record, index) for index, record in enumerate(session_records))
         records.extend({
             **message,
             "record_type": "message",
@@ -364,6 +372,16 @@ class _CommandResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+def _session_audit(record: dict[str, Any], position: int) -> dict[str, Any]:
+    """只保留 Session 审计字段，避免再次复制实际模型消息内容。"""
+    message_fields = {"content", "tool_calls"}
+    return {
+        "record_type": "session_audit",
+        "session_position": position,
+        **{key: value for key, value in record.items() if key not in message_fields},
+    }
 
 
 def _forbidden_changed_paths(status: str) -> list[str]:

@@ -188,10 +188,16 @@ class ResilienceTests(unittest.TestCase):
             records = [json.loads(line) for line in text.splitlines()]
             kinds = [record["record_type"] for record in records]
             self.assertIn("incident", kinds)
-            self.assertIn("session_record", kinds)
+            self.assertIn("session_audit", kinds)
             self.assertIn("message", kinds)
             self.assertIn("tool_schema", kinds)
             self.assertIn("error", kinds)
+            self.assertNotIn("session_record", kinds)
+            self.assertTrue(all("content" not in record for record in records if record["record_type"] == "session_audit"))
+            self.assertEqual(
+                sum(record.get("content") == "问题" for record in records),
+                1,
+            )
 
     def test_declined_repair_records_decision_without_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -208,6 +214,33 @@ class ResilienceTests(unittest.TestCase):
             self.assertEqual(len(snapshots), 1)
             self.assertIn('"confirmed": false', snapshots[0].read_text(encoding="utf-8"))
             self.assertFalse((root / ".yy" / "harness-evolution" / "worktrees").exists())
+
+    def test_network_failure_does_not_create_snapshot(self) -> None:
+        """网络重试耗尽只向 CLI 报错，不应产生代码缺陷快照。"""
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(root)
+            memory = MemoryStore(config.memory_dir)
+            session_id = memory.create_session("网络失败问题")
+            memory.record_user(session_id, "网络失败问题")
+            runtime = AgentRuntime(config, provider=FlakyProvider(0), memory=memory)
+            failure = RuntimeFailure.capture(ModelNetworkError("连接失败"))
+
+            asyncio.run(_handle_chat_failure(config, runtime, "网络失败问题", session_id, failure))
+
+            self.assertFalse((root / "tests" / "error").exists())
+
+    def test_service_failure_does_not_create_snapshot(self) -> None:
+        """模型服务状态错误同样不属于可通过 Harness 修复的代码缺陷。"""
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(root)
+            runtime = AgentRuntime(config, provider=FlakyProvider(0))
+            failure = RuntimeFailure.capture(ModelServiceError("服务不可用", 503))
+
+            asyncio.run(_handle_chat_failure(config, runtime, "服务失败问题", "", failure))
+
+            self.assertFalse((root / "tests" / "error").exists())
 
     def test_dirty_worktree_stops_harness(self) -> None:
         harness = load_harness_module()

@@ -28,6 +28,11 @@ class RuntimeFailure:
         """首期只允许代码缺陷和模型格式错误进入 Harness。"""
         return self.category in {"code_defect", "model_response_format"}
 
+    @property
+    def snapshot_worthy(self) -> bool:
+        """仅为可能通过修改代码解决的缺陷保留完整复现快照。"""
+        return self.repairable
+
     @classmethod
     def capture(cls, error: BaseException) -> "RuntimeFailure":
         context = getattr(error, "yy_failure_context", {})

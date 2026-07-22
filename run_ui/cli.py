@@ -15,6 +15,7 @@ from rich.table import Table
 from Agent import AgentRuntime, EventType, ModelRetryPolicy, RuntimeFailure, load_runtime_config
 from bootstrap import ensure_project_initialized, initialize_project
 from memory import MemoryStore
+from .approval import InteractiveApproval, active_live as _active_live
 from .harness_loader import load_harness_module
 from .web import serve
 
@@ -45,8 +46,8 @@ def _validate_session(session_id: str | None) -> str | None:
 
 
 async def _approve(name: str, arguments: dict[str, object]) -> bool:
-    """在终端中请求一次性高风险工具批准。"""
-    return typer.confirm(f"允许执行 {name} {arguments}？", default=False)
+    """兼容测试和外部调用的一次性审批入口。"""
+    return await InteractiveApproval(console)(name, arguments)
 
 
 async def _render(
@@ -63,42 +64,46 @@ async def _render(
     active_session_id = session_id or ""
     try:
         with Live(Panel("正在准备…", title="Yuan Ye Agent"), console=console, refresh_per_second=10) as live:
-            async for event in runtime.run_task(task, session_id):
-                if event.type is EventType.STARTED:
-                    active_session_id = str(event.payload["session_id"])
-                elif event.type is EventType.TEXT:
-                    streaming_text += str(event.payload["content"])
-                elif event.type is EventType.MODEL_RETRY:
-                    if streaming_text:
-                        lines.append("[yellow]本次流式片段因网络中断已丢弃[/]")
-                        streaming_text = ""
-                    lines.append(
-                        f"[yellow]模型网络异常，{event.payload['delay_seconds']} 秒后进行 "
-                        f"第 {event.payload['attempt']}/{event.payload['max_attempts']} 次请求[/]"
-                    )
-                elif event.type is EventType.TOOL_REQUESTED:
-                    if streaming_text:
-                        lines.append(streaming_text)
-                        streaming_text = ""
-                    lines.append(f"[cyan]工具请求[/] {event.payload['name']}")
-                elif event.type is EventType.TOOL_COMPLETED:
-                    lines.append(f"[green]工具完成[/] {event.payload['name']}")
-                elif event.type is EventType.COMPRESSION_STARTED:
-                    lines.append("[cyan]正在压缩上下文…[/]")
-                elif event.type is EventType.CONTEXT_COMPRESSED:
-                    displayed_status = str(event.payload.get("message", "上下文压缩完成"))
-                    lines.append(f"[green]{displayed_status}[/]")
-                elif event.type is EventType.COMPRESSION_FALLBACK:
-                    displayed_status = str(event.payload.get("message", "压缩失败，已启用内存裁剪"))
-                    lines.append(f"[yellow]{displayed_status}[/]")
-                elif event.type is EventType.ERROR:
-                    lines.append(f"[red]错误[/] {event.payload['message']}")
-                elif event.type is EventType.FINAL:
-                    answer = str(event.payload["answer"])
-                    if answer and answer != displayed_status and not streaming_text and (not lines or answer != lines[-1]):
-                        lines.append(f"[bold green]{answer}[/]")
-                display = lines[-12:] + ([streaming_text] if streaming_text else [])
-                live.update(Panel("\n".join(display) or "正在思考…", title="Yuan Ye Agent"))
+            token = _active_live.set(live)
+            try:
+                async for event in runtime.run_task(task, session_id):
+                    if event.type is EventType.STARTED:
+                        active_session_id = str(event.payload["session_id"])
+                    elif event.type is EventType.TEXT:
+                        streaming_text += str(event.payload["content"])
+                    elif event.type is EventType.MODEL_RETRY:
+                        if streaming_text:
+                            lines.append("[yellow]本次流式片段因网络中断已丢弃[/]")
+                            streaming_text = ""
+                        lines.append(
+                            f"[yellow]模型网络异常，{event.payload['delay_seconds']} 秒后进行 "
+                            f"第 {event.payload['attempt']}/{event.payload['max_attempts']} 次请求[/]"
+                        )
+                    elif event.type is EventType.TOOL_REQUESTED:
+                        if streaming_text:
+                            lines.append(streaming_text)
+                            streaming_text = ""
+                        lines.append(f"[cyan]工具请求[/] {event.payload['name']}")
+                    elif event.type is EventType.TOOL_COMPLETED:
+                        lines.append(f"[green]工具完成[/] {event.payload['name']}")
+                    elif event.type is EventType.COMPRESSION_STARTED:
+                        lines.append("[cyan]正在压缩上下文…[/]")
+                    elif event.type is EventType.CONTEXT_COMPRESSED:
+                        displayed_status = str(event.payload.get("message", "上下文压缩完成"))
+                        lines.append(f"[green]{displayed_status}[/]")
+                    elif event.type is EventType.COMPRESSION_FALLBACK:
+                        displayed_status = str(event.payload.get("message", "压缩失败，已启用内存裁剪"))
+                        lines.append(f"[yellow]{displayed_status}[/]")
+                    elif event.type is EventType.ERROR:
+                        lines.append(f"[red]错误[/] {event.payload['message']}")
+                    elif event.type is EventType.FINAL:
+                        answer = str(event.payload["answer"])
+                        if answer and answer != displayed_status and not streaming_text and (not lines or answer != lines[-1]):
+                            lines.append(f"[bold green]{answer}[/]")
+                    display = lines[-12:] + ([streaming_text] if streaming_text else [])
+                    live.update(Panel("\n".join(display) or "正在思考…", title="Yuan Ye Agent"))
+            finally:
+                _active_live.reset(token)
     except Exception as exc:
         if propagate_errors:
             raise
@@ -108,7 +113,7 @@ async def _render(
 
 async def _run_once(task: str, session_id: str | None) -> str:
     """为单次任务创建并可靠关闭一个 Session 运行范围。"""
-    runtime = AgentRuntime(approval=_approve)
+    runtime = AgentRuntime(approval=InteractiveApproval(console))
     try:
         return await _render(runtime, task, session_id)
     finally:
@@ -146,7 +151,7 @@ async def _chat(session_id: str | None) -> None:
     config = load_runtime_config()
     runtime = AgentRuntime(
         config,
-        approval=_approve,
+        approval=InteractiveApproval(console),
         retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=2),
         raise_errors=True,
     )
@@ -181,7 +186,13 @@ async def _chat(session_id: str | None) -> None:
 
 
 async def _handle_chat_failure(config, runtime, task: str, session_id: str, failure: RuntimeFailure) -> None:
-    """保存完整现场，并在明确代码缺陷时由用户决定是否启动 Harness。"""
+    """仅保存代码类缺陷现场，并由用户决定是否启动 Harness。"""
+    if not failure.snapshot_worthy:
+        # 网络、服务、配置、权限和普通运行错误已经由 CLI 展示。它们不能
+        # 通过修改项目代码可靠解决，因此既不保存隐私敏感快照，也不加载
+        # Harness 模块。网络重试最终成功时不会进入本函数。
+        return
+
     harness = load_harness_module()
     writer = harness.ErrorSnapshotWriter(
         config.project_root,
@@ -200,9 +211,6 @@ async def _handle_chat_failure(config, runtime, task: str, session_id: str, fail
         console.print(f"[yellow]错误现场保存失败：{str(snapshot_error) or type(snapshot_error).__name__}[/]")
         return
     console.print(f"[dim]错误复现快照：{snapshot}[/]")
-    if not failure.repairable:
-        writer.append_event(snapshot, "decision", repairable=False, confirmed=False)
-        return
     confirmed = typer.confirm("检测到可诊断的代码/模型格式缺陷，是否启动 Harness 隔离流水线？", default=False)
     writer.append_event(snapshot, "decision", repairable=True, confirmed=confirmed)
     if not confirmed:
