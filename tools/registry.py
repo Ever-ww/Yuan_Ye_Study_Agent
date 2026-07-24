@@ -7,7 +7,11 @@ from typing import Any, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
-from .contracts import AsyncTool, ToolContext
+from .contracts import AsyncTool, ToolContext, ToolRisk
+
+
+_STATIC_RISKS = {"read", "write", "high"}
+_ALL_RISKS = {*_STATIC_RISKS, "dynamic"}
 
 
 class AsyncToolRegistry:
@@ -23,6 +27,10 @@ class AsyncToolRegistry:
         """注册一个工具，并拒绝名称冲突。"""
         if tool.name in self._tools:
             raise ValueError(f"工具名称重复：{tool.name}")
+        if tool.risk not in _ALL_RISKS:
+            raise ValueError(f"工具 {tool.name} 的风险等级无效：{tool.risk}")
+        if tool.risk == "dynamic" and not callable(getattr(tool, "risk_for", None)):
+            raise ValueError(f"动态风险工具 {tool.name} 必须实现 risk_for(arguments)")
         self._tools[tool.name] = tool
         self._argument_models[tool.name] = _build_argument_model(tool.name, tool.schema)
 
@@ -50,12 +58,24 @@ class AsyncToolRegistry:
                 selected.append(tool)
         return AsyncToolRegistry(selected)
 
-    def risk_of(self, name: str) -> str:
-        """返回指定工具风险等级，供委派审批使用。"""
+    def risk_of(self, name: str, arguments: dict[str, Any] | None = None) -> ToolRisk:
+        """返回静态或基于已校验参数计算出的动态风险等级。"""
         tool = self._tools.get(name)
         if tool is None:
             raise ValueError(f"未知工具：{name}")
-        return tool.risk
+        if arguments is None:
+            return tool.risk
+        return self._resolved_risk(tool, self._validate(name, arguments))
+
+    @staticmethod
+    def _resolved_risk(tool: AsyncTool, arguments: dict[str, Any]) -> ToolRisk:
+        """使用已校验参数解析动态风险，并拒绝工具返回非法等级。"""
+        if tool.risk != "dynamic":
+            return tool.risk
+        risk = tool.risk_for(arguments)
+        if risk not in _STATIC_RISKS:
+            raise ValueError(f"工具 {tool.name} 计算出了无效风险等级：{risk}")
+        return risk
 
     async def execute(self, name: str, arguments: dict[str, Any], context: ToolContext) -> str:
         """重新校验 Hook 处理后的参数，获批后执行工具。"""
@@ -63,8 +83,7 @@ class AsyncToolRegistry:
         if tool is None:
             raise ValueError(f"未知工具：{name}")
         arguments = self._validate(name, arguments)
-        dynamic = getattr(tool, "requires_approval", None)
-        needs_approval = bool(dynamic(arguments)) if callable(dynamic) else tool.risk != "read"
+        needs_approval = self._resolved_risk(tool, arguments) != "read"
         if needs_approval:
             if context.approval is None or not await context.approval(name, arguments):
                 raise PermissionError(f"工具调用未获批准：{name}")

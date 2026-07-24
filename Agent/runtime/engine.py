@@ -16,8 +16,7 @@ from Agent.retry import ModelRetryPolicy
 from context_process import ContextProcessor
 from memory import MemoryStore
 from prompt import PromptComposer
-from tools import AsyncToolRegistry, ToolContext, default_tools
-from tools.subagent import SubagentTool
+from tools import AsyncToolRegistry, ToolContext, default_tools, register_subagent
 from .subagent import RuntimeSubagentRunner
 from .failure import RuntimeFailure
 
@@ -44,6 +43,7 @@ class AgentRuntime:
         memory=None,
         hooks: HookRegistry | None = None,
         approval: ApprovalCallback | None = None,
+        tool_context: ToolContext | None = None,
         context_processor: ContextProcessor | None = None,
         compression_provider_factory=None,
         subagent_runner=None,
@@ -60,7 +60,15 @@ class AgentRuntime:
             api_key=self.config.api_key,
             stream=self.config.stream,
         )
-        self.approval = approval
+        if tool_context is not None and approval is not None:
+            raise ValueError("tool_context 与 approval 不可同时传入")
+        if tool_context is not None and tool_context.project_root.resolve() != self.config.project_root:
+            raise ValueError("ToolContext 工作区必须与 RuntimeConfig.project_root 一致")
+        self.tool_context = tool_context or ToolContext(
+            project_root=self.config.project_root,
+            approval=approval,
+        )
+        self.approval = self.tool_context.approval
         self.retry_policy = retry_policy
         self.raise_errors = raise_errors
         self.last_failure: RuntimeFailure | None = None
@@ -71,8 +79,7 @@ class AgentRuntime:
             base_tools = default_tools(self.config.project_root)
             if enable_subagent:
                 runner = subagent_runner or RuntimeSubagentRunner(self.config, base_tools)
-                risks = {name: base_tools.risk_of(name) for name in base_tools.names()}
-                base_tools.register(SubagentTool(runner, risks))
+                register_subagent(base_tools, runner)
             self.tools = base_tools
         self.context_processor = None
         if enable_context_processing:
@@ -108,7 +115,6 @@ class AgentRuntime:
             return
         yield RunEvent(type=EventType.STARTED, payload={"session_id": active_id})
         messages = self.prompts.compose(task)
-        context = ToolContext(project_root=self.config.project_root, approval=self.approval)
         loop = ReactLoop(
             self.provider,
             self.tools,
@@ -123,7 +129,7 @@ class AgentRuntime:
             "stream": self.config.stream,
         }
         try:
-            async for event in loop.run(messages, context, task=task, session_id=active_id, model=model):
+            async for event in loop.run(messages, self.tool_context, task=task, session_id=active_id, model=model):
                 yield event
         except Exception as exc:
             self.last_failure = RuntimeFailure.capture(exc)

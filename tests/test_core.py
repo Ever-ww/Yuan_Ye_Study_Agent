@@ -12,6 +12,7 @@ from pydantic import BaseModel, ValidationError
 
 from Agent import AgentRuntime, EventType, HookEvent, HookPoint, HookRegistry, load_runtime_config
 from Agent.contracts import ModelReply, TokenUsage, ToolCall
+from Agent.runtime.subagent import RuntimeSubagentRunner
 from bootstrap import ensure_project_initialized, is_project_initialized
 from context_process import ContextProcessor
 from memory import MemoryStore
@@ -580,6 +581,14 @@ class CoreTests(unittest.TestCase):
 
                 registry = default_tools(root, subagent_runner=runner)
                 context = ToolContext(project_root=root, approval=approve)
+                self.assertEqual(registry.risk_of("subagent"), "dynamic")
+                self.assertEqual(registry.risk_of("subagent", {"task": "分析"}), "read")
+                self.assertEqual(
+                    registry.risk_of("subagent", {"task": "写入", "tools": ["write_file"]}),
+                    "write",
+                )
+                with self.assertRaisesRegex(ValueError, "工具参数校验失败"):
+                    registry.risk_of("subagent", {"task": "越权", "tools": ["unknown_tool"]})
                 self.assertEqual(
                     await registry.execute("subagent", {"task": "分析"}, context),
                     "子任务完成：分析",
@@ -597,6 +606,38 @@ class CoreTests(unittest.TestCase):
                     await registry.execute("subagent", {"task": "递归", "tools": ["subagent"]}, context)
 
         asyncio.run(check())
+
+    def test_subagent_runtime_reuses_context_without_session_persistence(self) -> None:
+        """真实临时 Runtime 复用父上下文，且不会创建独立 Session。"""
+        async def check(root: Path) -> None:
+            config = load_runtime_config(root)
+            context = ToolContext(project_root=root)
+            runner = RuntimeSubagentRunner(config, default_tools(root))
+            result = await runner("独立分析", "保持简洁", [], context)
+            self.assertIn("独立分析", result)
+            index = json.loads((config.memory_dir / "session" / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(index["sessions"], {})
+
+            runtime = AgentRuntime(
+                config,
+                provider=UsageProvider(),
+                tool_context=context,
+                enable_subagent=False,
+            )
+            self.assertIs(runtime.tool_context, context)
+            await runtime.close()
+
+            outside_context = ToolContext(project_root=root / "other-workspace")
+            with self.assertRaisesRegex(ValueError, "工作区"):
+                AgentRuntime(
+                    config,
+                    provider=UsageProvider(),
+                    tool_context=outside_context,
+                    enable_subagent=False,
+                )
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(check(Path(value)))
 
     def test_subagent_only_persists_as_parent_tool_chain(self) -> None:
         with tempfile.TemporaryDirectory() as value:

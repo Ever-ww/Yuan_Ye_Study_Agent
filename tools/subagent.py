@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from .contracts import ToolContext
+from .contracts import ToolContext, ToolRisk
 
 
 class SubagentRunner(Protocol):
@@ -24,9 +24,9 @@ class SubagentTool:
 
     name = "subagent"
     description = "启动无独立记忆的子 Agent 完成任务，并返回最终结果"
-    risk = "read"
+    risk = "dynamic"
 
-    def __init__(self, runner: SubagentRunner, available_risks: dict[str, str]) -> None:
+    def __init__(self, runner: SubagentRunner, available_risks: dict[str, ToolRisk]) -> None:
         self.runner = runner
         self.available_risks = dict(available_risks)
         self.schema: dict[str, Any] = {
@@ -42,9 +42,14 @@ class SubagentTool:
             "required": ["task"],
         }
 
-    def requires_approval(self, arguments: dict[str, Any]) -> bool:
-        """委派包含非只读能力时先执行第一阶段审批。"""
-        return any(self.available_risks.get(name) != "read" for name in arguments.get("tools", []))
+    def risk_for(self, arguments: dict[str, Any]) -> ToolRisk:
+        """按委派工具子集计算风险，供统一 Registry 权限链使用。"""
+        risks = [self.available_risks[name] for name in arguments.get("tools", [])]
+        if "high" in risks or "dynamic" in risks:
+            return "high"
+        if "write" in risks:
+            return "write"
+        return "read"
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> str:
         names = list(arguments.get("tools", []))

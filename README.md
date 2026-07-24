@@ -286,7 +286,9 @@ tool_before  tool_during  tool_after
 
 自动压缩检查位于最终回答的 `turn_end`，且在 assistant 落盘之后执行。压缩最多尝试三次；全部失败时不修改 Profile、不切换 JSONL，后续 `model_before` 只在内存中按最旧完整对话块裁剪输入，原始审计记录继续保留。
 
-默认工具还包含 `subagent`。父模型必须明确给出子任务、可选角色说明和工具名称子集；省略工具子集表示无工具，且子 Agent 永远不能再次调用 `subagent`。子 Agent 不创建独立会话记录，最终输出作为父 Agent 的普通 tool 结果保存。委派写能力和实际执行写入分别需要一次批准。
+默认 Runtime 还通过统一工具装配入口注册 `subagent`。父模型必须明确给出子任务、可选角色说明和工具名称子集；省略工具子集表示无工具，且子 Agent 永远不能再次调用 `subagent`。
+
+`subagent` 的风险等级是 `dynamic`：无工具或只读子集解析为 `read`，包含写入能力时解析为 `write`，由同一个工具 Registry 决定是否审批。委派写能力和实际执行写入分别需要一次批准。临时子 Agent 复用父级完整 `ToolContext`，工作区必须与父 Runtime 一致；它使用空 Memory，不创建独立会话记录，最终输出只作为父 Agent 的普通 `tool` 结果保存。
 
 Hook 注册方式参考 [PI Agent Extensions](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md) 的事件订阅模式：单一入口、可变事件上下文、按注册顺序执行。为保持本项目的安全边界，工具参数被 Hook 修改后仍会重新校验 Schema，这一点比 PI Agent 当前默认行为更严格。
 

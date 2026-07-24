@@ -9,6 +9,10 @@ from prompt import compose_subagent_messages
 from tools import AsyncToolRegistry, ToolContext
 
 
+class _NoMemory:
+    """临时 Subagent Runtime 的无持久化占位对象。"""
+
+
 class RuntimeSubagentRunner:
     """使用父 Agent 的模型配置和显式工具子集执行临时任务。"""
 
@@ -46,8 +50,9 @@ class RuntimeSubagentRunner:
             config,
             provider=provider,
             tools=selected,
+            memory=_NoMemory(),
             hooks=hooks,
-            approval=context.approval,
+            tool_context=context,
             enable_context_processing=False,
             enable_subagent=False,
         )

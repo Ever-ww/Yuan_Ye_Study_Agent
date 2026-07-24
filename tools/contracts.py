@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
+
+
+ToolRisk = Literal["read", "write", "high", "dynamic"]
 
 class AsyncTool(Protocol):
     """所有工具实现都必须遵守的稳定协议。"""
@@ -14,7 +17,7 @@ class AsyncTool(Protocol):
     name: str
     description: str
     schema: dict[str, Any]
-    risk: str
+    risk: ToolRisk
 
     async def run(self, arguments: dict[str, Any], context: "ToolContext") -> str: ...
 

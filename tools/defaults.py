@@ -11,6 +11,13 @@ from .subagent import SubagentRunner, SubagentTool
 from .write_file import WriteFileTool
 
 
+def register_subagent(registry: AsyncToolRegistry, runner: SubagentRunner) -> AsyncToolRegistry:
+    """在工具层统一注册运行期 Subagent，并返回同一个 Registry。"""
+    risks = {name: registry.risk_of(name) for name in registry.names()}
+    registry.register(SubagentTool(runner, risks))
+    return registry
+
+
 def default_tools(project_root: Path, *, subagent_runner: SubagentRunner | None = None) -> AsyncToolRegistry:
     """装配首期默认工具；项目根目录由执行上下文统一传入。"""
     del project_root  # 保留正式构造接口，工具执行时以 ToolContext 为安全边界。
@@ -23,6 +30,5 @@ def default_tools(project_root: Path, *, subagent_runner: SubagentRunner | None 
     ]
     registry = AsyncToolRegistry(builtins)
     if subagent_runner is not None:
-        risks = {name: registry.risk_of(name) for name in registry.names()}
-        registry.register(SubagentTool(subagent_runner, risks))
+        register_subagent(registry, subagent_runner)
     return registry
