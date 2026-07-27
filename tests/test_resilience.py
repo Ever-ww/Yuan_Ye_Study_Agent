@@ -89,6 +89,7 @@ class ResilienceTests(unittest.TestCase):
                 provider=provider,
                 memory=memory,
                 retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=0),
+                enable_sandbox=False,
             )
             points: list[str] = []
 
@@ -112,6 +113,7 @@ class ResilienceTests(unittest.TestCase):
                 load_runtime_config(Path(value)),
                 provider=provider,
                 retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=0),
+                enable_sandbox=False,
             )
             result = asyncio.run(runtime.run("计算"))
             self.assertTrue(result.completed)
@@ -125,6 +127,7 @@ class ResilienceTests(unittest.TestCase):
                 provider=FlakyProvider(3),
                 retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=0),
                 raise_errors=True,
+                enable_sandbox=False,
             )
             with self.assertRaises(ModelNetworkError):
                 await runtime.run("失败问题")
@@ -206,7 +209,9 @@ class ResilienceTests(unittest.TestCase):
             memory = MemoryStore(config.memory_dir)
             session_id = memory.create_session("问题")
             memory.record_user(session_id, "问题")
-            runtime = AgentRuntime(config, provider=FlakyProvider(0), memory=memory)
+            runtime = AgentRuntime(
+                config, provider=FlakyProvider(0), memory=memory, enable_sandbox=False,
+            )
             failure = RuntimeFailure.capture(ModelResponseFormatError("格式错误", "{}"))
             with patch("run_ui.cli.typer.confirm", return_value=False):
                 asyncio.run(_handle_chat_failure(config, runtime, "问题", session_id, failure))
@@ -223,7 +228,9 @@ class ResilienceTests(unittest.TestCase):
             memory = MemoryStore(config.memory_dir)
             session_id = memory.create_session("网络失败问题")
             memory.record_user(session_id, "网络失败问题")
-            runtime = AgentRuntime(config, provider=FlakyProvider(0), memory=memory)
+            runtime = AgentRuntime(
+                config, provider=FlakyProvider(0), memory=memory, enable_sandbox=False,
+            )
             failure = RuntimeFailure.capture(ModelNetworkError("连接失败"))
 
             asyncio.run(_handle_chat_failure(config, runtime, "网络失败问题", session_id, failure))
@@ -235,7 +242,7 @@ class ResilienceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             config = load_runtime_config(root)
-            runtime = AgentRuntime(config, provider=FlakyProvider(0))
+            runtime = AgentRuntime(config, provider=FlakyProvider(0), enable_sandbox=False)
             failure = RuntimeFailure.capture(ModelServiceError("服务不可用", 503))
 
             asyncio.run(_handle_chat_failure(config, runtime, "服务失败问题", "", failure))
@@ -269,6 +276,8 @@ class ResilienceTests(unittest.TestCase):
             runtime = harness.create_coding_runtime(config, worktree)
             self.assertIsInstance(runtime, AgentRuntime)
             self.assertEqual(runtime.tools.schemas(), [])
+            self.assertEqual(runtime.config.workspace_root, worktree.resolve())
+            self.assertEqual(runtime.tool_context.project_root, worktree.resolve())
             result = asyncio.run(runtime.run("只诊断"))
             self.assertTrue(result.completed)
             self.assertFalse((worktree / ".yy").exists())
@@ -301,12 +310,57 @@ class ResilienceTests(unittest.TestCase):
             self.assertIn('"status": "no_code_changes"', text)
             self.assertIn('"status": "cleanup"', text)
 
+    def test_harness_rejects_runtime_outside_isolated_worktree(self) -> None:
+        harness = load_harness_module()
+
+        class WrongWorkspaceRuntime:
+            def __init__(self, workspace_root: Path) -> None:
+                self.workspace_root = workspace_root
+
+            async def run(self, task):
+                raise AssertionError(f"不应运行：{task}")
+
+            async def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            _init_repo(root)
+            config = load_runtime_config(root)
+            failure = RuntimeFailure.capture(RuntimeError("内部缺陷"))
+            writer = harness.ErrorSnapshotWriter(root)
+            snapshot = writer.capture(
+                task="问题",
+                session_id="e" * 16,
+                failure=failure,
+                session_records=[],
+            )
+            request = harness.HarnessEvolutionRequest(
+                project_root=root,
+                incident_id=snapshot.stem,
+                snapshot_path=snapshot,
+                task="问题",
+                config=config,
+            )
+            runner = harness.HarnessEvolutionRunner(
+                writer,
+                runtime_factory=lambda current, worktree: WrongWorkspaceRuntime(root),
+            )
+
+            result = asyncio.run(runner.run(request))
+
+            self.assertEqual(result.status, "invalid_runtime_workspace")
+            self.assertFalse(Path(result.worktree_path).exists())
+            self.assertNotIn(result.branch, _git(root, "branch", "--list"))
+            self.assertIn('"status": "invalid_runtime_workspace"', snapshot.read_text(encoding="utf-8"))
+
     def test_injected_future_capability_can_test_and_merge(self) -> None:
         harness = load_harness_module()
 
         class EditingRuntime:
             def __init__(self, worktree: Path) -> None:
                 self.worktree = worktree
+                self.workspace_root = worktree
 
             async def run(self, task):
                 del task
@@ -343,6 +397,7 @@ class ResilienceTests(unittest.TestCase):
         class EditingRuntime:
             def __init__(self, worktree: Path) -> None:
                 self.worktree = worktree
+                self.workspace_root = worktree
 
             async def run(self, task):
                 del task

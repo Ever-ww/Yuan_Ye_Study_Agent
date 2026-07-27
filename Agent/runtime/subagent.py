@@ -55,6 +55,7 @@ class RuntimeSubagentRunner:
             tool_context=context,
             enable_context_processing=False,
             enable_subagent=False,
+            enable_sandbox=False,
         )
         result = await runtime.run(task)
         if not result.completed:

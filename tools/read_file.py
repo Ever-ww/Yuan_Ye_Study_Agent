@@ -20,4 +20,7 @@ class ReadFileTool:
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> str:
         path = safe_workspace_path(context.project_root, arguments["path"])
-        return path.read_text(encoding="utf-8")[:20000]
+        if context.file_locks is None:
+            raise RuntimeError("当前 Runtime 未启用文件锁，禁止执行 read_file")
+        async with context.file_locks.read(path):
+            return path.read_text(encoding="utf-8")[:20000]

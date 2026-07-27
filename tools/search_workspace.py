@@ -19,20 +19,24 @@ class SearchWorkspaceTool:
     _excluded_directories = {".git", ".yy", ".venv", "__pycache__"}
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        if context.file_locks is None:
+            raise RuntimeError("当前 Runtime 未启用文件锁，禁止执行 search_workspace")
         query = arguments["query"].lower()
         matches: list[str] = []
         root = context.project_root.resolve()
-        for path in root.rglob("*"):
-            if len(matches) >= 30:
-                break
-            if not path.is_file() or self._excluded_directories.intersection(path.relative_to(root).parts):
-                continue
-            try:
-                for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                    if query in line.lower():
-                        matches.append(f"{path.relative_to(root)}:{number}: {line[:200]}")
-                        if len(matches) >= 30:
-                            break
-            except (OSError, UnicodeDecodeError):
-                continue
+        async with context.file_locks.workspace_shared():
+            for path in root.rglob("*"):
+                if len(matches) >= 30:
+                    break
+                if not path.is_file() or self._excluded_directories.intersection(path.relative_to(root).parts):
+                    continue
+                try:
+                    async with context.file_locks.file_shared(path):
+                        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                            if query in line.lower():
+                                matches.append(f"{path.relative_to(root)}:{number}: {line[:200]}")
+                                if len(matches) >= 30:
+                                    break
+                except (OSError, UnicodeDecodeError):
+                    continue
         return "\n".join(matches) or "未找到匹配内容"

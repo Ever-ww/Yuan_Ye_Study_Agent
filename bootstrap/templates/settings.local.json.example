@@ -5,5 +5,6 @@
   "api_key": "",
   "stream": false,
   "max_steps": 8,
-  "compression_threshold_tokens": 20000
+  "compression_threshold_tokens": 20000,
+  "sandbox_checkpoint_limit": 17
 }

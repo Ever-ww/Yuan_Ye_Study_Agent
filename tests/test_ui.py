@@ -17,6 +17,7 @@ from memory import MemoryStore
 from run_ui.cli import _active_live, _approve, _render, app
 from run_ui.approval import InteractiveApproval
 from run_ui.web import create_app
+from tools import ToolContext
 
 
 class UiTests(unittest.TestCase):
@@ -100,6 +101,14 @@ class UiTests(unittest.TestCase):
         self.assertEqual(calls, ["stop", ("start", True)])
 
     def test_write_tool_approval_completes_inside_real_live_render(self) -> None:
+        class CheckpointSandbox:
+            async def checkpoint_write(self, path: str):
+                del path
+                return type("Checkpoint", (), {"commit_sha": "0" * 40})()
+
+            async def restore_current(self):
+                return None
+
         class WriteProvider:
             streaming = False
 
@@ -115,7 +124,12 @@ class UiTests(unittest.TestCase):
             runtime = AgentRuntime(
                 load_runtime_config(root),
                 provider=WriteProvider(),
-                approval=_approve,
+                tool_context=ToolContext(
+                    project_root=root,
+                    approval=_approve,
+                    sandbox=CheckpointSandbox(),
+                ),
+                enable_sandbox=False,
             )
             try:
                 with patch("run_ui.cli.typer.confirm", return_value=True):

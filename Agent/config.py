@@ -18,7 +18,8 @@ class RuntimeConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    project_root: Path
+    agent_root: Path
+    workspace_root: Path
     model: str = Field(default="echo", min_length=1)
     provider: str = Field(default="echo", min_length=1)
     base_url: str | None = None
@@ -28,8 +29,9 @@ class RuntimeConfig(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     profile: str = Field(default="general", min_length=1)
     compression_threshold_tokens: StrictInt = Field(default=20000, ge=0)
+    sandbox_checkpoint_limit: StrictInt = Field(default=17, ge=1)
 
-    @field_validator("project_root")
+    @field_validator("agent_root", "workspace_root")
     @classmethod
     def _resolve_project_root(cls, value: Path) -> Path:
         """在配置边界统一工作区为绝对路径。"""
@@ -38,7 +40,7 @@ class RuntimeConfig(BaseModel):
     @property
     def memory_dir(self) -> Path:
         """返回唯一的项目本地记忆目录。"""
-        return self.project_root / ".yy" / "memory"
+        return self.agent_root / ".yy" / "memory"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -51,15 +53,33 @@ def _read_json(path: Path) -> dict[str, Any]:
         raise ValueError(f"配置必须是合法 JSON 对象：{path}\n{exc}") from exc
 
 
-def load_runtime_config(project_root: Path | None = None, **overrides: Any) -> RuntimeConfig:
-    """按共享配置、本机配置和显式参数的顺序合并。"""
-    root = (project_root or Path.cwd()).resolve()
-    ensure_project_initialized(root)
-    values: dict[str, Any] = {"project_root": root}
-    shared = _read_json(root / ".yy" / "settings.json")
+def load_runtime_config(
+    agent_root: Path | None = None,
+    *,
+    workspace_root: Path | None = None,
+    **overrides: Any,
+) -> RuntimeConfig:
+    """加载 Agent 本机状态，并把启动目录作为独立工作区。"""
+    selected_agent_root = (agent_root or default_agent_root()).resolve()
+    selected_workspace = (
+        workspace_root.resolve()
+        if workspace_root is not None
+        else (selected_agent_root if agent_root is not None else Path.cwd().resolve())
+    )
+    ensure_project_initialized(selected_agent_root)
+    values: dict[str, Any] = {}
+    shared = _read_json(selected_agent_root / ".yy" / "settings.json")
     if "api_key" in shared:
         raise ValueError("禁止在 .yy/settings.json 保存 api_key；请移至已忽略的 .yy/settings.local.json")
     values.update(shared)
-    values.update(_read_json(root / ".yy" / "settings.local.json"))
+    values.update(_read_json(selected_agent_root / ".yy" / "settings.local.json"))
     values.update({key: value for key, value in overrides.items() if value is not None})
+    # 配置文件不能改变状态目录与本轮文件操作边界。
+    values["agent_root"] = selected_agent_root
+    values["workspace_root"] = selected_workspace
     return RuntimeConfig.model_validate(values)
+
+
+def default_agent_root() -> Path:
+    """返回 Agent 源码/安装根目录；模型配置和记忆固定保存在这里。"""
+    return Path(__file__).resolve().parents[1]

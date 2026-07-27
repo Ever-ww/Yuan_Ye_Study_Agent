@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -12,7 +11,14 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
-from Agent import AgentRuntime, EventType, ModelRetryPolicy, RuntimeFailure, load_runtime_config
+from Agent import (
+    AgentRuntime,
+    EventType,
+    ModelRetryPolicy,
+    RuntimeFailure,
+    default_agent_root,
+    load_runtime_config,
+)
 from bootstrap import ensure_project_initialized, initialize_project
 from memory import MemoryStore
 from .approval import InteractiveApproval, active_live as _active_live
@@ -28,14 +34,19 @@ console = Console()
 @app.command()
 def init() -> None:
     """初始化本机 `.yy` 配置、会话索引和长期记忆文件。"""
-    yy = initialize_project(Path.cwd())
+    yy = initialize_project(default_agent_root())
     console.print(f"[green]初始化完成[/] {yy}")
     console.print("请编辑 .yy/settings.local.json 配置模型；已有文件不会被覆盖。")
 
 
 def _memory() -> MemoryStore:
     """从当前项目配置创建 Memory 门面。"""
-    return MemoryStore(load_runtime_config().memory_dir)
+    config = load_runtime_config()
+    return MemoryStore(
+        config.memory_dir,
+        workspace_root=config.workspace_root,
+        agent_root=config.agent_root,
+    )
 
 
 def _validate_session(session_id: str | None) -> str | None:
@@ -195,7 +206,7 @@ async def _handle_chat_failure(config, runtime, task: str, session_id: str, fail
 
     harness = load_harness_module()
     writer = harness.ErrorSnapshotWriter(
-        config.project_root,
+        config.agent_root,
         secrets=(config.api_key or "",),
     )
     try:
@@ -216,7 +227,7 @@ async def _handle_chat_failure(config, runtime, task: str, session_id: str, fail
     if not confirmed:
         return
     request = harness.HarnessEvolutionRequest(
-        project_root=config.project_root,
+        project_root=config.agent_root,
         incident_id=snapshot.stem,
         snapshot_path=snapshot,
         task=task,
@@ -277,7 +288,7 @@ def serve_ui(port: int = typer.Option(8765, "--port")) -> None:
 def main() -> None:
     """供源码入口和打包命令调用。"""
     if not sys.argv[1:] or sys.argv[1] != "init":
-        result = ensure_project_initialized(Path.cwd())
+        result = ensure_project_initialized(default_agent_root())
         if result.initialized:
             console.print(f"[green]首次运行初始化完成[/] {result.yy_dir}")
             console.print("请按需编辑 .yy/settings.local.json；后续启动不会重复初始化。")

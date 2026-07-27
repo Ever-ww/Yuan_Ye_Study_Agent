@@ -158,6 +158,7 @@ class ContextProcessor:
             hooks=hooks,
             enable_context_processing=False,
             enable_subagent=False,
+            enable_sandbox=False,
         )
         result = await runtime.run("压缩当前会话上下文")
         if not result.completed:

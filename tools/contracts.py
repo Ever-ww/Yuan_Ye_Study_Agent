@@ -29,3 +29,7 @@ class ToolContext(BaseModel):
 
     project_root: Path
     approval: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None
+    # 运行时注入 Docker/Checkpoint 契约；保持 Any 可避免工具协议反向依赖 Agent 核心。
+    sandbox: Any | None = None
+    # Runtime 与 Docker 共享的跨进程工作区锁；文件工具禁止自行创建旁路锁。
+    file_locks: Any | None = None

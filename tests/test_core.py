@@ -17,6 +17,7 @@ from bootstrap import ensure_project_initialized, is_project_initialized
 from context_process import ContextProcessor
 from memory import MemoryStore
 from prompt import PromptComposer
+from sandbox import WorkspaceLockManager
 from tools import AsyncToolRegistry, ToolContext, default_tools
 
 
@@ -131,6 +132,17 @@ class CapturingProvider:
         return ModelReply(text="第二答")
 
 
+class _CheckpointSandbox:
+    """不涉及 Docker 的工具单测 checkpoint 替身。"""
+
+    async def checkpoint_write(self, path: str):
+        del path
+        return type("Checkpoint", (), {"commit_sha": "0" * 40})()
+
+    async def restore_current(self):
+        return None
+
+
 class CoreTests(unittest.TestCase):
     """覆盖配置、Runtime、工具边界与记忆目录。"""
 
@@ -175,6 +187,63 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(config.api_key, "local-key")
             self.assertFalse(config.stream)
 
+    def test_config_keeps_memory_in_agent_root_and_workspace_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            agent_root = base / "agent"
+            workspace = base / "workspace"
+            agent_root.mkdir()
+            workspace.mkdir()
+
+            config = load_runtime_config(agent_root, workspace_root=workspace)
+
+            self.assertEqual(config.agent_root, agent_root.resolve())
+            self.assertEqual(config.workspace_root, workspace.resolve())
+            self.assertEqual(config.memory_dir, agent_root / ".yy" / "memory")
+            self.assertTrue((agent_root / ".yy" / "settings.local.json").exists())
+            self.assertFalse((workspace / ".yy").exists())
+
+    def test_sessions_are_workspace_scoped_but_profiles_are_shared(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            agent_root = base / "agent"
+            first_workspace = base / "first"
+            second_workspace = base / "second"
+            for path in (agent_root, first_workspace, second_workspace):
+                path.mkdir()
+            memory_root = agent_root / ".yy" / "memory"
+            first = MemoryStore(
+                memory_root,
+                workspace_root=first_workspace,
+                agent_root=agent_root,
+            )
+            second = MemoryStore(
+                memory_root,
+                workspace_root=second_workspace,
+                agent_root=agent_root,
+            )
+
+            session_id = first.create_session("第一工作区问题")
+            first.record_user(session_id, "第一工作区问题")
+            first.profiles.directory.joinpath("USER.md").write_text(
+                "用户偏好中文回答",
+                encoding="utf-8",
+            )
+
+            self.assertTrue(first.has_session(session_id))
+            self.assertFalse(second.has_session(session_id))
+            with self.assertRaises(KeyError):
+                second.restore_messages(session_id)
+            self.assertNotIn(session_id, {item["session_id"] for item in second.list_sessions()})
+            self.assertIn("用户偏好中文回答", second.profile_context())
+            session_indexes = list((memory_root / "session").glob("*/index.json"))
+            self.assertEqual(len(session_indexes), 2)
+            self.assertFalse((first_workspace / ".yy").exists())
+            self.assertFalse((second_workspace / ".yy").exists())
+            config = load_runtime_config(agent_root, workspace_root=first_workspace)
+            with self.assertRaisesRegex(ValueError, "MemoryStore.workspace_root"):
+                AgentRuntime(config, memory=second, enable_sandbox=False)
+
     def test_shared_configuration_rejects_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
@@ -203,11 +272,18 @@ class CoreTests(unittest.TestCase):
     def test_compression_threshold_defaults_and_validates(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
-            self.assertEqual(load_runtime_config(root).compression_threshold_tokens, 20000)
+            defaults = load_runtime_config(root)
+            self.assertEqual(defaults.compression_threshold_tokens, 20000)
+            self.assertEqual(defaults.sandbox_checkpoint_limit, 17)
             (root / ".yy" / "settings.local.json").write_text(
                 '{"compression_threshold_tokens":-1}', encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "compression_threshold_tokens"):
+                load_runtime_config(root)
+            (root / ".yy" / "settings.local.json").write_text(
+                '{"sandbox_checkpoint_limit":0}', encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "sandbox_checkpoint_limit"):
                 load_runtime_config(root)
 
     def test_memory_uses_timestamped_jsonl_and_index(self) -> None:
@@ -254,7 +330,9 @@ class CoreTests(unittest.TestCase):
             memory.record_user(session_id, "第一句")
             memory.record_assistant(session_id, "第一答")
             provider = CapturingProvider()
-            runtime = AgentRuntime(load_runtime_config(root), provider=provider, memory=memory)
+            runtime = AgentRuntime(
+                load_runtime_config(root), provider=provider, memory=memory, enable_sandbox=False,
+            )
             asyncio.run(runtime.run("第二句", session_id))
             self.assertEqual(
                 [(item["role"], item["content"]) for item in provider.messages[1:]],
@@ -276,7 +354,9 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             config = load_runtime_config(Path(value))
             memory = MemoryStore(config.memory_dir)
-            runtime = AgentRuntime(config, provider=ToolProvider(), memory=memory)
+            runtime = AgentRuntime(
+                config, provider=ToolProvider(), memory=memory, enable_sandbox=False,
+            )
             result = asyncio.run(runtime.run("计算 2 + 2"))
             self.assertTrue(result.completed)
             self.assertEqual(result.answer, "计算完成：4")
@@ -290,7 +370,9 @@ class CoreTests(unittest.TestCase):
             root = Path(value)
             config = load_runtime_config(root)
             memory = MemoryStore(config.memory_dir)
-            result = asyncio.run(AgentRuntime(config, provider=ToolProvider(), memory=memory).run("计算 2 + 2"))
+            result = asyncio.run(AgentRuntime(
+                config, provider=ToolProvider(), memory=memory, enable_sandbox=False,
+            ).run("计算 2 + 2"))
             records = memory.session_records(result.session_id)
             self.assertEqual([record["role"] for record in records], ["user", "assistant", "tool", "assistant"])
             call = records[1]["tool_calls"][0]
@@ -306,7 +388,9 @@ class CoreTests(unittest.TestCase):
             root = Path(value)
             config = load_runtime_config(root)
             memory = MemoryStore(config.memory_dir)
-            result = asyncio.run(AgentRuntime(config, provider=FailingToolProvider(), memory=memory).run("读取缺失文件"))
+            result = asyncio.run(AgentRuntime(
+                config, provider=FailingToolProvider(), memory=memory, enable_sandbox=False,
+            ).run("读取缺失文件"))
             self.assertFalse(result.completed)
             records = memory.session_records(result.session_id)
             self.assertEqual([record["role"] for record in records], ["user", "assistant", "tool"])
@@ -324,6 +408,7 @@ class CoreTests(unittest.TestCase):
                 provider=LargeUsageProvider(),
                 memory=memory,
                 compression_provider_factory=lambda: compressor,
+                enable_sandbox=False,
             )
             result = asyncio.run(runtime.run("整理长上下文"))
             self.assertTrue(result.completed)
@@ -365,6 +450,7 @@ class CoreTests(unittest.TestCase):
                 provider=UsageProvider(),
                 memory=memory,
                 compression_provider_factory=lambda: compressor,
+                enable_sandbox=False,
             )
             result = asyncio.run(runtime.run("/compress", session_id))
             self.assertTrue(result.completed)
@@ -415,7 +501,9 @@ class CoreTests(unittest.TestCase):
             root = Path(value)
             config = load_runtime_config(root, provider="deepseek", model="deepseek-chat", base_url="https://api.deepseek.com/v1")
             memory = MemoryStore(config.memory_dir)
-            runtime = AgentRuntime(config, provider=UsageProvider(), memory=memory)
+            runtime = AgentRuntime(
+                config, provider=UsageProvider(), memory=memory, enable_sandbox=False,
+            )
             result = asyncio.run(runtime.run("请记录指标"))
             assistant = memory.session_records(result.session_id)[-1]
             self.assertEqual(assistant["model"]["provider"], "deepseek")
@@ -439,7 +527,10 @@ class CoreTests(unittest.TestCase):
 
             for point in HookPoint:
                 hooks.register(point, observe)
-            runtime = AgentRuntime(load_runtime_config(Path(value)), provider=ToolProvider(), hooks=hooks)
+            runtime = AgentRuntime(
+                load_runtime_config(Path(value)), provider=ToolProvider(), hooks=hooks,
+                enable_sandbox=False,
+            )
             result = asyncio.run(runtime.run("计算 2 + 2"))
             self.assertTrue(result.completed)
             self.assertEqual(points, [
@@ -459,7 +550,10 @@ class CoreTests(unittest.TestCase):
                 tool_events.append(event)
 
             hooks.register(HookPoint.TOOL_BEFORE, observe)
-            runtime = AgentRuntime(load_runtime_config(Path(value)), provider=MultiToolProvider(), hooks=hooks)
+            runtime = AgentRuntime(
+                load_runtime_config(Path(value)), provider=MultiToolProvider(), hooks=hooks,
+                enable_sandbox=False,
+            )
             result = asyncio.run(runtime.run("连续计算"))
             self.assertEqual(result.answer, "结果为 60")
             self.assertEqual(len(tool_events), 2)
@@ -473,7 +567,10 @@ class CoreTests(unittest.TestCase):
                 event.data["arguments"] = {"expression": 4}
 
             hooks.register(HookPoint.TOOL_BEFORE, invalidate)
-            runtime = AgentRuntime(load_runtime_config(Path(value)), provider=ToolProvider(), hooks=hooks)
+            runtime = AgentRuntime(
+                load_runtime_config(Path(value)), provider=ToolProvider(), hooks=hooks,
+                enable_sandbox=False,
+            )
             result = asyncio.run(runtime.run("计算"))
             self.assertFalse(result.completed)
 
@@ -487,7 +584,10 @@ class CoreTests(unittest.TestCase):
                     events.append(event)
 
                 hooks.register(HookPoint.MODEL_AFTER, observe)
-                runtime = AgentRuntime(load_runtime_config(Path(value)), provider=UsageProvider(), hooks=hooks)
+                runtime = AgentRuntime(
+                    load_runtime_config(Path(value)), provider=UsageProvider(), hooks=hooks,
+                    enable_sandbox=False,
+                )
                 await runtime.run("问题")
                 return events
 
@@ -499,7 +599,9 @@ class CoreTests(unittest.TestCase):
     def test_runtime_emits_streaming_text_events_in_order(self) -> None:
         async def collect() -> list[str]:
             with tempfile.TemporaryDirectory() as value:
-                runtime = AgentRuntime(load_runtime_config(Path(value)), provider=StreamProvider())
+                runtime = AgentRuntime(
+                    load_runtime_config(Path(value)), provider=StreamProvider(), enable_sandbox=False,
+                )
                 return [str(event.payload["content"]) async for event in runtime.run_task("问候") if event.type is EventType.TEXT]
         self.assertEqual(asyncio.run(collect()), ["你", "好"])
 
@@ -525,9 +627,22 @@ class CoreTests(unittest.TestCase):
                 registry = default_tools(root)
                 self.assertEqual(
                     {schema["name"] for schema in registry.schemas()},
-                    {"read_file", "write_file", "calculator", "search_workspace", "current_time"},
+                    {
+                        "read_file",
+                        "write_file",
+                        "bash",
+                        "sandbox_rollback",
+                        "calculator",
+                        "search_workspace",
+                        "current_time",
+                    },
                 )
-                context = ToolContext(project_root=root, approval=approve)
+                context = ToolContext(
+                    project_root=root,
+                    approval=approve,
+                    sandbox=_CheckpointSandbox(),
+                    file_locks=WorkspaceLockManager(root),
+                )
                 await registry.execute("write_file", {"path": "notes/demo.txt", "content": "独立工具模块"}, context)
                 self.assertEqual(
                     await registry.execute("read_file", {"path": "notes/demo.txt"}, context),
@@ -580,7 +695,12 @@ class CoreTests(unittest.TestCase):
                     return f"子任务完成：{task}"
 
                 registry = default_tools(root, subagent_runner=runner)
-                context = ToolContext(project_root=root, approval=approve)
+                context = ToolContext(
+                    project_root=root,
+                    approval=approve,
+                    sandbox=_CheckpointSandbox(),
+                    file_locks=WorkspaceLockManager(root),
+                )
                 self.assertEqual(registry.risk_of("subagent"), "dynamic")
                 self.assertEqual(registry.risk_of("subagent", {"task": "分析"}), "read")
                 self.assertEqual(
@@ -611,7 +731,10 @@ class CoreTests(unittest.TestCase):
         """真实临时 Runtime 复用父上下文，且不会创建独立 Session。"""
         async def check(root: Path) -> None:
             config = load_runtime_config(root)
-            context = ToolContext(project_root=root)
+            context = ToolContext(
+                project_root=root,
+                file_locks=WorkspaceLockManager(root),
+            )
             runner = RuntimeSubagentRunner(config, default_tools(root))
             result = await runner("独立分析", "保持简洁", [], context)
             self.assertIn("独立分析", result)
@@ -623,6 +746,7 @@ class CoreTests(unittest.TestCase):
                 provider=UsageProvider(),
                 tool_context=context,
                 enable_subagent=False,
+                enable_sandbox=False,
             )
             self.assertIs(runtime.tool_context, context)
             await runtime.close()
@@ -634,6 +758,7 @@ class CoreTests(unittest.TestCase):
                     provider=UsageProvider(),
                     tool_context=outside_context,
                     enable_subagent=False,
+                    enable_sandbox=False,
                 )
 
         with tempfile.TemporaryDirectory() as value:
@@ -654,6 +779,7 @@ class CoreTests(unittest.TestCase):
                 provider=SubagentCallingProvider(),
                 memory=memory,
                 subagent_runner=runner,
+                enable_sandbox=False,
             )
             result = asyncio.run(runtime.run("委派任务"))
             self.assertTrue(result.completed)

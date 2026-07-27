@@ -9,13 +9,20 @@ from pydantic import BaseModel, ConfigDict
 
 from Agent.config import RuntimeConfig, load_runtime_config
 from Agent.contracts import ApprovalCallback, EventType, RunEvent
-from Agent.hook import HookEvent, HookPoint, HookRegistry, build_default_hooks
+from Agent.hook import (
+    HookEvent,
+    HookPoint,
+    HookRegistry,
+    build_default_hooks,
+    register_sandbox_callbacks,
+)
 from Agent.models import build_provider
 from Agent.react import ReactLoop
 from Agent.retry import ModelRetryPolicy
 from context_process import ContextProcessor
 from memory import MemoryStore
 from prompt import PromptComposer
+from sandbox import DockerSandboxSession, SandboxSessionProtocol, WorkspaceLockManager
 from tools import AsyncToolRegistry, ToolContext, default_tools, register_subagent
 from .subagent import RuntimeSubagentRunner
 from .failure import RuntimeFailure
@@ -49,6 +56,9 @@ class AgentRuntime:
         subagent_runner=None,
         enable_context_processing: bool = True,
         enable_subagent: bool = True,
+        sandbox: SandboxSessionProtocol | None = None,
+        file_locks: WorkspaceLockManager | None = None,
+        enable_sandbox: bool = True,
         retry_policy: ModelRetryPolicy | None = None,
         raise_errors: bool = False,
     ) -> None:
@@ -62,21 +72,72 @@ class AgentRuntime:
         )
         if tool_context is not None and approval is not None:
             raise ValueError("tool_context 与 approval 不可同时传入")
-        if tool_context is not None and tool_context.project_root.resolve() != self.config.project_root:
-            raise ValueError("ToolContext 工作区必须与 RuntimeConfig.project_root 一致")
-        self.tool_context = tool_context or ToolContext(
-            project_root=self.config.project_root,
-            approval=approval,
+        if tool_context is not None and tool_context.project_root.resolve() != self.config.workspace_root:
+            raise ValueError("ToolContext 工作区必须与 RuntimeConfig.workspace_root 一致")
+        context_sandbox = tool_context.sandbox if tool_context is not None else None
+        if sandbox is not None and context_sandbox is not None and sandbox is not context_sandbox:
+            raise ValueError("sandbox 与 ToolContext.sandbox 不可指向不同实例")
+        selected_sandbox = context_sandbox if context_sandbox is not None else sandbox
+        context_locks = tool_context.file_locks if tool_context is not None else None
+        sandbox_locks = getattr(selected_sandbox, "file_locks", None)
+        candidates = [value for value in (context_locks, file_locks, sandbox_locks) if value is not None]
+        if candidates and any(value is not candidates[0] for value in candidates[1:]):
+            raise ValueError("Runtime、ToolContext 与 sandbox 必须共享同一个文件锁管理器")
+        self.file_locks = candidates[0] if candidates else WorkspaceLockManager(
+            self.config.workspace_root,
+            state_root=self.config.agent_root,
         )
+        self._owns_sandbox = False
+        if context_sandbox is not None:
+            self.sandbox = context_sandbox
+        elif sandbox is not None:
+            self.sandbox = sandbox
+            self._owns_sandbox = True
+        elif enable_sandbox:
+            self.sandbox = DockerSandboxSession(
+                self.config.workspace_root,
+                state_root=self.config.agent_root,
+                checkpoint_limit=self.config.sandbox_checkpoint_limit,
+                file_locks=self.file_locks,
+            )
+            self._owns_sandbox = True
+        else:
+            self.sandbox = None
+        if tool_context is None:
+            self.tool_context = ToolContext(
+                project_root=self.config.workspace_root,
+                approval=approval,
+                sandbox=self.sandbox,
+                file_locks=self.file_locks,
+            )
+        else:
+            updates = {}
+            if tool_context.sandbox is None and self.sandbox is not None:
+                updates["sandbox"] = self.sandbox
+            if tool_context.file_locks is None:
+                updates["file_locks"] = self.file_locks
+            self.tool_context = tool_context.model_copy(update=updates) if updates else tool_context
         self.approval = self.tool_context.approval
         self.retry_policy = retry_policy
         self.raise_errors = raise_errors
         self.last_failure: RuntimeFailure | None = None
-        self.memory = memory or MemoryStore(self.config.memory_dir)
+        if memory is None:
+            self.memory = MemoryStore(
+                self.config.memory_dir,
+                workspace_root=self.config.workspace_root,
+                agent_root=self.config.agent_root,
+            )
+        else:
+            if isinstance(memory, MemoryStore):
+                if memory.agent_root != self.config.agent_root:
+                    raise ValueError("MemoryStore.agent_root 必须与 RuntimeConfig.agent_root 一致")
+                if memory.workspace_root != self.config.workspace_root:
+                    raise ValueError("MemoryStore.workspace_root 必须与 RuntimeConfig.workspace_root 一致")
+            self.memory = memory
         if tools is not None:
             self.tools = tools
         else:
-            base_tools = default_tools(self.config.project_root)
+            base_tools = default_tools(self.config.workspace_root)
             if enable_subagent:
                 runner = subagent_runner or RuntimeSubagentRunner(self.config, base_tools)
                 register_subagent(base_tools, runner)
@@ -89,7 +150,9 @@ class AgentRuntime:
                 provider_factory=compression_provider_factory,
             )
         self.hooks = hooks or build_default_hooks(self.config.memory_dir, self.memory, self.context_processor)
-        self.prompts = PromptComposer(self.config.project_root)
+        if self._owns_sandbox and self.sandbox is not None:
+            register_sandbox_callbacks(self.hooks, self.sandbox)
+        self.prompts = PromptComposer(self.config.workspace_root)
         self._session_id: str | None = None
         self._session_open = False
 
@@ -183,6 +246,8 @@ class AgentRuntime:
         try:
             await self.hooks.emit(HookEvent(point=HookPoint.TRACE_END, session_id=session_id, data={"error": error}))
         finally:
+            if self._owns_sandbox and self.sandbox is not None:
+                await self.sandbox.close()
             self._session_open = False
             self._session_id = None
 
@@ -200,7 +265,14 @@ class AgentRuntime:
             return str(self._session_id)
         session_id = requested_session_id or uuid4().hex[:16]
         event = HookEvent(point=HookPoint.TRACE_START, session_id=session_id, data={"task": task, "new_session": requested_session_id is None})
-        await self.hooks.emit(event)
+        try:
+            await self.hooks.emit(event)
+        except Exception:
+            # trace_start 中后续 Memory/项目 Hook 失败时，Runtime 尚未标记打开，
+            # 因此必须在这里显式回收已经启动的容器。
+            if self._owns_sandbox and self.sandbox is not None:
+                await self.sandbox.close()
+            raise
         self._session_id = event.session_id
         self._session_open = True
         return event.session_id

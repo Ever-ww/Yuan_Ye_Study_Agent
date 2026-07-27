@@ -169,7 +169,7 @@ class _NoMemory:
 def create_coding_runtime(config: RuntimeConfig, worktree_root: Path) -> AgentRuntime:
     """复用正式 AgentRuntime 类创建无 Tool、无 Skill、无 Memory 的诊断实例。"""
     isolated = config.model_copy(update={
-        "project_root": worktree_root.resolve(),
+        "workspace_root": worktree_root.resolve(),
         "stream": False,
         "compression_threshold_tokens": 0,
     })
@@ -180,6 +180,7 @@ def create_coding_runtime(config: RuntimeConfig, worktree_root: Path) -> AgentRu
         hooks=HookRegistry(),
         enable_context_processing=False,
         enable_subagent=False,
+        enable_sandbox=False,
         retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=2),
         raise_errors=True,
     )
@@ -228,6 +229,22 @@ class HarnessEvolutionRunner:
                 base_commit=base,
             )
             runtime = self.runtime_factory(request.config, worktree)
+            if not _runtime_targets_worktree(runtime, worktree):
+                await runtime.close()
+                message = "Coding Runtime 的 workspace 未指向隔离 Git worktree，已拒绝运行"
+                self.writer.append_event(
+                    request.snapshot_path,
+                    "evolution",
+                    status="invalid_runtime_workspace",
+                    message=message,
+                    expected_workspace=str(worktree),
+                )
+                return HarnessEvolutionResult(
+                    status="invalid_runtime_workspace",
+                    message=message,
+                    worktree_path=str(worktree),
+                    branch=branch,
+                )
             diagnostic_task = (
                 "你是一个尚未接入 Coding Tool 与 Skill 的诊断 Agent。"
                 "请仅根据下面的完整错误快照分析可能原因，不要声称已经读取或修改仓库。\n\n"
@@ -320,7 +337,7 @@ class HarnessEvolutionRunner:
         commands = [
             ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"],
             ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "unittest", "discover", "-s", "tests", "-v"],
-            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "compileall", "-q", "Agent", "bootstrap", "context_process", "memory", "prompt", "tools", "run_ui", "tests", "harness-evolution", "run.py"],
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "compileall", "-q", "Agent", "bootstrap", "context_process", "memory", "prompt", "sandbox", "tools", "run_ui", "tests", "harness-evolution", "run.py"],
             ["uv", "lock", "--check"],
             ["git", "diff", "--check"],
         ]
@@ -391,6 +408,22 @@ class _CommandResult(BaseModel):
     returncode: int = Field(ge=0)
     stdout: str
     stderr: str
+
+
+def _runtime_targets_worktree(runtime: Any, worktree: Path) -> bool:
+    """要求 Coding Runtime 暴露的全部工作区边界都严格指向隔离 worktree。"""
+    roots: list[Path] = []
+    configured = getattr(getattr(runtime, "config", None), "workspace_root", None)
+    if configured is not None:
+        roots.append(Path(configured).resolve())
+    tool_root = getattr(getattr(runtime, "tool_context", None), "project_root", None)
+    if tool_root is not None:
+        roots.append(Path(tool_root).resolve())
+    declared = getattr(runtime, "workspace_root", None)
+    if declared is not None:
+        roots.append(Path(declared).resolve())
+    expected = worktree.resolve()
+    return bool(roots) and all(root == expected for root in roots)
 
 
 def _session_audit(record: dict[str, Any], position: int) -> dict[str, Any]:

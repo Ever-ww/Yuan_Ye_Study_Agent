@@ -148,3 +148,10 @@ def build_default_hooks(
     for point, callback in _PROJECT_CALLBACKS.items():
         registry.register(point, callback, priority=-200 if point is HookPoint.TRACE_START else 0)
     return registry
+
+
+def register_sandbox_callbacks(registry: HookRegistry, sandbox: Any) -> None:
+    """把 Docker 生命周期接入正式 Hook；延迟导入避免核心层循环依赖。"""
+    from sandbox.callbacks import register_sandbox_callbacks as register
+
+    register(registry, sandbox)

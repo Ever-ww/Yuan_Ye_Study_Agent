@@ -18,11 +18,12 @@ yy-agent = "run_ui.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["Agent*", "bootstrap*", "context_process*", "memory*", "prompt*", "tools*", "run_ui*"]
+include = ["Agent*", "bootstrap*", "context_process*", "memory*", "prompt*", "sandbox*", "tools*", "run_ui*"]
 
 [tool.setuptools.package-data]
 bootstrap = ["templates/*.example"]
 run_ui = ["templates/*.html", "static/*.css", "static/*.js"]
+sandbox = ["Dockerfile"]
 
 [tool.setuptools.data-files]
 "harness-evolution" = ["harness-evolution/harness.py"]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 from pathlib import Path
 from typing import Any
 
@@ -12,10 +14,21 @@ from .session import SessionStore
 class MemoryStore:
     """项目 `.yy/memory` 下全部记忆能力的唯一入口。"""
 
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        self.sessions = SessionStore(root / "session")
-        self.profiles = ProfileStore(root / "profile")
+    def __init__(
+        self,
+        root: Path,
+        *,
+        workspace_root: Path | None = None,
+        agent_root: Path | None = None,
+    ) -> None:
+        self.root = root.resolve()
+        self.agent_root = (agent_root or _infer_agent_root(self.root)).resolve()
+        self.workspace_root = (workspace_root or self.agent_root).resolve()
+        session_directory = self.root / "session"
+        if self.workspace_root != self.agent_root:
+            session_directory /= _workspace_key(self.workspace_root)
+        self.sessions = SessionStore(session_directory)
+        self.profiles = ProfileStore(self.root / "profile")
         self.initialize()
 
     def initialize(self) -> None:
@@ -150,3 +163,14 @@ class MemoryStore:
             if index_backup is not None:
                 self.profiles.index_path.write_bytes(index_backup)
             raise
+
+
+def _infer_agent_root(memory_root: Path) -> Path:
+    if memory_root.name == "memory" and memory_root.parent.name == ".yy":
+        return memory_root.parents[1]
+    return memory_root
+
+
+def _workspace_key(path: Path) -> str:
+    normalized = os.path.normcase(str(path.resolve()))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]

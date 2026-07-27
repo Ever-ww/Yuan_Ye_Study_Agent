@@ -2,10 +2,12 @@
 
 from pathlib import Path
 
+from .bash import BashTool
 from .calculator import CalculatorTool
 from .current_time import CurrentTimeTool
 from .read_file import ReadFileTool
 from .registry import AsyncToolRegistry
+from .sandbox_rollback import SandboxRollbackTool
 from .search_workspace import SearchWorkspaceTool
 from .subagent import SubagentRunner, SubagentTool
 from .write_file import WriteFileTool
@@ -24,6 +26,8 @@ def default_tools(project_root: Path, *, subagent_runner: SubagentRunner | None 
     builtins = [
         ReadFileTool(),
         WriteFileTool(),
+        BashTool(),
+        SandboxRollbackTool(),
         CalculatorTool(),
         SearchWorkspaceTool(),
         CurrentTimeTool(),
