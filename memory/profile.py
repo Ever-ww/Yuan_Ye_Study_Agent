@@ -16,8 +16,19 @@ DEFAULT_PROFILE_FILES = ("USER.md", "RESEARCH.md", "OTHERS.md")
 class ProfileStore:
     """管理可扩展的用户长期记忆文件集合。"""
 
-    def __init__(self, directory: Path, defaults: tuple[str, ...] = DEFAULT_PROFILE_FILES) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        defaults: tuple[str, ...] = DEFAULT_PROFILE_FILES,
+        *,
+        include_extensions: bool = True,
+        session_profiles_enabled: bool = True,
+        prompt_context_limit: int | None = 6000,
+    ) -> None:
         self.directory, self.defaults = directory, defaults
+        self.include_extensions = include_extensions
+        self.session_profiles_enabled = session_profiles_enabled
+        self.prompt_context_limit = prompt_context_limit
         self.index_path = directory / "index.json"
 
     def initialize(self) -> None:
@@ -36,8 +47,11 @@ class ProfileStore:
         """加载全局 Profile 与当前 Session Profile，隔离其他会话哈希。"""
         self.initialize()
         parts = []
-        paths = sorted(self.directory.glob("*.md"))
-        if session_id is not None:
+        if self.include_extensions:
+            paths = sorted(self.directory.glob("*.md"))
+        else:
+            paths = [self.directory / name for name in self.defaults if (self.directory / name).exists()]
+        if session_id is not None and self.session_profiles_enabled:
             session_path = self.directory / f"{session_id}.md"
             paths = ([session_path] if session_path in paths else []) + [path for path in paths if path != session_path]
         for path in paths:
@@ -50,6 +64,8 @@ class ProfileStore:
 
     def session_profile(self, session_id: str) -> str:
         """读取单个会话哈希对应的合并 Profile。"""
+        if not self.session_profiles_enabled:
+            return ""
         path = self.directory / f"{session_id}.md"
         return path.read_text(encoding="utf-8").strip() if path.exists() else ""
 
@@ -64,6 +80,8 @@ class ProfileStore:
         tool_calls_processed: int,
     ) -> Path:
         """原子更新哈希 Profile，并累计其上下文整理索引。"""
+        if not self.session_profiles_enabled:
+            raise RuntimeError("当前 ProfileStore 禁止创建 Session 哈希 Profile")
         self.initialize()
         profile_path = self.directory / f"{session_id}.md"
         temporary = profile_path.with_suffix(".md.tmp")

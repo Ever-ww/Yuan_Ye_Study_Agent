@@ -20,15 +20,21 @@ class MemoryStore:
         *,
         workspace_root: Path | None = None,
         agent_root: Path | None = None,
+        partition_by_workspace: bool = True,
+        profiles: ProfileStore | None = None,
     ) -> None:
         self.root = root.resolve()
         self.agent_root = (agent_root or _infer_agent_root(self.root)).resolve()
         self.workspace_root = (workspace_root or self.agent_root).resolve()
         session_directory = self.root / "session"
-        if self.workspace_root != self.agent_root:
+        self.partition_by_workspace = partition_by_workspace
+        if partition_by_workspace and self.workspace_root != self.agent_root:
             session_directory /= _workspace_key(self.workspace_root)
         self.sessions = SessionStore(session_directory)
-        self.profiles = ProfileStore(self.root / "profile")
+        self.profiles = profiles or ProfileStore(self.root / "profile")
+        if self.profiles.directory.resolve() != (self.root / "profile").resolve():
+            raise ValueError("ProfileStore 必须位于 MemoryStore 的 profile 目录")
+        self.session_profiles_enabled = self.profiles.session_profiles_enabled
         self.initialize()
 
     def initialize(self) -> None:
@@ -117,6 +123,19 @@ class MemoryStore:
         """返回全局 Profile 与指定会话独占的哈希 Profile。"""
         return self.profiles.load_for_session(session_id)
 
+    def prompt_context(self, session_id: str | None = None) -> str:
+        """返回注入模型的预算内长期上下文；普通用户记忆维持 6000 字符上限。"""
+        value = self.profile_context(session_id)
+        limit = self.profiles.prompt_context_limit
+        return value if limit is None else value[:limit]
+
+    def has_compressible_history(self, session_id: str) -> bool:
+        """判断当前分段是否包含可被摘要的对话或工具记录。"""
+        return any(
+            record.get("role") in {"user", "assistant", "tool"}
+            for record in self.session_records(session_id)
+        )
+
     def active_filename(self, session_id: str) -> str:
         """返回会话当前 JSONL 文件名。"""
         return self.sessions.active_filename(session_id)
@@ -139,8 +158,10 @@ class MemoryStore:
         conversation_turns: int,
         records_processed: int,
         tool_calls_processed: int,
-    ) -> tuple[Path, Path]:
+    ) -> tuple[Path | None, Path]:
         """协调 Profile 与新分段写入；切段失败时恢复旧 Profile 状态。"""
+        if not self.session_profiles_enabled:
+            return None, self.rollover_with_summary(session_id, context_summary, source_file)
         profile_path = self.profiles.directory / f"{session_id}.md"
         profile_backup = profile_path.read_bytes() if profile_path.exists() else None
         index_backup = self.profiles.index_path.read_bytes() if self.profiles.index_path.exists() else None

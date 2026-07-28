@@ -27,6 +27,7 @@ _REQUIRED_PATHS = (
     "memory/profile/RESEARCH.md",
     "memory/profile/OTHERS.md",
     "memory/profile/index.json",
+    "skills/index.json",
     ".initialized.json",
 )
 
@@ -40,6 +41,15 @@ def initialize_project(project_root: Path) -> Path:
         template = Path(__file__).parent / "templates" / "settings.local.json.example"
         local.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
     MemoryStore(yy / "memory")
+    (project_root / "skills").mkdir(parents=True, exist_ok=True)
+    for directory in ("review", "audit", "backups"):
+        (yy / "skills" / directory).mkdir(parents=True, exist_ok=True)
+    skill_index = yy / "skills" / "index.json"
+    if not skill_index.exists():
+        skill_index.write_text(
+            json.dumps({"version": 1, "skills": {}}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     marker = yy / ".initialized.json"
     if not marker.exists():
         marker.write_text(

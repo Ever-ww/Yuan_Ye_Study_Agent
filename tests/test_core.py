@@ -15,7 +15,7 @@ from Agent.contracts import ModelReply, TokenUsage, ToolCall
 from Agent.runtime.subagent import RuntimeSubagentRunner
 from bootstrap import ensure_project_initialized, is_project_initialized
 from context_process import ContextProcessor
-from memory import MemoryStore
+from memory import HarnessLongTermMemory, MemoryStore
 from prompt import PromptComposer
 from sandbox import WorkspaceLockManager
 from tools import AsyncToolRegistry, ToolContext, default_tools
@@ -110,6 +110,18 @@ class CompressionProvider:
         }, ensure_ascii=False))
 
 
+class SummaryOnlyCompressionProvider:
+    """Harness 压缩不允许生成 Session Profile。"""
+
+    streaming = False
+
+    async def complete(self, messages, tools):
+        del messages, tools
+        return ModelReply(text=json.dumps({
+            "context_summary_markdown": "# 用户目标\n修复项目\n# 已完成任务\n定位\n# 未完成任务\n修改\n# 关键决策\n最小改动\n# 必要工具结论\n无",
+        }, ensure_ascii=False))
+
+
 class LargeUsageProvider:
     """用精确 usage 触发自动压缩。"""
 
@@ -117,6 +129,25 @@ class LargeUsageProvider:
 
     async def complete(self, messages, tools):
         return ModelReply(text="已完成大上下文回答", usage=TokenUsage(input_tokens=20000, output_tokens=20))
+
+
+class ToolThenFinalProvider:
+    """先调用工具，再验证压缩后的下一次请求仍能完成。"""
+
+    streaming = False
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.second_messages = []
+
+    async def complete(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            return ModelReply(tool_calls=(
+                ToolCall(name="calculator", arguments={"expression": "2 + 2"}),
+            ))
+        self.second_messages = [dict(message) for message in messages]
+        return ModelReply(text="压缩后继续完成：4")
 
 
 class CapturingProvider:
@@ -164,6 +195,8 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(local.exists())
             self.assertTrue((yy / "memory" / "session" / "index.json").exists())
             self.assertTrue((yy / "memory" / "profile" / "index.json").exists())
+            self.assertTrue((yy / "skills" / "index.json").exists())
+            self.assertTrue((root / "skills").is_dir())
             for name in ("USER.md", "RESEARCH.md", "OTHERS.md"):
                 self.assertTrue((yy / "memory" / "profile" / name).exists())
             local.write_text("用户配置", encoding="utf-8")
@@ -400,23 +433,44 @@ class CoreTests(unittest.TestCase):
     def test_automatic_compression_merges_profile_and_rolls_over(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
-            config = load_runtime_config(root, compression_threshold_tokens=20000)
+            config = load_runtime_config(root, compression_threshold_tokens=300)
             memory = MemoryStore(config.memory_dir)
+            session_id = memory.create_session("历史问题")
+            memory.record_user(session_id, "历史问题" * 300)
+            memory.record_assistant(session_id, "历史回答" * 300)
             compressor = CompressionProvider()
+            provider = CapturingProvider()
             runtime = AgentRuntime(
                 config,
-                provider=LargeUsageProvider(),
+                provider=provider,
                 memory=memory,
                 compression_provider_factory=lambda: compressor,
                 enable_sandbox=False,
             )
-            result = asyncio.run(runtime.run("整理长上下文"))
+            result = asyncio.run(runtime.run("整理长上下文", session_id))
             self.assertTrue(result.completed)
             self.assertEqual(compressor.calls, 1)
             self.assertTrue(memory.active_filename(result.session_id).endswith("_002.jsonl"))
-            summary = memory.session_records(result.session_id)[0]
+            active_records = memory.session_records(result.session_id)
+            summary = active_records[0]
             self.assertEqual(summary["role"], "summary")
+            self.assertEqual([record["role"] for record in active_records], [
+                "summary",
+                "user",
+                "assistant",
+            ])
+            self.assertEqual(active_records[1]["content"], "整理长上下文")
+            self.assertEqual(
+                sum(record.get("content") == "整理长上下文" for record in active_records),
+                1,
+            )
             self.assertEqual(memory.restore_messages(result.session_id)[0]["role"], "system")
+            self.assertEqual(provider.messages[-1]["content"], "整理长上下文")
+            compression_payload = json.loads(compressor.messages[-1]["content"])
+            self.assertNotIn(
+                "整理长上下文",
+                json.dumps(compression_payload["session_records"], ensure_ascii=False),
+            )
             profile = config.memory_dir / "profile" / f"{result.session_id}.md"
             self.assertIn("偏好中文", profile.read_text(encoding="utf-8"))
             index = json.loads((config.memory_dir / "profile" / "index.json").read_text(encoding="utf-8"))
@@ -434,7 +488,35 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(memory.active_filename(result.session_id).endswith("_003.jsonl"))
             updated = json.loads((config.memory_dir / "profile" / "index.json").read_text(encoding="utf-8"))["profiles"][result.session_id]
             self.assertEqual(updated["segments_processed"], 2)
-            self.assertEqual(updated["conversation_turns"], 2)
+            self.assertEqual(updated["conversation_turns"], 3)
+
+    def test_tool_chain_is_compressed_before_the_followup_model_call(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(root, compression_threshold_tokens=80)
+            memory = MemoryStore(config.memory_dir)
+            compressor = CompressionProvider()
+            provider = ToolThenFinalProvider()
+            runtime = AgentRuntime(
+                config,
+                provider=provider,
+                memory=memory,
+                compression_provider_factory=lambda: compressor,
+                enable_sandbox=False,
+            )
+            result = asyncio.run(runtime.run("计算 2 + 2"))
+            self.assertTrue(result.completed)
+            self.assertEqual(provider.calls, 2)
+            self.assertEqual(compressor.calls, 1)
+            self.assertTrue(memory.active_filename(result.session_id).endswith("_002.jsonl"))
+            payload = json.loads(compressor.messages[-1]["content"])
+            roles = [record["role"] for record in payload["session_records"]]
+            self.assertEqual(roles, ["user", "assistant", "tool"])
+            self.assertIn("tool_calls", payload["session_records"][1])
+            self.assertEqual(
+                [message["role"] for message in provider.second_messages],
+                ["system", "system"],
+            )
 
     def test_manual_compress_is_not_recorded_and_only_returns_status(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -484,6 +566,62 @@ class CoreTests(unittest.TestCase):
             self.assertEqual([item["role"] for item in messages], ["system", "user"])
             self.assertEqual(messages[-1]["content"], "新问题")
             self.assertEqual(memory.session_records(session_id), original)
+
+    def test_harness_compression_rolls_session_without_hash_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            memory_root = root / ".yy" / "harness-evolution" / "memory"
+            profiles = HarnessLongTermMemory(memory_root / "profile", agent_root=root)
+            memory = MemoryStore(
+                memory_root,
+                workspace_root=root,
+                agent_root=root,
+                partition_by_workspace=False,
+                profiles=profiles,
+            )
+            session_id = memory.create_session("修复问题")
+            memory.record_user(session_id, "修复问题")
+            memory.record_assistant(session_id, "开始定位")
+            config = load_runtime_config(root)
+            result = asyncio.run(ContextProcessor(
+                config,
+                memory,
+                provider_factory=SummaryOnlyCompressionProvider,
+            ).compress(session_id))
+            self.assertEqual(result.status, "compressed")
+            self.assertIsNone(result.profile_file)
+            self.assertTrue(memory.active_filename(session_id).endswith("_002.jsonl"))
+            self.assertFalse((profiles.directory / f"{session_id}.md").exists())
+            self.assertEqual(
+                {path.name for path in profiles.directory.glob("*.md")},
+                {"AGENT.md", "PROJECT.md", "CHANGES.md", "LESSONS.md"},
+            )
+
+    def test_harness_long_term_prompt_keeps_core_and_newest_log_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            profiles = HarnessLongTermMemory(
+                root / ".yy" / "harness-evolution" / "memory" / "profile",
+                agent_root=root,
+            )
+            profiles.initialize()
+            (profiles.directory / "AGENT.md").write_text(
+                "# 用户规则\n始终保留这条规则\n",
+                encoding="utf-8",
+            )
+            entries = [
+                f"## 2026-07-{index:02d} - 更新 {index}\n\n" + ("内容" * 1800)
+                for index in range(1, 25)
+            ]
+            (profiles.directory / "CHANGES.md").write_text(
+                "# Verified Changes\n\n" + "\n\n".join(entries) + "\n",
+                encoding="utf-8",
+            )
+            context = profiles.load_for_session("a" * 16)
+            self.assertLessEqual(len(context), 64 * 1024)
+            self.assertIn("始终保留这条规则", context)
+            self.assertIn("更新 24", context)
+            self.assertNotIn("更新 1\n", context)
 
     def test_hash_profiles_are_isolated_between_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as value:

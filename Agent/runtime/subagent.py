@@ -54,6 +54,7 @@ class RuntimeSubagentRunner:
             hooks=hooks,
             tool_context=context,
             enable_context_processing=False,
+            enable_skills=False,
             enable_subagent=False,
             enable_sandbox=False,
         )

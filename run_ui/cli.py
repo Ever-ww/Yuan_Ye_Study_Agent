@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 import sys
 
 import typer
@@ -21,6 +22,7 @@ from Agent import (
 )
 from bootstrap import ensure_project_initialized, initialize_project
 from memory import MemoryStore
+from skill import SkillInstallRequest
 from .approval import InteractiveApproval, active_live as _active_live
 from .harness_loader import load_harness_module
 from .web import serve
@@ -172,7 +174,13 @@ async def _chat(session_id: str | None) -> None:
             if task in {"/exit", "/quit"}:
                 return
             if task == "/help":
-                console.print("/compress 压缩当前上下文；/exit 退出；其余内容将发送给 Agent。")
+                console.print(
+                    "/compress 压缩当前上下文；/skill list|install|update|audit 管理 Skill；"
+                    "/exit 退出；其余内容将发送给 Agent。"
+                )
+                continue
+            if task == "/skill" or task.startswith("/skill "):
+                await _handle_skill_command(runtime, task)
                 continue
             if task:
                 previous_id = session_id
@@ -194,6 +202,105 @@ async def _chat(session_id: str | None) -> None:
                     console.print(f"[dim]会话哈希：{session_id}；下次可使用 chat --session {session_id} 恢复[/]")
     finally:
         await runtime.close()
+
+
+async def _handle_skill_command(runtime: AgentRuntime, task: str) -> None:
+    """处理不进入 Session JSONL 的显式 Skill 管理命令。"""
+    if runtime.skills is None:
+        console.print("[red]当前 Runtime 已禁用 Skill[/]")
+        return
+    try:
+        parts = [_strip_cli_quote(value) for value in shlex.split(task, posix=False)]
+        if len(parts) < 2:
+            raise ValueError(_skill_usage())
+        action = parts[1].lower()
+        if action == "list":
+            catalog = runtime.skills.catalog()
+            if not catalog:
+                console.print("尚未安装可用 Skill。")
+                return
+            table = Table(title="已审核 Skill")
+            table.add_column("名称", style="cyan")
+            table.add_column("描述")
+            table.add_column("位置")
+            for item in catalog:
+                table.add_row(item.name, item.description, item.location)
+            console.print(table)
+            return
+        if action == "audit":
+            if len(parts) != 3:
+                raise ValueError("用法：/skill audit <review-id>")
+            report = runtime.skills.audit_report(parts[2])
+            table = Table(title=f"Skill 审核 {report.review_id}")
+            table.add_column("等级")
+            table.add_column("项目")
+            table.add_column("路径")
+            for finding in report.findings:
+                table.add_row(finding.severity, finding.message, finding.path or "")
+            console.print(
+                f"状态：{report.status}；文件：{report.total_files}；"
+                f"大小：{report.total_bytes} 字节；完整报告：{report.report_path}"
+            )
+            if report.findings:
+                console.print(table)
+            return
+        if action not in {"install", "update"}:
+            raise ValueError(_skill_usage())
+        position = 2
+        name = None
+        if action == "update":
+            if len(parts) <= position:
+                raise ValueError("用法：/skill update <name> <source> [--ref REF] [--path PATH]")
+            name = parts[position]
+            position += 1
+        if len(parts) <= position:
+            raise ValueError(f"/skill {action} 缺少来源")
+        source = parts[position]
+        options = _parse_skill_options(parts[position + 1 :])
+        request = SkillInstallRequest(
+            source=source,
+            action=action,
+            name=name,
+            ref=options.get("ref"),
+            skill_path=options.get("skill_path"),
+        )
+        result = await runtime.skills.install(request)
+        style = "green" if result.status == "installed" else "yellow"
+        console.print(f"[{style}]{result.message}[/]")
+        if result.candidates:
+            console.print("候选 Skill：" + "、".join(result.candidates))
+        if result.report_path:
+            console.print(f"[dim]审核报告：{result.report_path}[/]")
+    except Exception as exc:
+        console.print(f"[red]{str(exc) or type(exc).__name__}[/]")
+
+
+def _parse_skill_options(values: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    index = 0
+    mapping = {"--ref": "ref", "--path": "skill_path", "--skill-path": "skill_path"}
+    while index < len(values):
+        key = values[index]
+        target = mapping.get(key)
+        if target is None or index + 1 >= len(values):
+            raise ValueError(f"无效或缺少值的 Skill 选项：{key}")
+        result[target] = values[index + 1]
+        index += 2
+    return result
+
+
+def _strip_cli_quote(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _skill_usage() -> str:
+    return (
+        "Skill 命令：/skill list；/skill audit <review-id>；"
+        "/skill install <source> [--ref REF] [--path PATH]；"
+        "/skill update <name> <source> [--ref REF] [--path PATH]"
+    )
 
 
 async def _handle_chat_failure(config, runtime, task: str, session_id: str, failure: RuntimeFailure) -> None:

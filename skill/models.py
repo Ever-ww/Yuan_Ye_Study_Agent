@@ -1,0 +1,140 @@
+"""Skill 获取、审核和安装状态的 Pydantic 数据契约。"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class SkillMetadata(BaseModel):
+    """可注入 System Prompt 的已审核 Skill 元数据。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    name: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", max_length=64)
+    description: str = Field(min_length=1, max_length=1024)
+    location: str = Field(min_length=1)
+    license: str | None = Field(default=None, min_length=1)
+    compatibility: str | None = Field(default=None, min_length=1, max_length=500)
+    metadata: dict[str, str] = Field(default_factory=dict)
+    allowed_tools: str | None = Field(default=None, min_length=1)
+    content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class SkillSource(BaseModel):
+    """一次审核使用的不可变来源信息。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    kind: Literal["github", "local"]
+    value: str = Field(min_length=1)
+    ref: str | None = None
+    skill_path: str | None = None
+    commit: str | None = None
+
+
+class SkillAuditFinding(BaseModel):
+    """静态审核发现的一条风险或说明。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    severity: Literal["block", "review", "info"]
+    code: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    path: str | None = None
+
+
+class SkillAuditReport(BaseModel):
+    """保存在 `.yy` 的完整审核报告。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    review_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    created_at: datetime
+    status: Literal["blocked", "review_required", "clean", "installed", "declined"]
+    source: SkillSource
+    skill: SkillMetadata | None = None
+    findings: tuple[SkillAuditFinding, ...] = ()
+    files: dict[str, str] = Field(default_factory=dict)
+    total_files: int = Field(default=0, ge=0)
+    total_bytes: int = Field(default=0, ge=0)
+    report_path: Path
+
+
+class SkillInstallRequest(BaseModel):
+    """CLI 与工具共用的安装请求。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    source: str = Field(min_length=1, max_length=4096)
+    action: Literal["install", "update"] = "install"
+    ref: str | None = Field(default=None, max_length=255)
+    skill_path: str | None = Field(default=None, max_length=1024)
+    name: str | None = Field(default=None, max_length=64)
+
+    @field_validator("source")
+    @classmethod
+    def _strip_source(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("source 不能为空")
+        return stripped
+
+    @field_validator("ref", "skill_path", "name")
+    @classmethod
+    def _strip_optional(cls, value: str | None) -> str | None:
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", value):
+            raise ValueError("Skill 名称格式无效")
+        return value
+
+
+class SkillInstallResult(BaseModel):
+    """安装流水线返回给 CLI 或模型的稳定结果。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    status: Literal[
+        "installed",
+        "blocked",
+        "declined",
+        "selection_required",
+        "conflict",
+        "error",
+    ]
+    message: str
+    review_id: str | None = None
+    name: str | None = None
+    candidates: tuple[str, ...] = ()
+    report_path: Path | None = None
+
+
+class InstalledSkillEntry(BaseModel):
+    """`.yy/skills/index.json` 中一个已安装 Skill 的来源和摘要。"""
+
+    model_config = ConfigDict(strict=True)
+
+    status: Literal["installed"] = "installed"
+    name: str
+    content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    description: str
+    source: SkillSource
+    review_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    installed_at: datetime
+
+
+class SkillIndex(BaseModel):
+    """已安装 Skill 的可信索引。"""
+
+    model_config = ConfigDict(strict=True)
+
+    version: Literal[1] = 1
+    skills: dict[str, InstalledSkillEntry] = Field(default_factory=dict)

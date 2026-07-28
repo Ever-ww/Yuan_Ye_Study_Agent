@@ -10,9 +10,13 @@ Yuan Ye Study Agent 是一个本地优先、单一异步 Runtime 驱动的学习
 
 模型像一匹拥有力量和方向感的马，Harness 则是让这种能力能够被稳定驾驭的整套挽具：Runtime 负责节奏，Prompt 提供方向，Tools 延伸行动能力，Hooks 留出新的连接点，Memory 和上下文压缩让它记住一路上真正重要的东西。
 
-所谓 **Harness 自进化**，不是让模型不受控制地改写自己，而是建立一条可审计的成长闭环：传统框架依赖硬编码固定逻辑，面对长对话、Token 波动、复杂子任务、新增交互场景容易失效，只能靠人工改代码、重启服务来适配。本 Agent 会实时感知运行瓶颈、自动生成并校验代码补丁，通过热更新动态优化自身逻辑，实现无需人工介入的持续自适应迭代。这是对"身体"和"大脑"的共同进化，而不是只优化"大脑"(skill)。
+所谓 **Harness 自进化**，不是让模型不受控制地改写自己，而是建立一条可审计的成长闭环：传统框架依赖硬编码固定逻辑，面对长对话、Token 波动、复杂子任务、新增交互场景容易失效，只能靠人工改代码、重启服务来适配。本 Agent 在发现代码类缺陷并取得用户确认后，会在隔离环境中生成和校验代码补丁。这是对“身体”和“大脑”的共同进化，而不是只优化“大脑”（Skill）。
 
-当前实现处于安全的第一阶段：CLI chat 能保存完整错误现场，并在确认后创建隔离 Git worktree，再启动一个复用正式 `AgentRuntime` 类的诊断实例。Coding Runtime 的 `workspace_root` 与 ToolContext 必须指向该 worktree，不能继续指向主仓库或触发错误时的用户 workspace；控制器会在运行前校验这一边界。该实例暂时没有 Tool 或 Skill，因此不会改代码；发现 Git diff 为空后会删除临时 worktree。后续接入 Coding Tool/Skill 后，所有文件操作、测试和 Git diff 仍只以该 worktree 为工作区，验证成功后才提交并本地快进合并。Harness 不会静默修改脏工作区，也不会自动推送 GitHub。
+CLI chat 能保存完整错误现场，并在用户确认后创建隔离 Git worktree，再启动一个复用正式 `AgentRuntime` 类的 Coding Agent。Coding Runtime 的 `workspace_root`、ToolContext、Docker 挂载和文件工具全部指向该 worktree；控制器会在运行前校验这一边界。它拥有专属 Memory、项目结构 Profile、上下文压缩、已审核 Skill、`skill_read`、文件读写/搜索、Docker Bash、checkpoint 回溯和 Subagent，但不提供 `skill_install`。用户确认启动 Harness 后，隔离 worktree 内的既有 Coding 工具自动获批；变更仍必须通过固定测试，才会提交并本地快进合并。测试失败或无变更时删除 worktree，Harness 不会 stash 脏主工作区，也不会自动推送 GitHub。
+
+Coding Agent 的记忆位于 Agent 根目录的 `.yy/harness-evolution/memory/`，与普通聊天 Memory 和目标 workspace 分离。每次 Harness 更新创建全新的 Session JSONL，不恢复上一项修复的临时对话；同一次更新发生压缩时，继续使用相同 Session 哈希生成 `_002.jsonl`、`_003.jsonl`。跨更新只共享 `profile/AGENT.md`、`PROJECT.md`、`CHANGES.md` 和 `LESSONS.md` 四个长期文件。
+
+`AGENT.md` 首次创建后只由用户维护；`PROJECT.md` 保存当前架构和 Tool/Hook 等开发规范；`CHANGES.md` 与 `LESSONS.md` 只追加已经通过测试并成功合并的事实。每个 Coding Session 都把 `AGENT.md`、`PROJECT.md` 全文和预算内的最新日志条目注入 System Prompt。合并成功后由无工具维护 Runtime 更新长期记忆，模型不可用时使用确定性项目扫描降级；失败、无变更或未合并的尝试只保留在 JSONL 和错误快照中。
 
 > 本文以 Windows PowerShell 为例。项目要求 Python 3.10+；由 uv 管理项目 Python、`.venv` 和依赖，不需要手动使用 `pip` 或激活虚拟环境。
 
@@ -25,6 +29,8 @@ context_process/ Token 阈值压缩、Profile 合并与失败裁剪
 harness-evolution/ 错误快照、隔离 worktree、诊断与验证流水线
 prompt/     System Prompt 分层组合
 sandbox/    Trace 级 Docker、独立本地 Git checkpoint 与跨进程文件锁
+skill/      Skill 获取、格式解析、静态审核、可信索引与安装事务
+skills/     本机已安装的第三方 Skill 内容（仅提交 .gitkeep）
 tools/      异步工具协议、注册表和受控内置工具
   contracts.py         AsyncTool 协议与 ToolContext
   registry.py          Schema 校验、注册与权限审批
@@ -37,6 +43,8 @@ tools/      异步工具协议、注册表和受控内置工具
   search_workspace.py  工作区文本搜索
   current_time.py      本地时间查询
   subagent.py          受父 Agent 限权的临时子 Agent
+  skill_read.py        渐进读取已审核 Skill 文本
+  skill_install.py     审批后获取、审核和安装 Skill
 run_ui/     Rich CLI、FastAPI 路由、模板和静态资源
 tests/      核心行为与 UI 安全测试
 .yy/memory/ Agent 根目录中的会话 JSONL、会话索引与长期 Profile（不提交）
@@ -111,7 +119,7 @@ docker info
 uv run python run.py
 ```
 
-第一次启动会在 Agent 根目录创建 `.yy/settings.local.json`、`.yy/.initialized.json`、`.yy/memory/session/index.json`，以及 `.yy/memory/profile/` 下的 `index.json`、`USER.md`、`RESEARCH.md` 和 `OTHERS.md`，然后显示命令帮助。后续执行 `run.py`、`chat`、`run` 或 `serve-ui` 时检测到初始化标记和必要文件齐全，就不会再次初始化。
+第一次启动会在 Agent 根目录创建 `.yy/settings.local.json`、`.yy/.initialized.json`、`.yy/memory/session/index.json`，以及 `.yy/memory/profile/` 下的 `index.json`、`USER.md`、`RESEARCH.md` 和 `OTHERS.md`。同时会初始化 `.yy/skills/index.json`、审核/备份目录和 Agent 根目录的 `skills/`。后续执行 `run.py`、`chat`、`run` 或 `serve-ui` 时检测到初始化标记和必要文件齐全，就不会再次初始化。
 
 如果你误删了 `.yy` 中的必要文件，可手动修复初始化：
 
@@ -188,7 +196,7 @@ uv run python run.py init
 
 `max_steps` 表示一次用户任务最多允许发起多少次模型 API 调用。
 
-`compression_threshold_tokens` 默认是 `20000`。最终回答保存后，如果本轮上下文 Token 与输出 Token 之和达到该值，Runtime 会在 `turn_end` 通过 Hook 自动压缩当前分段；设为 `0` 可关闭自动压缩，但仍可手动使用 `/compress`。
+`compression_threshold_tokens` 默认是 `20000`。所有具备持久化 Memory 的 Runtime 会在每次 `model_before` 估算即将发送的完整 messages 与 Tool Schema；达到阈值时先压缩已经落盘的历史，再把当前新问题作为独立 `user` 消息写入新分段并调用模型。工具调用及结果会在下一次模型请求前一起参与检查。设为 `0` 可关闭自动压缩，但仍可手动使用 `/compress`。
 
 `sandbox_checkpoint_limit` 默认是 `17`，必须是大于等于 1 的整数。它限制每个 Session 在 `.yy/sandbox/checkpoints/` 中保留的本地快照数量，基线也计入上限；超过后会删除最旧引用，并只清理独立 checkpoint 对象库，不改写项目主仓库。
 
@@ -226,6 +234,7 @@ uv run python run.py chat
 - 直接输入任务并按 Enter 发送。
 - `/help` 查看帮助；`/exit` 或 `/quit` 退出。
 - 已经开始会话后输入 `/compress`，可立即压缩当前上下文；命令本身不会写入 JSONL。
+- `/skill list`、`/skill install`、`/skill update` 和 `/skill audit` 管理本机 Skill；这些命令不会写入 Session JSONL。
 - `stream=true` 时，OpenAI-compatible Provider 会通过 SSE 逐段显示文本。
 - 高风险工具会显示方向键审批菜单：使用 ↑/↓ 选择“允许本次 / 当前会话始终允许该工具 / 拒绝”，按 Enter 确认、Esc 取消，默认选中拒绝。会话授权在退出当前 Runtime 后自动失效。
 - `bash` 只在当前 Trace 的无网络 Docker 容器中运行。容器读写挂载启动时的 workspace，因此命令造成的文件变化会立即出现在宿主机；一次成功 Bash 调用无论修改多少文件都只创建一个 checkpoint，没有变化则不创建。
@@ -305,6 +314,55 @@ Agent 自身 workspace：
 
 `context_total` 和 `output_tokens` 优先使用模型接口返回的精确 usage；接口不返回时使用本地估算并将对应 `source` 标记为 `estimated`。OpenAI-compatible 接口在流式模式下会请求返回 usage。由于常见模型接口不提供“当前问题”独立计数，`current_question` 始终是本地估算值。一次用户任务若因工具结果产生多个模型 Turn，`model_calls` 会逐次记录，避免把多次输出 Token 混成一个数字。记录中绝不会写入 API Key。
 
+## Skill 获取、审核与渐进加载
+
+Skill 遵循 [Agent Skills 规范](https://agentskills.io/specification)。一个 Skill 至少要有带 YAML frontmatter 的 `SKILL.md`，其中 `name` 必须与目录名一致。框架实现位于 `skill/`；安装后的第三方内容位于 Agent 根目录 `skills/<name>/`。`skills/` 和 `.yy/skills/` 都不会上传 Git，仓库只保留 `skills/.gitkeep`。
+
+在 `chat` 中使用以下命令：
+
+```text
+/skill list
+/skill install <source> [--ref REF] [--path SKILL_PATH]
+/skill update <name> <source> [--ref REF] [--path SKILL_PATH]
+/skill audit <review-id>
+```
+
+本地来源必须位于当前 workspace，例如：
+
+```text
+/skill install .\my-skills\research-helper
+```
+
+公共 GitHub 仓库只接受无凭据的仓库根 HTTPS URL。仓库包含多个 Skill 时先列出候选，再用 `--path` 指定：
+
+```text
+/skill install https://github.com/example/agent-skills --ref main --path skills/research-helper
+```
+
+普通安装不会覆盖同名 Skill。更新必须显式提供现有名称和新来源：
+
+```text
+/skill update research-helper https://github.com/example/agent-skills --ref v2 --path skills/research-helper
+```
+
+`/skill install` 表示用户已经主动授权获取来源；审核干净时会直接安装。若发现脚本、可执行文件、网络/凭据/提权等敏感说明，或者许可证无法识别，CLI 会显示审核摘要与 `.yy/skills/audit/<review-id>.json` 路径，并再次通过方向键菜单确认。路径越界、符号链接、嵌套 Git、特殊文件、私钥/高置信凭据、格式错误或体积超限属于硬阻断，不能人工覆盖。更新无论审核是否干净都要再次确认，并在 `.yy/skills/backups/` 保留最多 5 个旧版本。
+
+也可以用自然语言让主 Agent 安装 Skill。此时模型调用高风险 `skill_install`，先确认下载意图；如果审核还发现可接受风险，再进行第二次确认。Subagent 不能获得 `skill_install`。
+
+安装成功后，每个新用户任务都会重新扫描可信索引。System Prompt 只加入如下发现信息，不加载正文：
+
+```xml
+<available_skills>
+  <skill>
+    <name>research-helper</name>
+    <description>能力与触发条件</description>
+    <location>skills/research-helper/SKILL.md</location>
+  </skill>
+</available_skills>
+```
+
+模型需要完整说明、`references/` 或脚本文本时调用只读 `skill_read`。该工具不执行任何脚本，并拒绝绝对路径、`..`、符号链接、二进制和超大结果。Skill 自带脚本若确有必要，只能继续通过现有 workspace 工具与 Docker Bash 执行，仍受 Schema、审批、沙箱和 checkpoint 约束。手工复制到 `skills/`、安装后被修改或内容摘要不匹配的 Skill 都不会进入 Prompt，也不能读取；必须重新走审核安装。
+
 ## Hook、Turn 与 Session
 
 本项目把 Session 视为逻辑上的完整 Trace，不额外创建 Trace 数据模型。每次真实模型 API 调用严格对应一个 Turn；该模型响应请求的一个或多个工具都在当前 Turn 内执行，工具结果需要再次发送给模型时才开始下一个 Turn。Turn 只表达生命周期边界，不创建实体、不编号，也不向事件或 Session JSONL 写入编号。
@@ -320,7 +378,7 @@ tool_before  tool_during  tool_after
 
 时序固定为 `trace_start → turn_start → model_* → tool_*（可重复）→ turn_end → … → trace_end`。`model_before` 可修改 `event.data["messages"]` 和 `event.data["tools"]`；`tool_before` 可修改工具名称和参数，修改后的参数仍会重新执行 JSON Schema 校验。`during` 在进入真实 Provider 或工具函数前通知一次，不会按流式文本片段重复触发；`after` 同时覆盖成功与失败，并通过 `result/reply/error` 暴露结果。
 
-默认 Runtime 在 `trace_start` 通过同一 Hook 注册器启动 Docker 沙箱并创建基线 checkpoint，在 `trace_end` 直接删除容器。Subagent 复用父 Runtime 的同一个沙箱上下文，不会提前关闭容器；上下文压缩和 Harness 诊断 Runtime 没有危险工具，因此显式禁用沙箱。
+默认 Runtime 在 `trace_start` 通过同一 Hook 注册器启动 Docker 沙箱并创建基线 checkpoint，在 `trace_end` 直接删除容器。Subagent 复用父 Runtime 的同一个沙箱上下文，不会提前关闭容器；上下文压缩 Runtime 没有危险工具，因此显式禁用沙箱。Harness Coding Runtime 则为隔离 Git worktree 启动自己的 Docker 和 checkpoint，绝不复用主聊天 workspace 的容器。
 
 Checkpoint 不写入 workspace 自身的 `.git`。当 workspace 就是 Agent 根目录时，每个 Session 在 `.yy/sandbox/checkpoints/<session-id>/` 使用独立 Git 对象库；外部 workspace 则保存到 `.yy/sandbox/checkpoints/<workspace-hash>/<session-id>/`。对象库用无父 commit 保存 workspace 快照，因此 workspace 的 `git status`、当前分支和 `git push` 都不会包含这些 commit。回溯采用 hard-reset 语义恢复非忽略文件，workspace 中的 `.git`、`.yy`、`.env*` 等敏感或运行期路径不会进入快照。
 
@@ -330,7 +388,7 @@ Checkpoint 不写入 workspace 自身的 `.git`。当 workspace 就是 Agent 根
 
 记忆没有专用的 Memory Hook 类。会话创建、历史与 Profile 注入、用户输入和最终回答落盘均作为普通回调注册到上述阶段；Runtime 和 PromptComposer 不直接读写记忆。自定义 `HookRegistry` 时，调用方需要自行注册希望保留的记忆回调。
 
-自动压缩检查位于最终回答的 `turn_end`，且在 assistant 落盘之后执行。压缩最多尝试三次；全部失败时不修改 Profile、不切换 JSONL，后续 `model_before` 只在内存中按最旧完整对话块裁剪输入，原始审计记录继续保留。
+自动压缩检查位于每次真实 API 请求的 `model_before`。Memory 先恢复历史但暂缓写入当前问题；请求上下文超限时只压缩已经持久化的历史，成功切段并重载 summary 后才把当前问题落盘，因此不会重复记录或把新问题吞进摘要。工具 Turn 的 `assistant.tool_calls` 和全部 `role=tool` 结果先完整落盘，下一次模型调用前可以作为一个完整链路被压缩。压缩最多尝试三次；全部失败时不修改 Profile、不切换 JSONL，只在当前进程内按最旧完整对话块裁剪输入，原始审计记录继续保留。
 
 默认 Runtime 还通过统一工具装配入口注册 `subagent`。父模型必须明确给出子任务、可选角色说明和工具名称子集；省略工具子集表示无工具，且子 Agent 永远不能再次调用 `subagent`。
 
@@ -361,7 +419,7 @@ uv run python run.py chat --help
 ```powershell
 uv run python -m unittest discover -s tests -v
 uv run python -m pytest -q
-uv run python -m compileall -q Agent bootstrap context_process memory prompt sandbox tools run_ui tests harness-evolution run.py
+uv run python -m compileall -q Agent bootstrap context_process memory prompt sandbox skill tools run_ui tests harness-evolution run.py
 uv run python run.py --help
 uv lock --check
 ```
@@ -371,13 +429,14 @@ uv lock --check
 - 核心配置、Runtime 事件、模型回复、Hook 事件、工具上下文、压缩结果和 Harness 请求均使用 Pydantic v2 定义；不可变契约启用冻结语义。
 - 配置文件会严格校验字段类型、数值范围和未知字段。拼错配置名会在启动时明确报错，不再被静默忽略。
 - 工具 JSON Schema 会在注册时编译为严格 Pydantic 参数模型；Hook 改写后的最终参数会再次校验，拒绝类型偷换、未知字段和非法枚举。
-- 上下文压缩模型的 JSON 输出由 Pydantic 校验，必须只包含非空的 `profile_markdown` 与 `context_summary_markdown`。
+- 上下文压缩模型的 JSON 输出由 Pydantic 校验：普通 Session 同时返回 `profile_markdown` 与 `context_summary_markdown`；Harness 只返回摘要，禁止压缩过程创建 Session 哈希 Profile。
 - Agent 根目录的 `.yy/` 是完整的本机状态目录，由 `uv run python run.py init` 创建并被 Git 忽略；外部 workspace 不会因此生成 `.yy`。
+- Skill 框架代码位于 `skill/`；可信索引、审核报告、暂存和备份位于 Agent 根目录 `.yy/skills/`，已安装内容位于 Agent 根目录 `skills/`。两处运行内容均被 Git 忽略。
 - Agent 根目录的 `.yy/sandbox/checkpoints/` 保存按 workspace 隔离的独立本地 Git 对象库和 Pydantic 审计索引；它捕获 workspace，但不会修改 workspace 的 Git 分支，也不会被上传。
 - Agent 根目录的 `.yy/sandbox/locks/` 保存按 workspace 隔离的空锁载体文件；Windows 使用 `LockFileEx`，Linux/macOS 使用 `flock`，进程退出后不依赖删除文件即可释放锁。
 - `tests/error/*.jsonl` 只保存代码类缺陷的完整上下文、请求与异常栈，可能包含隐私，只在本机保留并由 Git 忽略。
 - 本机模型配置：`.yy/settings.local.json`，可放置 `provider`、`model`、`base_url` 与 `api_key`；初始化模板由源码中的 `bootstrap/templates/` 提供。
-- 全部记忆衍生物仍只位于 Agent 根目录 `.yy/memory/`。Session 按 workspace 路径哈希分区，各分区的 `index.json` 只指向本 workspace 的 JSONL；Profile 目录全局共享。
+- 普通聊天记忆位于 Agent 根目录 `.yy/memory/`；Harness 专属记忆位于 `.yy/harness-evolution/memory/`。两者都不写入目标 workspace。普通 Session 按 workspace 路径哈希分区；Harness 每次更新使用独立 Session，并只跨更新共享四个固定 Markdown。
 - Session JSONL、Session 索引和 Profile 索引读取时均经过 Pydantic 校验；非法角色、损坏的工具链关联或错误索引会明确失败，不会静默污染下一轮上下文。
 - 首次运行自动创建 `profile/USER.md`、`profile/RESEARCH.md`、`profile/OTHERS.md` 和索引。普通命名的扩展 Profile 全局加载；16 位会话哈希命名的 Profile 只注入对应 Session，避免跨会话污染。
 - 新模型实现 `Agent.contracts.ModelProvider`；新工具实现 `tools.AsyncTool`；新回调通过 `HookRegistry.register()` 或 `HookRegistry.on()` 注册。

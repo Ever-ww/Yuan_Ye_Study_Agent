@@ -7,28 +7,26 @@ from .compression import ContextProcessor
 
 
 def register_context_callbacks(registry: HookRegistry, processor: ContextProcessor) -> None:
-    """在 model_before 裁剪，在最终 turn_end 检查并执行自动压缩。"""
+    """在每次真实模型请求前检查完整上下文并安排压缩。"""
 
-    async def trim_failed_context(event: HookEvent) -> None:
+    async def schedule_compression_before_model(event: HookEvent) -> None:
         messages = event.data.get("messages")
-        if isinstance(messages, list) and processor.trim_messages_if_needed(event.session_id, messages):
-            event.data["context_trimmed"] = True
-
-    async def schedule_compression_after_answer(event: HookEvent) -> None:
+        tools = event.data.get("tools")
         threshold = processor.config.compression_threshold_tokens
-        if threshold <= 0 or event.data.get("error") is not None or not event.data.get("completed"):
+        if threshold <= 0 or not isinstance(messages, list) or not isinstance(tools, list):
             return
-        calls = event.data.get("model_calls", [])
-        totals = []
-        for call in calls if isinstance(calls, list) else []:
-            inputs = call.get("input_tokens", {}) if isinstance(call, dict) else {}
-            context_total = inputs.get("context_total", 0) if isinstance(inputs, dict) else 0
-            output = call.get("output_tokens", 0) if isinstance(call, dict) else 0
-            if isinstance(context_total, (int, float)) and isinstance(output, (int, float)):
-                totals.append(context_total + output)
-        if not totals or max(totals) < threshold:
+        if processor.fallback_active(event.session_id):
+            if processor.trim_messages_if_needed(event.session_id, messages):
+                event.data["context_trimmed"] = True
             return
-        event.data["compression_operation"] = lambda: processor.compress(event.session_id)
+        if not processor.should_compress(event.session_id, messages, tools):
+            return
+        reload_messages = event.data.get("reload_messages_after_compression")
+        event.data["compression_operation"] = lambda: processor.prepare_before_model(
+            event.session_id,
+            messages,
+            tools,
+            reload_messages=reload_messages if callable(reload_messages) else None,
+        )
 
-    registry.register(HookPoint.MODEL_BEFORE, trim_failed_context, priority=0)
-    registry.register(HookPoint.TURN_END, schedule_compression_after_answer, priority=200)
+    registry.register(HookPoint.MODEL_BEFORE, schedule_compression_before_model, priority=0)

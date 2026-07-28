@@ -28,6 +28,10 @@ AGENT.md
 AGENT.local.md
 DEVELOPMENT_REFERENCE.md
 
+# 已安装第三方 Skill 只保留在本机；目录占位文件用于保留结构。
+skills/*
+!skills/.gitkeep
+
 # Chat 错误复现快照包含完整用户上下文，仅保留本机说明文件。
 tests/error/*.jsonl
 tests/error/*.log

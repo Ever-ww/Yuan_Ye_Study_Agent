@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import math
 import time
@@ -65,6 +66,40 @@ class ReactLoop:
                 })
                 try:
                     await self.hooks.emit(before)
+                    compression_operation = before.data.pop("compression_operation", None)
+                    if callable(compression_operation):
+                        yield RunEvent(
+                            type=EventType.COMPRESSION_STARTED,
+                            payload={"session_id": session_id},
+                        )
+                        try:
+                            compression_result = await compression_operation()
+                            compression = (
+                                compression_result.payload()
+                                if compression_result is not None
+                                else None
+                            )
+                        except Exception as exc:
+                            compression = {
+                                "status": "fallback",
+                                "session_id": session_id,
+                                "message": (
+                                    "请求前自动压缩异常，已保留原上下文继续执行："
+                                    f"{str(exc) or type(exc).__name__}"
+                                ),
+                            }
+                        if compression is not None:
+                            kind = (
+                                EventType.CONTEXT_COMPRESSED
+                                if compression.get("status") == "compressed"
+                                else EventType.COMPRESSION_FALLBACK
+                            )
+                            yield RunEvent(type=kind, payload=compression)
+                    persist_user = before.data.pop("persist_current_user_operation", None)
+                    if callable(persist_user):
+                        persisted = persist_user()
+                        if inspect.isawaitable(persisted):
+                            await persisted
                     messages = before.data.get("messages")
                     schemas = before.data.get("tools")
                     if not isinstance(messages, list) or not isinstance(schemas, list):
@@ -183,21 +218,11 @@ class ReactLoop:
                 "model_calls": model_calls,
                 "task_latency_ms": round((time.perf_counter() - task_started_at) * 1000, 2),
             }
-            ended = await self.hooks.emit(HookEvent(point=HookPoint.TURN_END, session_id=session_id, data=completed))
-            operation = ended.data.get("compression_operation")
-            if callable(operation):
-                yield RunEvent(type=EventType.COMPRESSION_STARTED, payload={"session_id": session_id})
-                try:
-                    result = await operation()
-                    compression = result.payload()
-                except Exception as exc:
-                    compression = {
-                        "status": "fallback",
-                        "session_id": session_id,
-                        "message": f"自动压缩失败，当前回答已保留：{str(exc) or type(exc).__name__}",
-                    }
-                kind = EventType.CONTEXT_COMPRESSED if compression.get("status") == "compressed" else EventType.COMPRESSION_FALLBACK
-                yield RunEvent(type=kind, payload=compression)
+            await self.hooks.emit(HookEvent(
+                point=HookPoint.TURN_END,
+                session_id=session_id,
+                data=completed,
+            ))
             yield RunEvent(type=EventType.FINAL, payload={"answer": reply.text, "completed": True, "model_calls": model_calls})
             return
 

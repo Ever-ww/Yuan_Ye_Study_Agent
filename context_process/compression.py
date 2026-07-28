@@ -29,6 +29,7 @@ class CompressionResult(BaseModel):
     profile_file: str | None = None
     records_processed: int = Field(default=0, ge=0)
     conversation_turns: int = Field(default=0, ge=0)
+    messages_reloaded: bool = False
     message: str = ""
 
     def payload(self) -> dict[str, Any]:
@@ -50,6 +51,22 @@ class _CompressionOutput(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("Markdown 内容不能为空")
+        return value
+
+
+class _SummaryOnlyOutput(BaseModel):
+    """禁用 Session Profile 时压缩模型只允许返回上下文摘要。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    context_summary_markdown: str = Field(min_length=1)
+
+    @field_validator("context_summary_markdown")
+    @classmethod
+    def _strip_summary(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("上下文摘要不能为空")
         return value
 
 
@@ -78,13 +95,19 @@ class ContextProcessor:
                 message="当前会话没有可压缩内容",
             )
         normalized = _normalize_records(records)
-        existing = self.memory.profiles.session_profile(session_id)
+        include_profile = self.memory.session_profiles_enabled
+        existing = self.memory.profiles.session_profile(session_id) if include_profile else ""
         validation_error = ""
         for attempt in range(1, 4):
             try:
-                messages = compose_compression_messages(normalized, existing, validation_error)
+                messages = compose_compression_messages(
+                    normalized,
+                    existing,
+                    validation_error,
+                    include_profile=include_profile,
+                )
                 raw = await self._run_compression_agent(messages)
-                profile, summary = _parse_output(raw)
+                profile, summary = _parse_output(raw, include_profile=include_profile)
                 turns = sum(1 for record in records if record.get("role") == "user")
                 tool_calls = sum(
                     len(record.get("tool_calls", []))
@@ -104,7 +127,7 @@ class ContextProcessor:
                 return CompressionResult(
                     status="compressed", session_id=session_id, attempts=attempt, source_file=source_file,
                     target_file=segment.name,
-                    profile_file=profile_path.name,
+                    profile_file=profile_path.name if profile_path is not None else None,
                     records_processed=len(records),
                     conversation_turns=turns,
                     message=f"上下文压缩完成：{len(records)} 条记录 → {segment.name}",
@@ -118,6 +141,50 @@ class ContextProcessor:
             conversation_turns=sum(1 for record in records if record.get("role") == "user"),
             message=f"压缩连续失败 3 次，已启用内存上下文裁剪：{validation_error}",
         )
+
+    async def prepare_before_model(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        reload_messages: Callable[[], list[dict[str, Any]]] | None = None,
+    ) -> CompressionResult | None:
+        """在真实请求前估算完整上下文，超限时压缩并替换当前内存消息。"""
+        threshold = self.config.compression_threshold_tokens
+        if threshold <= 0 or _request_tokens(messages, tools) < threshold:
+            return None
+        if session_id in self._fallback_sessions:
+            self.trim_messages_if_needed(session_id, messages)
+            return None
+        if not self.memory.has_compressible_history(session_id):
+            return None
+        result = await self.compress(session_id)
+        if result.status == "compressed" and reload_messages is not None:
+            messages[:] = reload_messages()
+            return result.model_copy(update={"messages_reloaded": True})
+        if result.status == "fallback":
+            self.trim_messages_if_needed(session_id, messages)
+        return result
+
+    def should_compress(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> bool:
+        """判断当前请求是否具备自动压缩条件，不产生任何持久化副作用。"""
+        threshold = self.config.compression_threshold_tokens
+        return (
+            threshold > 0
+            and session_id not in self._fallback_sessions
+            and _request_tokens(messages, tools) >= threshold
+            and self.memory.has_compressible_history(session_id)
+        )
+
+    def fallback_active(self, session_id: str) -> bool:
+        """返回当前进程内该 Session 是否已进入压缩失败裁剪模式。"""
+        return session_id in self._fallback_sessions
 
     def trim_messages_if_needed(self, session_id: str, messages: list[dict[str, Any]]) -> bool:
         """压缩失败后按最旧完整对话块裁剪本轮内存消息。"""
@@ -157,6 +224,7 @@ class ContextProcessor:
             tools=AsyncToolRegistry(),
             hooks=hooks,
             enable_context_processing=False,
+            enable_skills=False,
             enable_subagent=False,
             enable_sandbox=False,
         )
@@ -187,15 +255,18 @@ def _normalize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return normalized
 
 
-def _parse_output(raw: str) -> tuple[str, str]:
+def _parse_output(raw: str, *, include_profile: bool = True) -> tuple[str, str]:
     value = raw.strip()
     if value.startswith("```"):
         lines = value.splitlines()
         value = "\n".join(lines[1:-1]).strip()
         if value.startswith("json"):
             value = value[4:].lstrip()
-    output = _CompressionOutput.model_validate_json(value)
-    return output.profile_markdown, output.context_summary_markdown
+    if include_profile:
+        output = _CompressionOutput.model_validate_json(value)
+        return output.profile_markdown, output.context_summary_markdown
+    output = _SummaryOnlyOutput.model_validate_json(value)
+    return "", output.context_summary_markdown
 
 
 def _conversation_blocks(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -212,3 +283,8 @@ def _message_tokens(messages: list[dict[str, Any]]) -> int:
     value = json.dumps(messages, ensure_ascii=False)
     cjk = sum(1 for char in value if "\u3400" <= char <= "\u9fff")
     return cjk + math.ceil((len(value) - cjk) / 4)
+
+
+def _request_tokens(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> int:
+    """估算真正发送给 Provider 的消息与工具 Schema 总 Token。"""
+    return _message_tokens([{"messages": messages, "tools": tools}])

@@ -14,8 +14,15 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from Agent import AgentRuntime, HookRegistry, ModelRetryPolicy, RuntimeConfig, RuntimeFailure
-from tools import AsyncToolRegistry
+from Agent import AgentRuntime, ModelRetryPolicy, RuntimeConfig, RuntimeFailure
+from Agent.hook import HookEvent, HookPoint, HookRegistry
+from Agent.models import build_provider
+from Agent.runtime.subagent import RuntimeSubagentRunner
+from memory import HarnessLongTermMemory, HarnessMemoryUpdate, MemoryStore
+from prompt import compose_harness_memory_messages
+from sandbox import SandboxSessionProtocol
+from skill import SkillService
+from tools import AsyncToolRegistry, SkillReadTool, default_tools, register_subagent
 
 
 _SECRET_KEYS = {"api_key", "authorization", "access_token", "token", "secret", "password"}
@@ -162,28 +169,60 @@ class HarnessEvolutionResult(BaseModel):
     merged: bool = False
 
 
-class _NoMemory:
-    """空 Coding Runtime 的显式无持久化占位对象。"""
+async def _approve_coding_tool(name: str, arguments: dict[str, Any]) -> bool:
+    """用户确认启动 Harness 后，允许隔离 worktree 内的既有 Coding 工具。"""
+    del arguments
+    return name != "skill_install"
 
 
-def create_coding_runtime(config: RuntimeConfig, worktree_root: Path) -> AgentRuntime:
-    """复用正式 AgentRuntime 类创建无 Tool、无 Skill、无 Memory 的诊断实例。"""
+def create_coding_runtime(
+    config: RuntimeConfig,
+    worktree_root: Path,
+    *,
+    sandbox: SandboxSessionProtocol | None = None,
+) -> AgentRuntime:
+    """复用正式 AgentRuntime 装配具备完整工作区能力的 Coding Agent。"""
     isolated = config.model_copy(update={
         "workspace_root": worktree_root.resolve(),
         "stream": False,
-        "compression_threshold_tokens": 0,
+        "compression_threshold_tokens": config.compression_threshold_tokens or 20000,
     })
-    return AgentRuntime(
+    skills = SkillService(isolated.agent_root, isolated.workspace_root)
+    memory_root = isolated.agent_root / ".yy" / "harness-evolution" / "memory"
+    long_term = HarnessLongTermMemory(
+        memory_root / "profile",
+        agent_root=isolated.agent_root,
+    )
+    long_term.ensure_project_initialized(isolated.workspace_root)
+    memory = MemoryStore(
+        memory_root,
+        workspace_root=isolated.workspace_root,
+        agent_root=isolated.agent_root,
+        partition_by_workspace=False,
+        profiles=long_term,
+    )
+    session_id = uuid4().hex[:16]
+    memory.create_session("Harness Coding Agent 本次更新", session_id=session_id)
+    tools = default_tools(isolated.workspace_root)
+    tools.register(SkillReadTool(skills))
+    register_subagent(tools, RuntimeSubagentRunner(isolated, tools))
+    runtime = AgentRuntime(
         isolated,
-        tools=AsyncToolRegistry(),
-        memory=_NoMemory(),
-        hooks=HookRegistry(),
-        enable_context_processing=False,
-        enable_subagent=False,
-        enable_sandbox=False,
+        tools=tools,
+        memory=memory,
+        skills=skills,
+        approval=_approve_coding_tool,
+        enable_context_processing=True,
+        enable_skills=True,
+        enable_subagent=True,
+        sandbox=sandbox,
+        enable_sandbox=True,
         retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=2),
         raise_errors=True,
     )
+    runtime.coding_session_id = session_id
+    runtime.harness_long_term_memory = long_term
+    return runtime
 
 
 class HarnessEvolutionRunner:
@@ -194,9 +233,11 @@ class HarnessEvolutionRunner:
         writer: ErrorSnapshotWriter,
         *,
         runtime_factory: Callable[[RuntimeConfig, Path], AgentRuntime] = create_coding_runtime,
+        memory_provider_factory: Callable[[RuntimeConfig], Any] | None = None,
     ) -> None:
         self.writer = writer
         self.runtime_factory = runtime_factory
+        self.memory_provider_factory = memory_provider_factory
 
     async def run(self, request: HarnessEvolutionRequest) -> HarnessEvolutionResult:
         root = request.project_root.resolve()
@@ -228,7 +269,22 @@ class HarnessEvolutionRunner:
                 branch=branch,
                 base_commit=base,
             )
-            runtime = self.runtime_factory(request.config, worktree)
+            try:
+                runtime = self.runtime_factory(request.config, worktree)
+            except Exception as exc:
+                message = f"Coding Runtime 初始化失败：{str(exc) or type(exc).__name__}"
+                self.writer.append_event(
+                    request.snapshot_path,
+                    "evolution",
+                    status="coding_runtime_failed",
+                    message=message,
+                )
+                return HarnessEvolutionResult(
+                    status="coding_runtime_failed",
+                    message=message,
+                    worktree_path=str(worktree),
+                    branch=branch,
+                )
             if not _runtime_targets_worktree(runtime, worktree):
                 await runtime.close()
                 message = "Coding Runtime 的 workspace 未指向隔离 Git worktree，已拒绝运行"
@@ -246,21 +302,44 @@ class HarnessEvolutionRunner:
                     branch=branch,
                 )
             diagnostic_task = (
-                "你是一个尚未接入 Coding Tool 与 Skill 的诊断 Agent。"
-                "请仅根据下面的完整错误快照分析可能原因，不要声称已经读取或修改仓库。\n\n"
+                "你是负责维护当前项目的 Coding Agent。当前 workspace 是隔离的 Git worktree。"
+                "请结合专属项目记忆、已审核 Skill、文件搜索/读写工具、Subagent 和 Docker Bash，"
+                "复现并修复下面的代码缺陷。只做解决问题所需的最小修改，不得修改 `.git`、`.yy`、"
+                "凭据或本机配置；完成后说明修改和验证结果。Harness 会在你结束后统一执行完整测试，"
+                "只有验证通过的变更才会合并。\n\n完整错误快照：\n"
                 + request.snapshot_path.read_text(encoding="utf-8")
             )
+            runtime_error: Exception | None = None
             try:
-                result = await runtime.run(diagnostic_task)
+                coding_session_id = getattr(runtime, "coding_session_id", None)
+                if coding_session_id:
+                    result = await runtime.run(diagnostic_task, session_id=str(coding_session_id))
+                else:
+                    result = await runtime.run(diagnostic_task)
                 diagnostic = result.answer
             except Exception as exc:
                 diagnostic = f"诊断 Agent 失败：{str(exc) or type(exc).__name__}"
+                runtime_error = exc
             finally:
                 await runtime.close()
             self.writer.append_event(request.snapshot_path, "evolution", status="diagnosed", diagnostic=diagnostic)
+            if runtime_error is not None:
+                message = f"Coding Runtime 执行失败：{str(runtime_error) or type(runtime_error).__name__}"
+                self.writer.append_event(
+                    request.snapshot_path,
+                    "evolution",
+                    status="coding_runtime_failed",
+                    message=message,
+                )
+                return HarnessEvolutionResult(
+                    status="coding_runtime_failed",
+                    message=message,
+                    worktree_path=str(worktree),
+                    branch=branch,
+                )
             changes = (await self._git(worktree, "status", "--porcelain", "--untracked-files=all")).stdout
             if not changes.strip():
-                message = "Coding Agent 当前没有 Tool/Skill，未产生代码变更"
+                message = "Coding Agent 完成诊断，但未产生代码变更"
                 self.writer.append_event(
                     request.snapshot_path,
                     "evolution",
@@ -301,6 +380,14 @@ class HarnessEvolutionRunner:
                 "-c", "user.email=harness@local.invalid",
                 "commit", "-m", f"Harness evolution {request.incident_id[:12]}",
             )
+            repair_commit = (await self._git(worktree, "rev-parse", "HEAD")).stdout.strip()
+            changed_files = [
+                line.strip()
+                for line in (
+                    await self._git(worktree, "diff", "--name-only", f"{base}..{repair_commit}")
+                ).stdout.splitlines()
+                if line.strip()
+            ]
             if (await self._git(root, "status", "--porcelain", "--untracked-files=all")).stdout.strip():
                 keep_branch = True
                 message = "验证后主 worktree 发生变化，已拒绝自动合并并保留临时分支"
@@ -317,6 +404,24 @@ class HarnessEvolutionRunner:
                 )
             await self._git(root, "merge", "--ff-only", branch)
             self.writer.append_event(request.snapshot_path, "evolution", status="merged", branch=branch)
+            try:
+                await self._update_long_term_memory(
+                    request,
+                    root,
+                    diagnostic=diagnostic,
+                    commit_sha=repair_commit,
+                    changed_files=changed_files,
+                )
+            except Exception as exc:
+                try:
+                    self.writer.append_event(
+                        request.snapshot_path,
+                        "evolution",
+                        status="long_term_memory_failed",
+                        message=str(exc) or type(exc).__name__,
+                    )
+                except Exception:
+                    pass
             return HarnessEvolutionResult(
                 status="merged", message="修复已合并，下次启动生效",
                 worktree_path=str(worktree), branch=branch, merged=True,
@@ -333,11 +438,136 @@ class HarnessEvolutionRunner:
                 **cleanup,
             )
 
+    async def _update_long_term_memory(
+        self,
+        request: HarnessEvolutionRequest,
+        root: Path,
+        *,
+        diagnostic: str,
+        commit_sha: str,
+        changed_files: list[str],
+    ) -> None:
+        """仅在成功合并后维护四文件长期记忆，失败时使用确定性降级。"""
+        long_term = HarnessLongTermMemory(
+            request.config.agent_root / ".yy" / "harness-evolution" / "memory" / "profile",
+            agent_root=request.config.agent_root,
+        )
+        long_term.ensure_project_initialized(root)
+        mode = "model"
+        error = ""
+        try:
+            update = await self._curate_long_term_memory(
+                request,
+                root,
+                long_term,
+                diagnostic=diagnostic,
+                commit_sha=commit_sha,
+                changed_files=changed_files,
+            )
+        except Exception as exc:
+            mode = "deterministic_fallback"
+            error = str(exc) or type(exc).__name__
+            update = long_term.deterministic_update(
+                root,
+                task=request.task,
+                commit_sha=commit_sha,
+                changed_files=changed_files,
+            )
+        try:
+            await long_term.apply_update(update)
+            self.writer.append_event(
+                request.snapshot_path,
+                "evolution",
+                status="long_term_memory_updated",
+                mode=mode,
+                files=["PROJECT.md", "CHANGES.md"] + (
+                    ["LESSONS.md"] if update.lesson_entry_markdown else []
+                ),
+                curator_error=error,
+            )
+        except Exception as exc:
+            self.writer.append_event(
+                request.snapshot_path,
+                "evolution",
+                status="long_term_memory_failed",
+                mode=mode,
+                message=str(exc) or type(exc).__name__,
+                curator_error=error,
+            )
+
+    async def _curate_long_term_memory(
+        self,
+        request: HarnessEvolutionRequest,
+        root: Path,
+        long_term: HarnessLongTermMemory,
+        *,
+        diagnostic: str,
+        commit_sha: str,
+        changed_files: list[str],
+    ) -> HarnessMemoryUpdate:
+        """通过无工具、无持久化维护 Runtime 生成长期记忆更新。"""
+        if self.memory_provider_factory is None and not request.config.api_key:
+            raise RuntimeError("未配置维护模型凭据")
+        payload = {
+            "updated_at": _timestamp(),
+            "task": request.task,
+            "diagnostic": diagnostic,
+            "commit_sha": commit_sha,
+            "changed_files": changed_files,
+            "tests": "Harness 固定测试集全部通过",
+            "existing_long_term_memory": long_term.load_for_session(None),
+            "deterministic_project_snapshot": long_term.deterministic_update(
+                root,
+                task=request.task,
+                commit_sha=commit_sha,
+                changed_files=changed_files,
+            ).project_markdown,
+        }
+        messages = compose_harness_memory_messages(payload)
+        hooks = HookRegistry()
+
+        async def inject_prompt(event: HookEvent) -> None:
+            event.data["messages"] = [dict(message) for message in messages]
+            event.data["tools"] = []
+
+        hooks.register(HookPoint.MODEL_BEFORE, inject_prompt, priority=-100)
+        curator_config = request.config.model_copy(update={
+            "workspace_root": root.resolve(),
+            "stream": False,
+            "compression_threshold_tokens": 0,
+        })
+        provider = (
+            self.memory_provider_factory(curator_config)
+            if self.memory_provider_factory is not None
+            else build_provider(
+                curator_config.provider,
+                curator_config.model,
+                base_url=curator_config.base_url,
+                api_key=curator_config.api_key,
+                stream=False,
+            )
+        )
+        runtime = AgentRuntime(
+            curator_config,
+            provider=provider,
+            tools=AsyncToolRegistry(),
+            hooks=hooks,
+            enable_context_processing=False,
+            enable_skills=False,
+            enable_subagent=False,
+            enable_sandbox=False,
+            raise_errors=True,
+        )
+        result = await runtime.run("维护 Harness Coding Agent 长期记忆")
+        if not result.completed:
+            raise RuntimeError("长期记忆维护 Runtime 未返回完整结果")
+        return _parse_harness_memory_update(result.answer)
+
     async def _run_tests(self, worktree: Path, snapshot_path: Path) -> bool:
         commands = [
             ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"],
             ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "unittest", "discover", "-s", "tests", "-v"],
-            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "compileall", "-q", "Agent", "bootstrap", "context_process", "memory", "prompt", "sandbox", "tools", "run_ui", "tests", "harness-evolution", "run.py"],
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "compileall", "-q", "Agent", "bootstrap", "context_process", "memory", "prompt", "sandbox", "skill", "tools", "run_ui", "tests", "harness-evolution", "run.py"],
             ["uv", "lock", "--check"],
             ["git", "diff", "--check"],
         ]
@@ -424,6 +654,17 @@ def _runtime_targets_worktree(runtime: Any, worktree: Path) -> bool:
         roots.append(Path(declared).resolve())
     expected = worktree.resolve()
     return bool(roots) and all(root == expected for root in roots)
+
+
+def _parse_harness_memory_update(raw: str) -> HarnessMemoryUpdate:
+    """兼容常见 JSON 代码围栏，并交由 Pydantic 严格校验。"""
+    value = raw.strip()
+    if value.startswith("```"):
+        lines = value.splitlines()
+        value = "\n".join(lines[1:-1]).strip()
+        if value.startswith("json"):
+            value = value[4:].lstrip()
+    return HarnessMemoryUpdate.model_validate_json(value)
 
 
 def _session_audit(record: dict[str, Any], position: int) -> dict[str, Any]:

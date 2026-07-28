@@ -49,8 +49,8 @@ class AsyncToolRegistry:
         """创建严格子集；未知名称和 subagent 递归调用会被拒绝。"""
         selected: list[AsyncTool] = []
         for name in names:
-            if name == "subagent":
-                raise ValueError("子 Agent 不允许递归调用 subagent")
+            if name in {"subagent", "skill_install"}:
+                raise ValueError(f"子 Agent 不允许选择工具：{name}")
             tool = self._tools.get(name)
             if tool is None:
                 raise ValueError(f"未知工具：{name}")

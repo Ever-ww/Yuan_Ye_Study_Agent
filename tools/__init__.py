@@ -8,6 +8,8 @@ from .defaults import default_tools, register_subagent
 from .read_file import ReadFileTool
 from .registry import AsyncToolRegistry
 from .search_workspace import SearchWorkspaceTool
+from .skill_install import SkillInstallTool
+from .skill_read import SkillReadTool
 from .sandbox_rollback import SandboxRollbackTool
 from .subagent import SubagentRunner, SubagentTool
 from .write_file import WriteFileTool
@@ -20,6 +22,8 @@ __all__ = [
     "CurrentTimeTool",
     "ReadFileTool",
     "SearchWorkspaceTool",
+    "SkillInstallTool",
+    "SkillReadTool",
     "SandboxRollbackTool",
     "SubagentRunner",
     "SubagentTool",

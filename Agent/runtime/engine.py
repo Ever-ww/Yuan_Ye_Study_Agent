@@ -23,6 +23,7 @@ from context_process import ContextProcessor
 from memory import MemoryStore
 from prompt import PromptComposer
 from sandbox import DockerSandboxSession, SandboxSessionProtocol, WorkspaceLockManager
+from skill import SkillService
 from tools import AsyncToolRegistry, ToolContext, default_tools, register_subagent
 from .subagent import RuntimeSubagentRunner
 from .failure import RuntimeFailure
@@ -52,9 +53,11 @@ class AgentRuntime:
         approval: ApprovalCallback | None = None,
         tool_context: ToolContext | None = None,
         context_processor: ContextProcessor | None = None,
+        skills: SkillService | None = None,
         compression_provider_factory=None,
         subagent_runner=None,
         enable_context_processing: bool = True,
+        enable_skills: bool = True,
         enable_subagent: bool = True,
         sandbox: SandboxSessionProtocol | None = None,
         file_locks: WorkspaceLockManager | None = None,
@@ -134,10 +137,25 @@ class AgentRuntime:
                 if memory.workspace_root != self.config.workspace_root:
                     raise ValueError("MemoryStore.workspace_root 必须与 RuntimeConfig.workspace_root 一致")
             self.memory = memory
+        if enable_skills:
+            if skills is not None:
+                if skills.agent_root != self.config.agent_root:
+                    raise ValueError("SkillService.agent_root 必须与 RuntimeConfig.agent_root 一致")
+                if skills.workspace_root != self.config.workspace_root:
+                    raise ValueError("SkillService.workspace_root 必须与 RuntimeConfig.workspace_root 一致")
+                self.skills = skills
+            else:
+                self.skills = SkillService(
+                    self.config.agent_root,
+                    self.config.workspace_root,
+                    approval=self.approval,
+                )
+        else:
+            self.skills = None
         if tools is not None:
             self.tools = tools
         else:
-            base_tools = default_tools(self.config.workspace_root)
+            base_tools = default_tools(self.config.workspace_root, skill_service=self.skills)
             if enable_subagent:
                 runner = subagent_runner or RuntimeSubagentRunner(self.config, base_tools)
                 register_subagent(base_tools, runner)
@@ -152,7 +170,7 @@ class AgentRuntime:
         self.hooks = hooks or build_default_hooks(self.config.memory_dir, self.memory, self.context_processor)
         if self._owns_sandbox and self.sandbox is not None:
             register_sandbox_callbacks(self.hooks, self.sandbox)
-        self.prompts = PromptComposer(self.config.workspace_root)
+        self.prompts = PromptComposer(self.config.workspace_root, self.skills)
         self._session_id: str | None = None
         self._session_open = False
 

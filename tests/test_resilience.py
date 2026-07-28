@@ -1,4 +1,4 @@
-"""CLI 网络兜底、错误快照与 Harness 空流水线测试。"""
+"""CLI 网络兜底、错误快照与 Harness Coding 流水线测试。"""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from Agent.models.providers import _openai_reply
 from memory import MemoryStore
 from run_ui.cli import _handle_chat_failure
 from run_ui.harness_loader import load_harness_module
+from skill import SkillInstallRequest, SkillService
 
 
 class FlakyProvider:
@@ -34,6 +35,68 @@ class FlakyProvider:
         if self.calls <= self.failures:
             raise ModelNetworkError(f"临时网络错误 {self.calls}")
         return ModelReply(text="成功")
+
+
+class _HarnessCheckpoint:
+    commit_sha = "0" * 40
+
+    def model_dump(self, mode="python"):
+        del mode
+        return {"commit_sha": self.commit_sha}
+
+
+class _FakeHarnessSandbox:
+    def __init__(self) -> None:
+        self.started: list[str] = []
+        self.closed = 0
+        self.writes: list[str] = []
+
+    async def start(self, session_id: str):
+        self.started.append(session_id)
+        return _HarnessCheckpoint()
+
+    async def close(self):
+        self.closed += 1
+
+    async def checkpoint_write(self, path: str):
+        self.writes.append(path)
+        return _HarnessCheckpoint()
+
+    async def restore_current(self):
+        return None
+
+
+class _FailingHarnessSandbox(_FakeHarnessSandbox):
+    async def start(self, session_id: str):
+        del session_id
+        raise RuntimeError("Docker unavailable")
+
+
+class _CodingWriteProvider:
+    streaming = False
+
+    async def complete(self, messages, tools):
+        del tools
+        if not any(message.get("role") == "tool" for message in messages):
+            return ModelReply(tool_calls=(ToolCall(
+                name="write_file",
+                arguments={"path": "fixed.py", "content": "FIXED = True\n"},
+            ),))
+        return ModelReply(text="已完成隔离修复")
+
+
+class _HarnessMemoryProvider:
+    """返回可校验的 Harness 长期记忆更新。"""
+
+    streaming = False
+
+    async def complete(self, messages, tools):
+        del messages, tools
+        return ModelReply(text=json.dumps({
+            "project_markdown": "# Curated Project\n\n- 当前架构已经更新。",
+            "change_entry_markdown": "## 2026-07-28 - 已验证修复\n\n- 测试全部通过。",
+            "lesson_entry_markdown": "## 2026-07-28 - 可复用经验\n\n- 合并前再次检查主分支。",
+        }, ensure_ascii=False))
 
 
 class PerStepFlakyProvider:
@@ -262,25 +325,121 @@ class ResilienceTests(unittest.TestCase):
             request = harness.HarnessEvolutionRequest(
                 project_root=root, incident_id=snapshot.stem, snapshot_path=snapshot, task="问题", config=config,
             )
-            result = asyncio.run(harness.HarnessEvolutionRunner(writer).run(request))
+            runner = harness.HarnessEvolutionRunner(
+                writer,
+                runtime_factory=lambda current, worktree: harness.create_coding_runtime(
+                    current,
+                    worktree,
+                    sandbox=_FakeHarnessSandbox(),
+                ),
+            )
+            result = asyncio.run(runner.run(request))
             self.assertEqual(result.status, "dirty_worktree")
             self.assertFalse((root / ".yy" / "harness-evolution" / "worktrees").exists())
 
-    def test_coding_runtime_reuses_agent_class_without_tools_or_memory_files(self) -> None:
+    def test_coding_runtime_has_persistent_memory_tools_subagent_and_sandbox(self) -> None:
         harness = load_harness_module()
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             config = load_runtime_config(root)
+            source = root / "sources" / "coding-helper"
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_text(
+                "---\n"
+                "name: coding-helper\n"
+                "description: 帮助诊断代码缺陷\n"
+                "license: MIT\n"
+                "---\n\n"
+                "先定位错误边界，再提出最小修复。\n",
+                encoding="utf-8",
+            )
+            installed = asyncio.run(
+                SkillService(root, root).install(SkillInstallRequest(source=str(source)))
+            )
+            self.assertEqual(installed.status, "installed")
             worktree = root / "isolated"
             worktree.mkdir()
-            runtime = harness.create_coding_runtime(config, worktree)
+            (worktree / "module.py").write_text("BROKEN = True\n", encoding="utf-8")
+            sandbox = _FakeHarnessSandbox()
+            runtime = harness.create_coding_runtime(config, worktree, sandbox=sandbox)
+            runtime.provider = _CodingWriteProvider()
             self.assertIsInstance(runtime, AgentRuntime)
-            self.assertEqual(runtime.tools.schemas(), [])
+            names = {schema["name"] for schema in runtime.tools.schemas()}
+            self.assertTrue({
+                "read_file",
+                "write_file",
+                "search_workspace",
+                "bash",
+                "sandbox_rollback",
+                "skill_read",
+                "subagent",
+            }.issubset(names))
+            self.assertNotIn("skill_install", names)
+            self.assertIsNotNone(runtime.skills)
+            self.assertIsNotNone(runtime.context_processor)
+            self.assertIn("coding-helper", runtime.prompts.compose("诊断")[0]["content"])
+            skill_text = asyncio.run(runtime.tools.execute(
+                "skill_read",
+                {"name": "coding-helper"},
+                runtime.tool_context,
+            ))
+            self.assertIn("最小修复", skill_text)
             self.assertEqual(runtime.config.workspace_root, worktree.resolve())
             self.assertEqual(runtime.tool_context.project_root, worktree.resolve())
-            result = asyncio.run(runtime.run("只诊断"))
+            expected_memory = root / ".yy" / "harness-evolution" / "memory"
+            self.assertEqual(runtime.memory.root, expected_memory.resolve())
+            self.assertEqual(runtime.memory.sessions.directory, expected_memory / "session")
+            self.assertIn("module.py", runtime.memory.profile_context(runtime.coding_session_id))
+            result = asyncio.run(runtime.run("修复 module.py", runtime.coding_session_id))
             self.assertTrue(result.completed)
+            self.assertEqual((worktree / "fixed.py").read_text(encoding="utf-8"), "FIXED = True\n")
+            self.assertEqual(sandbox.started, [runtime.coding_session_id])
+            self.assertEqual(sandbox.writes, ["fixed.py"])
+            self.assertGreaterEqual(sandbox.closed, 1)
+            records = runtime.memory.session_records(runtime.coding_session_id)
+            self.assertEqual([record["role"] for record in records[-4:]], [
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+            ])
             self.assertFalse((worktree / ".yy").exists())
+
+            second_worktree = root / "isolated-second"
+            second_worktree.mkdir()
+            second = harness.create_coding_runtime(
+                config,
+                second_worktree,
+                sandbox=_FakeHarnessSandbox(),
+            )
+            self.assertNotEqual(second.coding_session_id, runtime.coding_session_id)
+            self.assertTrue(second.memory.has_session(second.coding_session_id))
+            self.assertEqual(second.memory.session_records(second.coding_session_id), [])
+            profile_files = {
+                path.name
+                for path in (expected_memory / "profile").glob("*.md")
+            }
+            self.assertEqual(profile_files, {
+                "AGENT.md",
+                "PROJECT.md",
+                "CHANGES.md",
+                "LESSONS.md",
+            })
+            self.assertNotIn(runtime.coding_session_id + ".md", profile_files)
+
+            agent_path = expected_memory / "profile" / "AGENT.md"
+            agent_path.write_text("# 用户维护的规则\n保持只读\n", encoding="utf-8")
+            third_worktree = root / "isolated-third"
+            third_worktree.mkdir()
+            harness.create_coding_runtime(
+                config,
+                third_worktree,
+                sandbox=_FakeHarnessSandbox(),
+            )
+            self.assertEqual(
+                agent_path.read_text(encoding="utf-8"),
+                "# 用户维护的规则\n保持只读\n",
+            )
 
     def test_forbidden_future_changes_are_rejected(self) -> None:
         harness = load_harness_module()
@@ -302,7 +461,15 @@ class ResilienceTests(unittest.TestCase):
             request = harness.HarnessEvolutionRequest(
                 project_root=root, incident_id=snapshot.stem, snapshot_path=snapshot, task="问题", config=config,
             )
-            result = asyncio.run(harness.HarnessEvolutionRunner(writer).run(request))
+            runner = harness.HarnessEvolutionRunner(
+                writer,
+                runtime_factory=lambda current, worktree: harness.create_coding_runtime(
+                    current,
+                    worktree,
+                    sandbox=_FakeHarnessSandbox(),
+                ),
+            )
+            result = asyncio.run(runner.run(request))
             self.assertEqual(result.status, "no_code_changes")
             self.assertFalse(Path(result.worktree_path).exists())
             self.assertNotIn(result.branch, _git(root, "branch", "--list"))
@@ -354,6 +521,41 @@ class ResilienceTests(unittest.TestCase):
             self.assertNotIn(result.branch, _git(root, "branch", "--list"))
             self.assertIn('"status": "invalid_runtime_workspace"', snapshot.read_text(encoding="utf-8"))
 
+    def test_harness_reports_coding_runtime_failure_instead_of_no_changes(self) -> None:
+        harness = load_harness_module()
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            _init_repo(root)
+            config = load_runtime_config(root)
+            failure = RuntimeFailure.capture(RuntimeError("内部缺陷"))
+            writer = harness.ErrorSnapshotWriter(root)
+            snapshot = writer.capture(
+                task="问题",
+                session_id="f" * 16,
+                failure=failure,
+                session_records=[],
+            )
+            request = harness.HarnessEvolutionRequest(
+                project_root=root,
+                incident_id=snapshot.stem,
+                snapshot_path=snapshot,
+                task="问题",
+                config=config,
+            )
+            runner = harness.HarnessEvolutionRunner(
+                writer,
+                runtime_factory=lambda current, worktree: harness.create_coding_runtime(
+                    current,
+                    worktree,
+                    sandbox=_FailingHarnessSandbox(),
+                ),
+            )
+            result = asyncio.run(runner.run(request))
+            self.assertEqual(result.status, "coding_runtime_failed")
+            self.assertIn("Docker unavailable", result.message)
+            self.assertFalse(Path(result.worktree_path).exists())
+            self.assertIn('"status": "coding_runtime_failed"', snapshot.read_text(encoding="utf-8"))
+
     def test_injected_future_capability_can_test_and_merge(self) -> None:
         harness = load_harness_module()
 
@@ -390,6 +592,57 @@ class ResilienceTests(unittest.TestCase):
             self.assertTrue(result.merged)
             self.assertEqual((root / "tracked.txt").read_text(encoding="utf-8"), "fixed\n")
             self.assertFalse(Path(result.worktree_path).exists())
+            profile = root / ".yy" / "harness-evolution" / "memory" / "profile"
+            self.assertIn("问题", (profile / "CHANGES.md").read_text(encoding="utf-8"))
+            self.assertIn(
+                "Project Architecture",
+                (profile / "PROJECT.md").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                {path.name for path in profile.glob("*.md")},
+                {"AGENT.md", "PROJECT.md", "CHANGES.md", "LESSONS.md"},
+            )
+
+    def test_successful_memory_curator_updates_only_the_three_managed_files(self) -> None:
+        harness = load_harness_module()
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            _init_repo(root)
+            config = load_runtime_config(root)
+            writer = harness.ErrorSnapshotWriter(root)
+            failure = RuntimeFailure.capture(RuntimeError("内部缺陷"))
+            snapshot = writer.capture(
+                task="修复记忆更新",
+                session_id="9" * 16,
+                failure=failure,
+                session_records=[],
+            )
+            request = harness.HarnessEvolutionRequest(
+                project_root=root,
+                incident_id=snapshot.stem,
+                snapshot_path=snapshot,
+                task="修复记忆更新",
+                config=config,
+            )
+            runner = harness.HarnessEvolutionRunner(
+                writer,
+                memory_provider_factory=lambda current: _HarnessMemoryProvider(),
+            )
+            profile = root / ".yy" / "harness-evolution" / "memory" / "profile"
+            profile.mkdir(parents=True)
+            agent = profile / "AGENT.md"
+            agent.write_text("# 用户规则\n不得覆盖\n", encoding="utf-8")
+            asyncio.run(runner._update_long_term_memory(
+                request,
+                root,
+                diagnostic="已完成",
+                commit_sha="a" * 40,
+                changed_files=["tracked.txt"],
+            ))
+            self.assertEqual(agent.read_text(encoding="utf-8"), "# 用户规则\n不得覆盖\n")
+            self.assertIn("Curated Project", (profile / "PROJECT.md").read_text(encoding="utf-8"))
+            self.assertIn("已验证修复", (profile / "CHANGES.md").read_text(encoding="utf-8"))
+            self.assertIn("可复用经验", (profile / "LESSONS.md").read_text(encoding="utf-8"))
 
     def test_injected_failed_tests_discard_worktree_and_branch(self) -> None:
         harness = load_harness_module()
