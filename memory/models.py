@@ -19,6 +19,7 @@ class SessionRecord(BaseModel):
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
     name: str | None = None
+    reasoning: str | None = None
 
     @model_validator(mode="after")
     def _validate_role_payload(self) -> "SessionRecord":

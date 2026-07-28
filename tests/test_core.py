@@ -368,10 +368,11 @@ class CoreTests(unittest.TestCase):
             )
             asyncio.run(runtime.run("第二句", session_id))
             self.assertEqual(
-                [(item["role"], item["content"]) for item in provider.messages[1:]],
-                [("user", "第一句"), ("assistant", "第一答"), ("user", "第二句")],
+                [(item["role"], item["content"]) for item in provider.messages[1:-1]],
+                [("user", "第一句"), ("assistant", "第一答")],
             )
-            self.assertEqual(PromptComposer(root).compose("纯基础")[1]["content"], "纯基础")
+            self.assertTrue(provider.messages[-1]["content"].startswith("第二句\n\n[本次提问时间："))
+            self.assertTrue(PromptComposer(root).compose("纯基础")[1]["content"].startswith("纯基础\n\n[本次提问时间："))
 
     def test_memory_initialization_creates_extensible_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -464,8 +465,8 @@ class CoreTests(unittest.TestCase):
                 sum(record.get("content") == "整理长上下文" for record in active_records),
                 1,
             )
-            self.assertEqual(memory.restore_messages(result.session_id)[0]["role"], "system")
-            self.assertEqual(provider.messages[-1]["content"], "整理长上下文")
+            self.assertEqual(memory.restore_messages(result.session_id)[0]["role"], "user")
+            self.assertTrue(provider.messages[-1]["content"].startswith("整理长上下文\n\n[本次提问时间："))
             compression_payload = json.loads(compressor.messages[-1]["content"])
             self.assertNotIn(
                 "整理长上下文",
@@ -515,7 +516,7 @@ class CoreTests(unittest.TestCase):
             self.assertIn("tool_calls", payload["session_records"][1])
             self.assertEqual(
                 [message["role"] for message in provider.second_messages],
-                ["system", "system"],
+                ["system"],
             )
 
     def test_manual_compress_is_not_recorded_and_only_returns_status(self) -> None:
@@ -674,8 +675,8 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(points, [
                 "trace_start",
                 "turn_start", "model_before", "model_during", "model_after",
-                "tool_before", "tool_during", "tool_after", "turn_end",
-                "turn_start", "model_before", "model_during", "model_after", "turn_end",
+                "tool_before", "tool_during", "tool_after",
+                "model_before", "model_during", "model_after", "turn_end",
                 "trace_end",
             ])
 
@@ -927,3 +928,69 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(records[2]["content"], "子 Agent 结论")
             session_index = json.loads((config.memory_dir / "session" / "index.json").read_text(encoding="utf-8"))
             self.assertEqual(list(session_index["sessions"]), [result.session_id])
+
+    def test_system_prompt_is_single_cached_string_and_skill_xml_is_first(self) -> None:
+        class CapturingProvider:
+            streaming = False
+
+            def __init__(self) -> None:
+                self.messages = []
+
+            async def complete(self, messages, tools):
+                self.messages = [dict(message) for message in messages]
+                return ModelReply(text="完成")
+
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(root)
+            (root / "AGENT.md").write_text("根目录不得进入模型", encoding="utf-8")
+            (root / ".yy" / "agents" / "SOUL.md").write_text("身份内容", encoding="utf-8")
+            (root / ".yy" / "agents" / "AGENT.md").write_text("项目内容", encoding="utf-8")
+            provider = CapturingProvider()
+            runtime = AgentRuntime(config, provider=provider, enable_sandbox=False)
+            result = asyncio.run(runtime.run("测试问题"))
+            self.assertTrue(result.completed)
+            self.assertEqual([item["role"] for item in provider.messages].count("system"), 1)
+            system = provider.messages[0]["content"]
+            self.assertTrue(system.startswith("<available_skills>"))
+            self.assertLess(system.index("身份内容"), system.index("项目内容"))
+            self.assertNotIn("根目录不得进入模型", system)
+            self.assertIn(f"Session ID：{result.session_id}", system)
+            self.assertIn("分段绝对路径：", system)
+            self.assertTrue(provider.messages[-1]["content"].startswith("测试问题\n\n[本次提问时间："))
+
+    def test_historical_tool_output_is_trimmed_only_in_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            memory = MemoryStore(Path(value) / ".yy" / "memory")
+            session_id = memory.create_session("问题")
+            memory.record_model_tool_calls(
+                session_id,
+                content=None,
+                tool_calls=[{"id": "call_x", "type": "function", "function": {"name": "demo", "arguments": "{}"}}],
+                model={}, model_call={},
+            )
+            raw = "A" * 6000 + "B" * 6000
+            memory.record_tool_result(session_id, tool_call_id="call_x", name="demo", content=raw, status="success", arguments={})
+            self.assertTrue(memory.prepare_historical_tool_outputs(
+                session_id, max_chars=10000, head_ratio=0.2, tail_ratio=0.2,
+            ))
+            projected = memory.restore_messages(session_id)[1]["content"]
+            self.assertIn("[历史工具输出已裁剪", projected)
+            self.assertTrue(projected.startswith("A" * 2000))
+            self.assertTrue(projected.endswith("B" * 2000))
+            records = memory.session_records(session_id)
+            self.assertEqual(records[-1]["content"], raw)
+
+    def test_explicit_reasoning_is_audited_but_not_reinjected(self) -> None:
+        class ReasoningProvider:
+            streaming = False
+
+            async def complete(self, messages, tools):
+                return ModelReply(text="答复", reasoning="供应商显式推理")
+
+        with tempfile.TemporaryDirectory() as value:
+            config = load_runtime_config(Path(value))
+            memory = MemoryStore(config.memory_dir)
+            result = asyncio.run(AgentRuntime(config, provider=ReasoningProvider(), memory=memory, enable_sandbox=False).run("问题"))
+            self.assertEqual(memory.session_records(result.session_id)[-1]["reasoning"], "供应商显式推理")
+            self.assertNotIn("供应商显式推理", str(memory.restore_messages(result.session_id)))

@@ -86,11 +86,11 @@ async def trace_end(event: HookEvent) -> None:
 
 
 async def turn_start(event: HookEvent) -> None:
-    """一次模型 API 调用及其后续工具阶段开始时调用。"""
+    """一次用户任务在用户消息进入模型上下文前调用。"""
 
 
 async def turn_end(event: HookEvent) -> None:
-    """该模型调用及其请求的全部工具完成后调用。"""
+    """一次用户任务最终回复持久化后，或终止错误后调用。"""
 
 
 async def model_before(event: HookEvent) -> None:
@@ -135,13 +135,14 @@ def build_default_hooks(
     memory_dir: Path,
     memory: MemoryStore | None = None,
     context_processor: ContextProcessor | None = None,
+    prompts: Any | None = None,
 ) -> HookRegistry:
     """组合项目与记忆回调；Memory 仍只是普通回调集合。"""
     from memory.callbacks import register_memory_callbacks
     from memory.store import MemoryStore
 
     registry = HookRegistry()
-    register_memory_callbacks(registry, memory or MemoryStore(memory_dir))
+    register_memory_callbacks(registry, memory or MemoryStore(memory_dir), prompts)
     if context_processor is not None:
         from context_process import register_context_callbacks
         register_context_callbacks(registry, context_processor)

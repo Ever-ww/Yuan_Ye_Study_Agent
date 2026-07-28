@@ -35,6 +35,7 @@ class MemoryStore:
         if self.profiles.directory.resolve() != (self.root / "profile").resolve():
             raise ValueError("ProfileStore 必须位于 MemoryStore 的 profile 目录")
         self.session_profiles_enabled = self.profiles.session_profiles_enabled
+        self._message_cache: dict[str, list[dict[str, Any]]] = {}
         self.initialize()
 
     def initialize(self) -> None:
@@ -48,7 +49,9 @@ class MemoryStore:
 
     def record_user(self, session_id: str, content: str) -> None:
         """记录一条用户输入。"""
+        cache = self._ensure_cache(session_id)
         self.sessions.append(session_id, "user", content)
+        cache.append({"role": "user", "content": content})
 
     def record_assistant(
         self,
@@ -58,6 +61,7 @@ class MemoryStore:
         model: dict[str, object] | None = None,
         model_calls: list[dict[str, object]] | None = None,
         task_latency_ms: float | None = None,
+        reasoning: str | None = None,
     ) -> None:
         """记录最终助手回复，以及本次用户任务的模型、时延和 Token 指标。"""
         metadata: dict[str, object] = {}
@@ -67,7 +71,11 @@ class MemoryStore:
             metadata["model_calls"] = model_calls
         if task_latency_ms is not None:
             metadata["task_latency_ms"] = task_latency_ms
+        if reasoning:
+            metadata["reasoning"] = reasoning
+        cache = self._ensure_cache(session_id)
         self.sessions.append(session_id, "assistant", content, metadata)
+        cache.append({"role": "assistant", "content": content})
 
     def record_model_tool_calls(
         self,
@@ -77,13 +85,19 @@ class MemoryStore:
         tool_calls: list[dict[str, Any]],
         model: dict[str, object],
         model_call: dict[str, object],
+        reasoning: str | None = None,
     ) -> None:
         """记录模型原始返回的标准 assistant.tool_calls 消息。"""
-        self.sessions.append(session_id, "assistant", content, {
+        metadata: dict[str, object] = {
             "tool_calls": tool_calls,
             "model": model,
             "model_call": model_call,
-        })
+        }
+        if reasoning:
+            metadata["reasoning"] = reasoning
+        cache = self._ensure_cache(session_id)
+        self.sessions.append(session_id, "assistant", content, metadata)
+        cache.append({"role": "assistant", "content": content, "tool_calls": tool_calls})
 
     def record_tool_result(
         self,
@@ -96,16 +110,54 @@ class MemoryStore:
         arguments: dict[str, Any],
     ) -> None:
         """记录工具成功结果或错误反馈。"""
+        cache = self._ensure_cache(session_id)
         self.sessions.append(session_id, "tool", content, {
             "tool_call_id": tool_call_id,
             "name": name,
             "status": status,
             "arguments": arguments,
         })
+        cache.append({
+            "role": "tool", "tool_call_id": tool_call_id, "name": name, "content": content,
+        })
 
     def restore_messages(self, session_id: str) -> list[dict[str, Any]]:
         """恢复索引指向的最新会话分段。"""
-        return self.sessions.restore(session_id)
+        return [dict(message) for message in self._ensure_cache(session_id)]
+
+    def refresh_messages(self, session_id: str) -> list[dict[str, Any]]:
+        """显式从最新 JSONL 重建内存消息缓存。"""
+        self._message_cache[session_id] = self.sessions.restore(session_id)
+        return self.restore_messages(session_id)
+
+    def prepare_historical_tool_outputs(
+        self,
+        session_id: str,
+        *,
+        max_chars: int,
+        head_ratio: float,
+        tail_ratio: float,
+    ) -> bool:
+        """仅在下一用户任务开始前，对内存中的旧工具结果建立裁剪投影。"""
+        if max_chars <= 0:
+            return False
+        messages = self._ensure_cache(session_id)
+        changed = False
+        for message in messages:
+            if message.get("role") != "tool" or not isinstance(message.get("content"), str):
+                continue
+            content = str(message["content"])
+            if len(content) <= max_chars or "[历史工具输出已裁剪" in content:
+                continue
+            head = int(max_chars * head_ratio)
+            tail = int(max_chars * tail_ratio)
+            omitted = max(0, len(content) - head - tail)
+            message["content"] = (
+                f"{content[:head]}\n\n[历史工具输出已裁剪：原始 {len(content)} 字符，"
+                f"省略 {omitted} 字符]\n\n{content[-tail:] if tail else ''}"
+            )
+            changed = True
+        return changed
 
     def has_session(self, session_id: str) -> bool:
         """判断会话哈希是否可恢复。"""
@@ -140,13 +192,27 @@ class MemoryStore:
         """返回会话当前 JSONL 文件名。"""
         return self.sessions.active_filename(session_id)
 
+    def active_path(self, session_id: str) -> Path:
+        return self.sessions.active_path(session_id)
+
+    def session_created_at(self, session_id: str) -> str:
+        return self.sessions.created_at(session_id)
+
+    def latest_summary(self, session_id: str) -> str:
+        return self.sessions.latest_summary(session_id)
+
+    def invalidate_session_cache(self, session_id: str) -> None:
+        self._message_cache.pop(session_id, None)
+
     def rollover_with_summary(self, session_id: str, summary: str, source_file: str) -> Path:
         """创建以 summary 记录开头的新会话分段。"""
-        return self.sessions.rollover(session_id, [{
+        result = self.sessions.rollover(session_id, [{
             "role": "summary",
             "content": summary,
             "source_file": source_file,
         }])
+        self.refresh_messages(session_id)
+        return result
 
     def commit_compression(
         self,
@@ -184,6 +250,11 @@ class MemoryStore:
             if index_backup is not None:
                 self.profiles.index_path.write_bytes(index_backup)
             raise
+
+    def _ensure_cache(self, session_id: str) -> list[dict[str, Any]]:
+        if session_id not in self._message_cache:
+            self._message_cache[session_id] = self.sessions.restore(session_id)
+        return self._message_cache[session_id]
 
 
 def _infer_agent_root(memory_root: Path) -> Path:

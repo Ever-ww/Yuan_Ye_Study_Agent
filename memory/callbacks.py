@@ -7,9 +7,10 @@ import json
 from Agent.contracts import ModelReply
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from memory.store import MemoryStore
+from prompt import PromptComposer
 
 
-def register_memory_callbacks(registry: HookRegistry, memory: MemoryStore) -> None:
+def register_memory_callbacks(registry: HookRegistry, memory: MemoryStore, prompts: PromptComposer | None = None) -> None:
     """注册会话创建、上下文加载和最终回复持久化回调。"""
     base_systems: dict[str, dict[str, object]] = {}
 
@@ -29,25 +30,27 @@ def register_memory_callbacks(registry: HookRegistry, memory: MemoryStore) -> No
             if len(messages) < 2:
                 raise ValueError("Memory 回调需要基础 system/user 消息")
             base_systems[event.session_id] = dict(messages[0])
+            current_user_message = dict(messages[-1])
+        else:
+            current_user_message = None
         base_system = base_systems.get(event.session_id)
         if base_system is None:
             base_system = dict(messages[0])
             base_systems[event.session_id] = base_system
         task = str(event.data.get("task", "")) if first_model_call else ""
 
-        def rebuild_messages() -> list[dict[str, object]]:
+        def rebuild_messages(*, refresh_system: bool = False) -> list[dict[str, object]]:
+            nonlocal base_system
+            if refresh_system and prompts is not None:
+                base_system = {"role": "system", "content": prompts.refresh(event.session_id).content}
+                base_systems[event.session_id] = dict(base_system)
             system = dict(base_system)
-            profile = memory.prompt_context(event.session_id)
-            if profile:
-                system["content"] = (
-                    f"{system.get('content', '')}\n\n长期记忆与项目上下文：\n{profile}"
-                )
             rebuilt: list[dict[str, object]] = [
                 system,
                 *memory.restore_messages(event.session_id),
             ]
             if first_model_call:
-                rebuilt.append({"role": "user", "content": task})
+                rebuilt.append(current_user_message or {"role": "user", "content": task})
             return rebuilt
 
         if first_model_call:
@@ -55,7 +58,7 @@ def register_memory_callbacks(registry: HookRegistry, memory: MemoryStore) -> No
             event.data["persist_current_user_operation"] = (
                 lambda: memory.record_user(event.session_id, task)
             )
-        event.data["reload_messages_after_compression"] = rebuild_messages
+        event.data["reload_messages_after_compression"] = lambda: rebuild_messages(refresh_system=True)
 
     async def clear_context_state(event: HookEvent) -> None:
         base_systems.pop(event.session_id, None)
@@ -72,6 +75,7 @@ def register_memory_callbacks(registry: HookRegistry, memory: MemoryStore) -> No
             model=dict(event.data.get("model", {})),
             model_calls=list(event.data.get("model_calls", [])),
             task_latency_ms=float(event.data.get("task_latency_ms", 0.0)),
+            reasoning=str(event.data["reasoning"]) if isinstance(event.data.get("reasoning"), str) else None,
         )
 
     async def persist_model_tool_calls(event: HookEvent) -> None:
@@ -92,6 +96,7 @@ def register_memory_callbacks(registry: HookRegistry, memory: MemoryStore) -> No
             tool_calls=calls,
             model=dict(event.data.get("model", {})),
             model_call=dict(event.data.get("model_call", {})),
+            reasoning=reply.reasoning,
         )
 
     async def persist_tool_result(event: HookEvent) -> None:
@@ -108,7 +113,20 @@ def register_memory_callbacks(registry: HookRegistry, memory: MemoryStore) -> No
             arguments=dict(event.data.get("arguments", {})),
         )
 
+    async def prepare_history(event: HookEvent) -> None:
+        """当前用户任务开始前只裁剪此前任务的工具输出投影。"""
+        config = event.data.get("config")
+        if config is None:
+            return
+        memory.prepare_historical_tool_outputs(
+            event.session_id,
+            max_chars=int(getattr(config, "tool_output_max_chars", 0)),
+            head_ratio=float(getattr(config, "tool_output_head_ratio", 0.20)),
+            tail_ratio=float(getattr(config, "tool_output_tail_ratio", 0.20)),
+        )
+
     registry.register(HookPoint.TRACE_START, create_or_restore_session, priority=-100)
+    registry.register(HookPoint.TURN_START, prepare_history, priority=-100)
     registry.register(HookPoint.MODEL_BEFORE, load_context, priority=-100)
     registry.register(HookPoint.MODEL_AFTER, persist_model_tool_calls, priority=100)
     registry.register(HookPoint.TOOL_AFTER, persist_tool_result, priority=100)

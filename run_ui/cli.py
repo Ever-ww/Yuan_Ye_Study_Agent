@@ -175,7 +175,8 @@ async def _chat(session_id: str | None) -> None:
                 return
             if task == "/help":
                 console.print(
-                    "/compress 压缩当前上下文；/skill list|install|update|audit 管理 Skill；"
+                    "/compress 压缩当前上下文；/context refresh 刷新上下文；"
+                    "/skill list|install|update|audit|refresh 管理 Skill；"
                     "/exit 退出；其余内容将发送给 Agent。"
                 )
                 continue
@@ -226,6 +227,12 @@ async def _handle_skill_command(runtime: AgentRuntime, task: str) -> None:
             for item in catalog:
                 table.add_row(item.name, item.description, item.location)
             console.print(table)
+            return
+        if action == "refresh":
+            if len(parts) != 2:
+                raise ValueError("用法：/skill refresh")
+            count = runtime.refresh_skills()
+            console.print(f"[green]Skill 目录与 System Prompt 缓存已刷新：{count} 个可用 Skill[/]")
             return
         if action == "audit":
             if len(parts) != 3:
@@ -297,7 +304,7 @@ def _strip_cli_quote(value: str) -> str:
 
 def _skill_usage() -> str:
     return (
-        "Skill 命令：/skill list；/skill audit <review-id>；"
+        "Skill 命令：/skill list；/skill refresh；/skill audit <review-id>；"
         "/skill install <source> [--ref REF] [--path PATH]；"
         "/skill update <name> <source> [--ref REF] [--path PATH]"
     )

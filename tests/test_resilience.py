@@ -164,8 +164,8 @@ class ResilienceTests(unittest.TestCase):
             result = asyncio.run(runtime.run("只记录一次"))
             self.assertTrue(result.completed)
             self.assertEqual(provider.calls, 3)
-            self.assertEqual(points.count("turn_start"), 3)
-            self.assertEqual(points.count("turn_end"), 3)
+            self.assertEqual(points.count("turn_start"), 1)
+            self.assertEqual(points.count("turn_end"), 1)
             records = memory.session_records(result.session_id)
             self.assertEqual([record["role"] for record in records], ["user", "assistant"])
 
@@ -201,7 +201,7 @@ class ResilienceTests(unittest.TestCase):
             self.assertIsNotNone(runtime.last_failure)
             self.assertEqual(runtime.last_failure.category, "network")
             self.assertEqual(len(runtime.last_failure.retry_history), 3)
-            self.assertEqual(runtime.last_failure.messages[-1]["content"], "失败问题")
+            self.assertTrue(runtime.last_failure.messages[-1]["content"].startswith("失败问题\n\n[本次提问时间："))
 
     def test_http_retry_classification(self) -> None:
         self.assertTrue(is_retryable_model_error(ModelServiceError("busy", 429)))

@@ -27,6 +27,8 @@ _REQUIRED_PATHS = (
     "memory/profile/RESEARCH.md",
     "memory/profile/OTHERS.md",
     "memory/profile/index.json",
+    "agents/SOUL.md",
+    "agents/AGENT.md",
     "skills/index.json",
     ".initialized.json",
 )
@@ -41,6 +43,16 @@ def initialize_project(project_root: Path) -> Path:
         template = Path(__file__).parent / "templates" / "settings.local.json.example"
         local.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
     MemoryStore(yy / "memory")
+    agents = yy / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    templates = {
+        "SOUL.md": "# Agent 身份\n\n你是 Yuan Ye Agent：本地优先、谨慎且透明的学习与研究助手。\n",
+        "AGENT.md": "# 项目说明\n\n在这里维护本项目的架构约束、开发规范与运行说明。\n",
+    }
+    for name, content in templates.items():
+        target = agents / name
+        if not target.exists():
+            target.write_text(content, encoding="utf-8")
     (project_root / "skills").mkdir(parents=True, exist_ok=True)
     for directory in ("review", "audit", "backups"):
         (yy / "skills" / directory).mkdir(parents=True, exist_ok=True)

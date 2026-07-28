@@ -59,9 +59,7 @@ class SessionStore:
         records: list[dict[str, Any]] = []
         for value in self.read_records(session_id):
             role, content = value.get("role"), value.get("content")
-            if role == "summary" and isinstance(content, str):
-                records.append({"role": "system", "content": f"上一分段压缩摘要：\n{content}"})
-            elif role == "user" and isinstance(content, str):
+            if role == "user" and isinstance(content, str):
                 records.append({"role": "user", "content": content})
             elif role == "assistant" and (isinstance(content, str) or content is None):
                 message: dict[str, Any] = {"role": "assistant", "content": content}
@@ -74,6 +72,13 @@ class SessionStore:
                 if isinstance(call_id, str) and isinstance(name, str):
                     records.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": content})
         return records
+
+    def latest_summary(self, session_id: str) -> str:
+        """读取当前分段首条摘要；摘要由唯一 System Prompt 承载。"""
+        for record in self.read_records(session_id):
+            if record.get("role") == "summary" and isinstance(record.get("content"), str):
+                return str(record["content"])
+        return ""
 
     def read_records(self, session_id: str) -> list[dict[str, object]]:
         """读取最新分段的原始记录，保留时间戳供 CLI 展示。"""
@@ -139,6 +144,17 @@ class SessionStore:
     def active_filename(self, session_id: str) -> str:
         """返回索引指向的当前分段文件名。"""
         return self._active_path(session_id).name
+
+    def active_path(self, session_id: str) -> Path:
+        """返回当前分段的绝对路径，供 System Prompt 审计说明使用。"""
+        return self._active_path(session_id)
+
+    def created_at(self, session_id: str) -> str:
+        """返回索引记录的 Session 初始化时间。"""
+        session = self._read_index()["sessions"].get(session_id)
+        if not session:
+            raise KeyError(f"未知会话：{session_id}")
+        return str(session["created_at"])
 
     @staticmethod
     def is_session_hash(value: str) -> bool:

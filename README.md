@@ -27,7 +27,7 @@ Agent/      模型适配、异步 ReAct、Runtime、Hook 协议与配置
 memory/     记忆领域 Python 服务
 context_process/ Token 阈值压缩、Profile 合并与失败裁剪
 harness-evolution/ 错误快照、隔离 worktree、诊断与验证流水线
-prompt/     System Prompt 分层组合
+prompt/     单一 System Prompt、任务时间与上下文缓存组合
 sandbox/    Trace 级 Docker、独立本地 Git checkpoint 与跨进程文件锁
 skill/      Skill 获取、格式解析、静态审核、可信索引与安装事务
 skills/     本机已安装的第三方 Skill 内容（仅提交 .gitkeep）
@@ -119,7 +119,7 @@ docker info
 uv run python run.py
 ```
 
-第一次启动会在 Agent 根目录创建 `.yy/settings.local.json`、`.yy/.initialized.json`、`.yy/memory/session/index.json`，以及 `.yy/memory/profile/` 下的 `index.json`、`USER.md`、`RESEARCH.md` 和 `OTHERS.md`。同时会初始化 `.yy/skills/index.json`、审核/备份目录和 Agent 根目录的 `skills/`。后续执行 `run.py`、`chat`、`run` 或 `serve-ui` 时检测到初始化标记和必要文件齐全，就不会再次初始化。
+第一次启动会在 Agent 根目录创建 `.yy/settings.local.json`、`.yy/.initialized.json`、`.yy/memory/session/index.json`，以及 `.yy/memory/profile/` 下的 `index.json`、`USER.md`、`RESEARCH.md` 和 `OTHERS.md`。同时会创建 `.yy/agents/SOUL.md`（Agent 身份）和 `.yy/agents/AGENT.md`（运行时项目说明），并初始化 `.yy/skills/index.json`、审核/备份目录和 Agent 根目录的 `skills/`。后续执行 `run.py`、`chat`、`run` 或 `serve-ui` 时检测到初始化标记和必要文件齐全，就不会再次初始化。
 
 如果你误删了 `.yy` 中的必要文件，可手动修复初始化：
 
@@ -174,6 +174,9 @@ uv run python run.py init
   "stream": false,
   "max_steps": 8,
   "compression_threshold_tokens": 20000,
+  "tool_output_max_chars": 10000,
+  "tool_output_head_ratio": 0.2,
+  "tool_output_tail_ratio": 0.2,
   "sandbox_checkpoint_limit": 17
 }
 '@ | Set-Content -Encoding utf8 .yy/settings.local.json
@@ -197,6 +200,8 @@ uv run python run.py init
 `max_steps` 表示一次用户任务最多允许发起多少次模型 API 调用。
 
 `compression_threshold_tokens` 默认是 `20000`。所有具备持久化 Memory 的 Runtime 会在每次 `model_before` 估算即将发送的完整 messages 与 Tool Schema；达到阈值时先压缩已经落盘的历史，再把当前新问题作为独立 `user` 消息写入新分段并调用模型。工具调用及结果会在下一次模型请求前一起参与检查。设为 `0` 可关闭自动压缩，但仍可手动使用 `/compress`。
+
+`tool_output_max_chars` 默认是 `10000`。在下一次用户任务开始时，超过该阈值的历史工具输出仅在模型上下文中裁剪：保留前 `tool_output_head_ratio`（默认 20%）和后 `tool_output_tail_ratio`（默认 20%），中段替换为审计标记。当前任务内的工具结果始终完整；Session JSONL 与错误快照也始终保存完整原文。设为 `0` 可关闭此裁剪。
 
 `sandbox_checkpoint_limit` 默认是 `17`，必须是大于等于 1 的整数。它限制每个 Session 在 `.yy/sandbox/checkpoints/` 中保留的本地快照数量，基线也计入上限；超过后会删除最旧引用，并只清理独立 checkpoint 对象库，不改写项目主仓库。
 
@@ -234,7 +239,8 @@ uv run python run.py chat
 - 直接输入任务并按 Enter 发送。
 - `/help` 查看帮助；`/exit` 或 `/quit` 退出。
 - 已经开始会话后输入 `/compress`，可立即压缩当前上下文；命令本身不会写入 JSONL。
-- `/skill list`、`/skill install`、`/skill update` 和 `/skill audit` 管理本机 Skill；这些命令不会写入 Session JSONL。
+- `/context refresh` 重新读取 Agent、Profile 与当前 Session 文件并刷新内存上下文；命令不会写入 JSONL。
+- `/skill list`、`/skill install`、`/skill update`、`/skill audit` 和 `/skill refresh` 管理本机 Skill；安装或更新不会自动修改当前 Prompt，只有 `/skill refresh` 成功后才重新扫描并加载 Skill XML。
 - `stream=true` 时，OpenAI-compatible Provider 会通过 SSE 逐段显示文本。
 - 高风险工具会显示方向键审批菜单：使用 ↑/↓ 选择“允许本次 / 当前会话始终允许该工具 / 拒绝”，按 Enter 确认、Esc 取消，默认选中拒绝。会话授权在退出当前 Runtime 后自动失效。
 - `bash` 只在当前 Trace 的无网络 Docker 容器中运行。容器读写挂载启动时的 workspace，因此命令造成的文件变化会立即出现在宿主机；一次成功 Bash 调用无论修改多少文件都只创建一个 checkpoint，没有变化则不创建。
@@ -272,7 +278,7 @@ uv run python run.py chat --session 60c2d464f820db43
 uv run python run.py chat -s 60c2d464f820db43
 ```
 
-程序会从当前 workspace 对应的 `session/index.json` 找到该哈希的 `latest_file`，恢复其中的 `summary`、`user`、`assistant.tool_calls` 和 `tool` 消息，然后把新输入接在同一会话后面。存储角色 `summary` 在发送模型前会转换为 `system`。即使另一个 workspace 中存在该哈希，当前 workspace 也会按“未找到会话”拒绝恢复。
+程序会从当前 workspace 对应的 `session/index.json` 找到该哈希的 `latest_file`，恢复其中的 `summary`、`user`、`assistant.tool_calls` 和 `tool` 消息，然后把新输入接在同一会话后面。`summary` 会合入唯一的 System Prompt，恢复后的消息列表不再额外插入 `system` 角色。即使另一个 workspace 中存在该哈希，当前 workspace 也会按“未找到会话”拒绝恢复。
 
 ### 4. 单次任务
 

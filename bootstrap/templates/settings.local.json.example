@@ -6,5 +6,8 @@
   "stream": false,
   "max_steps": 8,
   "compression_threshold_tokens": 20000,
+  "tool_output_max_chars": 10000,
+  "tool_output_head_ratio": 0.2,
+  "tool_output_tail_ratio": 0.2,
   "sandbox_checkpoint_limit": 17
 }

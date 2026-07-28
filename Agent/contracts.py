@@ -62,6 +62,7 @@ class ModelReply(BaseModel):
     tool_calls: tuple[ToolCall, ...] = ()
     finished: bool = True
     usage: TokenUsage | None = None
+    reasoning: str | None = None
 
 
 class ModelProvider(Protocol):

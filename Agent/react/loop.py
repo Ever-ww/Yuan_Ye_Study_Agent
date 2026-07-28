@@ -1,4 +1,4 @@
-"""单一异步 ReAct 循环；Turn 只表示相邻模型调用之间的生命周期。"""
+"""单一异步 ReAct 循环；Turn 生命周期由 Runtime 的用户任务边界管理。"""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from tools import AsyncToolRegistry, ToolContext
 
 
 class ReactLoop:
-    """一次模型调用及其请求的全部工具构成一个无编号 Turn。"""
+    """在一个 Runtime Turn 内执行多次模型调用与工具调用。"""
 
     def __init__(
         self,
@@ -43,7 +43,7 @@ class ReactLoop:
         session_id: str,
         model: dict[str, Any],
     ) -> AsyncIterator[RunEvent]:
-        """重复无编号 Turn，直到模型返回最终文本或达到调用上限。"""
+        """重复模型调用，直到模型返回最终文本或达到调用上限。"""
         model_calls: list[dict[str, Any]] = []
         question_tokens = _estimate_tokens(task)
         task_started_at = time.perf_counter()
@@ -56,7 +56,6 @@ class ReactLoop:
             while True:
                 attempt += 1
                 schemas = self.tools.schemas()
-                await self.hooks.emit(HookEvent(point=HookPoint.TURN_START, session_id=session_id, data={"task": task, "messages": messages}))
                 before = HookEvent(point=HookPoint.MODEL_BEFORE, session_id=session_id, data={
                     "task": task,
                     "messages": messages,
@@ -110,7 +109,6 @@ class ReactLoop:
                         "task": task, "messages": messages, "tools": schemas, "model": model,
                     }))
                 except Exception as exc:
-                    await self._end_failed_turn(session_id, task, model, model_calls, exc)
                     _attach_failure_context(exc, messages, schemas, model, retry_history)
                     raise
 
@@ -120,17 +118,20 @@ class ReactLoop:
                     if getattr(self.provider, "streaming", False) and getattr(self.provider, "stream", None):
                         streamed = True
                         parts: list[str] = []
+                        reasoning_parts: list[str] = []
                         calls: tuple[ToolCall, ...] = ()
                         usage = None
                         async for chunk in self.provider.stream(messages, schemas):
                             if chunk.text:
                                 parts.append(chunk.text)
                                 yield RunEvent(type=EventType.TEXT, payload={"content": chunk.text})
+                            if chunk.reasoning:
+                                reasoning_parts.append(chunk.reasoning)
                             if chunk.tool_calls:
                                 calls = chunk.tool_calls
                             if chunk.usage is not None:
                                 usage = chunk.usage
-                        reply = ModelReply(text="".join(parts), tool_calls=calls, finished=True, usage=usage)
+                        reply = ModelReply(text="".join(parts), tool_calls=calls, finished=True, usage=usage, reasoning="".join(reasoning_parts) or None)
                     else:
                         reply = await self.provider.complete(messages, schemas)
                 except Exception as exc:
@@ -149,7 +150,6 @@ class ReactLoop:
                     }
                     try:
                         await self.hooks.emit(HookEvent(point=HookPoint.MODEL_AFTER, session_id=session_id, data=failure))
-                        await self.hooks.emit(HookEvent(point=HookPoint.TURN_END, session_id=session_id, data=failure))
                     except Exception as hook_error:
                         _attach_failure_context(hook_error, messages, schemas, model, retry_history)
                         raise
@@ -180,7 +180,6 @@ class ReactLoop:
             try:
                 await self.hooks.emit(after)
             except Exception as exc:
-                await self._end_failed_turn(session_id, task, model, model_calls, exc)
                 _attach_failure_context(exc, messages, schemas, model, [])
                 raise
             reply = after.data.get("reply")
@@ -199,31 +198,18 @@ class ReactLoop:
                     async for event in self._execute_tools(prepared_calls, messages, context, task, session_id):
                         yield event
                 except Exception as exc:
-                    await self._end_failed_turn(session_id, task, model, model_calls, exc)
                     _attach_failure_context(exc, messages, schemas, model, [])
                     raise
-                await self.hooks.emit(HookEvent(point=HookPoint.TURN_END, session_id=session_id, data={
-                    "task": task, "model": model, "reply": reply, "error": None, "completed": False, "model_calls": model_calls,
-                }))
                 successful_steps += 1
                 continue
 
-            completed = {
-                "task": task,
-                "model": model,
-                "reply": reply,
+            yield RunEvent(type=EventType.FINAL, payload={
                 "answer": reply.text,
-                "error": None,
                 "completed": True,
                 "model_calls": model_calls,
                 "task_latency_ms": round((time.perf_counter() - task_started_at) * 1000, 2),
-            }
-            await self.hooks.emit(HookEvent(
-                point=HookPoint.TURN_END,
-                session_id=session_id,
-                data=completed,
-            ))
-            yield RunEvent(type=EventType.FINAL, payload={"answer": reply.text, "completed": True, "model_calls": model_calls})
+                "reasoning": reply.reasoning,
+            })
             return
 
         error = AgentExecutionLimitError("模型在最大调用次数内未完成")
@@ -266,20 +252,6 @@ class ReactLoop:
             yield RunEvent(type=EventType.TOOL_COMPLETED, payload={"name": name, "content": result})
             messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result})
 
-    async def _end_failed_turn(
-        self,
-        session_id: str,
-        task: str,
-        model: dict[str, Any],
-        model_calls: list[dict[str, Any]],
-        error: Exception,
-    ) -> None:
-        """确保已开始的 Turn 在失败时仍触发 turn_end。"""
-        await self.hooks.emit(HookEvent(point=HookPoint.TURN_END, session_id=session_id, data={
-            "task": task, "model": model, "error": error, "completed": False, "model_calls": model_calls,
-        }))
-
-
 def _assistant_tool_message(reply: ModelReply) -> dict[str, Any]:
     """构造可再次发送给 OpenAI-compatible 接口的 assistant 工具消息。"""
     serialized = [{
@@ -295,7 +267,7 @@ def _ensure_tool_call_ids(reply: ModelReply) -> ModelReply:
     if not reply.tool_calls or all(call.id for call in reply.tool_calls):
         return reply
     calls = tuple(ToolCall(name=call.name, arguments=dict(call.arguments), id=call.id or f"call_{uuid4().hex}") for call in reply.tool_calls)
-    return ModelReply(text=reply.text, tool_calls=calls, finished=reply.finished, usage=reply.usage)
+    return ModelReply(text=reply.text, tool_calls=calls, finished=reply.finished, usage=reply.usage, reasoning=reply.reasoning)
 
 
 def _model_call_metric(latency_ms: float, context_tokens: int, question_tokens: int, reply: ModelReply) -> dict[str, Any]:

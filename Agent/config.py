@@ -29,6 +29,9 @@ class RuntimeConfig(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     profile: str = Field(default="general", min_length=1)
     compression_threshold_tokens: StrictInt = Field(default=20000, ge=0)
+    tool_output_max_chars: StrictInt = Field(default=10000, ge=0)
+    tool_output_head_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
+    tool_output_tail_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
     sandbox_checkpoint_limit: StrictInt = Field(default=17, ge=1)
 
     @field_validator("agent_root", "workspace_root")
@@ -41,6 +44,15 @@ class RuntimeConfig(BaseModel):
     def memory_dir(self) -> Path:
         """返回唯一的项目本地记忆目录。"""
         return self.agent_root / ".yy" / "memory"
+
+    @field_validator("tool_output_tail_ratio")
+    @classmethod
+    def _validate_tool_output_ratios(cls, value: float, info) -> float:
+        """首尾保留比例总和不得超过完整工具输出。"""
+        head = info.data.get("tool_output_head_ratio", 0.20)
+        if head + value > 1.0:
+            raise ValueError("tool_output_head_ratio 与 tool_output_tail_ratio 之和不能超过 1")
+        return value
 
 
 def _read_json(path: Path) -> dict[str, Any]:

@@ -167,10 +167,12 @@ class AgentRuntime:
                 self.memory,
                 provider_factory=compression_provider_factory,
             )
-        self.hooks = hooks or build_default_hooks(self.config.memory_dir, self.memory, self.context_processor)
+        self.prompts = PromptComposer(self.config, self.memory, self.skills, sandbox_enabled=self.sandbox is not None)
+        self.hooks = hooks or build_default_hooks(
+            self.config.memory_dir, self.memory, self.context_processor, self.prompts,
+        )
         if self._owns_sandbox and self.sandbox is not None:
             register_sandbox_callbacks(self.hooks, self.sandbox)
-        self.prompts = PromptComposer(self.config.workspace_root, self.skills)
         self._session_id: str | None = None
         self._session_open = False
 
@@ -180,10 +182,14 @@ class AgentRuntime:
         return self._session_id
 
     async def run_task(self, task: str, session_id: str | None = None) -> AsyncIterator[RunEvent]:
-        """处理一次用户输入；内部每次模型 API 调用各自形成一个 Turn。"""
+        """处理一次用户输入；一个 Turn 覆盖完整的用户任务。"""
         self.last_failure = None
         if task.strip() == "/compress":
             async for event in self._compress_command(session_id):
+                yield event
+            return
+        if task.strip() == "/context refresh":
+            async for event in self._refresh_context_command(session_id):
                 yield event
             return
         try:
@@ -195,14 +201,7 @@ class AgentRuntime:
             yield RunEvent(type=EventType.ERROR, payload={"message": str(exc) or type(exc).__name__})
             return
         yield RunEvent(type=EventType.STARTED, payload={"session_id": active_id})
-        messages = self.prompts.compose(task)
-        loop = ReactLoop(
-            self.provider,
-            self.tools,
-            self.hooks,
-            self.config.max_steps,
-            retry_policy=self.retry_policy,
-        )
+        turn_started = False
         model = {
             "provider": self.config.provider,
             "name": self.config.model,
@@ -210,14 +209,71 @@ class AgentRuntime:
             "stream": self.config.stream,
         }
         try:
+            await self.hooks.emit(HookEvent(
+                point=HookPoint.TURN_START,
+                session_id=active_id,
+                data={"task": task, "config": self.config},
+            ))
+            turn_started = True
+            messages = self.prompts.compose(task, active_id)
+        except Exception as exc:
+            self.last_failure = RuntimeFailure.capture(exc)
+            if self.raise_errors:
+                raise
+            yield RunEvent(type=EventType.ERROR, payload={"message": str(exc) or type(exc).__name__})
+            return
+        loop = ReactLoop(
+            self.provider,
+            self.tools,
+            self.hooks,
+            self.config.max_steps,
+            retry_policy=self.retry_policy,
+        )
+        final_payload: dict[str, object] | None = None
+        failure: Exception | None = None
+        try:
             async for event in loop.run(messages, self.tool_context, task=task, session_id=active_id, model=model):
+                if event.type is EventType.FINAL:
+                    final_payload = dict(event.payload)
                 yield event
         except Exception as exc:
+            failure = exc
             self.last_failure = RuntimeFailure.capture(exc)
             if self.raise_errors:
                 raise
             message = str(exc) or f"{type(exc).__name__}：运行时发生未提供详情的异常"
             yield RunEvent(type=EventType.ERROR, payload={"message": message})
+        finally:
+            if turn_started:
+                payload: dict[str, object] = {
+                    "task": task,
+                    "model": model,
+                    "error": failure,
+                    "completed": failure is None and final_payload is not None,
+                }
+                if final_payload is not None:
+                    payload.update(final_payload)
+                await self.hooks.emit(HookEvent(point=HookPoint.TURN_END, session_id=active_id, data=payload))
+
+    async def _refresh_context_command(self, session_id: str | None) -> AsyncIterator[RunEvent]:
+        """显式重新读取当前 Session 的文件上下文，不写入 JSONL。"""
+        requested = session_id or self._session_id
+        if not requested:
+            yield RunEvent(type=EventType.ERROR, payload={"message": "当前没有可刷新的会话"})
+            return
+        active_id = await self._ensure_session("", str(requested))
+        self.memory.refresh_messages(active_id)
+        self.prompts.refresh(active_id)
+        yield RunEvent(type=EventType.FINAL, payload={"answer": "上下文缓存已刷新", "completed": True})
+
+    def refresh_skills(self) -> int:
+        """显式重新扫描已审核 Skill，并刷新当前 System Prompt。"""
+        if self.skills is None:
+            raise RuntimeError("当前 Runtime 已禁用 Skill")
+        count = len(self.skills.catalog())
+        if self._session_id is not None:
+            self.prompts.refresh(self._session_id)
+        return count
 
     async def _compress_command(self, session_id: str | None) -> AsyncIterator[RunEvent]:
         """由主 Runtime 处理手动压缩命令，不把命令写入 Session。"""
@@ -240,6 +296,8 @@ class AgentRuntime:
             yield RunEvent(type=EventType.ERROR, payload={"message": result.message})
             return
         event_type = EventType.CONTEXT_COMPRESSED if result.status == "compressed" else EventType.COMPRESSION_FALLBACK
+        if result.status == "compressed":
+            self.prompts.refresh(active_id)
         yield RunEvent(type=event_type, payload=result.payload())
         yield RunEvent(type=EventType.FINAL, payload={"answer": result.message, "completed": True})
 
@@ -264,6 +322,7 @@ class AgentRuntime:
         try:
             await self.hooks.emit(HookEvent(point=HookPoint.TRACE_END, session_id=session_id, data={"error": error}))
         finally:
+            self.prompts.close(session_id)
             if self._owns_sandbox and self.sandbox is not None:
                 await self.sandbox.close()
             self._session_open = False
@@ -291,6 +350,8 @@ class AgentRuntime:
             if self._owns_sandbox and self.sandbox is not None:
                 await self.sandbox.close()
             raise
+        if not self.memory.has_session(event.session_id):
+            self.memory.create_session(task, session_id=event.session_id)
         self._session_id = event.session_id
         self._session_open = True
         return event.session_id

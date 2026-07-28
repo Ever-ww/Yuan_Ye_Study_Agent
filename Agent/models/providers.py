@@ -85,11 +85,13 @@ def _openai_reply(data: object) -> ModelReply:
                 arguments=_tool_arguments(function.get("arguments"), data),
                 id=str(call_id) if call_id else None,
             ))
+        reasoning = message.get("reasoning_content", message.get("reasoning"))
         return ModelReply(
             text=_content_text(message.get("content")),
             tool_calls=tuple(calls),
             finished=not calls,
             usage=_openai_usage(data.get("usage")),
+            reasoning=reasoning if isinstance(reasoning, str) and reasoning else None,
         )
     except ModelResponseFormatError:
         raise
@@ -160,6 +162,7 @@ class OpenAICompatibleProvider:
             payload["tools"] = [{"type": "function", "function": tool} for tool in tools]
         pending_calls: dict[int, dict[str, str]] = {}
         usage: TokenUsage | None = None
+        reasoning_parts: list[str] = []
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=15)) as client:
                 async with client.stream("POST", f"{self.base_url}/chat/completions", headers={"Authorization": f"Bearer {self.api_key}"}, json=payload) as response:
@@ -190,6 +193,9 @@ class OpenAICompatibleProvider:
                         content = delta.get("content")
                         if content:
                             yield ModelReply(text=str(content), finished=False)
+                        reasoning = delta.get("reasoning_content", delta.get("reasoning"))
+                        if isinstance(reasoning, str) and reasoning:
+                            reasoning_parts.append(reasoning)
                         raw_tool_calls = delta.get("tool_calls", [])
                         if not isinstance(raw_tool_calls, list):
                             raise ModelResponseFormatError("模型 SSE tool_calls 必须是数组", _response_excerpt(packet))
@@ -232,7 +238,7 @@ class OpenAICompatibleProvider:
                     f"模型返回了无效的流式工具参数：{slot['name']}",
                     _response_excerpt(pending_calls),
                 ) from exc
-        yield ModelReply(tool_calls=tuple(calls), finished=True, usage=usage)
+        yield ModelReply(tool_calls=tuple(calls), finished=True, usage=usage, reasoning="".join(reasoning_parts) or None)
 
 
 class AnthropicProvider:
@@ -274,14 +280,18 @@ class AnthropicProvider:
             output_tokens=int(raw_usage["output_tokens"]) if isinstance(raw_usage.get("output_tokens"), (int, float)) else None,
         )
         text_parts: list[str] = []
+        thinking_parts: list[str] = []
         for item in blocks:
+            if item.get("type") == "thinking" and isinstance(item.get("thinking"), str):
+                thinking_parts.append(str(item["thinking"]))
+                continue
             if item.get("type") != "text":
                 continue
             text = item.get("text", "")
             if not isinstance(text, str):
                 raise ModelResponseFormatError("Anthropic 文本块的 text 必须是字符串", _response_excerpt(data))
             text_parts.append(text)
-        return ModelReply(text="".join(text_parts), usage=usage)
+        return ModelReply(text="".join(text_parts), usage=usage, reasoning="".join(thinking_parts) or None)
 
     async def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> AsyncIterator[ModelReply]:
         """在 Anthropic 流式适配完成前，保持统一接口并回退完整响应。"""
