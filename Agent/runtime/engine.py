@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
@@ -230,12 +231,15 @@ class AgentRuntime:
             retry_policy=self.retry_policy,
         )
         final_payload: dict[str, object] | None = None
-        failure: Exception | None = None
+        failure: BaseException | None = None
         try:
             async for event in loop.run(messages, self.tool_context, task=task, session_id=active_id, model=model):
                 if event.type is EventType.FINAL:
                     final_payload = dict(event.payload)
                 yield event
+        except asyncio.CancelledError as exc:
+            failure = exc
+            raise
         except Exception as exc:
             failure = exc
             self.last_failure = RuntimeFailure.capture(exc)
@@ -250,6 +254,7 @@ class AgentRuntime:
                     "model": model,
                     "error": failure,
                     "completed": failure is None and final_payload is not None,
+                    "cancelled": isinstance(failure, asyncio.CancelledError),
                 }
                 if final_payload is not None:
                     payload.update(final_payload)

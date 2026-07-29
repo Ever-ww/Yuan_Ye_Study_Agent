@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from Agent import AgentRuntime, HookPoint, ModelNetworkError, ModelResponseFormatError, ModelRetryPolicy, RuntimeFailure, load_runtime_config
+from Agent import AgentRuntime, EventType, HookPoint, ModelNetworkError, ModelResponseFormatError, ModelRetryPolicy, RuntimeFailure, load_runtime_config
 from Agent.contracts import ModelReply, ToolCall
 from Agent.models.errors import ModelServiceError, is_retryable_model_error
 from Agent.models.providers import _openai_reply
@@ -19,6 +19,7 @@ from memory import MemoryStore
 from run_ui.cli import _handle_chat_failure
 from run_ui.harness_loader import load_harness_module
 from skill import SkillInstallRequest, SkillService
+from tools import AsyncToolRegistry
 
 
 class FlakyProvider:
@@ -35,6 +36,78 @@ class FlakyProvider:
         if self.calls <= self.failures:
             raise ModelNetworkError(f"临时网络错误 {self.calls}")
         return ModelReply(text="成功")
+
+
+class HangingProvider:
+    """模拟等待网络响应、只能通过任务取消终止的 Provider。"""
+
+    streaming = False
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def complete(self, messages, tools):
+        del messages, tools
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("不可到达")
+
+
+class PartialStreamingProvider:
+    """产生文本和未完成工具调用后保持连接，等待 Ctrl+C。"""
+
+    streaming = True
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def stream(self, messages, tools):
+        del messages, tools
+        yield ModelReply(
+            text="这是已经生成的一半内容",
+            tool_calls=(ToolCall(name="calculator", arguments={"expression": "2+"}),),
+            finished=False,
+        )
+        self.started.set()
+        await asyncio.Event().wait()
+
+
+class CapturingProvider:
+    streaming = False
+
+    def __init__(self) -> None:
+        self.messages: list[dict[str, object]] = []
+
+    async def complete(self, messages, tools):
+        del tools
+        self.messages = [dict(message) for message in messages]
+        return ModelReply(text="已继续")
+
+
+class ToolRequestProvider:
+    """立即请求一个会挂起的工具。"""
+
+    streaming = False
+
+    async def complete(self, messages, tools):
+        del messages, tools
+        return ModelReply(tool_calls=(ToolCall(name="hanging_tool", arguments={}),))
+
+
+class HangingTool:
+    name = "hanging_tool"
+    description = "等待取消的测试工具"
+    schema = {"type": "object", "properties": {}}
+    risk = "read"
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def run(self, arguments, context):
+        del arguments, context
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("不可到达")
 
 
 class _HarnessCheckpoint:
@@ -169,6 +242,146 @@ class ResilienceTests(unittest.TestCase):
             records = memory.session_records(result.session_id)
             self.assertEqual([record["role"] for record in records], ["user", "assistant"])
 
+    def test_network_recovery_emits_reconnected_event(self) -> None:
+        async def check(root: Path) -> tuple[list[EventType], int]:
+            provider = FlakyProvider(2)
+            runtime = AgentRuntime(
+                load_runtime_config(root),
+                provider=provider,
+                retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=0),
+                enable_sandbox=False,
+            )
+            try:
+                events = [event.type async for event in runtime.run_task("等待重连")]
+                return events, provider.calls
+            finally:
+                await runtime.close()
+
+        with tempfile.TemporaryDirectory() as value:
+            events, calls = asyncio.run(check(Path(value)))
+            self.assertEqual(calls, 3)
+            self.assertEqual(events.count(EventType.MODEL_RETRY), 2)
+            self.assertEqual(events.count(EventType.MODEL_RECONNECTED), 1)
+            self.assertEqual(events[-1], EventType.FINAL)
+
+    def test_cancelling_current_answer_keeps_session_recoverable(self) -> None:
+        async def check(root: Path) -> list[dict[str, object]]:
+            config = load_runtime_config(root)
+            memory = MemoryStore(config.memory_dir)
+            provider = HangingProvider()
+            runtime = AgentRuntime(
+                config,
+                provider=provider,
+                memory=memory,
+                retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=0),
+                enable_sandbox=False,
+            )
+
+            async def consume() -> None:
+                async for _ in runtime.run_task("会被取消的问题"):
+                    pass
+
+            running = asyncio.create_task(consume())
+            await provider.started.wait()
+            running.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await running
+            session_id = str(runtime.active_session_id)
+            runtime.provider = FlakyProvider(0)
+            followup = [event async for event in runtime.run_task("取消后的新问题", session_id)]
+            self.assertEqual(followup[-1].type, EventType.FINAL)
+            records = memory.session_records(session_id)
+            await runtime.close()
+            return records
+
+        with tempfile.TemporaryDirectory() as value:
+            records = asyncio.run(check(Path(value)))
+            self.assertEqual([record["role"] for record in records], [
+                "user", "assistant", "user", "assistant",
+            ])
+            self.assertEqual(records[1]["status"], "cancelled")
+            self.assertIn("Ctrl+C", records[1]["content"])
+
+    def test_streaming_cancellation_keeps_partial_text_without_tool_calls(self) -> None:
+        async def check(root: Path):
+            config = load_runtime_config(root)
+            memory = MemoryStore(config.memory_dir)
+            provider = PartialStreamingProvider()
+            runtime = AgentRuntime(
+                config,
+                provider=provider,
+                memory=memory,
+                enable_sandbox=False,
+            )
+
+            async def consume() -> None:
+                async for _ in runtime.run_task("保留部分回答"):
+                    pass
+
+            running = asyncio.create_task(consume())
+            await provider.started.wait()
+            running.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await running
+            session_id = str(runtime.active_session_id)
+            cancelled_records = memory.session_records(session_id)
+
+            capturing = CapturingProvider()
+            runtime.provider = capturing
+            followup = [event async for event in runtime.run_task("继续回答", session_id)]
+            await runtime.close()
+            return cancelled_records, capturing.messages, followup
+
+        with tempfile.TemporaryDirectory() as value:
+            records, next_messages, followup = asyncio.run(check(Path(value)))
+            self.assertEqual([record["role"] for record in records], ["user", "assistant"])
+            self.assertEqual(records[-1]["content"], "这是已经生成的一半内容")
+            self.assertEqual(records[-1]["status"], "cancelled")
+            self.assertNotIn("tool_calls", records[-1])
+            partial = next(
+                message for message in next_messages
+                if message.get("role") == "assistant"
+                and message.get("content") == "这是已经生成的一半内容"
+            )
+            self.assertNotIn("tool_calls", partial)
+            self.assertEqual(followup[-1].type, EventType.FINAL)
+
+    def test_cancelling_running_tool_closes_tool_chain(self) -> None:
+        async def check(root: Path) -> list[dict[str, object]]:
+            config = load_runtime_config(root)
+            memory = MemoryStore(config.memory_dir)
+            tool = HangingTool()
+            runtime = AgentRuntime(
+                config,
+                provider=ToolRequestProvider(),
+                memory=memory,
+                tools=AsyncToolRegistry([tool]),
+                enable_sandbox=False,
+            )
+
+            async def consume() -> None:
+                async for _ in runtime.run_task("调用会挂起的工具"):
+                    pass
+
+            running = asyncio.create_task(consume())
+            await tool.started.wait()
+            running.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await running
+            records = memory.session_records(str(runtime.active_session_id))
+            await runtime.close()
+            return records
+
+        with tempfile.TemporaryDirectory() as value:
+            records = asyncio.run(check(Path(value)))
+            self.assertEqual(
+                [record["role"] for record in records],
+                ["user", "assistant", "tool", "assistant"],
+            )
+            self.assertEqual(records[2]["status"], "cancelled")
+            self.assertEqual(records[3]["status"], "cancelled")
+            self.assertEqual(records[1]["tool_calls"][0]["id"], records[2]["tool_call_id"])
+
     def test_retry_budget_resets_after_tool_result(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             provider = PerStepFlakyProvider()
@@ -185,23 +398,41 @@ class ResilienceTests(unittest.TestCase):
 
     def test_retry_exhaustion_preserves_failure_context(self) -> None:
         async def run_case(root: Path):
+            config = load_runtime_config(root)
+            memory = MemoryStore(config.memory_dir)
             runtime = AgentRuntime(
-                load_runtime_config(root),
+                config,
                 provider=FlakyProvider(3),
+                memory=memory,
                 retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=0),
                 raise_errors=True,
                 enable_sandbox=False,
             )
             with self.assertRaises(ModelNetworkError):
-                await runtime.run("失败问题")
-            return runtime
+                async for _ in runtime.run_task("失败问题"):
+                    pass
+            failure = runtime.last_failure
+            session_id = str(runtime.active_session_id)
+            failed_records = memory.session_records(session_id)
+            runtime.provider = FlakyProvider(0)
+            followup = [event async for event in runtime.run_task("网络恢复后的问题", session_id)]
+            all_records = memory.session_records(session_id)
+            await runtime.close()
+            return failure, failed_records, followup, all_records
 
         with tempfile.TemporaryDirectory() as value:
-            runtime = asyncio.run(run_case(Path(value)))
-            self.assertIsNotNone(runtime.last_failure)
-            self.assertEqual(runtime.last_failure.category, "network")
-            self.assertEqual(len(runtime.last_failure.retry_history), 3)
-            self.assertTrue(runtime.last_failure.messages[-1]["content"].startswith("失败问题\n\n[本次提问时间："))
+            failure, failed_records, followup, all_records = asyncio.run(run_case(Path(value)))
+            self.assertIsNotNone(failure)
+            self.assertEqual(failure.category, "network")
+            self.assertEqual(len(failure.retry_history), 3)
+            self.assertTrue(failure.messages[-1]["content"].startswith("失败问题\n\n[本次提问时间："))
+            self.assertEqual([record["role"] for record in failed_records], ["user", "assistant"])
+            self.assertEqual(failed_records[-1]["status"], "network_error")
+            self.assertEqual(followup[-1].type, EventType.FINAL)
+            self.assertEqual(
+                [record["role"] for record in all_records],
+                ["user", "assistant", "user", "assistant"],
+            )
 
     def test_http_retry_classification(self) -> None:
         self.assertTrue(is_retryable_model_error(ModelServiceError("busy", 429)))

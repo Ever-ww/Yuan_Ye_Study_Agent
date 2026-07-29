@@ -14,7 +14,7 @@ from typer.testing import CliRunner
 from Agent import AgentRuntime, load_runtime_config
 from Agent.contracts import ModelReply, ToolCall
 from memory import MemoryStore
-from run_ui.cli import _active_live, _approve, _render, app
+from run_ui.cli import ChatInterruptController, _active_live, _approve, _render, app
 from run_ui.approval import InteractiveApproval
 from run_ui.web import create_app
 from tools import ToolContext
@@ -49,6 +49,24 @@ class UiTests(unittest.TestCase):
         self.assertIn('data.type==="compression_started"', script)
         self.assertIn('data.type==="context_compressed"', script)
         self.assertIn('data.type==="compression_fallback"', script)
+        self.assertIn('data.type==="model_retry"', script)
+        self.assertIn('data.type==="model_reconnected"', script)
+
+    def test_ctrl_c_cancels_active_answer_and_is_exit_when_idle(self) -> None:
+        async def check() -> None:
+            controller = ChatInterruptController()
+            controller.bind(asyncio.get_running_loop())
+            active = asyncio.create_task(asyncio.Event().wait())
+            controller.set_active(active)
+            controller.handle_sigint(2, None)
+            with self.assertRaises(asyncio.CancelledError):
+                await active
+            self.assertTrue(controller.consume_cancel_request())
+            controller.clear_active()
+            with self.assertRaises(KeyboardInterrupt):
+                controller.handle_sigint(2, None)
+
+        asyncio.run(check())
 
     def test_tool_approval_pauses_and_resumes_live_display(self) -> None:
         class FakeLive:

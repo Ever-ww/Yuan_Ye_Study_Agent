@@ -6,6 +6,7 @@ import json
 
 from Agent.contracts import ModelReply
 from Agent.hook import HookEvent, HookPoint, HookRegistry
+from Agent.models.errors import is_retryable_model_error
 from memory.store import MemoryStore
 from prompt import PromptComposer
 
@@ -64,7 +65,14 @@ def register_memory_callbacks(registry: HookRegistry, memory: MemoryStore, promp
         base_systems.pop(event.session_id, None)
 
     async def persist_answer(event: HookEvent) -> None:
-        if event.data.get("error") is not None or not event.data.get("completed"):
+        if event.data.get("cancelled"):
+            memory.record_cancellation(event.session_id)
+            return
+        error = event.data.get("error")
+        if isinstance(error, BaseException) and is_retryable_model_error(error):
+            memory.record_network_failure(event.session_id)
+            return
+        if error is not None or not event.data.get("completed"):
             return
         answer = str(event.data.get("answer", ""))
         if not answer:
@@ -80,6 +88,11 @@ def register_memory_callbacks(registry: HookRegistry, memory: MemoryStore, promp
 
     async def persist_model_tool_calls(event: HookEvent) -> None:
         """把每次模型返回的工具调用作为标准 assistant 消息落盘。"""
+        if event.data.get("cancelled"):
+            partial_text = event.data.get("partial_text")
+            if isinstance(partial_text, str) and partial_text:
+                memory.record_cancelled_partial(event.session_id, partial_text)
+            return
         if event.data.get("error") is not None:
             return
         reply = event.data.get("reply")
@@ -103,13 +116,19 @@ def register_memory_callbacks(registry: HookRegistry, memory: MemoryStore, promp
         """把工具成功结果或异常写为与 assistant.tool_calls 对应的 tool 消息。"""
         error = event.data.get("error")
         result = event.data.get("result")
-        content = str(result) if error is None else f"工具执行失败：{str(error) or type(error).__name__}"
+        cancelled = bool(event.data.get("cancelled"))
+        content = (
+            "工具执行已由用户按 Ctrl+C 终止"
+            if cancelled
+            else str(result) if error is None
+            else f"工具执行失败：{str(error) or type(error).__name__}"
+        )
         memory.record_tool_result(
             event.session_id,
             tool_call_id=str(event.data.get("tool_call_id", "")),
             name=str(event.data.get("name", "")),
             content=content,
-            status="success" if error is None else "error",
+            status="cancelled" if cancelled else "success" if error is None else "error",
             arguments=dict(event.data.get("arguments", {})),
         )
 

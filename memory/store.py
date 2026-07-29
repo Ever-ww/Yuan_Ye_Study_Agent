@@ -121,6 +121,71 @@ class MemoryStore:
             "role": "tool", "tool_call_id": tool_call_id, "name": name, "content": content,
         })
 
+    def record_cancellation(self, session_id: str) -> bool:
+        """补齐未完成工具链并记录用户取消，保证后续消息角色合法。"""
+        cache = self._ensure_cache(session_id)
+        if not cache:
+            return False
+        last = cache[-1]
+        if last.get("role") == "assistant" and not last.get("tool_calls"):
+            return False
+
+        pending: list[tuple[str, str]] = []
+        assistant_index = next((
+            index for index in range(len(cache) - 1, -1, -1)
+            if cache[index].get("role") == "assistant" and cache[index].get("tool_calls")
+        ), None)
+        if assistant_index is not None:
+            calls = cache[assistant_index].get("tool_calls")
+            completed = {
+                str(message.get("tool_call_id"))
+                for message in cache[assistant_index + 1 :]
+                if message.get("role") == "tool"
+            }
+            if isinstance(calls, list):
+                for call in calls:
+                    if not isinstance(call, dict):
+                        continue
+                    call_id = str(call.get("id") or "")
+                    function = call.get("function")
+                    name = str(function.get("name") or "") if isinstance(function, dict) else ""
+                    if call_id and name and call_id not in completed:
+                        pending.append((call_id, name))
+        for call_id, name in pending:
+            self.record_tool_result(
+                session_id,
+                tool_call_id=call_id,
+                name=name,
+                content="工具执行已由用户按 Ctrl+C 终止",
+                status="cancelled",
+                arguments={},
+            )
+
+        return self._record_terminal_marker(
+            session_id,
+            "本次回答已由用户按 Ctrl+C 终止。",
+            status="cancelled",
+        )
+
+    def record_network_failure(self, session_id: str) -> bool:
+        """网络重试耗尽时闭合当前问答，允许用户在同一 Session 重新发送。"""
+        return self._record_terminal_marker(
+            session_id,
+            "本次回答因网络连接中断未完成，请重新发送问题。",
+            status="network_error",
+        )
+
+    def record_cancelled_partial(self, session_id: str, content: str) -> bool:
+        """保存 Ctrl+C 前已流式生成的文本，不接纳未完成的工具调用字段。"""
+        if not content:
+            return False
+        cache = self._ensure_cache(session_id)
+        if not cache or cache[-1].get("role") not in {"user", "tool"}:
+            return False
+        self.sessions.append(session_id, "assistant", content, {"status": "cancelled"})
+        cache.append({"role": "assistant", "content": content})
+        return True
+
     def restore_messages(self, session_id: str) -> list[dict[str, Any]]:
         """恢复索引指向的最新会话分段。"""
         return [dict(message) for message in self._ensure_cache(session_id)]
@@ -255,6 +320,14 @@ class MemoryStore:
         if session_id not in self._message_cache:
             self._message_cache[session_id] = self.sessions.restore(session_id)
         return self._message_cache[session_id]
+
+    def _record_terminal_marker(self, session_id: str, content: str, *, status: str) -> bool:
+        cache = self._ensure_cache(session_id)
+        if not cache or cache[-1].get("role") not in {"user", "tool"}:
+            return False
+        self.sessions.append(session_id, "assistant", content, {"status": status})
+        cache.append({"role": "assistant", "content": content})
+        return True
 
 
 def _infer_agent_root(memory_root: Path) -> Path:

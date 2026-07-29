@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+import signal
 import sys
+from types import FrameType
 
 import typer
 from rich.console import Console
@@ -31,6 +33,40 @@ app = typer.Typer(add_completion=False, no_args_is_help=True, help="Yuan Ye Stud
 session_app = typer.Typer(help="列出、查看和恢复本地会话")
 app.add_typer(session_app, name="session")
 console = Console()
+
+
+class ChatInterruptController:
+    """把 Ctrl+C 路由到当前回答；空闲时保留终端退出语义。"""
+
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._active_task: asyncio.Task[str] | None = None
+        self._cancel_requested = False
+
+    def bind(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+    def set_active(self, task: asyncio.Task[str]) -> None:
+        self._active_task = task
+        self._cancel_requested = False
+
+    def clear_active(self) -> None:
+        self._active_task = None
+
+    def consume_cancel_request(self) -> bool:
+        requested = self._cancel_requested
+        self._cancel_requested = False
+        return requested
+
+    def handle_sigint(self, signum: int, frame: FrameType | None) -> None:
+        del signum, frame
+        task = self._active_task
+        loop = self._loop
+        if task is not None and not task.done() and loop is not None:
+            self._cancel_requested = True
+            loop.call_soon_threadsafe(task.cancel)
+            return
+        raise KeyboardInterrupt
 
 
 @app.command()
@@ -89,9 +125,11 @@ async def _render(
                             lines.append("[yellow]本次流式片段因网络中断已丢弃[/]")
                             streaming_text = ""
                         lines.append(
-                            f"[yellow]模型网络异常，{event.payload['delay_seconds']} 秒后进行 "
+                            f"[yellow]模型网络异常，正在等待重连；{event.payload['delay_seconds']} 秒后进行 "
                             f"第 {event.payload['attempt']}/{event.payload['max_attempts']} 次请求[/]"
                         )
+                    elif event.type is EventType.MODEL_RECONNECTED:
+                        lines.append("[green]模型网络连接已恢复，继续当前任务[/]")
                     elif event.type is EventType.TOOL_REQUESTED:
                         if streaming_text:
                             lines.append(streaming_text)
@@ -150,15 +188,29 @@ def run(task: str, session_id: str | None = typer.Option(None, "--session", "-s"
 def chat(session_id: str | None = typer.Option(None, "--session", "-s", help="恢复指定会话哈希")) -> None:
     """启动连续交互会话。"""
     session_id = _validate_session(session_id)
+    interrupts = ChatInterruptController()
+    previous_handler = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, interrupts.handle_sigint)
     try:
-        asyncio.run(_chat(session_id))
+        asyncio.run(_chat(session_id, interrupt_controller=interrupts))
+    except KeyboardInterrupt:
+        console.print("\n[dim]已退出会话。[/]")
     except Exception as exc:
         console.print(Panel(f"[red]{str(exc) or type(exc).__name__}[/]", title="Yuan Ye Agent 配置错误"))
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
 
 
-async def _chat(session_id: str | None) -> None:
+async def _chat(
+    session_id: str | None,
+    *,
+    interrupt_controller: ChatInterruptController | None = None,
+) -> None:
     """在一个 Runtime/Session 中处理多次用户输入，退出时触发 trace_end。"""
-    console.print("[bold cyan]Yuan Ye Agent[/]  输入 /help 查看命令，/exit 退出。")
+    console.print(
+        "[bold cyan]Yuan Ye Agent[/]  输入 /help 查看命令，/exit 退出；"
+        "运行中按 Ctrl+C 终止当前回答，空闲时按 Ctrl+C 退出。"
+    )
     if session_id:
         console.print(f"[green]已恢复会话[/] {session_id}（{len(_memory().session_records(session_id))} 条消息）")
     config = load_runtime_config()
@@ -168,16 +220,22 @@ async def _chat(session_id: str | None) -> None:
         retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=2),
         raise_errors=True,
     )
+    interrupts = interrupt_controller or ChatInterruptController()
+    interrupts.bind(asyncio.get_running_loop())
     try:
         while True:
-            task = console.input("[bold blue]你 > [/]").strip()
+            try:
+                task = console.input("[bold blue]你 > [/]").strip()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[dim]已退出会话。[/]")
+                return
             if task in {"/exit", "/quit"}:
                 return
             if task == "/help":
                 console.print(
                     "/compress 压缩当前上下文；/context refresh 刷新上下文；"
                     "/skill list|install|update|audit|refresh 管理 Skill；"
-                    "/exit 退出；其余内容将发送给 Agent。"
+                    "/exit 退出；运行中 Ctrl+C 终止当前回答，空闲时 Ctrl+C 退出。"
                 )
                 continue
             if task == "/skill" or task.startswith("/skill "):
@@ -185,8 +243,21 @@ async def _chat(session_id: str | None) -> None:
                 continue
             if task:
                 previous_id = session_id
+                render_task = asyncio.create_task(
+                    _render(runtime, task, session_id, propagate_errors=True)
+                )
+                interrupts.set_active(render_task)
                 try:
-                    session_id = await _render(runtime, task, session_id, propagate_errors=True)
+                    session_id = await render_task
+                except asyncio.CancelledError:
+                    if not interrupts.consume_cancel_request():
+                        raise
+                    active_id = runtime.active_session_id or session_id or ""
+                    session_id = active_id or session_id
+                    console.print("[yellow]已终止当前回答，可继续输入下一条问题。[/]")
+                    if active_id and not previous_id:
+                        console.print(f"[dim]会话哈希：{active_id}；取消记录已保存[/]")
+                    continue
                 except Exception as exc:
                     active_id = runtime.active_session_id or session_id or ""
                     failure = runtime.last_failure or RuntimeFailure.capture(exc)
@@ -199,6 +270,8 @@ async def _chat(session_id: str | None) -> None:
                     if active_id and not previous_id:
                         console.print(f"[dim]会话哈希：{active_id}；失败现场已保留，可继续本会话[/]")
                     continue
+                finally:
+                    interrupts.clear_active()
                 if session_id and not previous_id:
                     console.print(f"[dim]会话哈希：{session_id}；下次可使用 chat --session {session_id} 恢复[/]")
     finally:

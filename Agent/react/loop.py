@@ -114,16 +114,16 @@ class ReactLoop:
 
                 started_at = time.perf_counter()
                 streamed = False
+                streamed_parts: list[str] = []
                 try:
                     if getattr(self.provider, "streaming", False) and getattr(self.provider, "stream", None):
                         streamed = True
-                        parts: list[str] = []
                         reasoning_parts: list[str] = []
                         calls: tuple[ToolCall, ...] = ()
                         usage = None
                         async for chunk in self.provider.stream(messages, schemas):
                             if chunk.text:
-                                parts.append(chunk.text)
+                                streamed_parts.append(chunk.text)
                                 yield RunEvent(type=EventType.TEXT, payload={"content": chunk.text})
                             if chunk.reasoning:
                                 reasoning_parts.append(chunk.reasoning)
@@ -131,9 +131,29 @@ class ReactLoop:
                                 calls = chunk.tool_calls
                             if chunk.usage is not None:
                                 usage = chunk.usage
-                        reply = ModelReply(text="".join(parts), tool_calls=calls, finished=True, usage=usage, reasoning="".join(reasoning_parts) or None)
+                        reply = ModelReply(text="".join(streamed_parts), tool_calls=calls, finished=True, usage=usage, reasoning="".join(reasoning_parts) or None)
                     else:
                         reply = await self.provider.complete(messages, schemas)
+                except asyncio.CancelledError as exc:
+                    failure = {
+                        "task": task,
+                        "model": model,
+                        "error": exc,
+                        "completed": False,
+                        "cancelled": True,
+                        # 只保留已经展示给用户的自然语言；流式阶段未完成的
+                        # tool_call 增量不具备可执行完整性，绝不能写入上下文。
+                        "partial_text": "".join(streamed_parts),
+                        "model_calls": model_calls,
+                        "retry_history": list(retry_history),
+                    }
+                    await self.hooks.emit(HookEvent(
+                        point=HookPoint.MODEL_AFTER,
+                        session_id=session_id,
+                        data=failure,
+                    ))
+                    _attach_failure_context(exc, messages, schemas, model, retry_history)
+                    raise
                 except Exception as exc:
                     retry_history.append({
                         "attempt": attempt,
@@ -164,6 +184,12 @@ class ReactLoop:
                         continue
                     _attach_failure_context(exc, messages, schemas, model, retry_history)
                     raise
+                if retry_history:
+                    yield RunEvent(type=EventType.MODEL_RECONNECTED, payload={
+                        "attempt": attempt,
+                        "recovered_failures": len(retry_history),
+                        "message": "模型网络连接已恢复，继续当前任务",
+                    })
                 break
 
             reply = _ensure_tool_call_ids(reply)
@@ -239,6 +265,17 @@ class ReactLoop:
             }))
             try:
                 result = await self.tools.execute(name, arguments, context)
+            except asyncio.CancelledError as exc:
+                await self.hooks.emit(HookEvent(point=HookPoint.TOOL_AFTER, session_id=session_id, data={
+                    "task": task,
+                    "name": name,
+                    "arguments": arguments,
+                    "tool_call_id": call_id,
+                    "result": None,
+                    "error": exc,
+                    "cancelled": True,
+                }))
+                raise
             except Exception as exc:
                 await self.hooks.emit(HookEvent(point=HookPoint.TOOL_AFTER, session_id=session_id, data={
                     "task": task, "name": name, "arguments": arguments, "tool_call_id": call_id, "result": None, "error": exc,
