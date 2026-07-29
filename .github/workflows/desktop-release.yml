@@ -1,0 +1,72 @@
+name: desktop-release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          version: "0.11.29"
+          python-version: "3.12"
+          enable-cache: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux 桌面依赖
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: 安装 Python 依赖
+        run: uv sync --frozen --extra dev
+      - name: 构建共享前端
+        run: |
+          npm --prefix ui install
+          npm --prefix ui run build
+      - name: 打包 Gateway 与 CLI sidecar
+        run: |
+          uv run --frozen --extra dev pyinstaller --clean --noconfirm packaging/yy-agent.spec
+          uv run --frozen --extra dev python packaging/prepare_sidecar.py
+      - name: 构建 Tauri 安装包
+        run: |
+          npm --prefix desktop install
+          npm --prefix desktop run build
+      - name: 生成 SHA-256
+        shell: pwsh
+        run: |
+          $files = @(
+            Get-ChildItem desktop/src-tauri/target/release/bundle -Recurse -File
+            Get-ChildItem dist -Filter "yy-agent*" -File
+          )
+          $files | Where-Object { $_.Extension -ne ".sha256" } |
+            ForEach-Object {
+              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+              "$hash  $($_.Name)" | Set-Content -Encoding utf8 "$($_.FullName).sha256"
+            }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: yuan-ye-agent-${{ matrix.os }}
+          path: |
+            desktop/src-tauri/target/release/bundle/**
+            dist/yy-agent*
+          if-no-files-found: error
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            desktop/src-tauri/target/release/bundle/**/*
+            dist/yy-agent*

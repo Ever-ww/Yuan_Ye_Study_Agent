@@ -19,6 +19,11 @@ model_choice/.env
 build/
 dist/
 *.egg-info/
+node_modules/
+ui/dist/
+desktop/src-tauri/target/
+desktop/src-tauri/binaries/*
+!desktop/src-tauri/binaries/.gitkeep
 .idea/
 .vscode/
 

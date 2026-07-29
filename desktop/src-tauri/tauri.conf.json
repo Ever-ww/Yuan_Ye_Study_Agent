@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Yuan Ye Agent",
+  "version": "1.0.0",
+  "identifier": "com.yuanye.agent",
+  "build": {
+    "beforeBuildCommand": "npm --prefix ../ui run build",
+    "beforeDevCommand": "npm --prefix ../ui run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../../ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Yuan Ye Agent",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 980,
+        "minHeight": 640,
+        "center": true,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "externalBin": ["binaries/yy-agent"],
+    "icon": ["../../images/harness_evolution.png"],
+    "createUpdaterArtifacts": false,
+    "windows": {
+      "wix": { "language": "zh-CN" },
+      "nsis": { "displayLanguageSelector": false }
+    },
+    "macOS": {
+      "signingIdentity": null
+    }
+  }
+}

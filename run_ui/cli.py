@@ -1,4 +1,4 @@
-"""实时 Rich CLI：仅消费 AgentRuntime 事件。"""
+"""实时 Rich CLI：生产命令只消费 Gateway 事件。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import asyncio
 import shlex
 import signal
 import sys
+from pathlib import Path
 from types import FrameType
 
 import typer
@@ -24,6 +25,8 @@ from Agent import (
 )
 from bootstrap import ensure_project_initialized, initialize_project
 from memory import MemoryStore
+from gateway import GatewayClient, GatewayProcessManager
+from gateway.models import GatewayEventEnvelope
 from skill import SkillInstallRequest
 from .approval import InteractiveApproval, active_live as _active_live
 from .harness_loader import load_harness_module
@@ -31,7 +34,9 @@ from .web import serve
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Yuan Ye Study Agent 本地入口")
 session_app = typer.Typer(help="列出、查看和恢复本地会话")
+gateway_app = typer.Typer(help="管理本机 Gateway 后台进程")
 app.add_typer(session_app, name="session")
+app.add_typer(gateway_app, name="gateway")
 console = Console()
 
 
@@ -40,13 +45,13 @@ class ChatInterruptController:
 
     def __init__(self) -> None:
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._active_task: asyncio.Task[str] | None = None
+        self._active_task: asyncio.Task[object] | None = None
         self._cancel_requested = False
 
     def bind(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
 
-    def set_active(self, task: asyncio.Task[str]) -> None:
+    def set_active(self, task: asyncio.Task[object]) -> None:
         self._active_task = task
         self._cancel_requested = False
 
@@ -74,7 +79,7 @@ def init() -> None:
     """初始化本机 `.yy` 配置、会话索引和长期记忆文件。"""
     yy = initialize_project(default_agent_root())
     console.print(f"[green]初始化完成[/] {yy}")
-    console.print("请编辑 .yy/settings.local.json 配置模型；已有文件不会被覆盖。")
+    console.print(f"请编辑 {yy / 'settings.local.json'} 配置模型；已有文件不会被覆盖。")
 
 
 def _memory() -> MemoryStore:
@@ -87,11 +92,88 @@ def _memory() -> MemoryStore:
     )
 
 
-def _validate_session(session_id: str | None) -> str | None:
-    """校验可选会话哈希，避免恢复命令在模型调用后才失败。"""
-    if session_id and not _memory().has_session(session_id):
-        raise typer.BadParameter(f"未找到会话：{session_id}", param_hint="--session")
-    return session_id
+def _gateway_client(*, port: int | None = None) -> GatewayClient:
+    """发现或自动启动单实例 Gateway。"""
+    config = load_runtime_config()
+    return GatewayClient(
+        config.agent_root,
+        port=port or config.gateway_port,
+    )
+
+
+async def _gateway_project(client: GatewayClient) -> dict[str, object]:
+    """把当前启动目录注册为 Gateway 项目。"""
+    return await client.register_project(Path.cwd())
+
+
+async def _render_gateway(
+    client: GatewayClient,
+    project_id: str,
+    task: str,
+    session_id: str | None = None,
+) -> tuple[str, str]:
+    """消费 Gateway 可重放事件，并把审批决定发回原 Run。"""
+    run = await client.start_run(project_id, task, session_id)
+    lines: list[str] = []
+    streaming_text = ""
+    active_session_id = session_id or ""
+    terminal_error = ""
+    with Live(Panel("正在排队…", title="Yuan Ye Gateway"), console=console, refresh_per_second=10) as live:
+        token = _active_live.set(live)
+        try:
+            async for event in client.subscribe(run.run_id):
+                if event.session_id:
+                    active_session_id = event.session_id
+                if event.type == EventType.TEXT.value:
+                    streaming_text += str(event.payload.get("content", ""))
+                elif event.type == EventType.MODEL_RETRY.value:
+                    if streaming_text:
+                        lines.append("[yellow]网络中断前的不完整流式片段已丢弃[/]")
+                        streaming_text = ""
+                    lines.append(
+                        f"[yellow]模型网络异常，{event.payload.get('delay_seconds', 2)} 秒后重试[/]"
+                    )
+                elif event.type == EventType.MODEL_RECONNECTED.value:
+                    lines.append("[green]模型网络连接已恢复[/]")
+                elif event.type == EventType.TOOL_REQUESTED.value:
+                    if streaming_text:
+                        lines.append(streaming_text)
+                        streaming_text = ""
+                    lines.append(f"[cyan]工具请求[/] {event.payload.get('name', '')}")
+                elif event.type == EventType.TOOL_COMPLETED.value:
+                    lines.append(f"[green]工具完成[/] {event.payload.get('name', '')}")
+                elif event.type == "approval_requested":
+                    approved = await InteractiveApproval(console)(
+                        str(event.payload.get("tool_name", "")),
+                        dict(event.payload.get("arguments", {})),
+                    )
+                    await client.respond_approval(
+                        str(event.payload["approval_id"]),
+                        approved,
+                    )
+                elif event.type == EventType.COMPRESSION_STARTED.value:
+                    lines.append("[cyan]正在压缩上下文…[/]")
+                elif event.type == EventType.CONTEXT_COMPRESSED.value:
+                    lines.append(f"[green]{event.payload.get('message', '上下文压缩完成')}[/]")
+                elif event.type == EventType.COMPRESSION_FALLBACK.value:
+                    lines.append(f"[yellow]{event.payload.get('message', '上下文裁剪降级')}[/]")
+                elif event.type in {"run_failed", "run_cancelled", "run_interrupted"}:
+                    terminal_error = str(event.payload.get("message", "运行结束"))
+                    lines.append(f"[red]{terminal_error}[/]")
+                elif event.type == "run_completed":
+                    answer = str(event.payload.get("answer", ""))
+                    if answer and not streaming_text:
+                        lines.append(f"[bold green]{answer}[/]")
+                display = lines[-12:] + ([streaming_text] if streaming_text else [])
+                live.update(Panel("\n".join(display) or "正在运行…", title="Yuan Ye Gateway"))
+                if event.type in {"run_completed", "run_failed", "run_cancelled", "run_interrupted"}:
+                    break
+        except asyncio.CancelledError:
+            await client.cancel_run(run.run_id)
+            raise
+        finally:
+            _active_live.reset(token)
+    return active_session_id, terminal_error
 
 
 async def _approve(name: str, arguments: dict[str, object]) -> bool:
@@ -162,23 +244,24 @@ async def _render(
     return active_session_id
 
 
-async def _run_once(task: str, session_id: str | None) -> str:
-    """为单次任务创建并可靠关闭一个 Session 运行范围。"""
-    runtime = AgentRuntime(approval=InteractiveApproval(console))
-    try:
-        return await _render(runtime, task, session_id)
-    finally:
-        await runtime.close()
-
-
 @app.command()
 def run(task: str, session_id: str | None = typer.Option(None, "--session", "-s", help="继续指定会话哈希")) -> None:
-    """运行一次任务。"""
-    session_id = _validate_session(session_id)
+    """通过本机 Gateway 运行一次任务。"""
     try:
-        active_id = asyncio.run(_run_once(task, session_id))
+        async def execute() -> str:
+            client = _gateway_client()
+            project = await _gateway_project(client)
+            active_id, _ = await _render_gateway(
+                client,
+                str(project["project_id"]),
+                task,
+                session_id,
+            )
+            return active_id
+
+        active_id = asyncio.run(execute())
     except Exception as exc:
-        console.print(Panel(f"[red]{str(exc) or type(exc).__name__}[/]", title="Yuan Ye Agent 配置错误"))
+        console.print(Panel(f"[red]{str(exc) or type(exc).__name__}[/]", title="Yuan Ye Gateway 错误"))
         return
     if active_id:
         console.print(f"[dim]会话哈希：{active_id}[/]")
@@ -186,19 +269,155 @@ def run(task: str, session_id: str | None = typer.Option(None, "--session", "-s"
 
 @app.command()
 def chat(session_id: str | None = typer.Option(None, "--session", "-s", help="恢复指定会话哈希")) -> None:
-    """启动连续交互会话。"""
-    session_id = _validate_session(session_id)
+    """连接 Gateway 并启动连续交互会话。"""
     interrupts = ChatInterruptController()
     previous_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, interrupts.handle_sigint)
     try:
-        asyncio.run(_chat(session_id, interrupt_controller=interrupts))
+        asyncio.run(_chat_gateway(session_id, interrupt_controller=interrupts))
     except KeyboardInterrupt:
         console.print("\n[dim]已退出会话。[/]")
     except Exception as exc:
         console.print(Panel(f"[red]{str(exc) or type(exc).__name__}[/]", title="Yuan Ye Agent 配置错误"))
+        raise typer.Exit(code=1) from exc
     finally:
         signal.signal(signal.SIGINT, previous_handler)
+
+
+async def _chat_gateway(
+    session_id: str | None,
+    *,
+    interrupt_controller: ChatInterruptController,
+) -> None:
+    console.print(
+        "[bold cyan]Yuan Ye Gateway[/]  输入 /help 查看命令，/exit 退出；"
+        "运行中按 Ctrl+C 终止当前回答。"
+    )
+    client = _gateway_client()
+    project = await _gateway_project(client)
+    project_id = str(project["project_id"])
+    if session_id:
+        sessions = await client.sessions(project_id)
+        if not any(item.get("session_id") == session_id for item in sessions):
+            raise ValueError(f"当前 workspace 未找到 Session：{session_id}")
+        console.print(f"[green]已恢复会话[/] {session_id}")
+    interrupt_controller.bind(asyncio.get_running_loop())
+    unread = await client.inbox(unread_only=True)
+    if unread:
+        console.print(f"[yellow]Inbox 有 {len(unread)} 条未读后台结果。[/]")
+    while True:
+        try:
+            task = console.input("[bold blue]你 > [/]").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]已退出客户端；Gateway 中的后台任务会继续运行。[/]")
+            return
+        if task in {"/exit", "/quit"}:
+            return
+        if task == "/help":
+            console.print(
+                "/compress；/context refresh；/skill list|install|update|audit|refresh；/exit；"
+                "运行中 Ctrl+C 取消当前 Run，空闲时 Ctrl+C 退出客户端。"
+            )
+            continue
+        if task == "/skill" or task.startswith("/skill "):
+            await _handle_gateway_skill_command(client, project_id, task)
+            continue
+        if not task:
+            continue
+        previous_id = session_id
+        render_task = asyncio.create_task(
+            _render_gateway(client, project_id, task, session_id),
+        )
+        interrupt_controller.set_active(render_task)
+        try:
+            session_id, _ = await render_task
+        except asyncio.CancelledError:
+            if not interrupt_controller.consume_cancel_request():
+                raise
+            console.print("[yellow]已请求 Gateway 终止当前回答，可继续输入。[/]")
+        finally:
+            interrupt_controller.clear_active()
+        if session_id and not previous_id:
+            console.print(f"[dim]会话哈希：{session_id}[/]")
+
+
+async def _handle_gateway_skill_command(
+    client: GatewayClient,
+    project_id: str,
+    task: str,
+) -> None:
+    """通过 Gateway 管理 Skill，命令本身不进入 Session。"""
+    try:
+        parts = [_strip_cli_quote(value) for value in shlex.split(task, posix=False)]
+        if len(parts) < 2:
+            raise ValueError(_skill_usage())
+        action = parts[1].lower()
+        if action == "list":
+            catalog = await client.skills(project_id)
+            if not catalog:
+                console.print("尚未安装可用 Skill。")
+                return
+            table = Table(title="已审核 Skill")
+            table.add_column("名称", style="cyan")
+            table.add_column("描述")
+            table.add_column("位置")
+            for item in catalog:
+                table.add_row(str(item["name"]), str(item["description"]), str(item["location"]))
+            console.print(table)
+            return
+        if action == "refresh":
+            count = await client.refresh_skills(project_id)
+            console.print(f"[green]Skill 目录与 Runtime Prompt 已刷新：{count} 个[/]")
+            return
+        if action == "audit":
+            if len(parts) != 3:
+                raise ValueError("用法：/skill audit <review-id>")
+            report = await client.skill_audit(project_id, parts[2])
+            console.print(
+                f"状态：{report['status']}；文件：{report['total_files']}；"
+                f"大小：{report['total_bytes']} 字节；报告：{report['report_path']}"
+            )
+            for finding in report.get("findings", []):
+                console.print(
+                    f"[yellow]{finding['severity']}[/] {finding['message']} "
+                    f"{finding.get('path') or ''}"
+                )
+            return
+        if action not in {"install", "update"}:
+            raise ValueError(_skill_usage())
+        position, name = 2, None
+        if action == "update":
+            if len(parts) <= position:
+                raise ValueError("用法：/skill update <name> <source> [--ref REF] [--path PATH]")
+            name, position = parts[position], position + 1
+        if len(parts) <= position:
+            raise ValueError(f"/skill {action} 缺少来源")
+        options = _parse_skill_options(parts[position + 1 :])
+        payload = {
+            "project_id": project_id,
+            "action": action,
+            "source": parts[position],
+            "name": name,
+            "ref": options.get("ref"),
+            "skill_path": options.get("skill_path"),
+            "confirmed": action == "update" and typer.confirm("更新会替换现有 Skill，是否继续？", default=False),
+        }
+        if action == "update" and not payload["confirmed"]:
+            console.print("[yellow]已取消 Skill 更新。[/]")
+            return
+        result = await client.manage_skill(payload)
+        if result["status"] == "declined" and typer.confirm(
+            f"{result['message']} 是否接受审核报告中的风险并重新安装？",
+            default=False,
+        ):
+            payload["confirmed"] = True
+            result = await client.manage_skill(payload)
+        style = "green" if result["status"] == "installed" else "yellow"
+        console.print(f"[{style}]{result['message']}[/]")
+        if result.get("report_path"):
+            console.print(f"[dim]审核报告：{result['report_path']}[/]")
+    except Exception as exc:
+        console.print(f"[red]{str(exc) or type(exc).__name__}[/]")
 
 
 async def _chat(
@@ -438,8 +657,13 @@ async def _handle_chat_failure(config, runtime, task: str, session_id: str, fail
 
 @session_app.command("list")
 def session_list() -> None:
-    """列出可恢复会话。"""
-    sessions = _memory().list_sessions()
+    """通过 Gateway 列出当前 workspace 的可恢复会话。"""
+    async def load() -> list[dict[str, object]]:
+        client = _gateway_client()
+        project = await _gateway_project(client)
+        return await client.sessions(str(project["project_id"]))
+
+    sessions = asyncio.run(load())
     if not sessions:
         console.print("暂无可恢复会话。")
         return
@@ -455,20 +679,79 @@ def session_list() -> None:
 
 @session_app.command("show")
 def session_show(session_id: str) -> None:
-    """显示指定会话最新分段中的带时间戳消息。"""
-    _validate_session(session_id)
+    """通过 Gateway 显示指定会话最新分段。"""
+    async def load() -> list[dict[str, object]]:
+        client = _gateway_client()
+        project = await _gateway_project(client)
+        return await client.session(str(project["project_id"]), session_id)
+
+    records = asyncio.run(load())
     table = Table(title=f"会话 {session_id}")
     table.add_column("时间", style="dim")
     table.add_column("角色", style="cyan")
     table.add_column("内容")
-    for record in _memory().session_records(session_id):
+    for record in records:
         table.add_row(str(record.get("timestamp", "")), str(record.get("role", "")), str(record.get("content", "")))
     console.print(table)
 
 
+@gateway_app.command("start")
+def gateway_start(port: int | None = typer.Option(None, "--port")) -> None:
+    """启动单实例本机 Gateway。"""
+    config = load_runtime_config()
+    manager = GatewayProcessManager(config.agent_root, port or config.gateway_port)
+    status = manager.ensure_running()
+    console.print(f"[green]Gateway 已运行[/] PID={status['pid']} {status['base_url']}")
+
+
+@gateway_app.command("stop")
+def gateway_stop(port: int | None = typer.Option(None, "--port")) -> None:
+    """停止当前 Agent Home 的 Gateway。"""
+    config = load_runtime_config()
+    manager = GatewayProcessManager(config.agent_root, port or config.gateway_port)
+    stopped = manager.stop()
+    console.print("[green]Gateway 已停止[/]" if stopped else "[yellow]Gateway 当前未运行[/]")
+
+
+@gateway_app.command("status")
+def gateway_status(port: int | None = typer.Option(None, "--port")) -> None:
+    """显示 Gateway 进程、地址和日志位置。"""
+    config = load_runtime_config()
+    status = GatewayProcessManager(config.agent_root, port or config.gateway_port).status()
+    style = "green" if status["running"] else "yellow"
+    console.print(
+        f"[{style}]状态：{'running' if status['running'] else 'stopped'}[/]\n"
+        f"PID：{status['pid'] or '-'}\n地址：{status['base_url']}\n日志：{status['log_path']}"
+    )
+
+
+@gateway_app.command("logs")
+def gateway_logs(
+    lines: int = typer.Option(100, "--lines", "-n", min=1, max=5000),
+) -> None:
+    """显示 Gateway 日志末尾内容。"""
+    config = load_runtime_config()
+    path = GatewayProcessManager(config.agent_root, config.gateway_port).log_path
+    if not path.exists():
+        console.print("尚无 Gateway 日志。")
+        return
+    content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    console.print("\n".join(content[-lines:]))
+
+
+@gateway_app.command("run-internal", hidden=True)
+def gateway_run_internal(
+    port: int = typer.Option(8765, "--port"),
+    agent_root: Path | None = typer.Option(None, "--agent-root"),
+) -> None:
+    """打包 sidecar 使用的前台服务入口。"""
+    from gateway.process import run_gateway
+    run_gateway(agent_root or default_agent_root(), port)
+
+
 @app.command()
-def serve_ui(port: int = typer.Option(8765, "--port")) -> None:
-    """启动仅绑定回环地址的 Web UI。"""
+def serve_ui(port: int | None = typer.Option(None, "--port")) -> None:
+    """自动启动 Gateway 并打开本机 Web 工作台。"""
     serve(port)
 
 
@@ -478,5 +761,5 @@ def main() -> None:
         result = ensure_project_initialized(default_agent_root())
         if result.initialized:
             console.print(f"[green]首次运行初始化完成[/] {result.yy_dir}")
-            console.print("请按需编辑 .yy/settings.local.json；后续启动不会重复初始化。")
+            console.print(f"请按需编辑 {result.yy_dir / 'settings.local.json'}；后续启动不会重复初始化。")
     app()

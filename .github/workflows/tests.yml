@@ -36,4 +36,27 @@ jobs:
       - name: 运行 unittest
         run: uv run --frozen --extra dev python -m unittest discover -s tests -v
       - name: 编译检查
-        run: uv run --frozen --extra dev python -m compileall -q Agent bootstrap context_process memory prompt sandbox skill tools run_ui tests harness-evolution run.py
+        run: uv run --frozen --extra dev python -m compileall -q Agent bootstrap context_process gateway memory prompt sandbox skill tools run_ui tests harness-evolution run.py
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: 检查共享 React 前端
+        run: |
+          npm --prefix ui install
+          npm --prefix ui test
+          npm --prefix ui run build
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 为 cargo check 准备 sidecar 占位文件
+        shell: bash
+        run: |
+          target="$(rustc -vV | awk '/^host:/ { print $2 }')"
+          mkdir -p desktop/src-tauri/binaries
+          touch "desktop/src-tauri/binaries/yy-agent-${target}"
+      - name: 检查 Tauri Rust 外壳
+        run: cargo check --manifest-path desktop/src-tauri/Cargo.toml

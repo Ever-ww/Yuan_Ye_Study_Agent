@@ -1,6 +1,6 @@
 # Yuan Ye Study Agent
 
-Yuan Ye Study Agent 是一个本地优先、单一异步 Runtime 驱动的学习与研究 Agent。正式入口始终是 `run.py`；CLI 与 Web UI 消费同一事件流，因此模型等待、工具执行、审批与错误都会即时可见。
+Yuan Ye Study Agent 是一个本地优先、单一异步 Runtime 驱动的学习与研究 Agent。正式入口始终是 `run.py`；常驻 Gateway 是 Runtime、Session、Sandbox、审批和事件流的唯一宿主，CLI、Web 与 Tauri 桌面工作台都是它的客户端。客户端关闭后任务仍可在后台继续，结果会进入 Inbox。
 
 <p align="center">
   <img src="images/harness_evolution.png" alt="Harness 自进化：工坊中的马正在修整自己的挽具" width="760">
@@ -24,6 +24,7 @@ Coding Agent 的记忆位于 Agent 根目录的 `.yy/harness-evolution/memory/`�
 
 ```text
 Agent/      模型适配、异步 ReAct、Runtime、Hook 协议与配置
+gateway/    单实例后台进程、Runtime 池、本机 API、事件重放、审批与 Inbox
 memory/     记忆领域 Python 服务
 context_process/ Token 阈值压缩、Profile 合并与失败裁剪
 harness-evolution/ 错误快照、隔离 worktree、诊断与验证流水线
@@ -46,12 +47,16 @@ tools/      异步工具协议、注册表和受控内置工具
   skill_read.py        渐进读取已审核 Skill 文本
   skill_install.py     审批后获取、审核和安装 Skill
 run_ui/     Rich CLI、FastAPI 路由、模板和静态资源
+ui/         Web 与 Tauri 共用的 React/TypeScript 工作台
+desktop/    Tauri 2 原生窗口与 Gateway sidecar 启动外壳
+packaging/  PyInstaller sidecar 构建与平台文件名准备
 tests/      核心行为与 UI 安全测试
-.yy/memory/ Agent 根目录中的会话 JSONL、会话索引与长期 Profile（不提交）
+.yy/gateway/ SQLite、可重放 Run 事件、Inbox、日志、令牌与单实例状态
+.yy/memory/ Agent Home 中的会话 JSONL、会话索引与长期 Profile（不提交）
 run.py      唯一源码树入口
 ```
 
-`memory/` 永远不保存用户数据。首次运行在 Agent 安装/源码根目录创建 `.yy/memory/`：会话消息按 workspace 隔离后写入 `session/` 下的 JSONL，长期 Profile 写入所有 workspace 共享的 `profile/` Markdown。启动 Agent 时所在的目录不会生成记忆或模型配置文件。
+`memory/` 永远不保存用户数据。首次运行在平台 Agent Home 创建 `.yy/memory/`：会话消息按 workspace 隔离后写入 `session/` 下的 JSONL，长期 Profile 写入所有 workspace 共享的 `profile/` Markdown。启动 Agent 时所在的目录不会生成记忆或模型配置文件。
 
 ## 从零开始
 
@@ -119,7 +124,15 @@ docker info
 uv run python run.py
 ```
 
-第一次启动会在 Agent 根目录创建 `.yy/settings.local.json`、`.yy/.initialized.json`、`.yy/memory/session/index.json`，以及 `.yy/memory/profile/` 下的 `index.json`、`USER.md`、`RESEARCH.md` 和 `OTHERS.md`。同时会创建 `.yy/agents/SOUL.md`（Agent 身份）和 `.yy/agents/AGENT.md`（运行时项目说明），并初始化 `.yy/skills/index.json`、审核/备份目录和 Agent 根目录的 `skills/`。后续执行 `run.py`、`chat`、`run` 或 `serve-ui` 时检测到初始化标记和必要文件齐全，就不会再次初始化。
+第一次启动会初始化平台用户数据目录中的 Agent Home：
+
+- Windows：`%LOCALAPPDATA%\YuanYeAgent`
+- macOS：`~/Library/Application Support/YuanYeAgent`
+- Linux：`$XDG_DATA_HOME/yuan-ye-agent`，未设置时为 `~/.local/share/yuan-ye-agent`
+
+可在启动前通过 `YY_AGENT_HOME` 显式覆盖。初始化会创建 `.yy/settings.local.json`、Agent 身份与项目说明、Memory、Skill、Gateway 和 Sandbox 状态目录。后续启动只补齐缺失项，不会覆盖已有配置或记忆。
+
+源码树中若已经存在旧 `.yy` 或已安装 `skills`，首次迁移会把它们复制到 Agent Home，原文件不删除；迁移结果记录在 `.yy/agent-home-migration.json`。旧的未分区 Session 会归入该源码 workspace 的哈希分区，全局 Profile 仍保持共享。
 
 如果你误删了 `.yy` 中的必要文件，可手动修复初始化：
 
@@ -127,11 +140,11 @@ uv run python run.py
 uv run python run.py init
 ```
 
-初始化和修复都不会覆盖已有配置或记忆。整个 `.yy/` 都被 Git 忽略。
+初始化和修复都不会覆盖已有配置或记忆。Agent Home 的 `.yy/` 不属于项目 Git。
 
 ### 6. 在其他 workspace 中运行
 
-Agent 根目录只负责代码、模型配置、记忆和本地沙箱状态；启动命令时的当前目录才是文件工具、Docker 挂载和 checkpoint 要处理的 workspace。例如：
+Agent Home 负责模型配置、记忆和本机状态；启动命令时的当前目录才是 Gateway 注册的项目，也是文件工具、Docker 挂载和 checkpoint 要处理的 workspace。例如：
 
 ```powershell
 $AgentRoot = "D:\Ever_workspace\Yuan_Ye_Study_Agent"
@@ -139,7 +152,7 @@ cd D:\Ever_workspace\My_Project
 uv run --project $AgentRoot yy-agent chat
 ```
 
-上述命令仍从 `$AgentRoot\.yy\settings.local.json` 读取模型配置，并把该 workspace 的会话写入 `$AgentRoot\.yy\memory\session\<workspace-hash>\`；`My_Project` 不会生成 `.yy`。其他 workspace 看不到也不能恢复这些 Session，但 USER、RESEARCH、OTHERS 和普通扩展 Profile 仍全局共享。`read_file`、`write_file`、搜索、Docker Bash 和回溯只允许操作 `My_Project`，checkpoint 捕获的也是该目录。外部 workspace 的 checkpoint 对象库按相同 workspace 边界隔离后保存在 `$AgentRoot\.yy\sandbox\checkpoints\`，不会写进用户项目的 `.git`。
+上述命令从平台 Agent Home 的 `.yy/settings.local.json` 读取模型配置，并把该 workspace 的会话写入 Agent Home 的 `.yy/memory/session/<workspace-hash>/`；`My_Project` 不会生成 `.yy`。其他 workspace 看不到也不能恢复这些 Session，但 USER、RESEARCH、OTHERS 和普通扩展 Profile 仍全局共享。`read_file`、`write_file`、搜索、Docker Bash 和回溯只允许操作 `My_Project`，checkpoint 捕获的也是该目录。checkpoint 对象库按 workspace 隔离保存在 Agent Home，不会写进用户项目的 `.git`。
 
 ### 7. 先进行离线启动验证
 
@@ -156,13 +169,20 @@ uv run python run.py chat
 
 ### 1. 创建本机配置文件
 
-Agent 根目录中的 `.yy/settings.local.json` 是首次启动自动生成的本机模型配置文件，支持直接保存 `base_url` 与 `api_key`。即使从其他 workspace 启动，也始终读取这一份配置。如果文件被误删，可在 Agent 根目录执行：
+Agent Home 中的 `.yy/settings.local.json` 是首次启动自动生成的本机模型配置文件，支持直接保存 `base_url` 与 `api_key`。即使从其他 workspace 启动，也始终读取这一份配置。如果文件被误删，可执行：
 
 ```powershell
 uv run python run.py init
 ```
 
-然后编辑 `.yy/settings.local.json`，将 `api_key` 改为你刚轮换后的有效 Key。下面以 DeepSeek 为例：
+然后编辑 Agent Home 下的 `.yy/settings.local.json`。Windows PowerShell 可先定位文件：
+
+```powershell
+$AgentHome = if ($env:YY_AGENT_HOME) { $env:YY_AGENT_HOME } else { Join-Path $env:LOCALAPPDATA "YuanYeAgent" }
+notepad (Join-Path $AgentHome ".yy\settings.local.json")
+```
+
+将 `api_key` 改为有效 Key。下面以 DeepSeek 为例：
 
 ```powershell
 @'
@@ -177,9 +197,12 @@ uv run python run.py init
   "tool_output_max_chars": 10000,
   "tool_output_head_ratio": 0.2,
   "tool_output_tail_ratio": 0.2,
-  "sandbox_checkpoint_limit": 17
+  "sandbox_checkpoint_limit": 17,
+  "gateway_port": 8765,
+  "gateway_max_concurrent_runs": 4,
+  "gateway_runtime_idle_seconds": 900
 }
-'@ | Set-Content -Encoding utf8 .yy/settings.local.json
+'@ | Set-Content -Encoding utf8 (Join-Path $AgentHome ".yy\settings.local.json")
 ```
 
 可用 Provider：`openai`、`anthropic`、`deepseek`、`qwen`、`glm`、`kimi`。对应环境变量为：
@@ -205,6 +228,8 @@ uv run python run.py init
 
 `sandbox_checkpoint_limit` 默认是 `17`，必须是大于等于 1 的整数。它限制每个 Session 在 `.yy/sandbox/checkpoints/` 中保留的本地快照数量，基线也计入上限；超过后会删除最旧引用，并只清理独立 checkpoint 对象库，不改写项目主仓库。
 
+Gateway 默认监听 `127.0.0.1:8765`，不同 Session 最多同时运行 4 个任务，同一 Session 同时只允许一个任务。`gateway_runtime_idle_seconds=900` 表示 Session Runtime 空闲 15 分钟后关闭 Trace 与 Docker；Session JSONL 不会删除，下一次请求仍可恢复。
+
 只允许将 Key 写在 `.yy/settings.local.json` 或环境变量中。程序会拒绝 `.yy/settings.json` 中的 `api_key` 字段；整个 `.yy/` 均为本机目录且不会提交。
 
 ### 2. 可选：使用环境变量保存密钥
@@ -221,6 +246,21 @@ uv run python run.py chat
 如果没有设置有效 Key，远程 Provider 会明确报出配置错误，不会静默退回网络请求或泄露密钥。
 
 ## 日常操作
+
+### 0. Gateway 管理
+
+`run`、`chat`、`serve-ui` 和桌面端会先探测 Gateway；未运行时自动启动单实例后台进程。客户端退出不会终止后台任务，也不会关闭 Gateway。
+
+```powershell
+uv run python run.py gateway start
+uv run python run.py gateway status
+uv run python run.py gateway logs --lines 100
+uv run python run.py gateway stop
+```
+
+Gateway 停止时先拒绝新任务，并给正在运行的任务一个短暂收尾窗口，随后取消剩余任务并关闭 Runtime 与 Docker。异常重启后，数据库中未完成的任务会标记为 `interrupted`；已经写入的 Session JSONL 和工具结果仍然保留。
+
+Gateway 状态位于 Agent Home 的 `.yy/gateway/`：SQLite 保存项目、运行、审批和 Inbox 元数据；`runs/<run-id>.jsonl` 保存带单调序号的可重放 UI 事件；`gateway.log` 最多保留当前文件与 5 份轮转日志。Session 对话正文仍只由 Memory 写一份，不会复制到 Gateway 事件文件。
 
 ### 1. 创建新会话
 
@@ -242,7 +282,7 @@ uv run python run.py chat
 - `/context refresh` 重新读取 Agent、Profile 与当前 Session 文件并刷新内存上下文；命令不会写入 JSONL。
 - `/skill list`、`/skill install`、`/skill update`、`/skill audit` 和 `/skill refresh` 管理本机 Skill；安装或更新不会自动修改当前 Prompt，只有 `/skill refresh` 成功后才重新扫描并加载 Skill XML。
 - `stream=true` 时，OpenAI-compatible Provider 会通过 SSE 逐段显示文本。
-- 高风险工具会显示方向键审批菜单：使用 ↑/↓ 选择“允许本次 / 当前会话始终允许该工具 / 拒绝”，按 Enter 确认、Esc 取消，默认选中拒绝。会话授权在退出当前 Runtime 后自动失效。
+- 高风险工具会显示方向键审批菜单：使用 ↑/↓ 选择“允许本次 / 当前会话始终允许该工具 / 拒绝”，按 Enter 确认、Esc 取消，默认选中拒绝。审批由发起任务的客户端优先处理；该客户端断开时待审批操作立即拒绝，后台 Agent 可继续处理错误或结束。
 - `bash` 只在当前 Trace 的无网络 Docker 容器中运行。容器读写挂载启动时的 workspace，因此命令造成的文件变化会立即出现在宿主机；一次成功 Bash 调用无论修改多少文件都只创建一个 checkpoint，没有变化则不创建。
 - `write_file` 仍由宿主机执行原子写入，每次实际内容变化后创建一个 checkpoint；重复写入相同内容不会制造空快照。可让 Agent 调用高风险 `sandbox_rollback` 按步数恢复，执行前仍需审批。
 - `enable_sandbox=False` 只用于没有写工具的压缩或诊断 Runtime。自定义 Runtime 未注入 checkpoint 上下文时，`write_file`、`bash` 和 `sandbox_rollback` 都会明确拒绝，不存在无快照写入旁路。
@@ -356,7 +396,7 @@ Skill 遵循 [Agent Skills 规范](https://agentskills.io/specification)。一�
 
 也可以用自然语言让主 Agent 安装 Skill。此时模型调用高风险 `skill_install`，先确认下载意图；如果审核还发现可接受风险，再进行第二次确认。Subagent 不能获得 `skill_install`。
 
-安装成功后，每个新用户任务都会重新扫描可信索引。System Prompt 只加入如下发现信息，不加载正文：
+安装或更新成功后不会修改当前 Runtime 的 Skill 缓存。只有显式执行 `/skill refresh` 成功后，Gateway 才重新扫描可信索引并刷新当前项目中已缓存 Runtime 的 System Prompt。System Prompt 只加入如下发现信息，不加载正文：
 
 ```xml
 <available_skills>
@@ -372,7 +412,7 @@ Skill 遵循 [Agent Skills 规范](https://agentskills.io/specification)。一�
 
 ## Hook、Turn 与 Session
 
-本项目把 Session 视为逻辑上的完整 Trace，不额外创建 Trace 数据模型。每次真实模型 API 调用严格对应一个 Turn；该模型响应请求的一个或多个工具都在当前 Turn 内执行，工具结果需要再次发送给模型时才开始下一个 Turn。Turn 只表达生命周期边界，不创建实体、不编号，也不向事件或 Session JSONL 写入编号。
+本项目把 Session 视为逻辑上的完整 Trace，不额外创建 Trace 数据模型。概念上，每次真实模型 API 调用对应一个模型 Turn；该响应请求的一个或多个工具在下一次模型调用前完成。Hook 中的 `TURN_START/TURN_END` 则刻意定义为一次完整用户任务的外层边界，任务内可以出现多次 `MODEL_*` 与 `TOOL_*`。两者都不创建实体、不编号，也不向事件或 Session JSONL 写入编号。
 
 统一注册入口是 `Agent/hook.py`，包含以下十个可直接填写代码的异步回调：
 
@@ -383,7 +423,7 @@ model_before model_during model_after
 tool_before  tool_during  tool_after
 ```
 
-时序固定为 `trace_start → turn_start → model_* → tool_*（可重复）→ turn_end → … → trace_end`。`model_before` 可修改 `event.data["messages"]` 和 `event.data["tools"]`；`tool_before` 可修改工具名称和参数，修改后的参数仍会重新执行 JSON Schema 校验。`during` 在进入真实 Provider 或工具函数前通知一次，不会按流式文本片段重复触发；`after` 同时覆盖成功与失败，并通过 `result/reply/error` 暴露结果。
+时序固定为 `trace_start → turn_start → (model_* → tool_* …)* → turn_end → … → trace_end`。第二个用户问题同样会触发新的 `turn_start`，并且发生在该问题进入上下文前。`model_before` 可修改 `event.data["messages"]` 和 `event.data["tools"]`；`tool_before` 可修改工具名称和参数，修改后的参数仍会重新执行 JSON Schema 校验。`during` 在进入真实 Provider 或工具函数前通知一次，不会按流式文本片段重复触发；`after` 同时覆盖成功与失败，并通过 `result/reply/error` 暴露结果。
 
 默认 Runtime 在 `trace_start` 通过同一 Hook 注册器启动 Docker 沙箱并创建基线 checkpoint，在 `trace_end` 直接删除容器。Subagent 复用父 Runtime 的同一个沙箱上下文，不会提前关闭容器；上下文压缩 Runtime 没有危险工具，因此显式禁用沙箱。Harness Coding Runtime 则为隔离 Git worktree 启动自己的 Docker 和 checkpoint，绝不复用主聊天 workspace 的容器。
 
@@ -408,12 +448,20 @@ Runtime 的事件流入口是 `AgentRuntime.run_task()`，表示处理一次用�
 ### 6. 启动本机 Web UI
 
 ```powershell
-uv run python run.py serve-ui --port 8765
+uv run python run.py serve-ui
 ```
 
-终端会输出包含随机 token 的本机地址。复制该地址到同一台电脑的浏览器访问；服务只监听 `127.0.0.1`，不要把带 token 的地址发布到聊天、Issue 或日志中。按 `Ctrl + C` 停止服务。
+该命令会确保 Gateway 已启动，然后打开带一次性启动码的本机浏览器地址。浏览器交换启动码后只保存 `HttpOnly + SameSite=Strict` Cookie；写请求还需要 CSRF，Gateway 只监听 `127.0.0.1`。关闭网页不会停止任务，最终结果会进入 Inbox；重连后客户端按事件序号补齐遗漏事件。`serve-ui` 不再创建第二套 Runtime。
 
-### 7. 查看全部命令
+共享 React 工作台提供项目侧栏、Session/任务线程、流式对话、工具时间线、审批卡片、取消运行、模型/Sandbox 状态和未读 Inbox。Tauri 2 桌面端使用同一套组件，并通过平台对应的 PyInstaller sidecar 启动 Gateway；正式安装包的使用者不需要预装 Python、uv、Node 或 Rust。
+
+### 7. 桌面安装包
+
+推送 `v*` 标签或手动运行 `desktop-release` GitHub Actions 后，会分别生成 Windows MSI/NSIS、macOS DMG、Linux AppImage/DEB、独立 CLI/Gateway 可执行文件及 SHA-256 文件。首期构建不签名、不公证，也不自动更新；下载安装包后应先用同一 Release 中的 `.sha256` 核对文件，再按系统提示手动允许运行。
+
+源码开发桌面端需要 Node 22、Rust stable 和 Tauri 的平台构建依赖，但这些只属于开发/CI 环境。构建流程先生成共享 React 产物，再用 PyInstaller 构建 `yy-agent` sidecar，最后由 Tauri 打包。
+
+### 8. 查看全部命令
 
 ```powershell
 uv run python run.py --help
@@ -421,14 +469,17 @@ uv run python run.py session --help
 uv run python run.py chat --help
 ```
 
-### 8. 运行测试与检查
+### 9. 运行测试与检查
 
 ```powershell
 uv run python -m unittest discover -s tests -v
 uv run python -m pytest -q
-uv run python -m compileall -q Agent bootstrap context_process memory prompt sandbox skill tools run_ui tests harness-evolution run.py
-uv run python run.py --help
+uv run python -m compileall -q Agent bootstrap context_process gateway memory prompt sandbox skill tools run_ui tests harness-evolution run.py
 uv lock --check
+npm --prefix ui install
+npm --prefix ui run build
+cargo check --manifest-path desktop/src-tauri/Cargo.toml
+uv run python run.py --help
 ```
 
 ## 配置、状态与安全
@@ -437,18 +488,18 @@ uv lock --check
 - 配置文件会严格校验字段类型、数值范围和未知字段。拼错配置名会在启动时明确报错，不再被静默忽略。
 - 工具 JSON Schema 会在注册时编译为严格 Pydantic 参数模型；Hook 改写后的最终参数会再次校验，拒绝类型偷换、未知字段和非法枚举。
 - 上下文压缩模型的 JSON 输出由 Pydantic 校验：普通 Session 同时返回 `profile_markdown` 与 `context_summary_markdown`；Harness 只返回摘要，禁止压缩过程创建 Session 哈希 Profile。
-- Agent 根目录的 `.yy/` 是完整的本机状态目录，由 `uv run python run.py init` 创建并被 Git 忽略；外部 workspace 不会因此生成 `.yy`。
-- Skill 框架代码位于 `skill/`；可信索引、审核报告、暂存和备份位于 Agent 根目录 `.yy/skills/`，已安装内容位于 Agent 根目录 `skills/`。两处运行内容均被 Git 忽略。
-- Agent 根目录的 `.yy/sandbox/checkpoints/` 保存按 workspace 隔离的独立本地 Git 对象库和 Pydantic 审计索引；它捕获 workspace，但不会修改 workspace 的 Git 分支，也不会被上传。
-- Agent 根目录的 `.yy/sandbox/locks/` 保存按 workspace 隔离的空锁载体文件；Windows 使用 `LockFileEx`，Linux/macOS 使用 `flock`，进程退出后不依赖删除文件即可释放锁。
+- 平台 Agent Home 中的 `.yy/` 是完整本机状态目录，由 `uv run python run.py init` 创建；外部 workspace 不会因此生成 `.yy`。
+- Skill 框架代码位于 `skill/`；可信索引、审核报告、暂存和备份位于 Agent Home 的 `.yy/skills/`，已安装内容位于 Agent Home 的 `skills/`。
+- Agent Home 的 `.yy/sandbox/checkpoints/` 保存按 workspace 隔离的独立本地 Git 对象库和 Pydantic 审计索引；它捕获 workspace，但不会修改 workspace 的 Git 分支，也不会被上传。
+- Agent Home 的 `.yy/sandbox/locks/` 保存按 workspace 隔离的空锁载体文件；Windows 使用 `LockFileEx`，Linux/macOS 使用 `flock`，进程退出后不依赖删除文件即可释放锁。
 - `tests/error/*.jsonl` 只保存代码类缺陷的完整上下文、请求与异常栈，可能包含隐私，只在本机保留并由 Git 忽略。
 - 本机模型配置：`.yy/settings.local.json`，可放置 `provider`、`model`、`base_url` 与 `api_key`；初始化模板由源码中的 `bootstrap/templates/` 提供。
-- 普通聊天记忆位于 Agent 根目录 `.yy/memory/`；Harness 专属记忆位于 `.yy/harness-evolution/memory/`。两者都不写入目标 workspace。普通 Session 按 workspace 路径哈希分区；Harness 每次更新使用独立 Session，并只跨更新共享四个固定 Markdown。
+- 普通聊天记忆位于 Agent Home 的 `.yy/memory/`；Harness 专属记忆位于 `.yy/harness-evolution/memory/`。两者都不写入目标 workspace。普通 Session 按 workspace 路径哈希分区；Harness 每次更新使用独立 Session，并只跨更新共享四个固定 Markdown。
 - Session JSONL、Session 索引和 Profile 索引读取时均经过 Pydantic 校验；非法角色、损坏的工具链关联或错误索引会明确失败，不会静默污染下一轮上下文。
 - 首次运行自动创建 `profile/USER.md`、`profile/RESEARCH.md`、`profile/OTHERS.md` 和索引。普通命名的扩展 Profile 全局加载；16 位会话哈希命名的 Profile 只注入对应 Session，避免跨会话污染。
 - 新模型实现 `Agent.contracts.ModelProvider`；新工具实现 `tools.AsyncTool`；新回调通过 `HookRegistry.register()` 或 `HookRegistry.on()` 注册。
 - 文件读取、搜索和写入必须使用 Runtime 注入的跨进程锁；写文件、Docker Bash 和 checkpoint 回溯还必须通过审批回调。写入路径不能越出项目工作区，Bash 不允许在宿主机执行。
-- Web 只监听 `127.0.0.1`，访问令牌随机生成，所有响应禁止缓存。
+- Gateway/Web 只监听 `127.0.0.1`；256 位以上访问令牌保存在 Agent Home，浏览器使用一次性启动码、HttpOnly Cookie、CSRF、Origin 白名单、安全响应头与禁止缓存。`ChannelAdapter` 只预留未来飞书等渠道所需的身份映射、收发、审批和路由协议，本阶段没有公网监听或飞书实现。
 
 ## 常见问题
 

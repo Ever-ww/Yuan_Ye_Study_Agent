@@ -1,0 +1,305 @@
+"""FastAPI 本机 API、WebSocket 事件桥和共享 Web 入口。"""
+
+import asyncio
+import secrets
+import shutil
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+from Agent import load_runtime_config
+from gateway.application import GatewayApplication
+from gateway.models import (
+    ApprovalDecision,
+    BrowserExchangeRequest,
+    ProjectCreateRequest,
+    RunCreateRequest,
+    SkillManageRequest,
+)
+from gateway.security import GatewayCredentials, bearer_value
+
+
+def create_gateway_api(
+    application: GatewayApplication | None = None,
+    *,
+    access_token: str | None = None,
+) -> Any:
+    try:
+        from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+        from fastapi.responses import FileResponse, HTMLResponse
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Gateway API 需要安装 fastapi") from exc
+
+    config = application.config if application is not None else load_runtime_config()
+    gateway = application or GatewayApplication(config)
+    token = access_token or GatewayCredentials(config.agent_root / ".yy" / "gateway").load_or_create()
+    csrf_token = secrets.token_urlsafe(32)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        await gateway.start()
+        try:
+            yield
+        finally:
+            await gateway.close()
+
+    app = FastAPI(lifespan=lifespan)
+
+    @app.exception_handler(KeyError)
+    async def key_error_handler(request, exc):
+        del request
+        return _json_response({"detail": str(exc)}, 404)
+
+    @app.exception_handler(PermissionError)
+    async def permission_error_handler(request, exc):
+        del request
+        return _json_response({"detail": str(exc)}, 403)
+
+    @app.exception_handler(ValueError)
+    async def value_error_handler(request, exc):
+        del request
+        return _json_response({"detail": str(exc)}, 400)
+
+    @app.exception_handler(RuntimeError)
+    async def runtime_error_handler(request, exc):
+        del request
+        return _json_response({"detail": str(exc)}, 409)
+
+    def authorize(
+        authorization: str | None = Header(default=None),
+        yy_gateway: str | None = Cookie(default=None),
+    ) -> str:
+        supplied = bearer_value(authorization) or yy_gateway
+        if supplied is None or not secrets.compare_digest(supplied, token):
+            raise HTTPException(401, "Gateway 访问凭据无效")
+        return supplied
+
+    def authorize_write(
+        request: Request,
+        authorization: str | None = Header(default=None),
+        yy_gateway: str | None = Cookie(default=None),
+        x_csrf_token: str | None = Header(default=None),
+    ) -> str:
+        supplied = authorize(authorization, yy_gateway)
+        if bearer_value(authorization) is None and not secrets.compare_digest(x_csrf_token or "", csrf_token):
+            raise HTTPException(403, "CSRF 校验失败")
+        origin = request.headers.get("origin")
+        if origin and origin not in {
+            f"http://127.0.0.1:{config.gateway_port}",
+            f"http://localhost:{config.gateway_port}",
+            "tauri://localhost",
+            "http://tauri.localhost",
+        }:
+            raise HTTPException(403, "Origin 不在本机客户端白名单")
+        return supplied
+
+    @app.middleware("http")
+    async def security_headers(request, call_next):
+        response = await call_next(request)
+        response.headers.update({
+            "Cache-Control": "no-store",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+            "Content-Security-Policy": (
+                "default-src 'self'; connect-src 'self' ws://127.0.0.1:* ws://localhost:* "
+                "tauri: ipc:; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+            ),
+        })
+        return response
+
+    @app.get("/api/v1/health")
+    async def health():
+        return {
+            "status": "ok",
+            "service": "yuan-ye-agent-gateway",
+            "version": 1,
+        }
+
+    @app.get("/api/v1/status", dependencies=[Depends(authorize)])
+    async def status():
+        return {
+            "gateway": "running",
+            "version": 1,
+            "provider": config.provider,
+            "model": config.model,
+            "stream": config.stream,
+            "sandbox": shutil.which("docker") is not None,
+            "max_concurrent_runs": config.gateway_max_concurrent_runs,
+        }
+
+    @app.get("/api/v1/bootstrap", dependencies=[Depends(authorize)])
+    async def bootstrap():
+        return {"csrf": csrf_token}
+
+    @app.post("/api/v1/projects", dependencies=[Depends(authorize_write)])
+    async def create_project(payload: ProjectCreateRequest):
+        return gateway.register_project(Path(payload.path), payload.name)
+
+    @app.get("/api/v1/projects", dependencies=[Depends(authorize)])
+    async def list_projects():
+        return gateway.store.list_projects()
+
+    @app.delete("/api/v1/projects/{project_id}", dependencies=[Depends(authorize_write)])
+    async def delete_project(project_id: str):
+        gateway.store.remove_project(project_id)
+        return {"removed": True}
+
+    @app.get("/api/v1/projects/{project_id}/sessions", dependencies=[Depends(authorize)])
+    async def list_sessions(project_id: str):
+        return gateway.sessions(project_id)
+
+    @app.get("/api/v1/projects/{project_id}/sessions/{session_id}", dependencies=[Depends(authorize)])
+    async def show_session(project_id: str, session_id: str):
+        return gateway.session_records(project_id, session_id)
+
+    @app.post("/api/v1/runs", dependencies=[Depends(authorize_write)])
+    async def start_run(payload: RunCreateRequest):
+        return await gateway.start_run(payload)
+
+    @app.get("/api/v1/runs", dependencies=[Depends(authorize)])
+    async def list_runs(project_id: str | None = None):
+        return gateway.store.list_runs(project_id)
+
+    @app.get("/api/v1/runs/{run_id}", dependencies=[Depends(authorize)])
+    async def get_run(run_id: str):
+        return gateway.store.run(run_id)
+
+    @app.post("/api/v1/runs/{run_id}/cancel", dependencies=[Depends(authorize_write)])
+    async def cancel_run(run_id: str):
+        return {"cancelled": await gateway.cancel_run(run_id)}
+
+    @app.get("/api/v1/runs/{run_id}/events", dependencies=[Depends(authorize)])
+    async def run_events(run_id: str, after_sequence: int = 0):
+        return gateway.store.read_events(run_id, after_sequence)
+
+    @app.post("/api/v1/approvals/{approval_id}", dependencies=[Depends(authorize_write)])
+    async def approval(approval_id: str, decision: ApprovalDecision):
+        return {"approved": await gateway.decide_approval(approval_id, decision)}
+
+    @app.get("/api/v1/inbox", dependencies=[Depends(authorize)])
+    async def inbox(unread_only: bool = False):
+        return gateway.store.list_inbox(unread_only=unread_only)
+
+    @app.post("/api/v1/inbox/{item_id}/read", dependencies=[Depends(authorize_write)])
+    async def read_inbox(item_id: str):
+        return gateway.store.mark_inbox_read(item_id)
+
+    @app.get("/api/v1/projects/{project_id}/skills", dependencies=[Depends(authorize)])
+    async def skills(project_id: str):
+        return gateway.skills(project_id).catalog()
+
+    @app.post("/api/v1/projects/{project_id}/skills/refresh", dependencies=[Depends(authorize_write)])
+    async def refresh_skills(project_id: str):
+        catalog = gateway.skills(project_id).catalog()
+        gateway.pool.refresh_skills(project_id)
+        return {"count": len(catalog)}
+
+    @app.get("/api/v1/projects/{project_id}/skills/audit/{review_id}", dependencies=[Depends(authorize)])
+    async def audit_skill(project_id: str, review_id: str):
+        return gateway.skills(project_id).audit_report(review_id)
+
+    @app.post("/api/v1/skills/manage", dependencies=[Depends(authorize_write)])
+    async def manage_skill(payload: SkillManageRequest):
+        return await gateway.manage_skill(payload)
+
+    @app.post("/api/v1/browser/code", dependencies=[Depends(authorize_write)])
+    async def browser_code():
+        code = gateway.issue_browser_code()
+        return {"url": f"http://127.0.0.1:{config.gateway_port}/?bootstrap={code}"}
+
+    @app.post("/api/v1/browser/exchange")
+    async def browser_exchange(payload: BrowserExchangeRequest, response: Response):
+        if not gateway.consume_browser_code(payload.code):
+            raise HTTPException(401, "浏览器启动码无效或已过期")
+        response.set_cookie(
+            "yy_gateway",
+            token,
+            httponly=True,
+            samesite="strict",
+            secure=False,
+            max_age=86400,
+        )
+        return {"csrf": csrf_token}
+
+    @app.websocket("/api/v1/events")
+    async def events(socket: WebSocket):
+        supplied = socket.query_params.get("token") or socket.cookies.get("yy_gateway")
+        client_id = socket.query_params.get("client_id") or ""
+        run_id = socket.query_params.get("run_id") or None
+        try:
+            after_sequence = int(socket.query_params.get("after_sequence") or "0")
+        except ValueError:
+            await socket.close(code=1008)
+            return
+        if not client_id or not supplied or not secrets.compare_digest(supplied, token):
+            await socket.close(code=1008)
+            return
+        origin = socket.headers.get("origin")
+        if origin and origin not in {
+            f"http://127.0.0.1:{config.gateway_port}",
+            f"http://localhost:{config.gateway_port}",
+            "tauri://localhost",
+            "http://tauri.localhost",
+        }:
+            await socket.close(code=1008)
+            return
+        await socket.accept()
+        gateway.store.client_connected(client_id)
+        subscription_id, queue = await gateway.events.subscribe(client_id, run_id)
+        try:
+            last_sent = after_sequence
+            if run_id:
+                for event in gateway.store.read_events(run_id, after_sequence):
+                    await socket.send_text(event.model_dump_json())
+                    last_sent = max(last_sent, event.sequence)
+            while True:
+                event = await queue.get()
+                if event.run_id == run_id and event.sequence <= last_sent:
+                    continue
+                await socket.send_text(event.model_dump_json())
+                if event.run_id == run_id:
+                    last_sent = event.sequence
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+        finally:
+            await gateway.events.unsubscribe(subscription_id)
+            if not await gateway.events.is_connected(client_id):
+                gateway.store.client_disconnected(client_id)
+                await gateway.disconnect_client(client_id)
+
+    ui_dist = Path(__file__).resolve().parents[1] / "ui" / "dist"
+    legacy = Path(__file__).resolve().parents[1] / "run_ui"
+
+    @app.get("/")
+    async def index(bootstrap: str | None = None):
+        del bootstrap
+        path = ui_dist / "index.html"
+        if path.exists():
+            return FileResponse(path, media_type="text/html")
+        fallback = legacy / "templates" / "index.html"
+        if fallback.exists():
+            return FileResponse(fallback, media_type="text/html")
+        return HTMLResponse("<h1>Yuan Ye Gateway</h1><p>前端尚未构建。</p>")
+
+    @app.get("/assets/{asset_path:path}")
+    async def assets(asset_path: str):
+        target = (ui_dist / "assets" / asset_path).resolve()
+        assets_root = (ui_dist / "assets").resolve()
+        if assets_root in target.parents and target.is_file():
+            return FileResponse(target)
+        fallback = (legacy / "static" / asset_path).resolve()
+        fallback_root = (legacy / "static").resolve()
+        if fallback_root not in fallback.parents or not fallback.is_file():
+            raise HTTPException(404, "资源不存在")
+        return FileResponse(fallback)
+
+    app.state.gateway = gateway
+    app.state.access_token = token
+    app.state.csrf_token = csrf_token
+    return app
+
+
+def _json_response(value: dict[str, Any], status_code: int):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(value, status_code=status_code)

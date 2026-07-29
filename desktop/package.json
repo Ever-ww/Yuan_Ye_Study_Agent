@@ -1,0 +1,13 @@
+{
+  "name": "yuan-ye-desktop",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "tauri": "tauri",
+    "build": "npm --prefix ../ui run build && tauri build",
+    "dev": "npm --prefix ../ui run dev & tauri dev"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.4"
+  }
+}

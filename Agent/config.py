@@ -33,6 +33,9 @@ class RuntimeConfig(BaseModel):
     tool_output_head_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
     tool_output_tail_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
     sandbox_checkpoint_limit: StrictInt = Field(default=17, ge=1)
+    gateway_port: StrictInt = Field(default=8765, ge=1024, le=65535)
+    gateway_max_concurrent_runs: StrictInt = Field(default=4, ge=1, le=32)
+    gateway_runtime_idle_seconds: StrictInt = Field(default=900, ge=30)
 
     @field_validator("agent_root", "workspace_root")
     @classmethod
@@ -93,5 +96,10 @@ def load_runtime_config(
 
 
 def default_agent_root() -> Path:
-    """返回 Agent 源码/安装根目录；模型配置和记忆固定保存在这里。"""
-    return Path(__file__).resolve().parents[1]
+    """返回安装版统一 Agent Home，并非当前用户 workspace。"""
+    from bootstrap import migrate_source_home, platform_agent_home
+
+    source_root = Path(__file__).resolve().parents[1]
+    selected = platform_agent_home()
+    migrate_source_home(source_root, selected)
+    return selected

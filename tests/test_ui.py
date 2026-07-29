@@ -33,8 +33,26 @@ class UiTests(unittest.TestCase):
             session_id = memory.create_session("第一句")
             memory.record_user(session_id, "第一句")
             memory.record_assistant(session_id, "第一答")
+
+            class FakeGatewayClient:
+                async def register_project(self, path):
+                    del path
+                    return {"project_id": "project"}
+
+                async def sessions(self, project_id):
+                    del project_id
+                    return memory.list_sessions()
+
+                async def session(self, project_id, selected_session):
+                    del project_id
+                    return memory.session_records(selected_session)
+
+                async def inbox(self, unread_only=False):
+                    del unread_only
+                    return []
+
             runner = CliRunner()
-            with patch("run_ui.cli._memory", return_value=memory):
+            with patch("run_ui.cli._gateway_client", return_value=FakeGatewayClient()):
                 listed = runner.invoke(app, ["session", "list"])
                 shown = runner.invoke(app, ["session", "show", session_id])
                 missing = runner.invoke(app, ["chat", "--session", "missing-session"])

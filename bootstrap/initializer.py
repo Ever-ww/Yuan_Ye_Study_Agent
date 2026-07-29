@@ -56,6 +56,8 @@ def initialize_project(project_root: Path) -> Path:
     (project_root / "skills").mkdir(parents=True, exist_ok=True)
     for directory in ("review", "audit", "backups"):
         (yy / "skills" / directory).mkdir(parents=True, exist_ok=True)
+    for directory in ("runs",):
+        (yy / "gateway" / directory).mkdir(parents=True, exist_ok=True)
     skill_index = yy / "skills" / "index.json"
     if not skill_index.exists():
         skill_index.write_text(
