@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 
-from Agent import AgentRuntime, EventType, ModelRetryPolicy, load_runtime_config
+from Agent import AgentRuntime, EventType, ExtensionCatalog, ModelRetryPolicy, load_runtime_config
 from gateway.approval import GatewayApprovalBroker
 from gateway.events import GatewayEventBus
 from gateway.models import ApprovalRequest, RunRecord, now_iso
@@ -37,6 +37,7 @@ class RuntimePool:
         max_concurrent_runs: int = 4,
         idle_timeout_seconds: int = 900,
         runtime_factory: RuntimeFactory | None = None,
+        extensions: ExtensionCatalog | None = None,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.store = store
@@ -44,6 +45,7 @@ class RuntimePool:
         self.max_concurrent_runs = max_concurrent_runs
         self.idle_timeout_seconds = idle_timeout_seconds
         self.runtime_factory = runtime_factory or self._default_runtime
+        self.extensions = extensions
         self.approvals = GatewayApprovalBroker(
             store,
             self._publish_approval,
@@ -207,6 +209,7 @@ class RuntimePool:
             approval=approvals,
             retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=2),
             raise_errors=True,
+            extensions=self.extensions,
         )
 
     async def _emit(self, run: RunRecord, event_type: str, payload: dict) -> None:

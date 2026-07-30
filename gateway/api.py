@@ -12,6 +12,8 @@ from gateway.application import GatewayApplication
 from gateway.models import (
     ApprovalDecision,
     BrowserExchangeRequest,
+    CodeSessionCreateRequest,
+    CodeTurnRequest,
     ProjectCreateRequest,
     RunCreateRequest,
     SkillManageRequest,
@@ -124,6 +126,11 @@ def create_gateway_api(
             "provider": config.provider,
             "model": config.model,
             "stream": config.stream,
+            "proxy_mode": (
+                "explicit" if config.proxy_url
+                else "system" if config.use_system_proxy
+                else "disabled"
+            ),
             "sandbox": shutil.which("docker") is not None,
             "max_concurrent_runs": config.gateway_max_concurrent_runs,
         }
@@ -168,6 +175,26 @@ def create_gateway_api(
     @app.post("/api/v1/runs/{run_id}/cancel", dependencies=[Depends(authorize_write)])
     async def cancel_run(run_id: str):
         return {"cancelled": await gateway.cancel_run(run_id)}
+
+    @app.post("/api/v1/code/sessions", dependencies=[Depends(authorize_write)])
+    async def start_code_session(payload: CodeSessionCreateRequest):
+        return await gateway.start_code_session(payload)
+
+    @app.post("/api/v1/code/sessions/{session_id}/turns", dependencies=[Depends(authorize_write)])
+    async def run_code_turn(session_id: str, payload: CodeTurnRequest):
+        return await gateway.run_code_turn(session_id, payload)
+
+    @app.post("/api/v1/code/sessions/{session_id}/finalize", dependencies=[Depends(authorize_write)])
+    async def finalize_code_session(session_id: str, client_id: str):
+        return await gateway.finalize_code_session(session_id, client_id)
+
+    @app.post("/api/v1/code/sessions/{session_id}/abort", dependencies=[Depends(authorize_write)])
+    async def abort_code_session(session_id: str, client_id: str):
+        return await gateway.abort_code_session(session_id, client_id)
+
+    @app.get("/api/v1/code/sessions/{session_id}/events", dependencies=[Depends(authorize)])
+    async def code_session_events(session_id: str, after_sequence: int = 0):
+        return gateway.code_session_events(session_id, after_sequence)
 
     @app.get("/api/v1/runs/{run_id}/events", dependencies=[Depends(authorize)])
     async def run_events(run_id: str, after_sequence: int = 0):

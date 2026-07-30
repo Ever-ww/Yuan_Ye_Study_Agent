@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from .bash import BashTool
 from .calculator import CalculatorTool
 from .current_time import CurrentTimeTool
+from .edit import EditTool
 from .read_file import ReadFileTool
 from .registry import AsyncToolRegistry
 from .sandbox_rollback import SandboxRollbackTool
@@ -13,7 +14,7 @@ from .search_workspace import SearchWorkspaceTool
 from .skill_install import SkillInstallTool
 from .skill_read import SkillReadTool
 from .subagent import SubagentRunner, SubagentTool
-from .write_file import WriteFileTool
+from .write import WriteTool
 
 if TYPE_CHECKING:
     from skill import SkillService
@@ -36,7 +37,8 @@ def default_tools(
     del project_root  # 保留正式构造接口，工具执行时以 ToolContext 为安全边界。
     builtins = [
         ReadFileTool(),
-        WriteFileTool(),
+        EditTool(),
+        WriteTool(),
         BashTool(),
         SandboxRollbackTool(),
         CalculatorTool(),

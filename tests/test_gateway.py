@@ -17,7 +17,7 @@ from gateway.api import create_gateway_api
 from gateway.application import GatewayApplication
 from gateway.approval import GatewayApprovalBroker
 from gateway.events import GatewayEventBus
-from gateway.models import RunCreateRequest
+from gateway.models import CodeFinalizeResult, CodeSessionRecord, CodeTurnResult, RunCreateRequest
 from gateway.runtime_pool import RuntimePool
 from gateway.store import GatewayStore
 from gateway.process import GatewayProcessManager, InstanceLock
@@ -70,7 +70,95 @@ class TrackingRuntime(FakeRuntime):
             self.tracker.active -= 1
 
 
+class FakeCodeSessions:
+    async def start(self, project_id: str, client_id: str):
+        return CodeSessionRecord(
+            code_session_id="c" * 32,
+            project_id=project_id,
+            client_id=client_id,
+            source_root="D:/source",
+            worktree_path="D:/agent/.yy/worktree",
+            branch="harness-code/test",
+            base_commit="a" * 40,
+            status="active",
+            verified_turns=0,
+        )
+
+    async def run_turn(self, session_id: str, client_id: str, task: str):
+        del client_id, task
+        return CodeTurnResult(
+            code_session_id=session_id,
+            status="verified",
+            message="ok",
+            test_file="tests/extensions/test_x.py",
+            attempts=1,
+            commit="b" * 40,
+        )
+
+    async def finalize(self, session_id: str, client_id: str):
+        del client_id
+        return CodeFinalizeResult(
+            code_session_id=session_id,
+            status="merged",
+            message="merged",
+            merged=True,
+        )
+
+    async def abort(self, session_id: str, client_id: str):
+        del client_id
+        return CodeFinalizeResult(
+            code_session_id=session_id,
+            status="aborted",
+            message="aborted",
+        )
+
+    def events(self, session_id: str, after_sequence: int = 0):
+        del session_id
+        return [
+            {"version": 1, "sequence": 2, "record_type": "code_test"}
+        ] if after_sequence < 2 else []
+
+    async def close(self) -> None:
+        return None
+
+
 class GatewayTests(unittest.TestCase):
+    def test_code_session_api_create_turn_events_and_finalize(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            application = GatewayApplication(
+                load_runtime_config(root),
+                runtime_factory=lambda workspace, approval: FakeRuntime(workspace),
+            )
+            application.code_sessions = FakeCodeSessions()
+            project = application.register_project(root)
+            headers = {"Authorization": "Bearer test-token"}
+            with TestClient(create_gateway_api(application, access_token="test-token")) as client:
+                created = client.post(
+                    "/api/v1/code/sessions",
+                    headers=headers,
+                    json={"project_id": project.project_id, "client_id": "code-client"},
+                )
+                self.assertEqual(created.status_code, 200)
+                session_id = created.json()["code_session_id"]
+                turn = client.post(
+                    f"/api/v1/code/sessions/{session_id}/turns",
+                    headers=headers,
+                    json={"client_id": "code-client", "task": "新增审计扩展"},
+                )
+                self.assertEqual(turn.json()["status"], "verified")
+                events = client.get(
+                    f"/api/v1/code/sessions/{session_id}/events",
+                    headers=headers,
+                )
+                self.assertEqual(events.json()[0]["record_type"], "code_test")
+                finalized = client.post(
+                    f"/api/v1/code/sessions/{session_id}/finalize",
+                    headers=headers,
+                    params={"client_id": "code-client"},
+                )
+                self.assertTrue(finalized.json()["merged"])
+
     def test_store_persists_replayable_monotonic_events_and_inbox(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
@@ -273,7 +361,7 @@ class GatewayTests(unittest.TestCase):
             broker = GatewayApprovalBroker(store, publish)
             token = broker.bind_run(run.run_id, "origin-client")
             try:
-                waiting = asyncio.create_task(broker("write_file", {"path": "demo.txt"}))
+                waiting = asyncio.create_task(broker("write", {"path": "demo.txt"}))
                 await published.wait()
                 self.assertEqual(await broker.deny_client("origin-client"), 1)
                 return await waiting
@@ -299,7 +387,7 @@ class GatewayTests(unittest.TestCase):
             broker = GatewayApprovalBroker(store, publish, disconnected)
             token = broker.bind_run(run.run_id, "missing-client")
             try:
-                return await broker("write_file", {"path": "demo.txt"})
+                return await broker("write", {"path": "demo.txt"})
             finally:
                 broker.reset_run(token)
 

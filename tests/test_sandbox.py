@@ -78,7 +78,7 @@ class SandboxTests(unittest.TestCase):
             without_checkpoint = ToolContext(project_root=root, approval=approve)
             with self.assertRaisesRegex(RuntimeError, "未启用 checkpoint"):
                 await registry.execute(
-                    "write_file",
+                    "write",
                     {"path": "must-not-exist.txt", "content": "x"},
                     without_checkpoint,
                 )
@@ -202,7 +202,7 @@ class SandboxTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             asyncio.run(check(Path(value)))
 
-    def test_write_file_creates_checkpoint_and_rollback_restores_workspace(self) -> None:
+    def test_write_creates_checkpoint_and_rollback_restores_workspace(self) -> None:
         async def check(root: Path) -> None:
             fake = _FakeDocker(root)
             sandbox = DockerSandboxSession(root, command_runner=fake)
@@ -219,27 +219,64 @@ class SandboxTests(unittest.TestCase):
                 file_locks=sandbox.file_locks,
             )
             first = await registry.execute(
-                "write_file",
+                "write",
                 {"path": "note.txt", "content": "第一版"},
                 context,
             )
             self.assertIn("checkpoint", first)
             count = len(sandbox.list_checkpoints())
             unchanged = await registry.execute(
-                "write_file",
+                "write",
                 {"path": "note.txt", "content": "第一版"},
                 context,
             )
             self.assertIn("未创建 checkpoint", unchanged)
             self.assertEqual(len(sandbox.list_checkpoints()), count)
             await registry.execute(
-                "write_file",
+                "write",
                 {"path": "note.txt", "content": "第二版"},
                 context,
             )
             result = await registry.execute("sandbox_rollback", {"steps": 1}, context)
             self.assertIn("已恢复 checkpoint", result)
             self.assertEqual((root / "note.txt").read_text(encoding="utf-8"), "第一版")
+            await sandbox.close()
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(check(Path(value)))
+
+    def test_edit_creates_an_edit_checkpoint(self) -> None:
+        async def check(root: Path) -> None:
+            fake = _FakeDocker(root)
+            sandbox = DockerSandboxSession(root, command_runner=fake)
+            await sandbox.start("edit-session")
+            (root / "note.txt").write_text("before", encoding="utf-8")
+            sandbox.checkpoints.create("fixture", force=True)
+
+            async def approve(name, arguments) -> bool:
+                del name, arguments
+                return True
+
+            registry = default_tools(root)
+            context = ToolContext(
+                project_root=root,
+                approval=approve,
+                sandbox=sandbox,
+                file_locks=sandbox.file_locks,
+            )
+            result = await registry.execute(
+                "edit",
+                {
+                    "path": "note.txt",
+                    "edits": [{"oldText": "before", "newText": "after"}],
+                },
+                context,
+            )
+            latest = sandbox.list_checkpoints()[-1]
+            self.assertEqual(latest.source, "edit")
+            self.assertEqual(latest.metadata, {"path": "note.txt"})
+            self.assertEqual((root / "note.txt").read_text(encoding="utf-8"), "after")
+            self.assertIn(latest.commit_sha, result)
             await sandbox.close()
 
         with tempfile.TemporaryDirectory() as value:
@@ -256,7 +293,7 @@ class SandboxTests(unittest.TestCase):
             self.assertIsNotNone(oldest)
             for number in range(1, 5):
                 (root / "value.txt").write_text(str(number), encoding="utf-8")
-                store.create("write_file", {"number": number})
+                store.create("write", {"number": number})
             self.assertEqual(len(store.list()), 3)
             git_dir = root / ".yy" / "sandbox" / "checkpoints" / "limit-session" / "repository.git"
             missing = subprocess.run(
@@ -286,7 +323,7 @@ class SandboxTests(unittest.TestCase):
             store.open("external-workspace")
             store.create("trace_start", force=True)
             target.write_text("修改内容", encoding="utf-8")
-            store.create("write_file")
+            store.create("write")
             target.write_text("未提交内容", encoding="utf-8")
             store.restore_current()
 
@@ -319,7 +356,7 @@ class SandboxTests(unittest.TestCase):
             store.open("head-session")
             store.create("trace_start", force=True)
             (root / "tracked.txt").write_text("after", encoding="utf-8")
-            store.create("write_file")
+            store.create("write")
             after = subprocess.run(
                 ["git", "-C", str(root), "rev-parse", "HEAD"],
                 check=True,

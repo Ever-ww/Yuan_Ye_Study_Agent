@@ -152,7 +152,7 @@ class _CodingWriteProvider:
         del tools
         if not any(message.get("role") == "tool" for message in messages):
             return ModelReply(tool_calls=(ToolCall(
-                name="write_file",
+                name="write",
                 arguments={"path": "fixed.py", "content": "FIXED = True\n"},
             ),))
         return ModelReply(text="已完成隔离修复")
@@ -598,7 +598,7 @@ class ResilienceTests(unittest.TestCase):
             names = {schema["name"] for schema in runtime.tools.schemas()}
             self.assertTrue({
                 "read_file",
-                "write_file",
+                "write",
                 "search_workspace",
                 "bash",
                 "sandbox_rollback",

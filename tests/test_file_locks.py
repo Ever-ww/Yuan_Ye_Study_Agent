@@ -108,7 +108,7 @@ class FileLockTests(unittest.TestCase):
             )
             registry = default_tools(root)
             writer = asyncio.create_task(registry.execute(
-                "write_file",
+                "write",
                 {"path": "shared.txt", "content": "完整的新内容"},
                 context,
             ))
@@ -143,13 +143,13 @@ class FileLockTests(unittest.TestCase):
             )
             registry = default_tools(root)
             first = asyncio.create_task(registry.execute(
-                "write_file",
+                "write",
                 {"path": "same.txt", "content": "第一版"},
                 context,
             ))
             await asyncio.wait_for(sandbox.entered.wait(), timeout=2)
             second = asyncio.create_task(registry.execute(
-                "write_file",
+                "write",
                 {"path": "same.txt", "content": "第二版"},
                 context,
             ))
@@ -180,7 +180,7 @@ class FileLockTests(unittest.TestCase):
             )
             registry = default_tools(root)
             writer = asyncio.create_task(registry.execute(
-                "write_file",
+                "write",
                 {"path": "writing.txt", "content": "写入中"},
                 context,
             ))
@@ -212,7 +212,7 @@ class FileLockTests(unittest.TestCase):
             )
             registry = default_tools(root)
             writer = asyncio.create_task(registry.execute(
-                "write_file",
+                "write",
                 {"path": "search.txt", "content": "唯一检索内容"},
                 context,
             ))

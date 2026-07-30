@@ -21,7 +21,9 @@ dist/
 *.egg-info/
 node_modules/
 ui/dist/
+ui/*.tsbuildinfo
 desktop/src-tauri/target/
+desktop/src-tauri/gen/
 desktop/src-tauri/binaries/*
 !desktop/src-tauri/binaries/.gitkeep
 .idea/
@@ -44,3 +46,5 @@ tests/error/*.log
 # Python 字节码缓存。
 __pycache__/
 *.py[cod]
+
+.VSCodeCounter

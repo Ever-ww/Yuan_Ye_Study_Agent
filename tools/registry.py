@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable, Literal
+from typing import Annotated, Any, Iterable, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError, create_model
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
 from .contracts import AsyncTool, ToolContext, ToolRisk
 
@@ -65,7 +65,8 @@ class AsyncToolRegistry:
             raise ValueError(f"未知工具：{name}")
         if arguments is None:
             return tool.risk
-        return self._resolved_risk(tool, self._validate(name, arguments))
+        prepared = self.prepare_arguments(name, arguments)
+        return self._resolved_risk(tool, self._validate(name, prepared))
 
     @staticmethod
     def _resolved_risk(tool: AsyncTool, arguments: dict[str, Any]) -> ToolRisk:
@@ -82,12 +83,26 @@ class AsyncToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             raise ValueError(f"未知工具：{name}")
+        arguments = self.prepare_arguments(name, arguments)
         arguments = self._validate(name, arguments)
         needs_approval = self._resolved_risk(tool, arguments) != "read"
         if needs_approval:
             if context.approval is None or not await context.approval(name, arguments):
                 raise PermissionError(f"工具调用未获批准：{name}")
         return await tool.run(arguments, context)
+
+    def prepare_arguments(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """在 Schema 校验前执行工具声明的兼容性规范化。"""
+        tool = self._tools.get(name)
+        if tool is None:
+            raise ValueError(f"未知工具：{name}")
+        prepare = getattr(tool, "prepare_arguments", None)
+        if not callable(prepare):
+            return dict(arguments)
+        prepared = prepare(dict(arguments))
+        if not isinstance(prepared, dict):
+            raise ValueError(f"工具 {name} 的 prepare_arguments 必须返回对象")
+        return prepared
 
     def _validate(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """用工具 Schema 对应的 Pydantic 模型严格校验实际执行参数。"""
@@ -110,13 +125,40 @@ def _build_argument_model(name: str, schema: dict[str, Any]) -> type[BaseModel]:
     if unknown_required:
         raise ValueError(f"工具 {name} 的 required 包含未知字段：{sorted(unknown_required)[0]}")
 
+    model_name = "ToolArguments_" + re.sub(r"\W+", "_", name)
+    return _build_object_model(
+        model_name,
+        properties,
+        required,
+        tool_name=name,
+    )
+
+
+def _build_object_model(
+    model_name: str,
+    properties: dict[str, Any],
+    required: set[str],
+    *,
+    tool_name: str,
+) -> type[BaseModel]:
+    """递归创建严格对象模型，使数组中的对象也在审批前完成校验。"""
+    unknown_required = required.difference(properties)
+    if unknown_required:
+        raise ValueError(
+            f"工具 {tool_name} 的 required 包含未知字段：{sorted(unknown_required)[0]}",
+        )
     fields: dict[str, tuple[Any, Any]] = {}
     for field_name, definition in properties.items():
         if not isinstance(definition, dict):
-            raise ValueError(f"工具 {name} 的字段 {field_name} 定义必须是对象")
-        annotation = _schema_type(definition)
+            raise ValueError(f"工具 {tool_name} 的字段 {field_name} 定义必须是对象")
+        safe_field_name = re.sub(r"\W+", "_", field_name)
+        nested_name = f"{model_name}_{safe_field_name}"
+        annotation = _schema_type(
+            definition,
+            model_name=nested_name,
+            tool_name=tool_name,
+        )
         fields[field_name] = (annotation, ... if field_name in required else None)
-    model_name = "ToolArguments_" + re.sub(r"\W+", "_", name)
     return create_model(
         model_name,
         __config__=ConfigDict(extra="forbid", strict=True),
@@ -124,7 +166,12 @@ def _build_argument_model(name: str, schema: dict[str, Any]) -> type[BaseModel]:
     )
 
 
-def _schema_type(definition: dict[str, Any]) -> Any:
+def _schema_type(
+    definition: dict[str, Any],
+    *,
+    model_name: str,
+    tool_name: str,
+) -> Any:
     """转换工具参数目前支持的字符串、数组、数值、布尔和对象类型。"""
     kind = definition.get("type")
     if kind == "string":
@@ -133,7 +180,24 @@ def _schema_type(definition: dict[str, Any]) -> Any:
             return Literal.__getitem__(tuple(allowed))
         return str
     if kind == "array":
-        item_type = _schema_type(definition.get("items", {}))
+        item_definition = definition.get("items", {})
+        if not isinstance(item_definition, dict):
+            raise ValueError(f"工具 {tool_name} 的数组 items 必须是对象")
+        item_type = _schema_type(
+            item_definition,
+            model_name=f"{model_name}_Item",
+            tool_name=tool_name,
+        )
+        minimum = definition.get("minItems")
+        maximum = definition.get("maxItems")
+        if isinstance(minimum, int) or isinstance(maximum, int):
+            return Annotated[
+                list[item_type],
+                Field(
+                    min_length=minimum if isinstance(minimum, int) else None,
+                    max_length=maximum if isinstance(maximum, int) else None,
+                ),
+            ]
         return list[item_type]
     if kind == "integer":
         return int
@@ -142,5 +206,18 @@ def _schema_type(definition: dict[str, Any]) -> Any:
     if kind == "boolean":
         return bool
     if kind == "object":
-        return dict[str, Any]
+        properties = definition.get("properties")
+        if properties is None:
+            return dict[str, Any]
+        if not isinstance(properties, dict):
+            raise ValueError(f"工具 {tool_name} 的对象 properties 必须是对象")
+        required = definition.get("required", [])
+        if not isinstance(required, list) or not all(isinstance(item, str) for item in required):
+            raise ValueError(f"工具 {tool_name} 的对象 required 必须是字符串数组")
+        return _build_object_model(
+            model_name,
+            properties,
+            set(required),
+            tool_name=tool_name,
+        )
     return Any

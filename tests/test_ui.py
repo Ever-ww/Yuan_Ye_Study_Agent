@@ -102,7 +102,7 @@ class UiTests(unittest.TestCase):
             token = _active_live.set(live)
             try:
                 with patch("run_ui.cli.typer.confirm", return_value=True):
-                    result = await _approve("write_file", {"path": "demo.txt", "content": "测试"})
+                    result = await _approve("write", {"path": "demo.txt", "content": "测试"})
                 return result, live.calls
             finally:
                 _active_live.reset(token)
@@ -127,7 +127,7 @@ class UiTests(unittest.TestCase):
             token = _active_live.set(live)
             try:
                 with patch("run_ui.cli.typer.confirm", side_effect=typer.Abort()):
-                    result = await _approve("write_file", {"path": "demo.txt", "content": "测试"})
+                    result = await _approve("write", {"path": "demo.txt", "content": "测试"})
                 return result, live.calls
             finally:
                 _active_live.reset(token)
@@ -151,7 +151,7 @@ class UiTests(unittest.TestCase):
             async def complete(self, messages, tools):
                 if not any(message.get("role") == "tool" for message in messages):
                     return ModelReply(tool_calls=(ToolCall(
-                        name="write_file",
+                        name="write",
                         arguments={"path": "approval-test.txt", "content": "审批成功"},
                     ),))
                 return ModelReply(text="文件已写入")
@@ -187,12 +187,12 @@ class UiTests(unittest.TestCase):
         )
 
         async def approve_twice() -> tuple[bool, bool]:
-            first = await approval("write_file", {"path": "first.txt"})
-            second = await approval("write_file", {"path": "second.txt"})
+            first = await approval("write", {"path": "first.txt"})
+            second = await approval("write", {"path": "second.txt"})
             return first, second
 
         self.assertEqual(asyncio.run(approve_twice()), (True, True))
-        self.assertEqual(approval.session_allowed_tools, {"write_file"})
+        self.assertEqual(approval.session_allowed_tools, {"write"})
 
     def test_arrow_menu_defaults_to_deny_and_escape_cancels(self) -> None:
         output = io.StringIO()
@@ -200,10 +200,10 @@ class UiTests(unittest.TestCase):
             Console(file=output, force_terminal=True, width=100),
             key_reader=lambda: "enter",
         )
-        self.assertFalse(asyncio.run(approval("write_file", {"path": "denied.txt"})))
+        self.assertFalse(asyncio.run(approval("write", {"path": "denied.txt"})))
 
         escaped = InteractiveApproval(
             Console(file=io.StringIO(), force_terminal=True, width=100),
             key_reader=lambda: "escape",
         )
-        self.assertFalse(asyncio.run(escaped("write_file", {"path": "cancelled.txt"})))
+        self.assertFalse(asyncio.run(escaped("write", {"path": "cancelled.txt"})))

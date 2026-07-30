@@ -2,6 +2,13 @@
 from pathlib import Path
 
 root = Path(SPECPATH).resolve().parent
+if not (root / "run.py").is_file():
+    root = root.parent
+extension_datas = [
+    (str(path), str(path.parent.relative_to(root)))
+    for path in (root / "extension").rglob("*")
+    if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+]
 
 a = Analysis(
     [str(root / "run.py")],
@@ -12,7 +19,8 @@ a = Analysis(
         (str(root / "sandbox" / "Dockerfile"), "sandbox"),
         (str(root / "ui" / "dist"), "ui/dist"),
         (str(root / "run_ui" / "templates"), "run_ui/templates"),
-    ],
+        (str(root / "harness-evolution" / "harness.py"), "harness-evolution"),
+    ] + extension_datas,
     hiddenimports=["uvicorn.logging", "uvicorn.loops.auto", "uvicorn.protocols.http.auto", "uvicorn.protocols.websockets.auto"],
 )
 pyz = PYZ(a.pure)

@@ -315,9 +315,13 @@ async def _chat_gateway(
             return
         if task == "/help":
             console.print(
+                "/code 进入 Hook Extension Coding 模式；"
                 "/compress；/context refresh；/skill list|install|update|audit|refresh；/exit；"
                 "运行中 Ctrl+C 取消当前 Run，空闲时 Ctrl+C 退出客户端。"
             )
+            continue
+        if task == "/code":
+            await _code_mode(client, project_id)
             continue
         if task == "/skill" or task.startswith("/skill "):
             await _handle_gateway_skill_command(client, project_id, task)
@@ -339,6 +343,115 @@ async def _chat_gateway(
             interrupt_controller.clear_active()
         if session_id and not previous_id:
             console.print(f"[dim]会话哈希：{session_id}[/]")
+
+
+async def _code_mode(client: GatewayClient, project_id: str) -> None:
+    """在 Gateway 托管的隔离 worktree 中运行持续 Extension Coding 会话。"""
+    try:
+        with console.status("[cyan]正在创建隔离 Git worktree 和 Coding Runtime…[/]"):
+            session = await client.start_code_session(project_id)
+    except Exception as exc:
+        console.print(Panel(
+            str(exc) or type(exc).__name__,
+            title="无法进入 /code",
+            border_style="red",
+        ))
+        return
+    console.print(
+        Panel(
+            f"worktree: {session.worktree_path}\nbranch: {session.branch}\n"
+            "每条需求都会生成独立测试并完成回归验证。输入 /exit 合并并返回聊天，"
+            "输入 /abort 放弃全部改动。",
+            title="Extension Coding 模式",
+            border_style="cyan",
+        )
+    )
+    while True:
+        try:
+            task = console.input("[bold magenta]Code > [/]").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print(
+                "\n[yellow]Coding Session 已保留，未自动合并。"
+                "Gateway 重启也不会自动合并，请检查上方 worktree。[/]"
+            )
+            return
+        if not task:
+            continue
+        if task in {"/exit", "/quit"}:
+            try:
+                with console.status("[cyan]正在检查并 fast-forward 合并…[/]"):
+                    result = await client.finalize_code_session(session.code_session_id)
+            except Exception as exc:
+                console.print(f"[red]{str(exc) or type(exc).__name__}[/]")
+                continue
+            style = "green" if result.merged or result.status == "no_changes" else "yellow"
+            console.print(f"[{style}]{result.message}[/]")
+            if result.stay_in_code_mode:
+                continue
+            if result.worktree_path:
+                console.print(
+                    f"[dim]保留 worktree：{result.worktree_path}\n分支：{result.branch}[/]"
+                )
+            return
+        if task == "/abort":
+            if not typer.confirm("放弃当前 Coding Session 的全部隔离改动？", default=False):
+                continue
+            result = await client.abort_code_session(session.code_session_id)
+            console.print(f"[yellow]{result.message}[/]")
+            return
+        try:
+            result = await _run_code_turn_with_progress(
+                client, session.code_session_id, task,
+            )
+            style = "green" if result.status == "verified" else "red"
+            console.print(Panel(
+                f"{result.message}\n测试文件：{result.test_file}\n"
+                f"尝试次数：{result.attempts}"
+                + (f"\n临时提交：{result.commit}" if result.commit else "")
+                + (f"\n\nAgent：{result.diagnostic}" if result.diagnostic else ""),
+                title="Coding 验证结果",
+                border_style=style,
+            ))
+        except Exception as exc:
+            console.print(Panel(
+                str(exc) or type(exc).__name__,
+                title="Coding Turn 失败",
+                border_style="red",
+            ))
+
+
+async def _run_code_turn_with_progress(
+    client: GatewayClient,
+    session_id: str,
+    task: str,
+):
+    """轮询持久化 Coding 事件，使长时间生成和测试不会表现为静止。"""
+    pending = asyncio.create_task(client.run_code_turn(session_id, task))
+    sequence = 0
+    labels = {
+        "code_turn_started": "正在分析需求并分配唯一测试文件…",
+        "code_generation": "Coding Agent 正在生成扩展代码…",
+        "code_auto_repair": "测试未通过，Coding Agent 正在自动修复…",
+        "code_test": "控制器正在执行验证命令…",
+        "code_turn_verified": "验证通过，正在创建临时提交…",
+        "code_turn_unverified": "三轮自动修复后仍未通过…",
+    }
+    with console.status("[cyan]正在启动 Coding Turn…[/]") as status:
+        while not pending.done():
+            try:
+                events = await client.code_session_events(
+                    session_id, after_sequence=sequence,
+                )
+                for event in events:
+                    sequence = max(sequence, int(event.get("sequence", 0)))
+                    label = labels.get(str(event.get("record_type", "")))
+                    if label:
+                        status.update(f"[cyan]{label}[/]")
+            except Exception:
+                # 主请求仍在 Gateway 中运行；短暂轮询失败不应取消 Coding Turn。
+                pass
+            await asyncio.sleep(0.5)
+        return await pending
 
 
 async def _handle_gateway_skill_command(

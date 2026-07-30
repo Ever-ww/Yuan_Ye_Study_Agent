@@ -24,6 +24,7 @@ Coding Agent 的记忆位于 Agent 根目录的 `.yy/harness-evolution/memory/`�
 
 ```text
 Agent/      模型适配、异步 ReAct、Runtime、Hook 协议与配置
+extension/  十阶段全局多文件 Hook Extension 与开发契约
 gateway/    单实例后台进程、Runtime 池、本机 API、事件重放、审批与 Inbox
 memory/     记忆领域 Python 服务
 context_process/ Token 阈值压缩、Profile 合并与失败裁剪
@@ -38,7 +39,8 @@ tools/      异步工具协议、注册表和受控内置工具
   defaults.py          默认工具装配入口
   bash.py              Docker 内受限 Bash
   read_file.py         受控文件读取
-  write_file.py        审批后原子写入并创建 checkpoint
+  edit.py              已有文件的精确多块替换并创建 checkpoint
+  write.py             新建或整文件覆盖并创建 checkpoint
   sandbox_rollback.py  审批后恢复本地 checkpoint
   calculator.py        受限四则运算
   search_workspace.py  工作区文本搜索
@@ -152,7 +154,7 @@ cd D:\Ever_workspace\My_Project
 uv run --project $AgentRoot yy-agent chat
 ```
 
-上述命令从平台 Agent Home 的 `.yy/settings.local.json` 读取模型配置，并把该 workspace 的会话写入 Agent Home 的 `.yy/memory/session/<workspace-hash>/`；`My_Project` 不会生成 `.yy`。其他 workspace 看不到也不能恢复这些 Session，但 USER、RESEARCH、OTHERS 和普通扩展 Profile 仍全局共享。`read_file`、`write_file`、搜索、Docker Bash 和回溯只允许操作 `My_Project`，checkpoint 捕获的也是该目录。checkpoint 对象库按 workspace 隔离保存在 Agent Home，不会写进用户项目的 `.git`。
+上述命令从平台 Agent Home 的 `.yy/settings.local.json` 读取模型配置，并把该 workspace 的会话写入 Agent Home 的 `.yy/memory/session/<workspace-hash>/`；`My_Project` 不会生成 `.yy`。其他 workspace 看不到也不能恢复这些 Session，但 USER、RESEARCH、OTHERS 和普通扩展 Profile 仍全局共享。`read_file`、`edit`、`write`、搜索、Docker Bash 和回溯只允许操作 `My_Project`，checkpoint 捕获的也是该目录。checkpoint 对象库按 workspace 隔离保存在 Agent Home，不会写进用户项目的 `.git`。
 
 ### 7. 先进行离线启动验证
 
@@ -191,6 +193,9 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
   "model": "deepseek-chat",
   "base_url": "https://api.deepseek.com",
   "api_key": "你的 API Key",
+  "use_system_proxy": false,
+  "proxy_url": null,
+  "coding_source_root": null,
   "stream": false,
   "max_steps": 8,
   "compression_threshold_tokens": 20000,
@@ -218,9 +223,35 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
 
 `base_url` 允许接入兼容 OpenAI 或 Anthropic 协议的企业网关；未填写时使用 Provider 内置官方地址。`api_key` 未填写时，程序才尝试读取下表所列环境变量。
 
+模型网络请求默认使用 `use_system_proxy=false`，即忽略 Python/HTTPX 可见的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 等环境代理，直接连接模型服务。这可避免 Windows 系统代理或代理软件意外接管并中断 DeepSeek 等服务的 TLS 连接。修改代理配置后需要重启 Gateway，使新建的 Provider 生效。
+
+如需显式复用系统环境代理，设置：
+
+```json
+{
+  "use_system_proxy": true,
+  "proxy_url": null
+}
+```
+
+如需只给 Yuan Ye Agent 指定一个代理，而不读取系统代理环境变量，设置：
+
+```json
+{
+  "use_system_proxy": false,
+  "proxy_url": "http://127.0.0.1:7890"
+}
+```
+
+`use_system_proxy=true` 与非空 `proxy_url` 互斥，程序会拒绝含糊配置。`proxy_url` 当前支持 `http://` 和 `https://` 代理地址；代理地址不会进入 Session 模型审计，审计只记录 `disabled`、`system` 或 `explicit` 模式。
+
 `stream` 控制模型文本是否使用 SSE 实时输出，默认 `false`。设为 `true` 后，OpenAI-compatible Provider（包括 DeepSeek）会逐段显示生成文本；设为 `false` 时等待完整响应后再显示最终答案。Anthropic 当前仍采用完整响应模式。
 
 `max_steps` 表示一次用户任务最多允许发起多少次模型 API 调用。
+
+`coding_source_root` 指定 `/code` 要维护的 Yuan Ye Agent 源码 Git 仓库。默认不需要填写：
+程序依次使用显式配置、`.yy/agent-home-migration.json` 中记录的 `source_root`，
+最后才使用当前 Python 源码根目录。它与普通聊天所操作的 `workspace_root` 是两个独立边界。
 
 `compression_threshold_tokens` 默认是 `20000`。所有具备持久化 Memory 的 Runtime 会在每次 `model_before` 估算即将发送的完整 messages 与 Tool Schema；达到阈值时先压缩已经落盘的历史，再把当前新问题作为独立 `user` 消息写入新分段并调用模型。工具调用及结果会在下一次模型请求前一起参与检查。设为 `0` 可关闭自动压缩，但仍可手动使用 `/compress`。
 
@@ -278,14 +309,47 @@ uv run python run.py chat
 
 - 直接输入任务并按 Enter 发送。
 - `/help` 查看帮助；`/exit` 或 `/quit` 退出。
+
+### 1.1 使用 `/code` 开发 Hook Extension
+
+在普通 `chat` 中输入 `/code`，CLI 会通过 Gateway 为 Yuan Ye 源码仓库创建一个持续
+Coding Session，提示符切换为 `Code >`。源码仓库必须处于正常分支且完全干净；
+系统不会 stash 或覆盖现有未提交内容。
+
+```text
+你 > /code
+Code > 在 tool_after 增加工具耗时统计
+Code > 再为失败结果增加分类字段
+Code > /exit
+你 >
+```
+
+同一次 Coding 模式始终复用同一个隔离 Git worktree、Coding Runtime、短期 Memory、
+上下文压缩、Skill、Subagent、Docker 和 checkpoint。worktree 位于 Agent Home：
+
+```text
+.yy/harness-evolution/worktrees/<source-hash>/<code-session-id>/
+```
+
+每条需求都必须创建或修改 `extension/hook/**` 中的描述性扩展文件，并生成一个由控制器
+指定的唯一 `tests/extensions/test_<name>_<hash>.py`。Coding Agent 会先主动测试，
+控制器随后独立检查修改路径、Extension 契约并执行专项测试、全部 Extension 测试、
+完整 pytest/unittest、compileall、`uv lock --check` 与 `git diff --check`。失败结果
+会回送同一个 Coding Runtime，最多进行三轮自动修复；通过后才在临时分支创建一条提交。
+
+`/exit` 不重新承担首次测试，只会合并已经验证的提交。只有 worktree 无未验证修改、
+源码主工作区仍干净且 HEAD 未变化时，才执行 `git merge --ff-only` 并返回普通聊天。
+未验证修改会拒绝退出合并；主 HEAD 变化时保留 worktree 和分支。输入 `/abort` 可在
+再次确认后放弃整个隔离会话。合并后的扩展需要重启 Gateway 才会加载。
 - 已经开始会话后输入 `/compress`，可立即压缩当前上下文；命令本身不会写入 JSONL。
 - `/context refresh` 重新读取 Agent、Profile 与当前 Session 文件并刷新内存上下文；命令不会写入 JSONL。
 - `/skill list`、`/skill install`、`/skill update`、`/skill audit` 和 `/skill refresh` 管理本机 Skill；安装或更新不会自动修改当前 Prompt，只有 `/skill refresh` 成功后才重新扫描并加载 Skill XML。
 - `stream=true` 时，OpenAI-compatible Provider 会通过 SSE 逐段显示文本。
 - 高风险工具会显示方向键审批菜单：使用 ↑/↓ 选择“允许本次 / 当前会话始终允许该工具 / 拒绝”，按 Enter 确认、Esc 取消，默认选中拒绝。审批由发起任务的客户端优先处理；该客户端断开时待审批操作立即拒绝，后台 Agent 可继续处理错误或结束。
 - `bash` 只在当前 Trace 的无网络 Docker 容器中运行。容器读写挂载启动时的 workspace，因此命令造成的文件变化会立即出现在宿主机；一次成功 Bash 调用无论修改多少文件都只创建一个 checkpoint，没有变化则不创建。
-- `write_file` 仍由宿主机执行原子写入，每次实际内容变化后创建一个 checkpoint；重复写入相同内容不会制造空快照。可让 Agent 调用高风险 `sandbox_rollback` 按步数恢复，执行前仍需审批。
-- `enable_sandbox=False` 只用于没有写工具的压缩或诊断 Runtime。自定义 Runtime 未注入 checkpoint 上下文时，`write_file`、`bash` 和 `sandbox_rollback` 都会明确拒绝，不存在无快照写入旁路。
+- `edit` 参考 PI Agent 的精确编辑语义：一次可提交多个 `{oldText,newText}`，每个 `oldText` 必须在原文件中唯一存在，所有定位都基于修改前的原文且不能重叠；工具保留 UTF-8 BOM 与原换行风格。它适合小范围修改已有文件。
+- `write` 用于创建新文件或明确替换整个文件。`edit` 与 `write` 都在宿主机执行原子替换，每次实际变化后创建一个 checkpoint；内容未变化不会制造空快照。可让 Agent 调用高风险 `sandbox_rollback` 按步数恢复，执行前仍需审批。
+- `enable_sandbox=False` 只用于没有写工具的压缩或诊断 Runtime。自定义 Runtime 未注入 checkpoint 上下文时，`edit`、`write`、`bash` 和 `sandbox_rollback` 都会明确拒绝，不存在无快照写入旁路。
 - 文件工具使用 Agent 根目录 `.yy/sandbox/locks/` 下按 workspace 隔离的跨进程读写锁。同一文件写入时，其他读取和写入会等待到原子替换、checkpoint 或失败恢复全部结束；不同文件的普通读取不会被无关写入阻塞。
 - CLI chat 的单次模型调用遇到临时网络错误时会保留同一份上下文、等待 2 秒后重试，总计最多 3 次；重连成功后继续当前任务，并显示“模型网络连接已恢复”。流式传输中断产生的不完整片段会被丢弃，避免与重试结果拼接；调用成功或进入工具结果后的下一次模型调用时重新计数。
 - 模型或工具正在运行时按 `Ctrl+C` 只终止当前回答，Runtime 和 Session 保持打开，可以立即继续提问。流式模型已经生成并展示的文本会以 `status=cancelled` 的 assistant 消息完整写入 JSONL，并进入下一次模型调用的历史上下文；尚未完成的流式 `tool_call` 增量不会保存。若工具已经正式进入执行阶段，系统会补齐对应的取消结果，保证工具链合法。等待网络重试的 2 秒同样可以取消。CLI 空闲等待输入时按 `Ctrl+C` 则退出整个 chat。
@@ -414,7 +478,9 @@ Skill 遵循 [Agent Skills 规范](https://agentskills.io/specification)。一�
 
 本项目把 Session 视为逻辑上的完整 Trace，不额外创建 Trace 数据模型。概念上，每次真实模型 API 调用对应一个模型 Turn；该响应请求的一个或多个工具在下一次模型调用前完成。Hook 中的 `TURN_START/TURN_END` 则刻意定义为一次完整用户任务的外层边界，任务内可以出现多次 `MODEL_*` 与 `TOOL_*`。两者都不创建实体、不编号，也不向事件或 Session JSONL 写入编号。
 
-统一注册入口是 `Agent/hook.py`，包含以下十个可直接填写代码的异步回调：
+核心注册入口是 `Agent/hook.py`。全局源码扩展由 `Agent/extensions.py` 在 Gateway
+启动时扫描 `extension/hook/`，以下十个阶段各自拥有目录，每个目录可包含任意数量、
+名称不同的 Python 能力文件：
 
 ```text
 trace_start  trace_end
@@ -429,7 +495,7 @@ tool_before  tool_during  tool_after
 
 Checkpoint 不写入 workspace 自身的 `.git`。当 workspace 就是 Agent 根目录时，每个 Session 在 `.yy/sandbox/checkpoints/<session-id>/` 使用独立 Git 对象库；外部 workspace 则保存到 `.yy/sandbox/checkpoints/<workspace-hash>/<session-id>/`。对象库用无父 commit 保存 workspace 快照，因此 workspace 的 `git status`、当前分支和 `git push` 都不会包含这些 commit。回溯采用 hard-reset 语义恢复非忽略文件，workspace 中的 `.git`、`.yy`、`.env*` 等敏感或运行期路径不会进入快照。
 
-文件锁同样不写入项目 `.git`。`read_file` 获取工作区共享锁和目标文件共享锁；`write_file` 按“工作区共享锁 → 写事务独占锁 → 目标文件独占锁”获取，并把锁持有到 checkpoint 完成。搜索会在读取每个文件前获取共享锁。Bash、回溯和 Trace 基线无法预先限定单一文件，因此使用工作区独占锁，期间所有遵循本项目协议的 Agent 文件操作都会等待。
+文件锁同样不写入项目 `.git`。`read_file` 获取工作区共享锁和目标文件共享锁；`edit` 与 `write` 按“工作区共享锁 → 写事务独占锁 → 目标文件独占锁”获取，并把锁持有到 checkpoint 完成。搜索会在读取每个文件前获取共享锁。Bash、回溯和 Trace 基线无法预先限定单一文件，因此使用工作区独占锁，期间所有遵循本项目协议的 Agent 文件操作都会等待。
 
 这些锁覆盖同一项目中的多个 Runtime、CLI 进程和 Subagent，并在进程异常退出时由操作系统自动释放。锁不会阻止普通编辑器、手工 PowerShell 或其他不使用本项目锁协议的程序修改文件。
 
@@ -442,6 +508,12 @@ Checkpoint 不写入 workspace 自身的 `.git`。当 workspace 就是 Agent 根
 `subagent` 的风险等级是 `dynamic`：无工具或只读子集解析为 `read`，包含写入能力时解析为 `write`，由同一个工具 Registry 决定是否审批。委派写能力和实际执行写入分别需要一次批准。临时子 Agent 复用父级完整 `ToolContext`，工作区必须与父 Runtime 一致；它使用空 Memory，不创建独立会话记录，最终输出只作为父 Agent 的普通 `tool` 结果保存。
 
 Hook 注册方式参考 [PI Agent Extensions](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md) 的事件订阅模式：单一入口、可变事件上下文、按注册顺序执行。为保持本项目的安全边界，工具参数被 Hook 修改后仍会重新校验 Schema，这一点比 PI Agent 当前默认行为更严格。
+
+每个扩展文件导出唯一 `EXTENSION_NAME`、`-50..50` 的 `PRIORITY`，以及
+`async def handle(event, context)`。同阶段按优先级、文件名稳定执行；文件名、路径、
+符号链接、重复名称、签名和导入错误都会在启动扫描时明确拒绝。扩展只获得不含凭据的
+`ExtensionContext`。完整字段、阶段数据和跨阶段示例见
+[`extension/README.md`](extension/README.md)。
 
 Runtime 的事件流入口是 `AgentRuntime.run_task()`，表示处理一次用户输入；`AgentRuntime.run()` 返回聚合结果。不要把一次用户任务与模型 Turn 混为一谈。
 
@@ -520,6 +592,13 @@ uv cache dir
 ### Agent 只显示“已收到：…”
 
 这表示仍在使用 `echo` Provider。按“配置真实模型”创建 `.yy/settings.local.json`，设置对应 API Key，然后重新启动命令。
+
+### DeepSeek 通过 Python 请求时 TLS/连接失败，但直连测试可到达服务
+
+程序现在默认 `use_system_proxy=false`，模型请求不会自动使用系统代理。确认本机配置没有把
+它改成 `true`，也没有填写不需要的 `proxy_url`，然后执行 `gateway stop` 并重新启动聊天。
+使用无效 API Key 直连时收到 HTTP 401，说明网络与 TLS 已经到达服务端；它属于认证错误，
+不是连接失败。确实需要代理时再按“配置真实模型”中的两种手动代理方式任选其一。
 
 ### 提示 Docker CLI 或服务不可用
 

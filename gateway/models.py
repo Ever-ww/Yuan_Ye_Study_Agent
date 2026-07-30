@@ -134,6 +134,64 @@ class SkillManageRequest(BaseModel):
     confirmed: bool = False
 
 
+class CodeSessionCreateRequest(BaseModel):
+    """由 CLI 发起的持续 Coding Session。"""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    project_id: str = Field(min_length=1)
+    client_id: str = Field(min_length=1)
+
+
+class CodeTurnRequest(BaseModel):
+    """活动 Coding Session 中的一条扩展需求。"""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    client_id: str = Field(min_length=1)
+    task: str = Field(min_length=1)
+
+
+class CodeSessionRecord(BaseModel):
+    """Gateway 对外暴露的 Coding Session 状态。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    code_session_id: str = Field(min_length=1)
+    project_id: str = Field(min_length=1)
+    client_id: str = Field(min_length=1)
+    source_root: str = Field(min_length=1)
+    worktree_path: str = Field(min_length=1)
+    branch: str = Field(min_length=1)
+    base_commit: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+    verified_turns: int = Field(ge=0)
+
+
+class CodeTurnResult(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    code_session_id: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+    message: str
+    test_file: str
+    attempts: int = Field(ge=1)
+    commit: str = ""
+    diagnostic: str = ""
+
+
+class CodeFinalizeResult(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    code_session_id: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+    message: str
+    merged: bool = False
+    stay_in_code_mode: bool = False
+    worktree_path: str = ""
+    branch: str = ""
+
+
 def now_iso() -> str:
     """生成带时区、秒级稳定格式的协议时间。"""
     return datetime.now().astimezone().isoformat(timespec="seconds")

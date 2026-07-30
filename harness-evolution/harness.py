@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from Agent import AgentRuntime, ModelRetryPolicy, RuntimeConfig, RuntimeFailure
+from Agent import AgentRuntime, EventType, ExtensionLoader, ModelRetryPolicy, RuntimeConfig, RuntimeFailure
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models import build_provider
 from Agent.runtime.subagent import RuntimeSubagentRunner
@@ -169,6 +169,515 @@ class HarnessEvolutionResult(BaseModel):
     merged: bool = False
 
 
+class CodeSessionRecord(BaseModel):
+    """一个持续 `/code` 会话在隔离 worktree 中的可审计状态。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    code_session_id: str
+    coding_memory_session_id: str
+    source_root: Path
+    worktree_path: Path
+    branch: str
+    base_commit: str
+    status: str = "active"
+    last_verified_commit: str
+    verified_turns: int = 0
+    audit_path: Path
+
+
+class CodeTurnResult(BaseModel):
+    """一次 Coding 需求经过生成、修复、验证和临时提交后的结果。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    code_session_id: str
+    status: str
+    message: str
+    test_file: str
+    attempts: int = Field(ge=1)
+    commit: str = ""
+    diagnostic: str = ""
+
+
+class CodeFinalizeResult(BaseModel):
+    """`/exit` 的合并或拒绝结果。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    code_session_id: str
+    status: str
+    message: str
+    merged: bool = False
+    stay_in_code_mode: bool = False
+    worktree_path: str = ""
+    branch: str = ""
+
+
+class CodeAuditWriter:
+    """把 Coding 模式生命周期追加到 Agent Home，不污染普通 Session。"""
+
+    def __init__(self, agent_root: Path) -> None:
+        self.directory = agent_root.resolve() / ".yy" / "harness-evolution" / "code"
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    def create(self, code_session_id: str, **data: Any) -> Path:
+        path = self.directory / f"{code_session_id}.jsonl"
+        if not re.fullmatch(r"[0-9a-f]{32}\.jsonl", path.name):
+            raise ValueError("Code Session ID 必须是 32 位小写十六进制")
+        temporary = path.with_suffix(".jsonl.tmp")
+        temporary.write_text("", encoding="utf-8")
+        temporary.replace(path)
+        self.append_event(path, "code_session_started", **data)
+        return path
+
+    def append_event(self, path: Path, record_type: str, **data: Any) -> None:
+        resolved = path.resolve()
+        if resolved.parent != self.directory or not re.fullmatch(r"[0-9a-f]{32}\.jsonl", resolved.name):
+            raise ValueError("Coding 审计路径不属于 Agent Home")
+        try:
+            sequence = sum(
+                1 for line in resolved.read_text(encoding="utf-8").splitlines() if line.strip()
+            ) + 1
+        except FileNotFoundError:
+            sequence = 1
+        record = {
+            "version": 1,
+            "sequence": sequence,
+            "record_type": record_type,
+            "timestamp": _timestamp(),
+            **data,
+        }
+        with resolved.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(_sanitize(record), ensure_ascii=False) + "\n")
+
+
+class CodeSessionController:
+    """持续持有 worktree 与同一个 AgentRuntime 的 `/code` 控制器。"""
+
+    _ALLOWED_PREFIXES = ("extension/hook/", "tests/extensions/")
+    _ALLOWED_FILES = {"extension/README.md"}
+    _BASE_FILES = {
+        f"extension/hook/{point}/{point}.py"
+        for point in (
+            "trace_start", "trace_end", "turn_start", "turn_end",
+            "model_before", "model_during", "model_after",
+            "tool_before", "tool_during", "tool_after",
+        )
+    }
+
+    def __init__(
+        self,
+        config: RuntimeConfig,
+        *,
+        runtime_factory: Callable[[RuntimeConfig, Path], AgentRuntime] | None = None,
+        memory_provider_factory: Callable[[RuntimeConfig], Any] | None = None,
+    ) -> None:
+        self.config = config
+        self.runtime_factory = runtime_factory
+        self.memory_provider_factory = memory_provider_factory
+        self.audit = CodeAuditWriter(config.agent_root)
+        self.record: CodeSessionRecord | None = None
+        self.runtime: AgentRuntime | None = None
+        self._requirements: list[str] = []
+
+    async def start(self, source_root: Path | None = None) -> CodeSessionRecord:
+        if self.record is not None:
+            raise RuntimeError("Coding Session 已经启动")
+        root = (source_root or self.config.coding_source_root or Path(__file__).resolve().parents[1]).resolve()
+        await self._require_clean_source(root)
+        branch_name = (await self._git(root, "symbolic-ref", "--quiet", "--short", "HEAD")).stdout.strip()
+        if not branch_name:
+            raise RuntimeError("Yuan Ye 源码仓库处于 detached HEAD，不能启动 /code")
+        base = (await self._git(root, "rev-parse", "HEAD")).stdout.strip()
+        code_id = uuid4().hex
+        source_hash = hashlib.sha256(str(root).casefold().encode("utf-8")).hexdigest()[:16]
+        worktree_parent = (
+            self.config.agent_root / ".yy" / "harness-evolution" / "worktrees" / source_hash
+        ).resolve()
+        worktree = (worktree_parent / code_id).resolve()
+        if worktree_parent not in worktree.parents:
+            raise ValueError("Coding worktree 路径越界")
+        existing = (
+            sorted(path for path in worktree_parent.iterdir() if path.is_dir())
+            if worktree_parent.is_dir()
+            else []
+        )
+        if existing:
+            raise RuntimeError(
+                "检测到该源码仓库尚未清理的 Coding worktree；为避免并发修改，"
+                f"请先检查或处理：{existing[0]}"
+            )
+        worktree_parent.mkdir(parents=True, exist_ok=True)
+        branch = f"harness-code/{code_id}"
+        await self._git(root, "worktree", "add", "-b", branch, str(worktree), base)
+        try:
+            factory = self.runtime_factory or create_coding_runtime
+            runtime = factory(self.config, worktree)
+            if not _runtime_targets_worktree(runtime, worktree):
+                await runtime.close()
+                raise RuntimeError("Coding Runtime 没有指向隔离 worktree")
+            audit_path = self.audit.create(
+                code_id,
+                source_root=str(root),
+                worktree_path=str(worktree),
+                branch=branch,
+                base_commit=base,
+                source_branch=branch_name,
+                coding_memory_session_id=str(getattr(runtime, "coding_session_id", "")),
+            )
+            self.runtime = runtime
+            self.record = CodeSessionRecord(
+                code_session_id=code_id,
+                coding_memory_session_id=str(getattr(runtime, "coding_session_id", "")),
+                source_root=root,
+                worktree_path=worktree,
+                branch=branch,
+                base_commit=base,
+                last_verified_commit=base,
+                audit_path=audit_path,
+            )
+            return self.record
+        except Exception:
+            await self._git(root, "worktree", "remove", "--force", str(worktree), check=False)
+            await self._git(root, "branch", "-D", branch, check=False)
+            raise
+
+    async def run_turn(self, task: str) -> CodeTurnResult:
+        record, runtime = self._active()
+        requirement = task.strip()
+        if not requirement:
+            raise ValueError("Coding 需求不能为空")
+        test_id = hashlib.sha256(
+            f"{record.code_session_id}:{record.verified_turns}:{requirement}:{uuid4().hex}".encode("utf-8")
+        ).hexdigest()[:8]
+        slug = _code_slug(requirement)
+        test_file = f"tests/extensions/test_{slug}_{test_id}.py"
+        self._requirements.append(requirement)
+        self.audit.append_event(
+            record.audit_path,
+            "code_turn_started",
+            task=requirement,
+            required_test_file=test_file,
+        )
+        diagnostic = ""
+        feedback = ""
+        for attempt in range(1, 5):
+            prompt = self._turn_prompt(requirement, test_file, attempt, feedback)
+            self.audit.append_event(
+                record.audit_path,
+                "code_generation" if attempt == 1 else "code_auto_repair",
+                attempt=attempt,
+                prompt=prompt,
+            )
+            try:
+                chunks: list[str] = []
+                async for event in runtime.run_task(prompt, session_id=record.coding_memory_session_id):
+                    if event.type is EventType.FINAL:
+                        chunks.append(str(event.payload.get("answer", "")))
+                diagnostic = chunks[-1] if chunks else ""
+            except Exception as exc:
+                feedback = f"Coding Runtime 执行失败：{str(exc) or type(exc).__name__}"
+                self.audit.append_event(
+                    record.audit_path,
+                    "code_runtime_failed",
+                    attempt=attempt,
+                    message=feedback,
+                )
+                if attempt < 4:
+                    continue
+                return self._failed_turn(record, test_file, attempt, feedback, diagnostic)
+
+            validation = await self._validate_and_test(record, test_file)
+            if validation["passed"]:
+                await self._git(record.worktree_path, "add", "--all")
+                await self._git(
+                    record.worktree_path,
+                    "-c", "user.name=Yuan Ye Harness",
+                    "-c", "user.email=harness@local.invalid",
+                    "commit", "-m", f"Extension: {slug} ({record.verified_turns + 1})",
+                )
+                commit = (await self._git(record.worktree_path, "rev-parse", "HEAD")).stdout.strip()
+                self.record = record.model_copy(update={
+                    "last_verified_commit": commit,
+                    "verified_turns": record.verified_turns + 1,
+                    "status": "active",
+                })
+                self.audit.append_event(
+                    record.audit_path,
+                    "code_turn_verified",
+                    attempt=attempt,
+                    commit=commit,
+                    test_file=test_file,
+                    diagnostic=diagnostic,
+                )
+                return CodeTurnResult(
+                    code_session_id=record.code_session_id,
+                    status="verified",
+                    message="扩展代码和测试已通过验证，并提交到隔离临时分支。",
+                    test_file=test_file,
+                    attempts=attempt,
+                    commit=commit,
+                    diagnostic=diagnostic,
+                )
+            feedback = str(validation["feedback"])
+            self.audit.append_event(
+                record.audit_path,
+                "code_tests_failed",
+                attempt=attempt,
+                feedback=feedback,
+            )
+        self.record = record.model_copy(update={"status": "unverified"})
+        return self._failed_turn(record, test_file, 4, feedback, diagnostic)
+
+    async def finalize(self) -> CodeFinalizeResult:
+        record, runtime = self._active()
+        status = (await self._git(
+            record.worktree_path, "status", "--porcelain", "--untracked-files=all"
+        )).stdout.strip()
+        head = (await self._git(record.worktree_path, "rev-parse", "HEAD")).stdout.strip()
+        if status or head != record.last_verified_commit or record.status == "unverified":
+            return CodeFinalizeResult(
+                code_session_id=record.code_session_id,
+                status="unverified_changes",
+                message="worktree 存在未验证修改，不能合并；请继续修复后再输入 /exit。",
+                stay_in_code_mode=True,
+                worktree_path=str(record.worktree_path),
+                branch=record.branch,
+            )
+        await runtime.close()
+        self.runtime = None
+        if record.last_verified_commit == record.base_commit:
+            await self._cleanup(record, keep_branch=False)
+            self.record = None
+            return CodeFinalizeResult(
+                code_session_id=record.code_session_id,
+                status="no_changes",
+                message="本次 Coding Session 没有已验证改动，已清理并返回普通聊天。",
+            )
+        await self._require_clean_source(record.source_root)
+        current_head = (await self._git(record.source_root, "rev-parse", "HEAD")).stdout.strip()
+        if current_head != record.base_commit:
+            self.audit.append_event(
+                record.audit_path, "code_merge_refused",
+                status="main_changed", current_head=current_head,
+            )
+            self.record = record.model_copy(update={"status": "main_changed"})
+            return CodeFinalizeResult(
+                code_session_id=record.code_session_id,
+                status="main_changed",
+                message="源码仓库 HEAD 已变化，已保留临时分支与 worktree，未执行合并。",
+                stay_in_code_mode=False,
+                worktree_path=str(record.worktree_path),
+                branch=record.branch,
+            )
+        await self._git(record.source_root, "merge", "--ff-only", record.branch)
+        changed_files = [
+            line for line in (
+                await self._git(
+                    record.source_root, "diff", "--name-only",
+                    f"{record.base_commit}..{record.last_verified_commit}",
+                )
+            ).stdout.splitlines() if line.strip()
+        ]
+        self.audit.append_event(
+            record.audit_path, "code_merged",
+            commit=record.last_verified_commit, changed_files=changed_files,
+        )
+        try:
+            await self._update_long_term(record, changed_files)
+        except Exception as exc:
+            self.audit.append_event(
+                record.audit_path, "long_term_memory_failed",
+                message=str(exc) or type(exc).__name__,
+            )
+        await self._cleanup(record, keep_branch=False)
+        self.record = None
+        return CodeFinalizeResult(
+            code_session_id=record.code_session_id,
+            status="merged",
+            message="已 fast-forward 合并验证通过的扩展；重启 Gateway 后生效。",
+            merged=True,
+        )
+
+    async def abort(self) -> CodeFinalizeResult:
+        record, runtime = self._active()
+        await runtime.close()
+        self.runtime = None
+        await self._cleanup(record, keep_branch=False)
+        self.audit.append_event(record.audit_path, "code_session_aborted")
+        self.record = None
+        return CodeFinalizeResult(
+            code_session_id=record.code_session_id,
+            status="aborted",
+            message="已放弃 Coding Session 并清理隔离 worktree。",
+        )
+
+    async def _validate_and_test(self, record: CodeSessionRecord, test_file: str) -> dict[str, Any]:
+        status = (await self._git(
+            record.worktree_path, "status", "--porcelain", "--untracked-files=all"
+        )).stdout
+        changed = _status_paths(status)
+        forbidden = [
+            path for path in changed
+            if path not in self._ALLOWED_FILES and not path.startswith(self._ALLOWED_PREFIXES)
+        ]
+        removed_base = [
+            path for path in self._BASE_FILES
+            if not (record.worktree_path / path).is_file()
+        ]
+        extension_changes = [path for path in changed if path.startswith("extension/hook/")]
+        failures: list[str] = []
+        if forbidden:
+            await self._rollback_unverified(record)
+            return {"passed": False, "feedback": f"检测到越界修改并已回滚：{', '.join(forbidden)}"}
+        if removed_base:
+            await self._rollback_unverified(record)
+            return {"passed": False, "feedback": f"基础 Hook 文件不能删除并已回滚：{', '.join(removed_base)}"}
+        if not extension_changes:
+            failures.append("本轮没有 Extension Hook 代码变更")
+        if test_file not in changed or not (record.worktree_path / test_file).is_file():
+            failures.append(f"必须生成控制器指定的测试文件：{test_file}")
+        if failures:
+            return {"passed": False, "feedback": "\n".join(failures)}
+        contract = _validate_changed_extensions(record.worktree_path, extension_changes)
+        if contract:
+            return {"passed": False, "feedback": contract}
+        commands = [
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q", test_file],
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q", "tests/extensions"],
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "compileall", "-q", "extension"],
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"],
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "unittest", "discover", "-s", "tests", "-v"],
+            ["uv", "lock", "--check"],
+            ["git", "diff", "--check"],
+        ]
+        outputs: list[str] = []
+        for command in commands:
+            result = await self._command(record.worktree_path, command, check=False, timeout=1200)
+            self.audit.append_event(
+                record.audit_path, "code_test",
+                command=command, returncode=result.returncode,
+                stdout=result.stdout[-65536:], stderr=result.stderr[-65536:],
+            )
+            if result.returncode != 0:
+                outputs.append(
+                    f"$ {' '.join(command)}\nexit={result.returncode}\n"
+                    f"{result.stdout[-12000:]}\n{result.stderr[-12000:]}"
+                )
+                return {"passed": False, "feedback": "\n".join(outputs)}
+        return {"passed": True, "feedback": ""}
+
+    async def _rollback_unverified(self, record: CodeSessionRecord) -> None:
+        await self._git(record.worktree_path, "reset", "--hard", record.last_verified_commit)
+        await self._git(record.worktree_path, "clean", "-fd")
+
+    async def _update_long_term(self, record: CodeSessionRecord, changed_files: list[str]) -> None:
+        request = HarnessEvolutionRequest(
+            project_root=record.source_root,
+            incident_id=record.code_session_id,
+            snapshot_path=record.audit_path,
+            task="\n\n".join(self._requirements),
+            config=self.config,
+        )
+        runner = HarnessEvolutionRunner(
+            self.audit,  # type: ignore[arg-type]
+            runtime_factory=self.runtime_factory or create_coding_runtime,
+            memory_provider_factory=self.memory_provider_factory,
+        )
+        await runner._update_long_term_memory(
+            request,
+            record.source_root,
+            diagnostic="通过交互式 /code Coding Session 创建并验证 Extension。",
+            commit_sha=record.last_verified_commit,
+            changed_files=changed_files,
+        )
+
+    async def _cleanup(self, record: CodeSessionRecord, *, keep_branch: bool) -> None:
+        remove = await self._git(
+            record.source_root, "worktree", "remove", "--force",
+            str(record.worktree_path), check=False,
+        )
+        branch = _CommandResult(returncode=0, stdout="", stderr="")
+        if not keep_branch:
+            branch = await self._git(record.source_root, "branch", "-D", record.branch, check=False)
+        self.audit.append_event(
+            record.audit_path, "code_cleanup",
+            worktree_remove_code=remove.returncode,
+            branch_remove_code=branch.returncode,
+            branch_preserved=keep_branch,
+        )
+
+    async def _require_clean_source(self, root: Path) -> None:
+        inside = await self._git(root, "rev-parse", "--is-inside-work-tree", check=False)
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            raise RuntimeError(f"Yuan Ye 源码目录不是 Git 仓库：{root}")
+        status = await self._git(root, "status", "--porcelain", "--untracked-files=all")
+        if status.stdout.strip():
+            raise RuntimeError("Yuan Ye 源码仓库存在未提交修改；/code 不会 stash 或覆盖这些内容")
+
+    def _active(self) -> tuple[CodeSessionRecord, AgentRuntime]:
+        if self.record is None or self.runtime is None:
+            raise RuntimeError("没有活动的 Coding Session")
+        return self.record, self.runtime
+
+    def _failed_turn(
+        self,
+        record: CodeSessionRecord,
+        test_file: str,
+        attempts: int,
+        feedback: str,
+        diagnostic: str,
+    ) -> CodeTurnResult:
+        self.audit.append_event(
+            record.audit_path, "code_turn_unverified",
+            attempts=attempts, feedback=feedback, diagnostic=diagnostic,
+        )
+        if self.record is not None:
+            self.record = self.record.model_copy(update={"status": "unverified"})
+        return CodeTurnResult(
+            code_session_id=record.code_session_id,
+            status="unverified",
+            message=f"自动修复三轮后仍未通过验证：\n{feedback}",
+            test_file=test_file,
+            attempts=attempts,
+            diagnostic=diagnostic,
+        )
+
+    @staticmethod
+    def _turn_prompt(task: str, test_file: str, attempt: int, feedback: str) -> str:
+        base = (
+            "你正在 Yuan Ye Agent 源码的隔离 Git worktree 中维护全局 Hook Extension。"
+            "先阅读 extension/README.md，再完成用户需求。只能修改 extension/hook/**、"
+            "extension/README.md 和 tests/extensions/**；禁止修改核心代码、.git、.yy 或凭据。"
+            "每项能力使用描述性 Python 文件，不要把逻辑堆入初始空文件。"
+            f"本轮必须创建测试文件 `{test_file}`，并主动运行它。"
+            "完成后简要说明变更和测试结果。\n\n"
+            f"用户需求：\n{task}"
+        )
+        if attempt > 1:
+            base += (
+                f"\n\n这是第 {attempt - 1} 轮自动修复。控制器上次验证失败：\n{feedback}\n"
+                "请在同一 worktree 中修复这些问题，不要另建测试文件替代指定路径。"
+            )
+        return base
+
+    async def _git(self, directory: Path, *arguments: str, check: bool = True) -> "_CommandResult":
+        return await self._command(directory, ["git", *arguments], check=check)
+
+    @staticmethod
+    async def _command(
+        directory: Path,
+        command: list[str],
+        *,
+        check: bool = True,
+        timeout: float = 120,
+    ) -> "_CommandResult":
+        return await HarnessEvolutionRunner._command(
+            directory, command, check=check, timeout=timeout,
+        )
+
+
 async def _approve_coding_tool(name: str, arguments: dict[str, Any]) -> bool:
     """用户确认启动 Harness 后，允许隔离 worktree 内的既有 Coding 工具。"""
     del arguments
@@ -219,6 +728,7 @@ def create_coding_runtime(
         enable_sandbox=True,
         retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=2),
         raise_errors=True,
+        enable_extensions=False,
     )
     runtime.coding_session_id = session_id
     runtime.harness_long_term_memory = long_term
@@ -545,6 +1055,8 @@ class HarnessEvolutionRunner:
                 base_url=curator_config.base_url,
                 api_key=curator_config.api_key,
                 stream=False,
+                use_system_proxy=curator_config.use_system_proxy,
+                proxy_url=curator_config.proxy_url,
             )
         )
         runtime = AgentRuntime(
@@ -557,6 +1069,7 @@ class HarnessEvolutionRunner:
             enable_subagent=False,
             enable_sandbox=False,
             raise_errors=True,
+            enable_extensions=False,
         )
         result = await runtime.run("维护 Harness Coding Agent 长期记忆")
         if not result.completed:
@@ -567,7 +1080,7 @@ class HarnessEvolutionRunner:
         commands = [
             ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"],
             ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "unittest", "discover", "-s", "tests", "-v"],
-            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "compileall", "-q", "Agent", "bootstrap", "context_process", "memory", "prompt", "sandbox", "skill", "tools", "run_ui", "tests", "harness-evolution", "run.py"],
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "compileall", "-q", "Agent", "bootstrap", "context_process", "extension", "gateway", "memory", "prompt", "sandbox", "skill", "tools", "run_ui", "tests", "harness-evolution", "run.py"],
             ["uv", "lock", "--check"],
             ["git", "diff", "--check"],
         ]
@@ -700,3 +1213,39 @@ def _forbidden_changed_paths(status: str) -> list[str]:
         ):
             forbidden.append(normalized)
     return forbidden
+
+
+def _code_slug(task: str) -> str:
+    """从需求中生成稳定、合法且较短的测试名称前缀。"""
+    ascii_words = re.findall(r"[a-z0-9]+", task.casefold())
+    if ascii_words:
+        return "_".join(ascii_words[:4])[:32].strip("_") or "extension"
+    return "extension"
+
+
+def _status_paths(status: str) -> list[str]:
+    """提取 Git porcelain v1 的目标路径，供严格路径白名单使用。"""
+    paths: list[str] = []
+    for line in status.splitlines():
+        if len(line) < 4:
+            continue
+        value = line[3:].strip().strip('"')
+        if " -> " in value:
+            value = value.split(" -> ", 1)[1].strip().strip('"')
+        paths.append(value.replace("\\", "/"))
+    return paths
+
+
+def _validate_changed_extensions(worktree: Path, changed: list[str]) -> str:
+    """加载整个不可变目录快照，并补充本轮文件位置约束。"""
+    for relative in changed:
+        path = worktree / relative
+        if path.exists():
+            parts = Path(relative).parts
+            if len(parts) != 4 or parts[:2] != ("extension", "hook") or path.suffix != ".py":
+                return f"Extension Python 文件必须是阶段目录的直接子文件：{relative}"
+    try:
+        ExtensionLoader(worktree).scan()
+    except Exception as exc:
+        return f"Extension 契约校验失败：{str(exc) or type(exc).__name__}"
+    return ""

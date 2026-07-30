@@ -126,12 +126,39 @@ class EchoProvider:
         yield await self.complete(messages, tools)
 
 
+def _http_client_options(
+    timeout: float | httpx.Timeout,
+    *,
+    use_system_proxy: bool,
+    proxy_url: str | None,
+) -> dict[str, Any]:
+    """默认禁用 HTTPX 环境代理；显式配置时才启用代理。"""
+    options: dict[str, Any] = {
+        "timeout": timeout,
+        "trust_env": bool(use_system_proxy and not proxy_url),
+    }
+    if proxy_url:
+        options["proxy"] = proxy_url
+    return options
+
+
 class OpenAICompatibleProvider:
     """适用于 OpenAI-compatible Chat Completions 的最小原生工具调用适配器。"""
 
-    def __init__(self, base_url: str, model: str, api_key: str, *, streaming: bool = False) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        api_key: str,
+        *,
+        streaming: bool = False,
+        use_system_proxy: bool = False,
+        proxy_url: str | None = None,
+    ) -> None:
         self.base_url, self.model, self.api_key = base_url.rstrip("/"), model, api_key
         self.streaming = streaming
+        self.use_system_proxy = use_system_proxy
+        self.proxy_url = proxy_url
 
     async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelReply:
         """请求供应商并转换其标准 tool_calls 响应。"""
@@ -139,7 +166,11 @@ class OpenAICompatibleProvider:
         if tools:
             payload["tools"] = [{"type": "function", "function": tool} for tool in tools]
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
+            async with httpx.AsyncClient(**_http_client_options(
+                60,
+                use_system_proxy=self.use_system_proxy,
+                proxy_url=self.proxy_url,
+            )) as client:
                 response = await client.post(f"{self.base_url}/chat/completions", headers={"Authorization": f"Bearer {self.api_key}"}, json=payload)
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -164,7 +195,11 @@ class OpenAICompatibleProvider:
         usage: TokenUsage | None = None
         reasoning_parts: list[str] = []
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=15)) as client:
+            async with httpx.AsyncClient(**_http_client_options(
+                httpx.Timeout(90, connect=15),
+                use_system_proxy=self.use_system_proxy,
+                proxy_url=self.proxy_url,
+            )) as client:
                 async with client.stream("POST", f"{self.base_url}/chat/completions", headers={"Authorization": f"Bearer {self.api_key}"}, json=payload) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
@@ -244,16 +279,31 @@ class OpenAICompatibleProvider:
 class AnthropicProvider:
     """Anthropic Messages API 的原生异步文本适配器。"""
 
-    def __init__(self, base_url: str, model: str, api_key: str, *, streaming: bool = False) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        api_key: str,
+        *,
+        streaming: bool = False,
+        use_system_proxy: bool = False,
+        proxy_url: str | None = None,
+    ) -> None:
         self.base_url, self.model, self.api_key = base_url.rstrip("/"), model, api_key
         self.streaming = streaming
+        self.use_system_proxy = use_system_proxy
+        self.proxy_url = proxy_url
 
     async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelReply:
         """调用 Messages API；首期仅接收其文本最终输出。"""
         system = "\n".join(str(item["content"]) for item in messages if item["role"] == "system")
         conversation = [{"role": item["role"], "content": item["content"]} for item in messages if item["role"] != "system"]
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
+            async with httpx.AsyncClient(**_http_client_options(
+                60,
+                use_system_proxy=self.use_system_proxy,
+                proxy_url=self.proxy_url,
+            )) as client:
                 response = await client.post(f"{self.base_url}/messages", headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01"}, json={"model": self.model, "max_tokens": 2048, "system": system, "messages": conversation})
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -298,7 +348,16 @@ class AnthropicProvider:
         yield await self.complete(messages, tools)
 
 
-def build_provider(provider: str, model: str, *, base_url: str | None = None, api_key: str | None = None, stream: bool = False) -> EchoProvider | OpenAICompatibleProvider | AnthropicProvider:
+def build_provider(
+    provider: str,
+    model: str,
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    stream: bool = False,
+    use_system_proxy: bool = False,
+    proxy_url: str | None = None,
+) -> EchoProvider | OpenAICompatibleProvider | AnthropicProvider:
     """根据配置构造 Provider；未配置凭据时明确使用离线 Provider。"""
     if provider == "echo":
         return EchoProvider()
@@ -307,8 +366,22 @@ def build_provider(provider: str, model: str, *, base_url: str | None = None, ap
     if provider == "anthropic":
         if not key:
             raise ValueError("未配置 Provider anthropic 的 API Key")
-        return AnthropicProvider(base_url or "https://api.anthropic.com/v1", model, key, streaming=stream)
+        return AnthropicProvider(
+            base_url or "https://api.anthropic.com/v1",
+            model,
+            key,
+            streaming=stream,
+            use_system_proxy=use_system_proxy,
+            proxy_url=proxy_url,
+        )
     url = base_url or {"openai": "https://api.openai.com/v1", "gpt": "https://api.openai.com/v1", "deepseek": "https://api.deepseek.com/v1", "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1", "glm": "https://open.bigmodel.cn/api/paas/v4", "kimi": "https://api.moonshot.cn/v1"}.get(provider)
     if not key or not url:
         raise ValueError(f"未配置 Provider {provider} 的地址或 API Key")
-    return OpenAICompatibleProvider(url, model, key, streaming=stream)
+    return OpenAICompatibleProvider(
+        url,
+        model,
+        key,
+        streaming=stream,
+        use_system_proxy=use_system_proxy,
+        proxy_url=proxy_url,
+    )

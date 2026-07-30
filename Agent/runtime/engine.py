@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict
 
 from Agent.config import RuntimeConfig, load_runtime_config
 from Agent.contracts import ApprovalCallback, EventType, RunEvent
+from Agent.extensions import ExtensionCatalog, ExtensionContext, ExtensionLoader
 from Agent.hook import (
     HookEvent,
     HookPoint,
@@ -65,6 +66,8 @@ class AgentRuntime:
         enable_sandbox: bool = True,
         retry_policy: ModelRetryPolicy | None = None,
         raise_errors: bool = False,
+        extensions: ExtensionCatalog | None = None,
+        enable_extensions: bool = True,
     ) -> None:
         self.config = config or load_runtime_config()
         self.provider = provider or build_provider(
@@ -73,6 +76,8 @@ class AgentRuntime:
             base_url=self.config.base_url,
             api_key=self.config.api_key,
             stream=self.config.stream,
+            use_system_proxy=self.config.use_system_proxy,
+            proxy_url=self.config.proxy_url,
         )
         if tool_context is not None and approval is not None:
             raise ValueError("tool_context 与 approval 不可同时传入")
@@ -174,6 +179,22 @@ class AgentRuntime:
         )
         if self._owns_sandbox and self.sandbox is not None:
             register_sandbox_callbacks(self.hooks, self.sandbox)
+        self.extensions = extensions
+        if enable_extensions:
+            source_root = self.config.coding_source_root or self.config.agent_root
+            self.extensions = self.extensions or ExtensionLoader(source_root).scan()
+            self.extensions.register(
+                self.hooks,
+                ExtensionContext(
+                    agent_root=self.config.agent_root,
+                    source_root=source_root,
+                    workspace_root=self.config.workspace_root,
+                    state_root=self.config.agent_root / ".yy" / "extension",
+                    provider=self.config.provider,
+                    model=self.config.model,
+                    sandbox_enabled=self.sandbox is not None,
+                ),
+            )
         self._session_id: str | None = None
         self._session_open = False
 
@@ -208,6 +229,11 @@ class AgentRuntime:
             "name": self.config.model,
             "base_url": self.config.base_url,
             "stream": self.config.stream,
+            "proxy_mode": (
+                "explicit" if self.config.proxy_url
+                else "system" if self.config.use_system_proxy
+                else "disabled"
+            ),
         }
         try:
             await self.hooks.emit(HookEvent(

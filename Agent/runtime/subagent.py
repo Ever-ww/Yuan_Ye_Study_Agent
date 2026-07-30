@@ -66,6 +66,8 @@ class RuntimeSubagentRunner:
             base_url=config.base_url,
             api_key=config.api_key,
             stream=False,
+            use_system_proxy=config.use_system_proxy,
+            proxy_url=config.proxy_url,
         )
         runtime = AgentRuntime(
             config,
@@ -78,6 +80,7 @@ class RuntimeSubagentRunner:
             enable_skills=False,
             enable_subagent=False,
             enable_sandbox=False,
+            enable_extensions=False,
         )
         result = await runtime.run(task)
         if not result.completed:

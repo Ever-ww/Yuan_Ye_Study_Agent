@@ -7,9 +7,18 @@ import secrets
 from pathlib import Path
 from time import monotonic
 
-from Agent import RuntimeConfig
+from Agent import ExtensionLoader, RuntimeConfig
+from gateway.code_sessions import CodeSessionManager
 from gateway.events import GatewayEventBus
-from gateway.models import ApprovalDecision, ProjectRecord, RunCreateRequest, RunRecord, SkillManageRequest
+from gateway.models import (
+    ApprovalDecision,
+    CodeSessionCreateRequest,
+    CodeTurnRequest,
+    ProjectRecord,
+    RunCreateRequest,
+    RunRecord,
+    SkillManageRequest,
+)
 from gateway.runtime_pool import RuntimeFactory, RuntimePool
 from gateway.store import GatewayStore
 from memory import MemoryStore
@@ -29,6 +38,8 @@ class GatewayApplication:
         self.config = config
         self.store = store or GatewayStore(config.agent_root / ".yy" / "gateway")
         self.events = GatewayEventBus()
+        source_root = config.coding_source_root or Path(__file__).resolve().parents[1]
+        self.extensions = ExtensionLoader(source_root).scan()
         self.pool = RuntimePool(
             agent_root=config.agent_root,
             store=self.store,
@@ -36,14 +47,33 @@ class GatewayApplication:
             max_concurrent_runs=config.gateway_max_concurrent_runs,
             idle_timeout_seconds=config.gateway_runtime_idle_seconds,
             runtime_factory=runtime_factory,
+            extensions=self.extensions,
         )
         self._browser_codes: dict[str, float] = {}
+        self.code_sessions = CodeSessionManager(config)
 
     async def start(self) -> None:
         await self.pool.start()
 
     async def close(self) -> None:
+        await self.code_sessions.close()
         await self.pool.close()
+
+    async def start_code_session(self, request: CodeSessionCreateRequest):
+        self.store.project(request.project_id)
+        return await self.code_sessions.start(request.project_id, request.client_id)
+
+    async def run_code_turn(self, session_id: str, request: CodeTurnRequest):
+        return await self.code_sessions.run_turn(session_id, request.client_id, request.task)
+
+    async def finalize_code_session(self, session_id: str, client_id: str):
+        return await self.code_sessions.finalize(session_id, client_id)
+
+    async def abort_code_session(self, session_id: str, client_id: str):
+        return await self.code_sessions.abort(session_id, client_id)
+
+    def code_session_events(self, session_id: str, after_sequence: int = 0):
+        return self.code_sessions.events(session_id, after_sequence)
 
     def register_project(self, path: Path, name: str | None = None) -> ProjectRecord:
         return self.store.register_project(path, name)

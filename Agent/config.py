@@ -5,7 +5,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, TypeAdapter, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from bootstrap import ensure_project_initialized
 
@@ -20,10 +30,13 @@ class RuntimeConfig(BaseModel):
 
     agent_root: Path
     workspace_root: Path
+    coding_source_root: Path | None = None
     model: str = Field(default="echo", min_length=1)
     provider: str = Field(default="echo", min_length=1)
     base_url: str | None = None
     api_key: str | None = None
+    use_system_proxy: StrictBool = False
+    proxy_url: str | None = None
     stream: StrictBool = False
     max_steps: StrictInt = Field(default=8, ge=1)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
@@ -37,11 +50,11 @@ class RuntimeConfig(BaseModel):
     gateway_max_concurrent_runs: StrictInt = Field(default=4, ge=1, le=32)
     gateway_runtime_idle_seconds: StrictInt = Field(default=900, ge=30)
 
-    @field_validator("agent_root", "workspace_root")
+    @field_validator("agent_root", "workspace_root", "coding_source_root")
     @classmethod
-    def _resolve_project_root(cls, value: Path) -> Path:
+    def _resolve_project_root(cls, value: Path | None) -> Path | None:
         """在配置边界统一工作区为绝对路径。"""
-        return value.resolve()
+        return value.resolve() if value is not None else None
 
     @property
     def memory_dir(self) -> Path:
@@ -56,6 +69,15 @@ class RuntimeConfig(BaseModel):
         if head + value > 1.0:
             raise ValueError("tool_output_head_ratio 与 tool_output_tail_ratio 之和不能超过 1")
         return value
+
+    @model_validator(mode="after")
+    def _validate_proxy_configuration(self) -> "RuntimeConfig":
+        """显式代理与系统代理二选一，默认完全忽略代理环境变量。"""
+        if self.use_system_proxy and self.proxy_url:
+            raise ValueError("use_system_proxy 与 proxy_url 不能同时启用")
+        if self.proxy_url and not self.proxy_url.startswith(("http://", "https://")):
+            raise ValueError("proxy_url 目前只支持 http:// 或 https://")
+        return self
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -89,6 +111,15 @@ def load_runtime_config(
     values.update(shared)
     values.update(_read_json(selected_agent_root / ".yy" / "settings.local.json"))
     values.update({key: value for key, value in overrides.items() if value is not None})
+    if not values.get("coding_source_root"):
+        marker = _read_json(selected_agent_root / ".yy" / "agent-home-migration.json")
+        source_root = marker.get("source_root")
+        marker_source = Path(source_root) if isinstance(source_root, str) and source_root else None
+        values["coding_source_root"] = (
+            marker_source
+            if marker_source is not None and marker_source.exists()
+            else Path(__file__).resolve().parents[1]
+        )
     # 配置文件不能改变状态目录与本轮文件操作边界。
     values["agent_root"] = selected_agent_root
     values["workspace_root"] = selected_workspace

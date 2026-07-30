@@ -160,7 +160,7 @@ export default function App() {
           <button className={`inbox ${item.read ? "" : "unread"}`} key={item.item_id}
             onClick={async () => {
               await api.markRead(item.item_id);
-              setSessionId(item.session_id);
+              setSessionId(item.session_id || undefined);
               if (item.session_id) setHistory(await api.session(item.project_id, item.session_id));
               await refresh();
             }}>

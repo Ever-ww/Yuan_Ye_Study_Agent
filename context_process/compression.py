@@ -227,6 +227,7 @@ class ContextProcessor:
             enable_skills=False,
             enable_subagent=False,
             enable_sandbox=False,
+            enable_extensions=False,
         )
         result = await runtime.run("压缩当前会话上下文")
         if not result.completed:
@@ -240,6 +241,8 @@ class ContextProcessor:
             base_url=self.config.base_url,
             api_key=self.config.api_key,
             stream=False,
+            use_system_proxy=self.config.use_system_proxy,
+            proxy_url=self.config.proxy_url,
         )
 
 

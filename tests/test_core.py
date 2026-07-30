@@ -12,6 +12,7 @@ from pydantic import BaseModel, ValidationError
 
 from Agent import AgentRuntime, EventType, HookEvent, HookPoint, HookRegistry, load_runtime_config
 from Agent.contracts import ModelReply, TokenUsage, ToolCall
+from Agent.models.providers import _http_client_options, build_provider
 from Agent.runtime.subagent import RuntimeSubagentRunner
 from bootstrap import ensure_project_initialized, is_project_initialized
 from context_process import ContextProcessor
@@ -219,6 +220,80 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(config.base_url, "https://gateway.example/v1")
             self.assertEqual(config.api_key, "local-key")
             self.assertFalse(config.stream)
+
+    def test_model_proxy_defaults_to_direct_and_supports_explicit_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            direct = load_runtime_config(root)
+            self.assertFalse(direct.use_system_proxy)
+            self.assertIsNone(direct.proxy_url)
+            self.assertEqual(
+                _http_client_options(
+                    60,
+                    use_system_proxy=direct.use_system_proxy,
+                    proxy_url=direct.proxy_url,
+                ),
+                {"timeout": 60, "trust_env": False},
+            )
+
+            local = root / ".yy" / "settings.local.json"
+            local.write_text('{"use_system_proxy":true}', encoding="utf-8")
+            system = load_runtime_config(root)
+            self.assertTrue(system.use_system_proxy)
+            self.assertEqual(
+                _http_client_options(
+                    60,
+                    use_system_proxy=system.use_system_proxy,
+                    proxy_url=system.proxy_url,
+                ),
+                {"timeout": 60, "trust_env": True},
+            )
+
+            local.write_text(
+                '{"use_system_proxy":false,"proxy_url":"http://127.0.0.1:7890"}',
+                encoding="utf-8",
+            )
+            explicit = load_runtime_config(root)
+            provider = build_provider(
+                "deepseek",
+                "deepseek-chat",
+                base_url="https://api.deepseek.com/v1",
+                api_key="test-key",
+                use_system_proxy=explicit.use_system_proxy,
+                proxy_url=explicit.proxy_url,
+            )
+            self.assertFalse(provider.use_system_proxy)
+            self.assertEqual(provider.proxy_url, "http://127.0.0.1:7890")
+            self.assertEqual(
+                _http_client_options(
+                    60,
+                    use_system_proxy=explicit.use_system_proxy,
+                    proxy_url=explicit.proxy_url,
+                ),
+                {
+                    "timeout": 60,
+                    "trust_env": False,
+                    "proxy": "http://127.0.0.1:7890",
+                },
+            )
+
+    def test_model_proxy_configuration_rejects_ambiguous_or_invalid_values(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            local = root / ".yy" / "settings.local.json"
+            load_runtime_config(root)
+            local.write_text(
+                '{"use_system_proxy":true,"proxy_url":"http://127.0.0.1:7890"}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "不能同时启用"):
+                load_runtime_config(root)
+            local.write_text(
+                '{"proxy_url":"socks5://127.0.0.1:1080"}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "只支持 http"):
+                load_runtime_config(root)
 
     def test_config_keeps_memory_in_agent_root_and_workspace_clean(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -750,7 +825,7 @@ class CoreTests(unittest.TestCase):
                 context = ToolContext(project_root=Path(value))
                 tools = default_tools(Path(value))
                 with self.assertRaises(PermissionError):
-                    await tools.execute("write_file", {"path": "note.txt", "content": "x"}, context)
+                    await tools.execute("write", {"path": "note.txt", "content": "x"}, context)
                 with self.assertRaises(PermissionError):
                     await tools.execute("read_file", {"path": "../secret.txt"}, context)
         asyncio.run(check())
@@ -768,7 +843,8 @@ class CoreTests(unittest.TestCase):
                     {schema["name"] for schema in registry.schemas()},
                     {
                         "read_file",
-                        "write_file",
+                        "edit",
+                        "write",
                         "bash",
                         "sandbox_rollback",
                         "calculator",
@@ -782,10 +858,18 @@ class CoreTests(unittest.TestCase):
                     sandbox=_CheckpointSandbox(),
                     file_locks=WorkspaceLockManager(root),
                 )
-                await registry.execute("write_file", {"path": "notes/demo.txt", "content": "独立工具模块"}, context)
+                await registry.execute("write", {"path": "notes/demo.txt", "content": "独立工具模块"}, context)
+                await registry.execute(
+                    "edit",
+                    {
+                        "path": "notes/demo.txt",
+                        "edits": [{"oldText": "独立", "newText": "精确编辑"}],
+                    },
+                    context,
+                )
                 self.assertEqual(
                     await registry.execute("read_file", {"path": "notes/demo.txt"}, context),
-                    "独立工具模块",
+                    "精确编辑工具模块",
                 )
                 self.assertEqual(
                     await registry.execute("calculator", {"expression": "(10 + 20) / 2"}, context),
@@ -793,9 +877,175 @@ class CoreTests(unittest.TestCase):
                 )
                 self.assertIn(
                     "demo.txt",
-                    await registry.execute("search_workspace", {"query": "独立工具模块"}, context),
+                    await registry.execute("search_workspace", {"query": "精确编辑工具模块"}, context),
                 )
                 self.assertIn("T", await registry.execute("current_time", {}, context))
+
+        asyncio.run(check())
+
+    def test_edit_uses_original_text_for_multiple_exact_replacements(self) -> None:
+        async def check() -> None:
+            with tempfile.TemporaryDirectory() as value:
+                root = Path(value)
+                path = root / "demo.txt"
+                path.write_text("one two\n", encoding="utf-8")
+
+                async def approve(name, arguments) -> bool:
+                    del name, arguments
+                    return True
+
+                registry = default_tools(root)
+                context = ToolContext(
+                    project_root=root,
+                    approval=approve,
+                    sandbox=_CheckpointSandbox(),
+                    file_locks=WorkspaceLockManager(root),
+                )
+                result = await registry.execute(
+                    "edit",
+                    {
+                        "path": "demo.txt",
+                        "edits": [
+                            {"oldText": "one", "newText": "two"},
+                            {"oldText": "two", "newText": "three"},
+                        ],
+                    },
+                    context,
+                )
+                self.assertEqual(path.read_text(encoding="utf-8"), "two three\n")
+                self.assertIn("checkpoint", result)
+
+        asyncio.run(check())
+
+    def test_edit_preserves_bom_and_crlf_and_normalizes_pi_arguments(self) -> None:
+        async def check() -> None:
+            with tempfile.TemporaryDirectory() as value:
+                root = Path(value)
+                path = root / "demo.txt"
+                path.write_bytes(b"\xef\xbb\xbfalpha\r\nbeta\r\n")
+
+                async def approve(name, arguments) -> bool:
+                    del name, arguments
+                    return True
+
+                registry = default_tools(root)
+                context = ToolContext(
+                    project_root=root,
+                    approval=approve,
+                    sandbox=_CheckpointSandbox(),
+                    file_locks=WorkspaceLockManager(root),
+                )
+                await registry.execute(
+                    "edit",
+                    {
+                        "path": "demo.txt",
+                        "edits": json.dumps(
+                            [{"oldText": "alpha\nbeta", "newText": "first\nsecond"}],
+                        ),
+                    },
+                    context,
+                )
+                self.assertEqual(
+                    path.read_bytes(),
+                    b"\xef\xbb\xbffirst\r\nsecond\r\n",
+                )
+
+        asyncio.run(check())
+
+    def test_edit_nested_schema_is_validated_before_approval(self) -> None:
+        async def check() -> None:
+            with tempfile.TemporaryDirectory() as value:
+                approvals: list[str] = []
+
+                async def approve(name, arguments) -> bool:
+                    del arguments
+                    approvals.append(name)
+                    return True
+
+                root = Path(value)
+                (root / "demo.txt").write_text("before", encoding="utf-8")
+                registry = default_tools(root)
+                context = ToolContext(
+                    project_root=root,
+                    approval=approve,
+                    sandbox=_CheckpointSandbox(),
+                    file_locks=WorkspaceLockManager(root),
+                )
+                with self.assertRaisesRegex(ValueError, "工具参数校验失败"):
+                    await registry.execute(
+                        "edit",
+                        {
+                            "path": "demo.txt",
+                            "edits": [{"oldText": "before"}],
+                        },
+                        context,
+                    )
+                with self.assertRaisesRegex(ValueError, "工具参数校验失败"):
+                    await registry.execute(
+                        "edit",
+                        {
+                            "path": "demo.txt",
+                            "edits": [{
+                                "oldText": "before",
+                                "newText": "after",
+                                "unexpected": True,
+                            }],
+                        },
+                        context,
+                    )
+                self.assertEqual(approvals, [])
+
+        asyncio.run(check())
+
+    def test_edit_rejects_missing_duplicate_and_overlapping_matches(self) -> None:
+        async def check() -> None:
+            with tempfile.TemporaryDirectory() as value:
+                root = Path(value)
+                path = root / "demo.txt"
+
+                async def approve(name, arguments) -> bool:
+                    del name, arguments
+                    return True
+
+                registry = default_tools(root)
+                context = ToolContext(
+                    project_root=root,
+                    approval=approve,
+                    sandbox=_CheckpointSandbox(),
+                    file_locks=WorkspaceLockManager(root),
+                )
+                path.write_text("repeat repeat", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "不是唯一匹配"):
+                    await registry.execute(
+                        "edit",
+                        {
+                            "path": "demo.txt",
+                            "edits": [{"oldText": "repeat", "newText": "once"}],
+                        },
+                        context,
+                    )
+                with self.assertRaisesRegex(ValueError, "不存在"):
+                    await registry.execute(
+                        "edit",
+                        {
+                            "path": "demo.txt",
+                            "edits": [{"oldText": "missing", "newText": "value"}],
+                        },
+                        context,
+                    )
+                path.write_text("abcdef", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "重叠或嵌套"):
+                    await registry.execute(
+                        "edit",
+                        {
+                            "path": "demo.txt",
+                            "edits": [
+                                {"oldText": "abc", "newText": "x"},
+                                {"oldText": "bcde", "newText": "y"},
+                            ],
+                        },
+                        context,
+                    )
 
         asyncio.run(check())
 
@@ -826,10 +1076,10 @@ class CoreTests(unittest.TestCase):
 
                 async def runner(task, instructions, names, context) -> str:
                     captured.append(names)
-                    if "write_file" in names:
+                    if "write" in names:
                         selected = default_tools(root).select(names)
                         return await selected.execute(
-                            "write_file", {"path": "delegated.txt", "content": task}, context,
+                            "write", {"path": "delegated.txt", "content": task}, context,
                         )
                     return f"子任务完成：{task}"
 
@@ -843,7 +1093,7 @@ class CoreTests(unittest.TestCase):
                 self.assertEqual(registry.risk_of("subagent"), "dynamic")
                 self.assertEqual(registry.risk_of("subagent", {"task": "分析"}), "read")
                 self.assertEqual(
-                    registry.risk_of("subagent", {"task": "写入", "tools": ["write_file"]}),
+                    registry.risk_of("subagent", {"task": "写入", "tools": ["write"]}),
                     "write",
                 )
                 with self.assertRaisesRegex(ValueError, "工具参数校验失败"):
@@ -856,10 +1106,10 @@ class CoreTests(unittest.TestCase):
                 self.assertEqual(approvals, [])
                 await registry.execute(
                     "subagent",
-                    {"task": "内容", "instructions": "负责写入", "tools": ["write_file"]},
+                    {"task": "内容", "instructions": "负责写入", "tools": ["write"]},
                     context,
                 )
-                self.assertEqual(approvals, ["subagent", "write_file"])
+                self.assertEqual(approvals, ["subagent", "write"])
                 self.assertEqual((root / "delegated.txt").read_text(encoding="utf-8"), "内容")
                 with self.assertRaises(ValueError):
                     await registry.execute("subagent", {"task": "递归", "tools": ["subagent"]}, context)

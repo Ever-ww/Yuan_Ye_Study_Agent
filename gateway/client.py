@@ -12,6 +12,11 @@ import httpx
 
 from gateway.models import (
     ApprovalDecision,
+    CodeFinalizeResult,
+    CodeSessionCreateRequest,
+    CodeSessionRecord,
+    CodeTurnRequest,
+    CodeTurnResult,
     GatewayEventEnvelope,
     ProjectCreateRequest,
     RunCreateRequest,
@@ -38,7 +43,7 @@ class GatewayClient:
         self._headers = {"Authorization": f"Bearer {self.token}"}
 
     async def connect(self) -> dict[str, Any]:
-        async with httpx.AsyncClient(headers=self._headers, timeout=10) as client:
+        async with httpx.AsyncClient(headers=self._headers, timeout=10, trust_env=False) as client:
             response = await client.get(f"{self.base_url}/api/v1/status")
             response.raise_for_status()
             return dict(response.json())
@@ -99,6 +104,48 @@ class GatewayClient:
         value = await self._request("POST", "/api/v1/browser/code")
         return str(value["url"])
 
+    async def start_code_session(self, project_id: str) -> CodeSessionRecord:
+        payload = CodeSessionCreateRequest(project_id=project_id, client_id=self.client_id)
+        value = await self._request(
+            "POST", "/api/v1/code/sessions", json=payload.model_dump(mode="json"),
+        )
+        return CodeSessionRecord.model_validate(value)
+
+    async def run_code_turn(self, session_id: str, task: str) -> CodeTurnResult:
+        payload = CodeTurnRequest(client_id=self.client_id, task=task)
+        value = await self._request(
+            "POST", f"/api/v1/code/sessions/{session_id}/turns",
+            json=payload.model_dump(mode="json"),
+            timeout=3600,
+        )
+        return CodeTurnResult.model_validate(value)
+
+    async def finalize_code_session(self, session_id: str) -> CodeFinalizeResult:
+        value = await self._request(
+            "POST", f"/api/v1/code/sessions/{session_id}/finalize",
+            params={"client_id": self.client_id},
+        )
+        return CodeFinalizeResult.model_validate(value)
+
+    async def abort_code_session(self, session_id: str) -> CodeFinalizeResult:
+        value = await self._request(
+            "POST", f"/api/v1/code/sessions/{session_id}/abort",
+            params={"client_id": self.client_id},
+        )
+        return CodeFinalizeResult.model_validate(value)
+
+    async def code_session_events(
+        self,
+        session_id: str,
+        *,
+        after_sequence: int = 0,
+    ) -> list[dict[str, Any]]:
+        return list(await self._request(
+            "GET",
+            f"/api/v1/code/sessions/{session_id}/events",
+            params={"after_sequence": after_sequence},
+        ))
+
     async def skills(self, project_id: str) -> list[dict[str, Any]]:
         return list(await self._request("GET", f"/api/v1/projects/{project_id}/skills"))
 
@@ -132,7 +179,8 @@ class GatewayClient:
             "run_id": run_id,
             "after_sequence": str(after_sequence),
         })
-        async with connect(f"{ws_url}/api/v1/events?{query}") as socket:
+        # Gateway 固定为本机回环服务，不允许系统代理劫持 WebSocket。
+        async with connect(f"{ws_url}/api/v1/events?{query}", proxy=None) as socket:
             async for raw in socket:
                 value = raw.decode("utf-8") if isinstance(raw, bytes) else raw
                 yield GatewayEventEnvelope.model_validate_json(value, strict=True)
@@ -176,7 +224,12 @@ class GatewayClient:
                 await asyncio.sleep(0.5)
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        async with httpx.AsyncClient(headers=self._headers, timeout=30) as client:
+        timeout = kwargs.pop("timeout", 30)
+        async with httpx.AsyncClient(
+            headers=self._headers,
+            timeout=timeout,
+            trust_env=False,
+        ) as client:
             response = await client.request(method, f"{self.base_url}{path}", **kwargs)
             if response.status_code == 409:
                 raise RuntimeError(response.json().get("detail", "Gateway 状态冲突"))

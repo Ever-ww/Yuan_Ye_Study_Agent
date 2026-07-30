@@ -38,6 +38,7 @@ class SandboxSessionProtocol(Protocol):
     async def close(self) -> None: ...
     async def run_bash(self, command: str, timeout_seconds: int = 30) -> BashResult: ...
     async def checkpoint_write(self, path: str) -> CheckpointRecord | None: ...
+    async def checkpoint_edit(self, path: str) -> CheckpointRecord | None: ...
     async def restore_current(self) -> CheckpointRecord: ...
     async def rollback(self, steps: int) -> RollbackResult: ...
     def list_checkpoints(self) -> tuple[CheckpointRecord, ...]: ...
@@ -161,12 +162,22 @@ class DockerSandboxSession:
                 return BashResult(exit_code=0, output=output, checkpoint=checkpoint)
 
     async def checkpoint_write(self, path: str) -> CheckpointRecord | None:
-        """为宿主机 write_file 已完成的实际修改创建一次 checkpoint。"""
+        """为宿主机 write 已完成的实际修改创建一次 checkpoint。"""
         async with self._operation_lock:
             self._require_container()
             return await asyncio.to_thread(
                 self.checkpoints.create,
-                "write_file",
+                "write",
+                {"path": path},
+            )
+
+    async def checkpoint_edit(self, path: str) -> CheckpointRecord | None:
+        """为宿主机 edit 已完成的实际修改创建一次独立审计 checkpoint。"""
+        async with self._operation_lock:
+            self._require_container()
+            return await asyncio.to_thread(
+                self.checkpoints.create,
+                "edit",
                 {"path": path},
             )
 

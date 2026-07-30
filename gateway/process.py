@@ -117,7 +117,11 @@ class GatewayProcessManager:
 
     def _healthy(self) -> bool:
         try:
-            response = httpx.get(f"{self.base_url}/api/v1/health", timeout=0.5)
+            response = httpx.get(
+                f"{self.base_url}/api/v1/health",
+                timeout=0.5,
+                trust_env=False,
+            )
             payload = response.json()
             return (
                 response.status_code == 200

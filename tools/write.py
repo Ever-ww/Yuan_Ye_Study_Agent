@@ -1,4 +1,4 @@
-"""需要审批的工作区原子写入工具。"""
+"""需要审批的工作区整文件原子写入工具。"""
 
 from typing import Any
 from uuid import uuid4
@@ -7,11 +7,11 @@ from .contracts import ToolContext
 from .path_guard import safe_workspace_path
 
 
-class WriteFileTool:
+class WriteTool:
     """经 Runtime 批准后，原子写入工作区内的 UTF-8 文本。"""
 
-    name = "write_file"
-    description = "写入工作区文本文件"
+    name = "write"
+    description = "创建工作区文本文件或完整替换已有文件"
     schema: dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -24,9 +24,9 @@ class WriteFileTool:
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> str:
         if context.sandbox is None:
-            raise RuntimeError("当前 Runtime 未启用 checkpoint，禁止执行 write_file")
+            raise RuntimeError("当前 Runtime 未启用 checkpoint，禁止执行 write")
         if context.file_locks is None:
-            raise RuntimeError("当前 Runtime 未启用文件锁，禁止执行 write_file")
+            raise RuntimeError("当前 Runtime 未启用文件锁，禁止执行 write")
         path = safe_workspace_path(context.project_root, arguments["path"])
         content = arguments["content"]
         async with context.file_locks.write(path):

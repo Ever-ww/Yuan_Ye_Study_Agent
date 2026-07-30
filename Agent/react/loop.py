@@ -259,6 +259,7 @@ class ReactLoop:
             name, arguments = before.data.get("name"), before.data.get("arguments")
             if not isinstance(name, str) or not isinstance(arguments, dict):
                 raise ValueError("tool_before 必须保留字符串 name 和对象 arguments")
+            arguments = self.tools.prepare_arguments(name, arguments)
             yield RunEvent(type=EventType.TOOL_REQUESTED, payload={"name": name, "arguments": arguments})
             await self.hooks.emit(HookEvent(point=HookPoint.TOOL_DURING, session_id=session_id, data={
                 "task": task, "name": name, "arguments": arguments, "tool_call_id": call_id,
