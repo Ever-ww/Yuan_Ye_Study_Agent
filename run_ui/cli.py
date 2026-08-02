@@ -27,6 +27,7 @@ from bootstrap import ensure_project_initialized, initialize_project
 from memory import MemoryStore
 from gateway import GatewayClient, GatewayProcessManager
 from gateway.models import GatewayEventEnvelope
+from cron import CronJobCreateRequest, CronJobEditRequest, CronSchedule, CronScheduleCalculator
 from skill import SkillInstallRequest
 from .approval import InteractiveApproval, active_live as _active_live
 from .harness_loader import load_harness_module
@@ -37,6 +38,8 @@ session_app = typer.Typer(help="列出、查看和恢复本地会话")
 gateway_app = typer.Typer(help="管理本机 Gateway 后台进程")
 app.add_typer(session_app, name="session")
 app.add_typer(gateway_app, name="gateway")
+cron_app = typer.Typer(help="管理 Gateway 后台 Cron 与 Heartbeat")
+app.add_typer(cron_app, name="cron")
 console = Console()
 
 
@@ -135,6 +138,10 @@ async def _render_gateway(
                     )
                 elif event.type == EventType.MODEL_RECONNECTED.value:
                     lines.append("[green]模型网络连接已恢复[/]")
+                elif event.type == EventType.SANDBOX_FALLBACK.value:
+                    lines.append(
+                        f"[yellow]{event.payload.get('message', 'Docker 不可用，已进入 checkpoint-only；Bash 已禁用')}[/]"
+                    )
                 elif event.type == EventType.TOOL_REQUESTED.value:
                     if streaming_text:
                         lines.append(streaming_text)
@@ -212,6 +219,10 @@ async def _render(
                         )
                     elif event.type is EventType.MODEL_RECONNECTED:
                         lines.append("[green]模型网络连接已恢复，继续当前任务[/]")
+                    elif event.type is EventType.SANDBOX_FALLBACK:
+                        lines.append(
+                            f"[yellow]{event.payload.get('message', 'Docker 不可用，已进入 checkpoint-only；Bash 已禁用')}[/]"
+                        )
                     elif event.type is EventType.TOOL_REQUESTED:
                         if streaming_text:
                             lines.append(streaming_text)
@@ -317,6 +328,8 @@ async def _chat_gateway(
             console.print(
                 "/code 进入 Hook Extension Coding 模式；"
                 "/compress；/context refresh；/skill list|install|update|audit|refresh；/exit；"
+                "/inbox [all|show <ID>|read <ID>|read-all]；"
+                "/cron list|status|add|at|preview|edit|pause|resume|run|remove；"
                 "运行中 Ctrl+C 取消当前 Run，空闲时 Ctrl+C 退出客户端。"
             )
             continue
@@ -325,6 +338,12 @@ async def _chat_gateway(
             continue
         if task == "/skill" or task.startswith("/skill "):
             await _handle_gateway_skill_command(client, project_id, task)
+            continue
+        if task == "/inbox" or task.startswith("/inbox "):
+            await _handle_inbox_command(client, task)
+            continue
+        if task == "/cron" or task.startswith("/cron "):
+            await _handle_cron_command(client, project_id, task)
             continue
         if not task:
             continue
@@ -343,6 +362,228 @@ async def _chat_gateway(
             interrupt_controller.clear_active()
         if session_id and not previous_id:
             console.print(f"[dim]会话哈希：{session_id}[/]")
+
+
+async def _handle_cron_command(client: GatewayClient, project_id: str, task: str) -> None:
+    """处理聊天内的轻量 `/cron` 管理命令，不写入普通 Session。"""
+    try:
+        parts = shlex.split(task)
+        action = parts[1].lower() if len(parts) > 1 else "list"
+        if action == "list":
+            _render_cron_jobs(await client.cron_jobs(project_id))
+        elif action == "status":
+            console.print((await client.cron_status()).model_dump_json(indent=2))
+        elif action == "preview" and len(parts) in {3, 4}:
+            timezone_name = parts[3] if len(parts) == 4 else CronScheduleCalculator.local_timezone()
+            result = await client.cron_preview(CronSchedule(
+                kind="cron", expression=parts[2], timezone=timezone_name,
+            ))
+            console.print("\n".join(_cron_preview_local(result)) or "没有后续执行时间")
+        elif action == "add" and len(parts) >= 3 and parts[2].startswith("--"):
+            options = _cron_options(parts[2:])
+            every, expression = options.get("every"), options.get("cron")
+            if bool(every) == bool(expression):
+                raise ValueError("必须且只能提供 --every 或 --cron")
+            schedule = (
+                CronSchedule(kind="interval", interval_seconds=_parse_interval(str(every)))
+                if every else CronSchedule(
+                    kind="cron", expression=expression,
+                    timezone=options.get("timezone") or CronScheduleCalculator.local_timezone(),
+                )
+            )
+            result = await client.create_cron(CronJobCreateRequest(
+                project_id=project_id,
+                name=_required_option(options, "name"),
+                prompt=_required_option(options, "prompt"),
+                schedule=schedule,
+            ))
+            console.print(f"[green]已创建[/] {result.job_id}")
+        elif action == "add" and len(parts) >= 6 and parts[2] == "every":
+            result = await client.create_cron(CronJobCreateRequest(
+                project_id=project_id,
+                name=parts[4],
+                prompt=" ".join(parts[5:]),
+                schedule=CronSchedule(
+                    kind="interval", interval_seconds=_parse_interval(parts[3]),
+                ),
+            ))
+            console.print(f"[green]已创建[/] {result.job_id}")
+        elif action == "add" and len(parts) >= 8 and parts[2] == "cron":
+            result = await client.create_cron(CronJobCreateRequest(
+                project_id=project_id,
+                name=parts[6],
+                prompt=" ".join(parts[7:]),
+                schedule=CronSchedule(
+                    kind="cron", expression=parts[3], timezone=parts[5],
+                ),
+            ))
+            console.print(f"[green]已创建[/] {result.job_id}")
+        elif action == "at" and len(parts) >= 5 and not any(item.startswith("--") for item in parts[3:]):
+            result = await client.create_cron(CronJobCreateRequest(
+                project_id=project_id,
+                name=parts[3],
+                prompt=" ".join(parts[4:]),
+                schedule=CronSchedule(kind="once", run_at=parts[2]),
+            ))
+            console.print(f"[green]已创建[/] {result.job_id}")
+        elif action == "at" and len(parts) >= 3:
+            options = _cron_options(parts[3:])
+            result = await client.create_cron(CronJobCreateRequest(
+                project_id=project_id,
+                name=_required_option(options, "name"),
+                prompt=_required_option(options, "prompt"),
+                schedule=CronSchedule(kind="once", run_at=parts[2]),
+            ))
+            console.print(f"[green]已创建[/] {result.job_id}")
+        elif action == "edit" and len(parts) >= 3:
+            options = _cron_options(parts[3:])
+            every, expression = options.get("every"), options.get("cron")
+            if every and expression:
+                raise ValueError("--every 与 --cron 不能同时使用")
+            schedule = None
+            if every:
+                schedule = CronSchedule(kind="interval", interval_seconds=_parse_interval(every))
+            elif expression:
+                schedule = CronSchedule(
+                    kind="cron", expression=expression,
+                    timezone=options.get("timezone") or CronScheduleCalculator.local_timezone(),
+                )
+            if options.get("name") is None and options.get("prompt") is None and schedule is None:
+                raise ValueError("edit 至少需要 --name、--prompt、--every 或 --cron")
+            result = await client.edit_cron(parts[2], CronJobEditRequest(
+                name=options.get("name"), prompt=options.get("prompt"), schedule=schedule,
+            ))
+            console.print(f"[green]已更新[/] {result.job_id}")
+        elif action in {"pause", "resume", "run", "remove"} and len(parts) == 3:
+            operation = getattr(client, f"{action}_cron")
+            result = await operation(parts[2])
+            console.print(f"[green]{action} 完成[/] {result.job_id}")
+        else:
+            raise ValueError(
+                "用法：/cron list|status；/cron preview <表达式> [时区]；"
+                "/cron add every <30m> <名称> <Prompt>；"
+                "/cron add cron <表达式> --timezone <时区> <名称> <Prompt>；"
+                "/cron at <ISO时间> --name <名称> --prompt <Prompt>；"
+                "/cron edit <ID> [--name/--prompt/--every/--cron]；"
+                "/cron pause|resume|run|remove <ID>"
+            )
+    except Exception as exc:
+        console.print(f"[red]Cron 命令失败：{str(exc) or type(exc).__name__}[/]")
+
+
+def _cron_options(parts: list[str]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    index = 0
+    while index < len(parts):
+        key = parts[index]
+        if not key.startswith("--") or index + 1 >= len(parts):
+            raise ValueError(f"无效 Cron 选项：{key}")
+        values[key[2:].replace("-", "_")] = parts[index + 1]
+        index += 2
+    return values
+
+
+def _required_option(options: dict[str, str], name: str) -> str:
+    value = options.get(name, "").strip()
+    if not value:
+        raise ValueError(f"缺少 --{name.replace('_', '-')}")
+    return value
+
+
+async def _handle_inbox_command(client: GatewayClient, task: str) -> None:
+    """在交互式 CLI 中查询和管理 Gateway 后台结果。"""
+    try:
+        parts = shlex.split(task)
+    except ValueError as exc:
+        console.print(f"[red]Inbox 命令解析失败：{exc}[/]")
+        return
+    action = parts[1].lower() if len(parts) > 1 else "unread"
+    if action in {"unread", "all"} and len(parts) == 1 + (action != "unread"):
+        items = await client.inbox(unread_only=action != "all")
+        _render_inbox_table(items, unread_only=action != "all")
+        return
+    if action == "show" and len(parts) == 3:
+        item = await _resolve_inbox_item(client, parts[2])
+        if item is not None:
+            _render_inbox_item(item)
+        return
+    if action == "read" and len(parts) == 3:
+        item = await _resolve_inbox_item(client, parts[2])
+        if item is None:
+            return
+        updated = await client.mark_inbox_read(str(item["item_id"]))
+        console.print(f"[green]已标记为已读：[/]{updated['item_id']}")
+        return
+    if action == "read-all" and len(parts) == 2:
+        items = await client.inbox(unread_only=True)
+        for item in items:
+            await client.mark_inbox_read(str(item["item_id"]))
+        console.print(f"[green]已将 {len(items)} 条 Inbox 结果标记为已读。[/]")
+        return
+    console.print(
+        "[yellow]用法：/inbox；/inbox all；/inbox show <ID>；"
+        "/inbox read <ID>；/inbox read-all[/]"
+    )
+
+
+async def _resolve_inbox_item(
+    client: GatewayClient,
+    item_id_or_prefix: str,
+) -> dict[str, object] | None:
+    """允许使用表格中显示的唯一 ID 前缀定位一条结果。"""
+    items = await client.inbox(unread_only=False)
+    exact = [item for item in items if str(item.get("item_id", "")) == item_id_or_prefix]
+    matches = exact or [
+        item for item in items
+        if str(item.get("item_id", "")).startswith(item_id_or_prefix)
+    ]
+    if not matches:
+        console.print(f"[red]未找到 Inbox 项：{item_id_or_prefix}[/]")
+        return None
+    if len(matches) > 1:
+        console.print(f"[red]Inbox ID 前缀不唯一，请输入更多字符：{item_id_or_prefix}[/]")
+        return None
+    return dict(matches[0])
+
+
+def _render_inbox_table(items: list[dict[str, object]], *, unread_only: bool) -> None:
+    if not items:
+        console.print("暂无未读后台结果。" if unread_only else "Inbox 暂无结果。")
+        return
+    table = Table(title="未读 Inbox" if unread_only else "全部 Inbox")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("状态")
+    table.add_column("任务")
+    table.add_column("结果摘要")
+    table.add_column("时间", style="dim")
+    table.add_column("已读", justify="center")
+    for item in items:
+        item_id = str(item.get("item_id", ""))
+        summary = str(item.get("summary", ""))
+        table.add_row(
+            item_id[:12],
+            str(item.get("status", "")),
+            str(item.get("title", "")),
+            summary if len(summary) <= 80 else summary[:77] + "…",
+            str(item.get("created_at", "")),
+            "是" if bool(item.get("read")) else "否",
+        )
+    console.print(table)
+    console.print("[dim]可使用表格中的 ID 前缀执行 /inbox show 或 /inbox read。[/]")
+
+
+def _render_inbox_item(item: dict[str, object]) -> None:
+    content = (
+        f"状态：{item.get('status', '')}\n"
+        f"任务：{item.get('title', '')}\n"
+        f"结果：{item.get('summary', '') or '（无结果正文）'}\n"
+        f"Session：{item.get('session_id') or '-'}\n"
+        f"Run：{item.get('run_id', '')}\n"
+        f"Project：{item.get('project_id', '')}\n"
+        f"时间：{item.get('created_at', '')}\n"
+        f"已读：{'是' if bool(item.get('read')) else '否'}"
+    )
+    console.print(Panel(content, title=f"Inbox {item.get('item_id', '')}"))
 
 
 async def _code_mode(client: GatewayClient, project_id: str) -> None:
@@ -726,7 +967,7 @@ async def _handle_chat_failure(config, runtime, task: str, session_id: str, fail
     harness = load_harness_module()
     writer = harness.ErrorSnapshotWriter(
         config.agent_root,
-        secrets=(config.api_key or "",),
+        secrets=(config.api_key or "", config.web_search_api_key or ""),
     )
     try:
         records = runtime.memory.session_records(session_id) if session_id and runtime.memory.has_session(session_id) else []
@@ -860,6 +1101,199 @@ def gateway_run_internal(
     """打包 sidecar 使用的前台服务入口。"""
     from gateway.process import run_gateway
     run_gateway(agent_root or default_agent_root(), port)
+
+
+@cron_app.command("list")
+def cron_list() -> None:
+    """列出当前 workspace 的全部 Cron Job。"""
+    async def execute():
+        client = _gateway_client()
+        project = await _gateway_project(client)
+        return await client.cron_jobs(str(project["project_id"]))
+    _render_cron_jobs(asyncio.run(execute()))
+
+
+@cron_app.command("status")
+def cron_status() -> None:
+    """显示 Heartbeat 健康状态和任务计数。"""
+    async def execute():
+        return await _gateway_client().cron_status()
+    console.print(asyncio.run(execute()).model_dump_json(indent=2))
+
+
+@cron_app.command("preview")
+def cron_preview(
+    expression: str,
+    timezone_name: str = typer.Option(None, "--timezone"),
+    count: int = typer.Option(5, "--count", min=1, max=20),
+) -> None:
+    """预览五段 Cron 表达式的未来执行时间（持久化值为 UTC）。"""
+    zone = timezone_name or CronScheduleCalculator.local_timezone()
+    async def execute():
+        return await _gateway_client().cron_preview(
+            CronSchedule(kind="cron", expression=expression, timezone=zone), count,
+        )
+    result = asyncio.run(execute())
+    console.print("\n".join(_cron_preview_local(result)) or "没有后续执行时间")
+
+
+@cron_app.command("add")
+def cron_add(
+    name: str = typer.Option(..., "--name"),
+    prompt: str = typer.Option(..., "--prompt"),
+    every: str | None = typer.Option(None, "--every"),
+    expression: str | None = typer.Option(None, "--cron"),
+    timezone_name: str | None = typer.Option(None, "--timezone"),
+) -> None:
+    """创建固定间隔或五段 Cron 任务。"""
+    if bool(every) == bool(expression):
+        raise typer.BadParameter("必须且只能提供 --every 或 --cron")
+    schedule = (
+        CronSchedule(kind="interval", interval_seconds=_parse_interval(str(every)))
+        if every else CronSchedule(
+            kind="cron",
+            expression=expression,
+            timezone=timezone_name or CronScheduleCalculator.local_timezone(),
+        )
+    )
+    async def execute():
+        client = _gateway_client()
+        project = await _gateway_project(client)
+        return await client.create_cron(CronJobCreateRequest(
+            project_id=str(project["project_id"]), name=name, prompt=prompt, schedule=schedule,
+        ))
+    result = asyncio.run(execute())
+    console.print(f"[green]已创建[/] {result.job_id}，下次：{result.next_run_at}")
+
+
+@cron_app.command("at")
+def cron_at(
+    when: str,
+    name: str = typer.Option(..., "--name"),
+    prompt: str = typer.Option(..., "--prompt"),
+) -> None:
+    """创建一次性、带时区的 ISO 8601 任务。"""
+    async def execute():
+        client = _gateway_client()
+        project = await _gateway_project(client)
+        return await client.create_cron(CronJobCreateRequest(
+            project_id=str(project["project_id"]), name=name, prompt=prompt,
+            schedule=CronSchedule(kind="once", run_at=when),
+        ))
+    result = asyncio.run(execute())
+    console.print(f"[green]已创建[/] {result.job_id}，执行时间：{result.next_run_at}")
+
+
+@cron_app.command("edit")
+def cron_edit(
+    job_id: str,
+    name: str | None = typer.Option(None, "--name"),
+    prompt: str | None = typer.Option(None, "--prompt"),
+    every: str | None = typer.Option(None, "--every"),
+    expression: str | None = typer.Option(None, "--cron"),
+    timezone_name: str | None = typer.Option(None, "--timezone"),
+) -> None:
+    """编辑任务名称、Prompt 或计划。"""
+    if every and expression:
+        raise typer.BadParameter("--every 与 --cron 不能同时提供")
+    schedule = None
+    if every:
+        schedule = CronSchedule(kind="interval", interval_seconds=_parse_interval(every))
+    elif expression:
+        schedule = CronSchedule(
+            kind="cron", expression=expression,
+            timezone=timezone_name or CronScheduleCalculator.local_timezone(),
+        )
+    if name is None and prompt is None and schedule is None:
+        raise typer.BadParameter("至少提供一项修改")
+    async def execute():
+        return await _gateway_client().edit_cron(
+            job_id, CronJobEditRequest(name=name, prompt=prompt, schedule=schedule),
+        )
+    console.print(f"[green]已更新[/] {asyncio.run(execute()).job_id}")
+
+
+def _cron_action_command(job_id: str, action: str) -> None:
+    async def execute():
+        return await getattr(_gateway_client(), f"{action}_cron")(job_id)
+    result = asyncio.run(execute())
+    console.print(f"[green]{action} 完成[/] {result.job_id}")
+
+
+@cron_app.command("pause")
+def cron_pause(job_id: str) -> None:
+    _cron_action_command(job_id, "pause")
+
+
+@cron_app.command("resume")
+def cron_resume(job_id: str) -> None:
+    _cron_action_command(job_id, "resume")
+
+
+@cron_app.command("run")
+def cron_run(job_id: str) -> None:
+    _cron_action_command(job_id, "run")
+
+
+@cron_app.command("remove")
+def cron_remove(job_id: str) -> None:
+    _cron_action_command(job_id, "remove")
+
+
+def _parse_interval(value: str) -> int:
+    import re
+    match = re.fullmatch(r"\s*(\d+)\s*([smhdw]?)\s*", value, re.IGNORECASE)
+    if match is None:
+        raise ValueError("固定间隔应类似 30m、2h、1d 或直接填写秒数")
+    amount = int(match.group(1))
+    multiplier = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[match.group(2).lower()]
+    seconds = amount * multiplier
+    if seconds < 60:
+        raise ValueError("固定间隔不能小于 60 秒")
+    return seconds
+
+
+def _render_cron_jobs(jobs) -> None:
+    if not jobs:
+        console.print("当前项目没有 Cron Job。")
+        return
+    table = Table(title="Cron Jobs")
+    table.add_column("ID", style="cyan")
+    table.add_column("名称")
+    table.add_column("状态")
+    table.add_column("计划")
+    table.add_column("下次执行（任务时区）")
+    table.add_column("运行/失败/重叠")
+    for job in jobs:
+        schedule = (
+            f"every {job.schedule.interval_seconds}s" if job.schedule.kind == "interval"
+            else str(job.schedule.run_at) if job.schedule.kind == "once"
+            else f"{job.schedule.expression} [{job.schedule.timezone}]"
+        )
+        table.add_row(
+            job.job_id, job.name, job.state, schedule, _cron_local_time(job),
+            f"{job.run_count}/{job.failure_count}/{job.skipped_overlap_count}",
+        )
+    console.print(table)
+
+
+def _cron_local_time(job) -> str:
+    if not job.next_run_at:
+        return "-"
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    selected = datetime.fromisoformat(job.next_run_at.replace("Z", "+00:00"))
+    return selected.astimezone(ZoneInfo(job.schedule.timezone)).isoformat(timespec="seconds")
+
+
+def _cron_preview_local(preview) -> tuple[str, ...]:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    zone = ZoneInfo(preview.schedule.timezone)
+    return tuple(
+        datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(zone).isoformat(timespec="seconds")
+        for value in preview.next_runs
+    )
 
 
 @app.command()

@@ -8,6 +8,16 @@ from pathlib import Path
 from time import monotonic
 
 from Agent import ExtensionLoader, RuntimeConfig
+from cron import (
+    CronJob,
+    CronJobCreateRequest,
+    CronJobEditRequest,
+    CronSchedule,
+    CronScheduleCalculator,
+    CronScheduler,
+    CronService,
+    CronStore,
+)
 from gateway.code_sessions import CodeSessionManager
 from gateway.events import GatewayEventBus
 from gateway.models import (
@@ -40,6 +50,11 @@ class GatewayApplication:
         self.events = GatewayEventBus()
         source_root = config.coding_source_root or Path(__file__).resolve().parents[1]
         self.extensions = ExtensionLoader(source_root).scan()
+        self.cron_store = CronStore(
+            config.agent_root,
+            heartbeat_seconds=config.cron_heartbeat_seconds,
+        )
+        self.cron_service = CronService(self.cron_store, CronScheduleCalculator())
         self.pool = RuntimePool(
             agent_root=config.agent_root,
             store=self.store,
@@ -48,14 +63,23 @@ class GatewayApplication:
             idle_timeout_seconds=config.gateway_runtime_idle_seconds,
             runtime_factory=runtime_factory,
             extensions=self.extensions,
+            cron_service=self.cron_service,
         )
+        self.cron_scheduler = CronScheduler(
+            self.cron_store,
+            self._submit_cron_run,
+            self.store.run,
+        )
+        self.cron_service.set_waker(self.cron_scheduler.wake)
         self._browser_codes: dict[str, float] = {}
         self.code_sessions = CodeSessionManager(config)
 
     async def start(self) -> None:
         await self.pool.start()
+        await self.cron_scheduler.start()
 
     async def close(self) -> None:
+        await self.cron_scheduler.close()
         await self.code_sessions.close()
         await self.pool.close()
 
@@ -78,6 +102,50 @@ class GatewayApplication:
     def register_project(self, path: Path, name: str | None = None) -> ProjectRecord:
         return self.store.register_project(path, name)
 
+    async def remove_project(self, project_id: str) -> None:
+        if await self.cron_service.project_has_jobs(project_id):
+            raise RuntimeError("项目仍有关联 Cron Job，必须先删除计划任务")
+        self.store.remove_project(project_id)
+
+    async def create_cron(self, request: CronJobCreateRequest) -> CronJob:
+        self.store.project(request.project_id)
+        result = await self.cron_service.create(request)
+        self.cron_scheduler.wake()
+        return result
+
+    async def edit_cron(self, job_id: str, request: CronJobEditRequest) -> CronJob:
+        current = await self.cron_service.get(job_id)
+        self.store.project(current.project_id)
+        result = await self.cron_service.edit(job_id, request)
+        self.cron_scheduler.wake()
+        return result
+
+    async def pause_cron(self, job_id: str) -> CronJob:
+        result = await self.cron_service.pause(job_id)
+        self.cron_scheduler.wake()
+        return result
+
+    async def resume_cron(self, job_id: str) -> CronJob:
+        result = await self.cron_service.resume(job_id)
+        self.cron_scheduler.wake()
+        return result
+
+    async def run_cron(self, job_id: str) -> CronJob:
+        result = await self.cron_service.trigger(job_id)
+        self.cron_scheduler.wake()
+        return result
+
+    async def remove_cron(self, job_id: str) -> CronJob:
+        result = await self.cron_service.remove(job_id)
+        self.cron_scheduler.wake()
+        return result
+
+    async def cron_status(self):
+        return await self.cron_service.status(error=self.cron_scheduler.last_error)
+
+    def cron_preview(self, schedule: CronSchedule, count: int = 5):
+        return self.cron_service.preview(schedule, count=count)
+
     async def start_run(self, request: RunCreateRequest) -> RunRecord:
         self.store.project(request.project_id)
         run = self.store.create_run(
@@ -97,6 +165,17 @@ class GatewayApplication:
             )
             raise
         return run
+
+    async def _submit_cron_run(self, job: CronJob, run_id: str) -> None:
+        self.store.project(job.project_id)
+        run = self.store.create_run(
+            job.project_id,
+            f"cron:{job.job_id}",
+            job.prompt,
+            None,
+            run_id=run_id,
+        )
+        await self.pool.submit(run)
 
     async def cancel_run(self, run_id: str) -> bool:
         self.store.run(run_id)

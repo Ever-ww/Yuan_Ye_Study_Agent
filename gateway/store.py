@@ -165,9 +165,10 @@ class GatewayStore:
         client_id: str,
         task: str,
         session_id: str | None,
+        run_id: str | None = None,
     ) -> RunRecord:
         run = RunRecord(
-            run_id=uuid4().hex,
+            run_id=run_id or uuid4().hex,
             project_id=project_id,
             session_id=session_id,
             client_id=client_id,

@@ -9,6 +9,15 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
+from cron import (
+    CronJob,
+    CronJobCreateRequest,
+    CronJobEditRequest,
+    CronPreview,
+    CronPreviewRequest,
+    CronSchedule,
+    CronStatus,
+)
 
 from gateway.models import (
     ApprovalDecision,
@@ -55,6 +64,50 @@ class GatewayClient:
     async def projects(self) -> list[dict[str, Any]]:
         return list(await self._request("GET", "/api/v1/projects"))
 
+    async def cron_jobs(self, project_id: str | None = None) -> tuple[CronJob, ...]:
+        params = {"project_id": project_id} if project_id else None
+        values = await self._request("GET", "/api/v1/cron/jobs", params=params)
+        return tuple(CronJob.model_validate(value) for value in values)
+
+    async def cron_status(self) -> CronStatus:
+        return CronStatus.model_validate(await self._request("GET", "/api/v1/cron/status"))
+
+    async def cron_preview(self, schedule: CronSchedule, count: int = 5) -> CronPreview:
+        payload = CronPreviewRequest(schedule=schedule, count=count)
+        value = await self._request(
+            "POST", "/api/v1/cron/preview", json=payload.model_dump(mode="json"),
+        )
+        return CronPreview.model_validate(value)
+
+    async def create_cron(self, request: CronJobCreateRequest) -> CronJob:
+        value = await self._request(
+            "POST", "/api/v1/cron/jobs", json=request.model_dump(mode="json"),
+        )
+        return CronJob.model_validate(value)
+
+    async def edit_cron(self, job_id: str, request: CronJobEditRequest) -> CronJob:
+        value = await self._request(
+            "PATCH", f"/api/v1/cron/jobs/{job_id}", json=request.model_dump(mode="json"),
+        )
+        return CronJob.model_validate(value)
+
+    async def pause_cron(self, job_id: str) -> CronJob:
+        return await self._cron_action(job_id, "pause")
+
+    async def resume_cron(self, job_id: str) -> CronJob:
+        return await self._cron_action(job_id, "resume")
+
+    async def run_cron(self, job_id: str) -> CronJob:
+        return await self._cron_action(job_id, "run")
+
+    async def remove_cron(self, job_id: str) -> CronJob:
+        value = await self._request("DELETE", f"/api/v1/cron/jobs/{job_id}")
+        return CronJob.model_validate(value)
+
+    async def _cron_action(self, job_id: str, action: str) -> CronJob:
+        value = await self._request("POST", f"/api/v1/cron/jobs/{job_id}/{action}")
+        return CronJob.model_validate(value)
+
     async def sessions(self, project_id: str) -> list[dict[str, Any]]:
         return list(await self._request("GET", f"/api/v1/projects/{project_id}/sessions"))
 
@@ -99,6 +152,10 @@ class GatewayClient:
             "/api/v1/inbox",
             params={"unread_only": str(unread_only).lower()},
         ))
+
+    async def mark_inbox_read(self, item_id: str) -> dict[str, Any]:
+        """将一条后台结果标记为已读。"""
+        return dict(await self._request("POST", f"/api/v1/inbox/{item_id}/read"))
 
     async def browser_url(self) -> str:
         value = await self._request("POST", "/api/v1/browser/code")

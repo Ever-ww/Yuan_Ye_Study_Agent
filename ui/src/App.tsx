@@ -172,7 +172,19 @@ export default function App() {
       <section className="workspace">
         <header>
           <div><h1>{project?.name || "选择一个项目"}</h1><p>{sessionId || "新任务"}</p></div>
-          <div className="pills"><span>Local</span><span>{status?.sandbox ? "Sandbox" : "No sandbox"}</span></div>
+          <div className="pills">
+            <span>Local</span>
+            <span title={status?.sandbox_reason || ""}>
+              {!status
+                ? "检测中"
+                : status.sandbox_mode === "docker"
+                  ? "Docker Sandbox"
+                  : "Checkpoint only"}
+            </span>
+            <span title={status?.cron.last_error || status?.cron.heartbeat?.next_tick_at || ""}>
+              {!status ? "Cron 检测中" : status.cron.healthy ? `Cron ${status.cron.jobs_scheduled}` : "Cron unhealthy"}
+            </span>
+          </div>
         </header>
         <div className="timeline">
           {history.length === 0 && events.length === 0 && <div className="empty"><b>开始一项工作</b><p>提出问题、研究主题或让 Agent 在 workspace 中完成任务。</p></div>}
@@ -227,7 +239,7 @@ function EventCard({ event }: { event: GatewayEvent }) {
     tool_completed: "工具完成", model_retry: "网络重试", model_reconnected: "网络恢复",
     compression_started: "上下文压缩", context_compressed: "压缩完成",
     run_completed: "运行完成", run_failed: "运行失败", run_cancelled: "已取消",
-    run_interrupted: "Gateway 异常中断"
+    run_interrupted: "Gateway 异常中断", sandbox_fallback: "Checkpoint-only 降级"
   };
   return (
     <article className={`event ${event.type}`}>

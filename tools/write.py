@@ -3,8 +3,8 @@
 from typing import Any
 from uuid import uuid4
 
-from .contracts import ToolContext
-from .path_guard import safe_workspace_path
+from tool.contracts import ToolContext
+from tool.path_guard import safe_workspace_path
 
 
 class WriteTool:

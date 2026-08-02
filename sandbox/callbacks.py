@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 
-from .docker import SandboxSessionProtocol
+from .docker import SandboxSessionProtocol, sandbox_status_of
 
 
 def register_sandbox_callbacks(
@@ -16,6 +16,7 @@ def register_sandbox_callbacks(
     async def start_sandbox(event: HookEvent) -> None:
         checkpoint = await sandbox.start(event.session_id)
         event.data["sandbox_checkpoint"] = checkpoint.model_dump(mode="json")
+        event.data["sandbox_status"] = sandbox_status_of(sandbox).model_dump(mode="json")
 
     async def close_sandbox(event: HookEvent) -> None:
         await sandbox.close()

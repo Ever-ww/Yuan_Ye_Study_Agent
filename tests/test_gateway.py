@@ -6,9 +6,11 @@ import asyncio
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -20,9 +22,10 @@ from gateway.events import GatewayEventBus
 from gateway.models import CodeFinalizeResult, CodeSessionRecord, CodeTurnResult, RunCreateRequest
 from gateway.runtime_pool import RuntimePool
 from gateway.store import GatewayStore
-from gateway.process import GatewayProcessManager, InstanceLock
+from gateway.process import GatewayProcessManager, InstanceLock, _windows_background_creationflags
 from bootstrap import initialize_project, migrate_source_home
 from memory import MemoryStore
+from sandbox import SandboxStatus
 
 
 class FakeRuntime:
@@ -123,6 +126,57 @@ class FakeCodeSessions:
 
 
 class GatewayTests(unittest.TestCase):
+    def test_windows_gateway_background_flags_never_allocate_console(self) -> None:
+        flags = _windows_background_creationflags()
+        detached = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        process_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        self.assertEqual(flags & detached, 0)
+        self.assertEqual(flags & no_window, no_window)
+        self.assertEqual(flags & process_group, process_group)
+
+    def test_gateway_process_manager_uses_no_window_flags_and_closes_handles(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            manager = GatewayProcessManager(Path(value), 18768)
+            with (
+                patch.object(manager, "_healthy", side_effect=[False, False, True, True]),
+                patch("gateway.process._port_available", return_value=True),
+                patch("gateway.process.os.name", "nt"),
+                patch("gateway.process.subprocess.Popen") as popen,
+            ):
+                status = manager.ensure_running(timeout_seconds=0.2)
+            self.assertTrue(status["running"])
+            options = popen.call_args.kwargs
+            self.assertEqual(options["creationflags"], _windows_background_creationflags())
+            self.assertTrue(options["close_fds"])
+            self.assertFalse(options["start_new_session"])
+
+    def test_gateway_status_reports_checkpoint_only_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            application = GatewayApplication(
+                load_runtime_config(root),
+                runtime_factory=lambda workspace, approval: FakeRuntime(workspace),
+            )
+            fallback = SandboxStatus(
+                mode="checkpoint_only",
+                bash_available=False,
+                reason_code="docker_daemon_unavailable",
+                message="Docker daemon 无法连接",
+            )
+            with patch("gateway.api.probe_docker_status", AsyncMock(return_value=fallback)):
+                with TestClient(create_gateway_api(application, access_token="test-token")) as client:
+                    response = client.get(
+                        "/api/v1/status",
+                        headers={"Authorization": "Bearer test-token"},
+                    )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertFalse(payload["sandbox"])
+            self.assertEqual(payload["sandbox_mode"], "checkpoint_only")
+            self.assertFalse(payload["bash_available"])
+            self.assertEqual(payload["sandbox_reason"], fallback.message)
+
     def test_code_session_api_create_turn_events_and_finalize(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)

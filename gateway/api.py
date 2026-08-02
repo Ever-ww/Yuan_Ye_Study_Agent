@@ -2,12 +2,12 @@
 
 import asyncio
 import secrets
-import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from Agent import load_runtime_config
+from cron import CronJobCreateRequest, CronJobEditRequest, CronPreviewRequest
 from gateway.application import GatewayApplication
 from gateway.models import (
     ApprovalDecision,
@@ -19,6 +19,7 @@ from gateway.models import (
     SkillManageRequest,
 )
 from gateway.security import GatewayCredentials, bearer_value
+from sandbox import probe_docker_status
 
 
 def create_gateway_api(
@@ -120,6 +121,8 @@ def create_gateway_api(
 
     @app.get("/api/v1/status", dependencies=[Depends(authorize)])
     async def status():
+        sandbox_status = await probe_docker_status()
+        cron_status = await gateway.cron_status()
         return {
             "gateway": "running",
             "version": 1,
@@ -131,8 +134,16 @@ def create_gateway_api(
                 else "system" if config.use_system_proxy
                 else "disabled"
             ),
-            "sandbox": shutil.which("docker") is not None,
+            "sandbox": sandbox_status.bash_available,
+            "sandbox_mode": sandbox_status.mode,
+            "bash_available": sandbox_status.bash_available,
+            "sandbox_reason": (
+                sandbox_status.message
+                if sandbox_status.mode == "checkpoint_only"
+                else None
+            ),
             "max_concurrent_runs": config.gateway_max_concurrent_runs,
+            "cron": cron_status.model_dump(mode="json"),
         }
 
     @app.get("/api/v1/bootstrap", dependencies=[Depends(authorize)])
@@ -149,8 +160,44 @@ def create_gateway_api(
 
     @app.delete("/api/v1/projects/{project_id}", dependencies=[Depends(authorize_write)])
     async def delete_project(project_id: str):
-        gateway.store.remove_project(project_id)
+        await gateway.remove_project(project_id)
         return {"removed": True}
+
+    @app.get("/api/v1/cron/jobs", dependencies=[Depends(authorize)])
+    async def list_cron(project_id: str | None = None):
+        return await gateway.cron_service.list(project_id)
+
+    @app.get("/api/v1/cron/status", dependencies=[Depends(authorize)])
+    async def cron_status():
+        return await gateway.cron_status()
+
+    @app.post("/api/v1/cron/preview", dependencies=[Depends(authorize)])
+    async def cron_preview(payload: CronPreviewRequest):
+        return gateway.cron_preview(payload.schedule, payload.count)
+
+    @app.post("/api/v1/cron/jobs", dependencies=[Depends(authorize_write)])
+    async def create_cron(payload: CronJobCreateRequest):
+        return await gateway.create_cron(payload)
+
+    @app.patch("/api/v1/cron/jobs/{job_id}", dependencies=[Depends(authorize_write)])
+    async def edit_cron(job_id: str, payload: CronJobEditRequest):
+        return await gateway.edit_cron(job_id, payload)
+
+    @app.post("/api/v1/cron/jobs/{job_id}/pause", dependencies=[Depends(authorize_write)])
+    async def pause_cron(job_id: str):
+        return await gateway.pause_cron(job_id)
+
+    @app.post("/api/v1/cron/jobs/{job_id}/resume", dependencies=[Depends(authorize_write)])
+    async def resume_cron(job_id: str):
+        return await gateway.resume_cron(job_id)
+
+    @app.post("/api/v1/cron/jobs/{job_id}/run", dependencies=[Depends(authorize_write)])
+    async def run_cron(job_id: str):
+        return await gateway.run_cron(job_id)
+
+    @app.delete("/api/v1/cron/jobs/{job_id}", dependencies=[Depends(authorize_write)])
+    async def remove_cron(job_id: str):
+        return await gateway.remove_cron(job_id)
 
     @app.get("/api/v1/projects/{project_id}/sessions", dependencies=[Depends(authorize)])
     async def list_sessions(project_id: str):

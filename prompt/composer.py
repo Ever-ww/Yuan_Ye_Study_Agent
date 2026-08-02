@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict
 if TYPE_CHECKING:
     from Agent.config import RuntimeConfig
     from memory import MemoryStore
+    from sandbox import SandboxStatus
     from skill import SkillService
 
 
@@ -39,8 +40,14 @@ class SystemPromptComposer:
         self.config = config
         self.memory = memory
         self.skills = skills
-        self.sandbox_enabled = sandbox_enabled
+        self.sandbox_mode = "docker" if sandbox_enabled else "closed"
         self._snapshots: dict[str, SystemPromptSnapshot] = {}
+
+    def set_sandbox_status(self, status: "SandboxStatus") -> None:
+        """在 Trace 探测完成后固定当前 Session 的实际安全能力。"""
+        if self.sandbox_mode != status.mode:
+            self._snapshots.clear()
+        self.sandbox_mode = status.mode
 
     def open_session(self, session_id: str, *, force: bool = False) -> SystemPromptSnapshot:
         """返回 Session 的缓存快照；仅 force 时重新读取文件。"""
@@ -53,11 +60,15 @@ class SystemPromptComposer:
         agent = _read(self.config.agent_root / ".yy" / "agents" / "AGENT.md")
         profile = self.memory.prompt_context(session_id)
         summary = self.memory.latest_summary(session_id)
-        environment = _environment(self.config, sandbox_enabled=self.sandbox_enabled)
+        environment = _environment(self.config, sandbox_mode=self.sandbox_mode)
         sections = [
             skill_xml,
             "# Agent 身份（SOUL）\n" + soul,
-            "# 核心规则\n你是严谨、透明的本地 Agent。工具调用必须遵守权限、工作区边界和审批要求。",
+            (
+                "# 核心规则\n你是严谨、透明的本地 Agent。工具调用必须遵守权限、工作区边界和审批要求。"
+                "网络调研中，web_search 只用于发现候选 URL；需要读取正文或核验摘要时，"
+                "应从搜索结果选择相关 URL 继续调用 web_fetch。"
+            ),
             "# 项目说明（AGENT）\n" + agent,
             "# 长时记忆\n" + (profile or "（暂无可用长期记忆）"),
             "# 系统与会话信息\n" + environment + (
@@ -125,16 +136,25 @@ class PromptComposer:
     def close(self, session_id: str) -> None:
         self.system.discard(session_id)
 
+    def set_sandbox_status(self, status: "SandboxStatus") -> None:
+        self.system.set_sandbox_status(status)
+
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8").strip() if path.exists() else "（未配置）"
 
 
-def _environment(config: "RuntimeConfig", *, sandbox_enabled: bool) -> str:
+def _environment(config: "RuntimeConfig", *, sandbox_mode: str) -> str:
     now = datetime.now().astimezone()
+    sandbox_text = {
+        "docker": "Docker 沙箱（Bash 可用，文件修改受 checkpoint 保护）",
+        "checkpoint_only": "Checkpoint-only（Bash 禁用，本地写入与回溯可用）",
+        "pending": "正在探测 Docker",
+        "closed": "未启用或已关闭",
+    }.get(sandbox_mode, sandbox_mode)
     return (
         f"操作系统：{platform.system()} {platform.release()}\n"
         f"架构：{platform.machine()}\nPython：{platform.python_version()}\n"
-        f"工作区：{config.workspace_root}\nSandbox：{'启用' if sandbox_enabled else '未启用'}\n"
+        f"工作区：{config.workspace_root}\nSandbox：{sandbox_text}\n"
         f"时区：{now.tzname() or str(now.tzinfo)}\n系统时间：{now:%Y-%m-%d %H:%M:%S}"
     )

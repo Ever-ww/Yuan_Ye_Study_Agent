@@ -7,7 +7,7 @@ from typing import Any
 
 from skill import SkillService
 
-from .contracts import ToolContext
+from tool.contracts import ToolContext
 
 
 class SkillReadTool:

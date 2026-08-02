@@ -36,7 +36,7 @@ jobs:
       - name: 运行 unittest
         run: uv run --frozen --extra dev python -m unittest discover -s tests -v
       - name: 编译检查
-        run: uv run --frozen --extra dev python -m compileall -q Agent bootstrap context_process extension gateway memory prompt sandbox skill tools run_ui tests harness-evolution run.py
+        run: uv run --frozen --extra dev python -m compileall -q Agent bootstrap context_process extension gateway memory prompt sandbox skill tool tools run_ui tests harness-evolution run.py
 
   frontend:
     runs-on: ubuntu-latest

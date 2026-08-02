@@ -35,6 +35,11 @@ class RuntimeConfig(BaseModel):
     provider: str = Field(default="echo", min_length=1)
     base_url: str | None = None
     api_key: str | None = None
+    web_search_api_key: str | None = None
+    web_search_timeout_seconds: StrictInt = Field(default=20, ge=5, le=60)
+    web_fetch_timeout_seconds: StrictInt = Field(default=20, ge=5, le=60)
+    web_fetch_max_bytes: StrictInt = Field(default=2_000_000, ge=100_000, le=5_000_000)
+    web_fetch_max_chars: StrictInt = Field(default=30_000, ge=1_000, le=30_000)
     use_system_proxy: StrictBool = False
     proxy_url: str | None = None
     stream: StrictBool = False
@@ -49,6 +54,7 @@ class RuntimeConfig(BaseModel):
     gateway_port: StrictInt = Field(default=8765, ge=1024, le=65535)
     gateway_max_concurrent_runs: StrictInt = Field(default=4, ge=1, le=32)
     gateway_runtime_idle_seconds: StrictInt = Field(default=900, ge=30)
+    cron_heartbeat_seconds: StrictInt = Field(default=60, ge=5)
 
     @field_validator("agent_root", "workspace_root", "coding_source_root")
     @classmethod
@@ -106,8 +112,11 @@ def load_runtime_config(
     ensure_project_initialized(selected_agent_root)
     values: dict[str, Any] = {}
     shared = _read_json(selected_agent_root / ".yy" / "settings.json")
-    if "api_key" in shared:
-        raise ValueError("禁止在 .yy/settings.json 保存 api_key；请移至已忽略的 .yy/settings.local.json")
+    sensitive_keys = {"api_key", "web_search_api_key"}.intersection(shared)
+    if sensitive_keys:
+        raise ValueError(
+            "禁止在 .yy/settings.json 保存 API Key；请移至已忽略的 .yy/settings.local.json",
+        )
     values.update(shared)
     values.update(_read_json(selected_agent_root / ".yy" / "settings.local.json"))
     values.update({key: value for key, value in overrides.items() if value is not None})

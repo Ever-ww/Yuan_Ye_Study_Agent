@@ -1,7 +1,15 @@
 """Docker 沙箱与本地 checkpoint 的正式公共接口。"""
 
 from .checkpoint import CheckpointStore
-from .docker import CommandResult, DockerSandboxSession, SandboxSessionProtocol
+from .docker import (
+    BashUnavailableError,
+    CommandResult,
+    DockerSandboxSession,
+    DockerUnavailableError,
+    SandboxSessionProtocol,
+    probe_docker_status,
+    sandbox_status_of,
+)
 from .locks import WorkspaceLockManager
 from .models import (
     BashResult,
@@ -9,6 +17,7 @@ from .models import (
     CheckpointRecord,
     CheckpointState,
     RollbackResult,
+    SandboxStatus,
 )
 
 
@@ -20,14 +29,19 @@ def register_sandbox_callbacks(*args, **kwargs):
 
 __all__ = [
     "BashResult",
+    "BashUnavailableError",
     "CheckpointAuditEvent",
     "CheckpointRecord",
     "CheckpointState",
     "CheckpointStore",
     "CommandResult",
     "DockerSandboxSession",
+    "DockerUnavailableError",
     "RollbackResult",
     "SandboxSessionProtocol",
+    "SandboxStatus",
     "WorkspaceLockManager",
     "register_sandbox_callbacks",
+    "probe_docker_status",
+    "sandbox_status_of",
 ]

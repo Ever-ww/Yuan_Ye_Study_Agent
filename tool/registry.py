@@ -34,22 +34,44 @@ class AsyncToolRegistry:
         self._tools[tool.name] = tool
         self._argument_models[tool.name] = _build_argument_model(tool.name, tool.schema)
 
-    def schemas(self) -> list[dict[str, Any]]:
+    def schemas(self, context: ToolContext | None = None) -> list[dict[str, Any]]:
         """返回供模型调用的 OpenAI function Schema 列表。"""
-        return [
-            {"name": tool.name, "description": tool.description, "parameters": tool.schema}
-            for tool in self._tools.values()
-        ]
+        schemas: list[dict[str, Any]] = []
+        for tool in self._tools.values():
+            if not self.is_available(tool.name, context):
+                continue
+            schema_for = getattr(tool, "schema_for", None)
+            parameters = schema_for(context) if callable(schema_for) else tool.schema
+            schemas.append({
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": parameters,
+            })
+        return schemas
 
-    def names(self) -> tuple[str, ...]:
+    def names(self, context: ToolContext | None = None) -> tuple[str, ...]:
         """按注册顺序返回工具名称。"""
-        return tuple(self._tools)
+        return tuple(name for name in self._tools if self.is_available(name, context))
+
+    def is_available(self, name: str, context: ToolContext | None) -> bool:
+        """判断工具在当前执行上下文中是否真实可用。"""
+        tool = self._tools.get(name)
+        if tool is None:
+            raise ValueError(f"未知工具：{name}")
+        if context is None:
+            return True
+        if name == "bash":
+            from sandbox import sandbox_status_of
+            status = sandbox_status_of(context.sandbox)
+            return status.mode == "docker" and status.bash_available
+        predicate = getattr(tool, "is_available", None)
+        return bool(predicate(context)) if callable(predicate) else True
 
     def select(self, names: Iterable[str]) -> "AsyncToolRegistry":
         """创建严格子集；未知名称和 subagent 递归调用会被拒绝。"""
         selected: list[AsyncTool] = []
         for name in names:
-            if name in {"subagent", "skill_install"}:
+            if name in {"subagent", "skill_install", "cronjob"}:
                 raise ValueError(f"子 Agent 不允许选择工具：{name}")
             tool = self._tools.get(name)
             if tool is None:
@@ -83,8 +105,18 @@ class AsyncToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             raise ValueError(f"未知工具：{name}")
+        if not self.is_available(name, context):
+            if name == "bash":
+                from sandbox import BashUnavailableError
+                raise BashUnavailableError(
+                    "当前 Trace 未运行 Docker 沙箱，Bash 已禁用且不会回退到宿主机 Shell",
+                )
+            raise RuntimeError(f"工具在当前执行上下文中不可用：{name}")
         arguments = self.prepare_arguments(name, arguments)
         arguments = self._validate(name, arguments)
+        ensure_available = getattr(tool, "ensure_available", None)
+        if callable(ensure_available):
+            ensure_available(arguments, context)
         needs_approval = self._resolved_risk(tool, arguments) != "read"
         if needs_approval:
             if context.approval is None or not await context.approval(name, arguments):

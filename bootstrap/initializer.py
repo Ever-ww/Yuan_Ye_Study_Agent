@@ -9,6 +9,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 
 from memory import MemoryStore
+from cron import CronState, HeartbeatState
 
 
 class InitializationResult(BaseModel):
@@ -42,7 +43,15 @@ def initialize_project(project_root: Path) -> Path:
     if not local.exists():
         template = Path(__file__).parent / "templates" / "settings.local.json.example"
         local.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
-    MemoryStore(yy / "memory")
+    memory_required = (
+        yy / "memory" / "session" / "index.json",
+        yy / "memory" / "profile" / "USER.md",
+        yy / "memory" / "profile" / "RESEARCH.md",
+        yy / "memory" / "profile" / "OTHERS.md",
+        yy / "memory" / "profile" / "index.json",
+    )
+    if not all(path.exists() for path in memory_required):
+        MemoryStore(yy / "memory")
     agents = yy / "agents"
     agents.mkdir(parents=True, exist_ok=True)
     templates = {
@@ -58,6 +67,14 @@ def initialize_project(project_root: Path) -> Path:
         (yy / "skills" / directory).mkdir(parents=True, exist_ok=True)
     for directory in ("runs",):
         (yy / "gateway" / directory).mkdir(parents=True, exist_ok=True)
+    cron_directory = yy / "cron"
+    cron_directory.mkdir(parents=True, exist_ok=True)
+    cron_state = cron_directory / "jobs.json"
+    if not cron_state.exists():
+        cron_state.write_text(
+            CronState(heartbeat=HeartbeatState()).model_dump_json(indent=2) + "\n",
+            encoding="utf-8",
+        )
     skill_index = yy / "skills" / "index.json"
     if not skill_index.exists():
         skill_index.write_text(

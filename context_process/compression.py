@@ -13,7 +13,7 @@ from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models import build_provider
 from memory import MemoryStore
 from prompt import compose_compression_messages
-from tools import AsyncToolRegistry
+from tool import AsyncToolRegistry
 
 
 class CompressionResult(BaseModel):

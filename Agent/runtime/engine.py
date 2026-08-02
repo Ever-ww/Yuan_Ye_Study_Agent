@@ -24,9 +24,20 @@ from Agent.retry import ModelRetryPolicy
 from context_process import ContextProcessor
 from memory import MemoryStore
 from prompt import PromptComposer
-from sandbox import DockerSandboxSession, SandboxSessionProtocol, WorkspaceLockManager
+from sandbox import (
+    DockerSandboxSession,
+    SandboxSessionProtocol,
+    WorkspaceLockManager,
+    sandbox_status_of,
+)
 from skill import SkillService
-from tools import AsyncToolRegistry, ToolContext, default_tools, register_subagent
+from tool import (
+    AsyncToolRegistry,
+    ToolContext,
+    default_tools,
+    register_subagent,
+)
+from tools import WebFetchTool, WebSearchTool
 from .subagent import RuntimeSubagentRunner
 from .failure import RuntimeFailure
 
@@ -68,6 +79,9 @@ class AgentRuntime:
         raise_errors: bool = False,
         extensions: ExtensionCatalog | None = None,
         enable_extensions: bool = True,
+        cron=None,
+        cron_project_id: str | None = None,
+        enable_cron: bool = True,
     ) -> None:
         self.config = config or load_runtime_config()
         self.provider = provider or build_provider(
@@ -161,7 +175,31 @@ class AgentRuntime:
         if tools is not None:
             self.tools = tools
         else:
-            base_tools = default_tools(self.config.workspace_root, skill_service=self.skills)
+            web_search = (
+                WebSearchTool(
+                    self.config.web_search_api_key,
+                    timeout_seconds=self.config.web_search_timeout_seconds,
+                    use_system_proxy=self.config.use_system_proxy,
+                    proxy_url=self.config.proxy_url,
+                )
+                if self.config.web_search_api_key
+                else None
+            )
+            web_fetch = WebFetchTool(
+                timeout_seconds=self.config.web_fetch_timeout_seconds,
+                max_bytes=self.config.web_fetch_max_bytes,
+                max_chars=self.config.web_fetch_max_chars,
+                use_system_proxy=self.config.use_system_proxy,
+                proxy_url=self.config.proxy_url,
+            )
+            base_tools = default_tools(
+                self.config.workspace_root,
+                skill_service=self.skills,
+                web_search_tool=web_search,
+                web_fetch_tool=web_fetch,
+                cron_service=cron if enable_cron else None,
+                cron_project_id=cron_project_id,
+            )
             if enable_subagent:
                 runner = subagent_runner or RuntimeSubagentRunner(self.config, base_tools)
                 register_subagent(base_tools, runner)
@@ -197,6 +235,7 @@ class AgentRuntime:
             )
         self._session_id: str | None = None
         self._session_open = False
+        self._sandbox_fallback_notified: set[str] = set()
 
     @property
     def active_session_id(self) -> str | None:
@@ -222,7 +261,18 @@ class AgentRuntime:
                 raise
             yield RunEvent(type=EventType.ERROR, payload={"message": str(exc) or type(exc).__name__})
             return
+        sandbox_status = sandbox_status_of(self.sandbox)
+        self.prompts.set_sandbox_status(sandbox_status)
         yield RunEvent(type=EventType.STARTED, payload={"session_id": active_id})
+        if (
+            sandbox_status.mode == "checkpoint_only"
+            and active_id not in self._sandbox_fallback_notified
+        ):
+            self._sandbox_fallback_notified.add(active_id)
+            yield RunEvent(
+                type=EventType.SANDBOX_FALLBACK,
+                payload=sandbox_status.model_dump(mode="json"),
+            )
         turn_started = False
         model = {
             "provider": self.config.provider,
@@ -383,6 +433,7 @@ class AgentRuntime:
             raise
         if not self.memory.has_session(event.session_id):
             self.memory.create_session(task, session_id=event.session_id)
+        self.prompts.set_sandbox_status(sandbox_status_of(self.sandbox))
         self._session_id = event.session_id
         self._session_open = True
         return event.session_id

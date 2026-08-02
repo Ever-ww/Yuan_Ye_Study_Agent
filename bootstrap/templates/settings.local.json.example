@@ -3,6 +3,11 @@
   "model": "echo",
   "base_url": "",
   "api_key": "",
+  "web_search_api_key": "",
+  "web_search_timeout_seconds": 20,
+  "web_fetch_timeout_seconds": 20,
+  "web_fetch_max_bytes": 2000000,
+  "web_fetch_max_chars": 30000,
   "use_system_proxy": false,
   "proxy_url": null,
   "coding_source_root": null,
@@ -15,5 +20,6 @@
   "sandbox_checkpoint_limit": 17,
   "gateway_port": 8765,
   "gateway_max_concurrent_runs": 4,
-  "gateway_runtime_idle_seconds": 900
+  "gateway_runtime_idle_seconds": 900,
+  "cron_heartbeat_seconds": 60
 }

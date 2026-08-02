@@ -14,10 +14,17 @@ from typer.testing import CliRunner
 from Agent import AgentRuntime, load_runtime_config
 from Agent.contracts import ModelReply, ToolCall
 from memory import MemoryStore
-from run_ui.cli import ChatInterruptController, _active_live, _approve, _render, app
+from run_ui.cli import (
+    ChatInterruptController,
+    _active_live,
+    _approve,
+    _handle_inbox_command,
+    _render,
+    app,
+)
 from run_ui.approval import InteractiveApproval
 from run_ui.web import create_app
-from tools import ToolContext
+from tool import ToolContext
 
 
 class UiTests(unittest.TestCase):
@@ -26,6 +33,66 @@ class UiTests(unittest.TestCase):
     def test_app_exposes_random_token(self) -> None:
         app = create_app("test-token")
         self.assertEqual(app.state.access_token, "test-token")
+
+    def test_cli_inbox_lists_shows_and_marks_background_results(self) -> None:
+        class FakeGatewayClient:
+            def __init__(self) -> None:
+                self.items = [
+                    {
+                        "item_id": "abcdef1234567890",
+                        "run_id": "run-1",
+                        "project_id": "project-1",
+                        "session_id": "session-1",
+                        "title": "未读任务",
+                        "summary": "后台执行成功",
+                        "status": "completed",
+                        "created_at": "2026-08-02 10:00:00",
+                        "read": False,
+                    },
+                    {
+                        "item_id": "fedcba9876543210",
+                        "run_id": "run-2",
+                        "project_id": "project-1",
+                        "session_id": None,
+                        "title": "已读任务",
+                        "summary": "历史结果",
+                        "status": "failed",
+                        "created_at": "2026-08-01 10:00:00",
+                        "read": True,
+                    },
+                ]
+
+            async def inbox(self, unread_only=False):
+                return [dict(item) for item in self.items if not unread_only or not item["read"]]
+
+            async def mark_inbox_read(self, item_id):
+                item = next(item for item in self.items if item["item_id"] == item_id)
+                item["read"] = True
+                return dict(item)
+
+        async def check() -> str:
+            fake = FakeGatewayClient()
+            output = io.StringIO()
+            local_console = Console(file=output, force_terminal=False, width=180)
+            with patch("run_ui.cli.console", local_console):
+                await _handle_inbox_command(fake, "/inbox")
+                first = output.getvalue()
+                self.assertIn("未读任务", first)
+                self.assertNotIn("已读任务", first)
+                await _handle_inbox_command(fake, "/inbox all")
+                await _handle_inbox_command(fake, "/inbox show abcdef123456")
+                await _handle_inbox_command(fake, "/inbox read abcdef123456")
+                self.assertTrue(fake.items[0]["read"])
+                fake.items[0]["read"] = False
+                await _handle_inbox_command(fake, "/inbox read-all")
+                self.assertTrue(all(item["read"] for item in fake.items))
+            return output.getvalue()
+
+        rendered = asyncio.run(check())
+        self.assertIn("已读任务", rendered)
+        self.assertIn("后台执行成功", rendered)
+        self.assertIn("已标记为已读", rendered)
+        self.assertIn("已将 1 条 Inbox 结果标记为已读", rendered)
 
     def test_session_commands_list_and_show_restorable_history(self) -> None:
         with tempfile.TemporaryDirectory() as value:

@@ -19,7 +19,7 @@ from memory import MemoryStore
 from run_ui.cli import _handle_chat_failure
 from run_ui.harness_loader import load_harness_module
 from skill import SkillInstallRequest, SkillService
-from tools import AsyncToolRegistry
+from tool import AsyncToolRegistry
 
 
 class FlakyProvider:

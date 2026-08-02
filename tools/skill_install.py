@@ -6,7 +6,7 @@ from typing import Any
 
 from skill import SkillInstallRequest, SkillService
 
-from .contracts import ToolContext
+from tool.contracts import ToolContext
 
 
 class SkillInstallTool:

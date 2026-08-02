@@ -13,7 +13,19 @@ from pydantic import BaseModel, ConfigDict
 
 from .checkpoint import CheckpointStore
 from .locks import WorkspaceLockManager
-from .models import BashResult, CheckpointRecord, RollbackResult
+from .models import BashResult, CheckpointRecord, RollbackResult, SandboxStatus
+
+
+class DockerUnavailableError(RuntimeError):
+    """仅表示 Docker CLI 缺失或 daemon 当前无法连接。"""
+
+    def __init__(self, message: str, *, reason_code: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+class BashUnavailableError(RuntimeError):
+    """当前 Trace 没有可安全执行 Bash 的 Docker 容器。"""
 
 
 class CommandResult(BaseModel):
@@ -33,6 +45,11 @@ class SandboxSessionProtocol(Protocol):
     """工具与 Runtime 之间共享的最小沙箱契约。"""
 
     file_locks: WorkspaceLockManager
+
+    @property
+    def status(self) -> SandboxStatus: ...
+    @property
+    def bash_available(self) -> bool: ...
 
     async def start(self, session_id: str) -> CheckpointRecord: ...
     async def close(self) -> None: ...
@@ -73,21 +90,52 @@ class DockerSandboxSession:
         self._run_command = command_runner or _subprocess_runner
         self._container_name: str | None = None
         self._operation_lock = asyncio.Lock()
+        self._status = SandboxStatus(
+            mode="pending",
+            bash_available=False,
+            message="沙箱尚未探测",
+        )
 
     @property
     def active(self) -> bool:
-        return self._container_name is not None
+        return self._status.mode in {"docker", "checkpoint_only"}
+
+    @property
+    def status(self) -> SandboxStatus:
+        return self._status
+
+    @property
+    def bash_available(self) -> bool:
+        return self._status.bash_available
 
     async def start(self, session_id: str) -> CheckpointRecord:
         """验证 Docker、启动受限容器并创建 Trace 基线快照。"""
         async with self.file_locks.workspace_exclusive():
             async with self._operation_lock:
-                if self._container_name is not None:
+                if self.active:
                     records = self.checkpoints.list()
                     if not records:
                         raise RuntimeError("沙箱已启动但缺少基线 checkpoint")
                     return records[-1]
-                await self._require_docker()
+                self._status = SandboxStatus(
+                    mode="pending",
+                    bash_available=False,
+                    message="正在探测 Docker",
+                )
+                try:
+                    await self._require_docker()
+                except DockerUnavailableError as exc:
+                    baseline = await self._open_checkpoint_baseline(session_id)
+                    self._status = SandboxStatus(
+                        mode="checkpoint_only",
+                        bash_available=False,
+                        reason_code=exc.reason_code,
+                        message=(
+                            f"{exc}；已进入 checkpoint-only 模式，Bash 已禁用，"
+                            "本地文件写入与回溯仍可用"
+                        ),
+                    )
+                    return baseline
                 await self._ensure_image()
                 container_name = f"yy-agent-{_container_fragment(session_id)}-{uuid4().hex[:8]}"
                 arguments = self._docker_run_arguments(container_name)
@@ -96,15 +144,12 @@ class DockerSandboxSession:
                     raise RuntimeError(f"Docker 沙箱启动失败：{_result_message(result)}")
                 self._container_name = container_name
                 try:
-                    self.checkpoints.open(session_id)
-                    baseline = await asyncio.to_thread(
-                        self.checkpoints.create,
-                        "trace_start",
-                        {"kind": "baseline"},
-                        force=True,
+                    baseline = await self._open_checkpoint_baseline(session_id)
+                    self._status = SandboxStatus(
+                        mode="docker",
+                        bash_available=True,
+                        message="Docker 沙箱已启动，Bash 可用",
                     )
-                    if baseline is None:
-                        raise RuntimeError("创建 Trace 基线 checkpoint 失败")
                     return baseline
                 except Exception:
                     await self._close_unlocked()
@@ -121,6 +166,10 @@ class DockerSandboxSession:
             raise ValueError("Bash command 不能为空")
         if timeout_seconds < 1 or timeout_seconds > 120:
             raise ValueError("Bash timeout_seconds 必须位于 1 到 120 之间")
+        if not self.bash_available:
+            raise BashUnavailableError(
+                "当前 Trace 处于 checkpoint-only 模式，Bash 不可用且不会回退到宿主机 Shell",
+            )
         async with self.file_locks.workspace_exclusive():
             async with self._operation_lock:
                 container = self._require_container()
@@ -164,7 +213,7 @@ class DockerSandboxSession:
     async def checkpoint_write(self, path: str) -> CheckpointRecord | None:
         """为宿主机 write 已完成的实际修改创建一次 checkpoint。"""
         async with self._operation_lock:
-            self._require_container()
+            self._require_checkpoint_session()
             return await asyncio.to_thread(
                 self.checkpoints.create,
                 "write",
@@ -174,7 +223,7 @@ class DockerSandboxSession:
     async def checkpoint_edit(self, path: str) -> CheckpointRecord | None:
         """为宿主机 edit 已完成的实际修改创建一次独立审计 checkpoint。"""
         async with self._operation_lock:
-            self._require_container()
+            self._require_checkpoint_session()
             return await asyncio.to_thread(
                 self.checkpoints.create,
                 "edit",
@@ -183,12 +232,13 @@ class DockerSandboxSession:
 
     async def restore_current(self) -> CheckpointRecord:
         async with self._operation_lock:
+            self._require_checkpoint_session()
             return await asyncio.to_thread(self.checkpoints.restore_current)
 
     async def rollback(self, steps: int) -> RollbackResult:
         async with self.file_locks.workspace_exclusive():
             async with self._operation_lock:
-                self._require_container()
+                self._require_checkpoint_session()
                 return await asyncio.to_thread(self.checkpoints.rollback, steps)
 
     def list_checkpoints(self) -> tuple[CheckpointRecord, ...]:
@@ -196,13 +246,43 @@ class DockerSandboxSession:
 
     async def _require_docker(self) -> None:
         if shutil.which("docker") is None and self._run_command is _subprocess_runner:
-            raise RuntimeError("未找到 Docker CLI；请安装并启动 Docker Desktop")
-        result = await self._run_command(
-            ["docker", "version", "--format", "{{.Server.Version}}"],
-            15,
-        )
+            raise DockerUnavailableError(
+                "未找到 Docker CLI",
+                reason_code="docker_cli_missing",
+            )
+        try:
+            result = await self._run_command(
+                ["docker", "version", "--format", "{{.Server.Version}}"],
+                15,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            raise DockerUnavailableError(
+                "无法执行 Docker CLI",
+                reason_code="docker_cli_missing",
+            ) from exc
+        except RuntimeError as exc:
+            raise DockerUnavailableError(
+                f"Docker daemon 无法连接：{exc}",
+                reason_code="docker_daemon_unavailable",
+            ) from exc
         if result.returncode != 0:
-            raise RuntimeError(f"Docker 服务不可用：{_result_message(result)}")
+            raise DockerUnavailableError(
+                f"Docker daemon 无法连接：{_result_message(result)}",
+                reason_code="docker_daemon_unavailable",
+            )
+
+    async def _open_checkpoint_baseline(self, session_id: str) -> CheckpointRecord:
+        """初始化独立 Git 对象库；失败属于数据安全问题，必须向上抛出。"""
+        self.checkpoints.open(session_id)
+        baseline = await asyncio.to_thread(
+            self.checkpoints.create,
+            "trace_start",
+            {"kind": "baseline"},
+            force=True,
+        )
+        if baseline is None:
+            raise RuntimeError("创建 Trace 基线 checkpoint 失败")
+        return baseline
 
     async def _ensure_image(self) -> None:
         inspected = await self._run_command(["docker", "image", "inspect", self.image], 15)
@@ -271,6 +351,11 @@ class DockerSandboxSession:
     async def _close_unlocked(self) -> None:
         container = self._container_name
         self._container_name = None
+        self._status = SandboxStatus(
+            mode="closed",
+            bash_available=False,
+            message="沙箱会话已关闭，checkpoint 已保留",
+        )
         if container is None:
             return
         result = await self._run_command(["docker", "rm", "--force", container], 30)
@@ -279,8 +364,78 @@ class DockerSandboxSession:
 
     def _require_container(self) -> str:
         if self._container_name is None:
-            raise RuntimeError("Docker 沙箱尚未启动或已经关闭")
+            raise BashUnavailableError(
+                "Docker 沙箱尚未启动或已经关闭；Bash 不会回退到宿主机 Shell",
+            )
         return self._container_name
+
+    def _require_checkpoint_session(self) -> None:
+        if not self.active:
+            raise RuntimeError("Checkpoint 会话尚未启动或已经关闭")
+
+
+async def probe_docker_status(
+    command_runner: CommandRunner | None = None,
+) -> SandboxStatus:
+    """只探测 CLI/daemon，不构建镜像或创建容器。"""
+    runner = command_runner or _subprocess_runner
+    if command_runner is None and shutil.which("docker") is None:
+        return SandboxStatus(
+            mode="checkpoint_only",
+            bash_available=False,
+            reason_code="docker_cli_missing",
+            message="未找到 Docker CLI；将使用 checkpoint-only 模式",
+        )
+    try:
+        result = await runner(["docker", "version", "--format", "{{.Server.Version}}"], 15)
+    except (FileNotFoundError, OSError):
+        return SandboxStatus(
+            mode="checkpoint_only",
+            bash_available=False,
+            reason_code="docker_cli_missing",
+            message="无法执行 Docker CLI；将使用 checkpoint-only 模式",
+        )
+    except Exception as exc:
+        return SandboxStatus(
+            mode="checkpoint_only",
+            bash_available=False,
+            reason_code="docker_daemon_unavailable",
+            message=f"Docker daemon 无法连接：{exc}",
+        )
+    if result.returncode != 0:
+        return SandboxStatus(
+            mode="checkpoint_only",
+            bash_available=False,
+            reason_code="docker_daemon_unavailable",
+            message=f"Docker daemon 无法连接：{_result_message(result)}",
+        )
+    return SandboxStatus(
+        mode="docker",
+        bash_available=True,
+        message="Docker daemon 可用",
+    )
+
+
+def sandbox_status_of(sandbox: object | None) -> SandboxStatus:
+    """读取正式状态；旧注入对象缺少状态时按最小权限处理。"""
+    if sandbox is None:
+        return SandboxStatus(
+            mode="closed",
+            bash_available=False,
+            reason_code="sandbox_disabled",
+            message="当前 Runtime 未启用沙箱与 checkpoint",
+        )
+    value = getattr(sandbox, "status", None)
+    if isinstance(value, SandboxStatus):
+        return value
+    if isinstance(value, dict):
+        return SandboxStatus.model_validate(value)
+    return SandboxStatus(
+        mode="checkpoint_only",
+        bash_available=False,
+        reason_code="injected_checkpoint_only",
+        message="注入的执行器未声明 Docker 状态，按 checkpoint-only 处理，Bash 已禁用",
+    )
 
 
 async def _subprocess_runner(arguments: list[str], timeout: float | None) -> CommandResult:

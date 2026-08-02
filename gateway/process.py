@@ -58,11 +58,7 @@ class GatewayProcessManager:
         creationflags = 0
         start_new_session = os.name != "nt"
         if os.name == "nt":
-            creationflags = (
-                getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-                | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            )
+            creationflags = _windows_background_creationflags()
         with self.log_path.open("a", encoding="utf-8") as log:
             subprocess.Popen(
                 command,
@@ -70,7 +66,7 @@ class GatewayProcessManager:
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=log,
-                close_fds=os.name != "nt",
+                close_fds=True,
                 start_new_session=start_new_session,
                 creationflags=creationflags,
             )
@@ -283,6 +279,14 @@ def _gateway_command(agent_root: Path, port: int) -> list[str]:
         "--port",
         str(port),
     ]
+
+
+def _windows_background_creationflags() -> int:
+    """创建无控制台后台进程；DETACHED_PROCESS 会使 CREATE_NO_WINDOW 失效。"""
+    return (
+        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    )
 
 
 def _port_available(port: int) -> bool:

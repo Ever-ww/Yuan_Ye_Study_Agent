@@ -5,7 +5,24 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class SandboxStatus(BaseModel):
+    """当前 Trace 的 Docker/Checkpoint 能力状态。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    mode: Literal["pending", "docker", "checkpoint_only", "closed"]
+    bash_available: bool
+    reason_code: str | None = None
+    message: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_capabilities(self) -> "SandboxStatus":
+        if self.bash_available != (self.mode == "docker"):
+            raise ValueError("只有 docker 模式可以声明 Bash 可用")
+        return self
 
 
 class CheckpointRecord(BaseModel):

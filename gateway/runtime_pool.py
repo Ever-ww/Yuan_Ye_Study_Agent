@@ -38,14 +38,16 @@ class RuntimePool:
         idle_timeout_seconds: int = 900,
         runtime_factory: RuntimeFactory | None = None,
         extensions: ExtensionCatalog | None = None,
+        cron_service=None,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.store = store
         self.events = events
         self.max_concurrent_runs = max_concurrent_runs
         self.idle_timeout_seconds = idle_timeout_seconds
-        self.runtime_factory = runtime_factory or self._default_runtime
+        self.runtime_factory = runtime_factory
         self.extensions = extensions
+        self.cron_service = cron_service
         self.approvals = GatewayApprovalBroker(
             store,
             self._publish_approval,
@@ -200,16 +202,27 @@ class RuntimePool:
             if entry is not None:
                 entry.last_used = monotonic()
                 return entry.runtime
-        return self.runtime_factory(workspace, self.approvals)
+        if self.runtime_factory is not None:
+            return self.runtime_factory(workspace, self.approvals)
+        return self._default_runtime(workspace, self.approvals, run)
 
-    def _default_runtime(self, workspace: Path, approvals: GatewayApprovalBroker) -> AgentRuntime:
+    def _default_runtime(
+        self,
+        workspace: Path,
+        approvals: GatewayApprovalBroker,
+        run: RunRecord,
+    ) -> AgentRuntime:
         config = load_runtime_config(self.agent_root, workspace_root=workspace)
+        scheduled = run.client_id.startswith("cron:")
         return AgentRuntime(
             config,
             approval=approvals,
             retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=2),
             raise_errors=True,
             extensions=self.extensions,
+            cron=self.cron_service if not scheduled else None,
+            cron_project_id=run.project_id,
+            enable_cron=not scheduled,
         )
 
     async def _emit(self, run: RunRecord, event_type: str, payload: dict) -> None:

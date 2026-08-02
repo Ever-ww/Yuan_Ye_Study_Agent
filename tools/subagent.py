@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from .contracts import ToolContext, ToolRisk
+from tool.contracts import ToolContext, ToolRisk
+
+if TYPE_CHECKING:
+    from tool.registry import AsyncToolRegistry
 
 
 class SubagentRunner(Protocol):
@@ -26,9 +29,15 @@ class SubagentTool:
     description = "启动无独立记忆的子 Agent 完成任务，并返回最终结果"
     risk = "dynamic"
 
-    def __init__(self, runner: SubagentRunner, available_risks: dict[str, ToolRisk]) -> None:
+    def __init__(
+        self,
+        runner: SubagentRunner,
+        available_risks: dict[str, ToolRisk],
+        registry: "AsyncToolRegistry",
+    ) -> None:
         self.runner = runner
         self.available_risks = dict(available_risks)
+        self.registry = registry
         self.schema: dict[str, Any] = {
             "type": "object",
             "properties": {
@@ -41,6 +50,38 @@ class SubagentTool:
             },
             "required": ["task"],
         }
+
+    def schema_for(self, context: ToolContext | None) -> dict[str, Any]:
+        """只向父模型列出子 Agent 在当前沙箱状态下可委派的工具。"""
+        allowed = sorted(
+            name for name in self.registry.names(context)
+            if name not in {"subagent", "skill_install", "cronjob"}
+        )
+        return {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "instructions": {"type": "string"},
+                "tools": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": allowed},
+                },
+            },
+            "required": ["task"],
+        }
+
+    def ensure_available(self, arguments: dict[str, Any], context: ToolContext) -> None:
+        """在父级审批前拒绝不可用能力，尤其禁止 checkpoint-only 委派 Bash。"""
+        for name in arguments.get("tools", []):
+            if name in {"subagent", "skill_install", "cronjob"}:
+                raise ValueError(f"子 Agent 不允许选择工具：{name}")
+            if not self.registry.is_available(name, context):
+                if name == "bash":
+                    from sandbox import BashUnavailableError
+                    raise BashUnavailableError(
+                        "当前 Trace 处于 checkpoint-only 模式，不能向子 Agent 委派 Bash",
+                    )
+                raise RuntimeError(f"子 Agent 工具当前不可用：{name}")
 
     def risk_for(self, arguments: dict[str, Any]) -> ToolRisk:
         """按委派工具子集计算风险，供统一 Registry 权限链使用。"""

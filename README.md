@@ -12,7 +12,7 @@ Yuan Ye Study Agent 是一个本地优先、单一异步 Runtime 驱动的学习
 
 所谓 **Harness 自进化**，不是让模型不受控制地改写自己，而是建立一条可审计的成长闭环：传统框架依赖硬编码固定逻辑，面对长对话、Token 波动、复杂子任务、新增交互场景容易失效，只能靠人工改代码、重启服务来适配。本 Agent 在发现代码类缺陷并取得用户确认后，会在隔离环境中生成和校验代码补丁。这是对“身体”和“大脑”的共同进化，而不是只优化“大脑”（Skill）。
 
-CLI chat 能保存完整错误现场，并在用户确认后创建隔离 Git worktree，再启动一个复用正式 `AgentRuntime` 类的 Coding Agent。Coding Runtime 的 `workspace_root`、ToolContext、Docker 挂载和文件工具全部指向该 worktree；控制器会在运行前校验这一边界。它拥有专属 Memory、项目结构 Profile、上下文压缩、已审核 Skill、`skill_read`、文件读写/搜索、Docker Bash、checkpoint 回溯和 Subagent，但不提供 `skill_install`。用户确认启动 Harness 后，隔离 worktree 内的既有 Coding 工具自动获批；变更仍必须通过固定测试，才会提交并本地快进合并。测试失败或无变更时删除 worktree，Harness 不会 stash 脏主工作区，也不会自动推送 GitHub。
+CLI chat 能保存完整错误现场，并在用户确认后创建隔离 Git worktree，再启动一个复用正式 `AgentRuntime` 类的 Coding Agent。Coding Runtime 的 `workspace_root`、ToolContext、Docker 挂载（可用时）和文件工具全部指向该 worktree；控制器会在运行前校验这一边界。它拥有专属 Memory、项目结构 Profile、上下文压缩、已审核 Skill、`skill_read`、文件读写/搜索、checkpoint 回溯和 Subagent；Docker 可用时还提供 Bash，但不提供 `skill_install`。用户确认启动 Harness 后，隔离 worktree 内的既有 Coding 工具自动获批；变更仍必须通过固定测试，才会提交并本地快进合并。测试失败或无变更时删除 worktree，Harness 不会 stash 脏主工作区，也不会自动推送 GitHub。
 
 Coding Agent 的记忆位于 Agent 根目录的 `.yy/harness-evolution/memory/`，与普通聊天 Memory 和目标 workspace 分离。每次 Harness 更新创建全新的 Session JSONL，不恢复上一项修复的临时对话；同一次更新发生压缩时，继续使用相同 Session 哈希生成 `_002.jsonl`、`_003.jsonl`。跨更新只共享 `profile/AGENT.md`、`PROJECT.md`、`CHANGES.md` 和 `LESSONS.md` 四个长期文件。
 
@@ -33,17 +33,21 @@ prompt/     单一 System Prompt、任务时间与上下文缓存组合
 sandbox/    Trace 级 Docker、独立本地 Git checkpoint 与跨进程文件锁
 skill/      Skill 获取、格式解析、静态审核、可信索引与安装事务
 skills/     本机已安装的第三方 Skill 内容（仅提交 .gitkeep）
-tools/      异步工具协议、注册表和受控内置工具
+tool/       工具共用框架（不包含模型可直接调用的工具）
   contracts.py         AsyncTool 协议与 ToolContext
   registry.py          Schema 校验、注册与权限审批
   defaults.py          默认工具装配入口
+  path_guard.py        工作区路径与敏感目录边界
+tools/      仅保存模型可直接调用的受控工具实现
   bash.py              Docker 内受限 Bash
-  read_file.py         受控文件读取
+  read_file.py         统一读取源码、文本、PDF 与 Office 文档
   edit.py              已有文件的精确多块替换并创建 checkpoint
   write.py             新建或整文件覆盖并创建 checkpoint
   sandbox_rollback.py  审批后恢复本地 checkpoint
   calculator.py        受限四则运算
   search_workspace.py  工作区文本搜索
+  web_search.py        Brave API 网络搜索（仅返回结构化索引摘要）
+  web_fetch.py         受 SSRF 边界保护的公开网页正文抓取
   current_time.py      本地时间查询
   subagent.py          受父 Agent 限权的临时子 Agent
   skill_read.py        渐进读取已审核 Skill 文本
@@ -107,16 +111,16 @@ uv run python --version
 uv tree
 ```
 
-### 4. 安装并启动 Docker Desktop
+### 4. 可选：安装并启动 Docker Desktop
 
-正式 Runtime 会在 `trace_start` 创建 Docker 沙箱，即使当前问题最终没有调用 Bash，也需要 Docker 服务可用。安装 Docker Desktop 后先启动它，再确认客户端和服务端都能响应：
+只有需要 `bash` 工具时才必须安装 Docker Desktop。安装后先启动它，再确认客户端和服务端都能响应：
 
 ```powershell
 docker version
 docker info
 ```
 
-首次 Trace 会自动构建本项目的 `yy-agent-sandbox:local` 镜像。容器运行时无网络、移除 Linux capabilities、限制 CPU/内存/进程数，并把容器根文件系统设为只读。若 Docker CLI 或服务不可用，Trace 会明确失败，不会把 Bash 降级到宿主机执行。
+首次 Docker Trace 会自动构建本项目的 `yy-agent-sandbox:local` 镜像。容器运行时无网络、移除 Linux capabilities、限制 CPU/内存/进程数，并把容器根文件系统设为只读。若 Docker CLI 缺失或 daemon 离线，Runtime 会自动进入 `checkpoint_only`：对话、Memory、Skill、Subagent、读取、`edit`、`write` 和回溯继续工作，`bash` 会从模型工具列表和 Subagent 可选工具中移除，且绝不回退到 PowerShell、CMD、WSL 或宿主机 Shell。镜像构建、容器创建或基线 checkpoint 失败仍会终止 Trace。
 
 ### 5. 首次启动并自动初始化 `.yy`
 
@@ -193,6 +197,11 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
   "model": "deepseek-chat",
   "base_url": "https://api.deepseek.com",
   "api_key": "你的 API Key",
+  "web_search_api_key": "你的 Brave Search API Key（不启用搜索时留空）",
+  "web_search_timeout_seconds": 20,
+  "web_fetch_timeout_seconds": 20,
+  "web_fetch_max_bytes": 2000000,
+  "web_fetch_max_chars": 30000,
   "use_system_proxy": false,
   "proxy_url": null,
   "coding_source_root": null,
@@ -205,7 +214,8 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
   "sandbox_checkpoint_limit": 17,
   "gateway_port": 8765,
   "gateway_max_concurrent_runs": 4,
-  "gateway_runtime_idle_seconds": 900
+  "gateway_runtime_idle_seconds": 900,
+  "cron_heartbeat_seconds": 60
 }
 '@ | Set-Content -Encoding utf8 (Join-Path $AgentHome ".yy\settings.local.json")
 ```
@@ -245,6 +255,33 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
 
 `use_system_proxy=true` 与非空 `proxy_url` 互斥，程序会拒绝含糊配置。`proxy_url` 当前支持 `http://` 和 `https://` 代理地址；代理地址不会进入 Session 模型审计，审计只记录 `disabled`、`system` 或 `explicit` 模式。
 
+### 1.1 可选：启用网络搜索
+
+网络搜索使用 [Brave Search API](https://api-dashboard.search.brave.com/app/documentation/web-search/get-started)。先在 Brave Search API 控制台创建 Key，再把它写入 Agent Home 的 `.yy/settings.local.json`：
+
+```json
+{
+  "web_search_api_key": "你的 Brave Search API Key",
+  "web_search_timeout_seconds": 20
+}
+```
+
+重启 Gateway 后，主 Agent、Harness Coding Agent 以及被明确授权该工具的 Subagent 会获得只读 `web_search` 工具。它支持查询词、1～10 条结果、国家、语言、Safe Search 和最近一天/一周/一月/一年筛选，返回稳定 JSON，其中包含标题、URL、摘要和可选发布时间。搜索工具本身只访问搜索 API，不会打开结果页面；结果会标记为不可信外部内容，并清理 HTML 与控制字符。
+
+未配置或留空 `web_search_api_key` 时，`web_search` 不会出现在模型的工具 Schema 中，因此不会产生无 Key 的失败调用。搜索请求和模型请求共用 `use_system_proxy` / `proxy_url` 规则：默认忽略系统代理，只有显式配置后才使用代理。Key 只能保存在 `.yy/settings.local.json`，不能写入 `.yy/settings.json`，也不会进入错误快照。
+
+独立的 `web_fetch` 不依赖 Brave Key，始终可用于抓取用户提供或搜索结果中的公开网页。它只接受标准端口的 HTTP(S)，逐次校验 DNS 和重定向目标，拒绝 localhost、局域网、链路本地/云元数据、保留地址、URL 凭据及二进制响应；不会携带 Cookie、执行 JavaScript 或下载附件。HTML 会转换为纯文本，默认最多读取 2,000,000 字节、返回 30,000 字符，响应中会标明是否被截断。可在本机配置中调整：
+
+```json
+{
+  "web_fetch_timeout_seconds": 20,
+  "web_fetch_max_bytes": 2000000,
+  "web_fetch_max_chars": 30000
+}
+```
+
+典型链路是 `web_search → web_fetch → 最终回答`。搜索结果 JSON 会明确返回 `next_tool=web_fetch` 和下一步说明；ReAct 循环把完整搜索结果作为 `role=tool` 保留给下一次模型调用，使模型可以从 `results` 选择 URL、继续抓取正文，再依据正文完成回答。抓取内容同样属于不可信外部输入，模型不得把网页中的提示文字视为系统指令。
+
 `stream` 控制模型文本是否使用 SSE 实时输出，默认 `false`。设为 `true` 后，OpenAI-compatible Provider（包括 DeepSeek）会逐段显示生成文本；设为 `false` 时等待完整响应后再显示最终答案。Anthropic 当前仍采用完整响应模式。
 
 `max_steps` 表示一次用户任务最多允许发起多少次模型 API 调用。
@@ -261,7 +298,7 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
 
 Gateway 默认监听 `127.0.0.1:8765`，不同 Session 最多同时运行 4 个任务，同一 Session 同时只允许一个任务。`gateway_runtime_idle_seconds=900` 表示 Session Runtime 空闲 15 分钟后关闭 Trace 与 Docker；Session JSONL 不会删除，下一次请求仍可恢复。
 
-只允许将 Key 写在 `.yy/settings.local.json` 或环境变量中。程序会拒绝 `.yy/settings.json` 中的 `api_key` 字段；整个 `.yy/` 均为本机目录且不会提交。
+只允许将模型 Key 写在 `.yy/settings.local.json` 或对应环境变量中；Brave Search Key 只从本机配置读取。程序会拒绝 `.yy/settings.json` 中的 `api_key` 或 `web_search_api_key` 字段；整个 `.yy/` 均为本机目录且不会提交。
 
 ### 2. 可选：使用环境变量保存密钥
 
@@ -291,6 +328,8 @@ uv run python run.py gateway stop
 
 Gateway 停止时先拒绝新任务，并给正在运行的任务一个短暂收尾窗口，随后取消剩余任务并关闭 Runtime 与 Docker。异常重启后，数据库中未完成的任务会标记为 `interrupted`；已经写入的 Session JSONL 和工具结果仍然保留。
 
+Windows 下 CLI 首次发现 Gateway 未运行时，会使用 `CREATE_NO_WINDOW` 在后台启动服务，不会另外打开空白 Windows Terminal；后台 stdout/stderr 统一写入 `gateway.log`。
+
 Gateway 状态位于 Agent Home 的 `.yy/gateway/`：SQLite 保存项目、运行、审批和 Inbox 元数据；`runs/<run-id>.jsonl` 保存带单调序号的可重放 UI 事件；`gateway.log` 最多保留当前文件与 5 份轮转日志。Session 对话正文仍只由 Memory 写一份，不会复制到 Gateway 事件文件。
 
 ### 1. 创建新会话
@@ -309,6 +348,9 @@ uv run python run.py chat
 
 - 直接输入任务并按 Enter 发送。
 - `/help` 查看帮助；`/exit` 或 `/quit` 退出。
+- `/inbox` 列出未读后台结果；`/inbox all` 列出全部结果；表格 ID 支持唯一前缀。
+- `/inbox show <ID>` 查看完整结果；`/inbox read <ID>` 标记单条已读；`/inbox read-all` 标记全部已读。
+- `/cron list|status|add|at|preview|edit|pause|resume|run|remove` 在聊天内管理后台定时任务，命令本身不会写入普通 Session。
 
 ### 1.1 使用 `/code` 开发 Hook Extension
 
@@ -346,9 +388,10 @@ Code > /exit
 - `/skill list`、`/skill install`、`/skill update`、`/skill audit` 和 `/skill refresh` 管理本机 Skill；安装或更新不会自动修改当前 Prompt，只有 `/skill refresh` 成功后才重新扫描并加载 Skill XML。
 - `stream=true` 时，OpenAI-compatible Provider 会通过 SSE 逐段显示文本。
 - 高风险工具会显示方向键审批菜单：使用 ↑/↓ 选择“允许本次 / 当前会话始终允许该工具 / 拒绝”，按 Enter 确认、Esc 取消，默认选中拒绝。审批由发起任务的客户端优先处理；该客户端断开时待审批操作立即拒绝，后台 Agent 可继续处理错误或结束。
-- `bash` 只在当前 Trace 的无网络 Docker 容器中运行。容器读写挂载启动时的 workspace，因此命令造成的文件变化会立即出现在宿主机；一次成功 Bash 调用无论修改多少文件都只创建一个 checkpoint，没有变化则不创建。
+- `bash` 只在当前 Trace 的无网络 Docker 容器中运行。Docker 不可用时它不会出现在主模型或 Subagent 的工具 Schema 中，伪造调用也会在审批前拒绝。容器读写挂载启动时的 workspace，因此命令造成的文件变化会立即出现在宿主机；一次成功 Bash 调用无论修改多少文件都只创建一个 checkpoint，没有变化则不创建。
 - `edit` 参考 PI Agent 的精确编辑语义：一次可提交多个 `{oldText,newText}`，每个 `oldText` 必须在原文件中唯一存在，所有定位都基于修改前的原文且不能重叠；工具保留 UTF-8 BOM 与原换行风格。它适合小范围修改已有文件。
 - `write` 用于创建新文件或明确替换整个文件。`edit` 与 `write` 都在宿主机执行原子替换，每次实际变化后创建一个 checkpoint；内容未变化不会制造空快照。可让 Agent 调用高风险 `sandbox_rollback` 按步数恢复，执行前仍需审批。
+- `read_file` 是唯一文件读取工具：源码和普通文本保持原始文本返回；PDF 论文、DOCX、PPTX、XLSX/XLSM、Jupyter Notebook 与 HTML 根据扩展名自动进入结构化解析。PDF 按页、PPTX 按幻灯片、XLSX 按工作表选择范围；长内容通过 `offset_chars` 和 `max_chars` 继续读取。它只提取文本，不执行宏、脚本、外部链接或嵌入对象。
 - `enable_sandbox=False` 只用于没有写工具的压缩或诊断 Runtime。自定义 Runtime 未注入 checkpoint 上下文时，`edit`、`write`、`bash` 和 `sandbox_rollback` 都会明确拒绝，不存在无快照写入旁路。
 - 文件工具使用 Agent 根目录 `.yy/sandbox/locks/` 下按 workspace 隔离的跨进程读写锁。同一文件写入时，其他读取和写入会等待到原子替换、checkpoint 或失败恢复全部结束；不同文件的普通读取不会被无关写入阻塞。
 - CLI chat 的单次模型调用遇到临时网络错误时会保留同一份上下文、等待 2 秒后重试，总计最多 3 次；重连成功后继续当前任务，并显示“模型网络连接已恢复”。流式传输中断产生的不完整片段会被丢弃，避免与重试结果拼接；调用成功或进入工具结果后的下一次模型调用时重新计数。
@@ -472,7 +515,7 @@ Skill 遵循 [Agent Skills 规范](https://agentskills.io/specification)。一�
 </available_skills>
 ```
 
-模型需要完整说明、`references/` 或脚本文本时调用只读 `skill_read`。该工具不执行任何脚本，并拒绝绝对路径、`..`、符号链接、二进制和超大结果。Skill 自带脚本若确有必要，只能继续通过现有 workspace 工具与 Docker Bash 执行，仍受 Schema、审批、沙箱和 checkpoint 约束。手工复制到 `skills/`、安装后被修改或内容摘要不匹配的 Skill 都不会进入 Prompt，也不能读取；必须重新走审核安装。
+模型需要完整说明、`references/` 或脚本文本时调用只读 `skill_read`。该工具不执行任何脚本，并拒绝绝对路径、`..`、符号链接、二进制和超大结果。Skill 自带脚本若确有必要，只能在 Docker 可用时通过 Bash 执行，仍受 Schema、审批、沙箱和 checkpoint 约束；checkpoint-only 模式不会执行这些脚本。手工复制到 `skills/`、安装后被修改或内容摘要不匹配的 Skill 都不会进入 Prompt，也不能读取；必须重新走审核安装。
 
 ## Hook、Turn 与 Session
 
@@ -491,11 +534,19 @@ tool_before  tool_during  tool_after
 
 时序固定为 `trace_start → turn_start → (model_* → tool_* …)* → turn_end → … → trace_end`。第二个用户问题同样会触发新的 `turn_start`，并且发生在该问题进入上下文前。`model_before` 可修改 `event.data["messages"]` 和 `event.data["tools"]`；`tool_before` 可修改工具名称和参数，修改后的参数仍会重新执行 JSON Schema 校验。`during` 在进入真实 Provider 或工具函数前通知一次，不会按流式文本片段重复触发；`after` 同时覆盖成功与失败，并通过 `result/reply/error` 暴露结果。
 
-默认 Runtime 在 `trace_start` 通过同一 Hook 注册器启动 Docker 沙箱并创建基线 checkpoint，在 `trace_end` 直接删除容器。Subagent 复用父 Runtime 的同一个沙箱上下文，不会提前关闭容器；上下文压缩 Runtime 没有危险工具，因此显式禁用沙箱。Harness Coding Runtime 则为隔离 Git worktree 启动自己的 Docker 和 checkpoint，绝不复用主聊天 workspace 的容器。
+默认 Runtime 在 `trace_start` 通过同一 Hook 注册器探测 Docker，并始终创建基线 checkpoint。Docker 可用时启动容器并在 `trace_end` 删除；CLI 缺失或 daemon 离线时进入 checkpoint-only，Trace 结束只关闭状态并保留快照。Subagent 复用父 Runtime 的同一个安全上下文及动态工具目录；上下文压缩 Runtime 没有危险工具，因此显式禁用沙箱。Harness Coding Runtime 对隔离 Git worktree 使用同样的自适应逻辑，绝不复用主聊天 workspace 的容器或 checkpoint。
 
 Checkpoint 不写入 workspace 自身的 `.git`。当 workspace 就是 Agent 根目录时，每个 Session 在 `.yy/sandbox/checkpoints/<session-id>/` 使用独立 Git 对象库；外部 workspace 则保存到 `.yy/sandbox/checkpoints/<workspace-hash>/<session-id>/`。对象库用无父 commit 保存 workspace 快照，因此 workspace 的 `git status`、当前分支和 `git push` 都不会包含这些 commit。回溯采用 hard-reset 语义恢复非忽略文件，workspace 中的 `.git`、`.yy`、`.env*` 等敏感或运行期路径不会进入快照。
 
-文件锁同样不写入项目 `.git`。`read_file` 获取工作区共享锁和目标文件共享锁；`edit` 与 `write` 按“工作区共享锁 → 写事务独占锁 → 目标文件独占锁”获取，并把锁持有到 checkpoint 完成。搜索会在读取每个文件前获取共享锁。Bash、回溯和 Trace 基线无法预先限定单一文件，因此使用工作区独占锁，期间所有遵循本项目协议的 Agent 文件操作都会等待。
+文件锁同样不写入项目 `.git`。统一的 `read_file` 获取工作区共享锁和目标文件共享锁，并把锁持有到文本读取或文档解析完全结束；`edit` 与 `write` 按“工作区共享锁 → 写事务独占锁 → 目标文件独占锁”获取，并把锁持有到 checkpoint 完成。搜索会在读取每个文件前获取共享锁。Bash、回溯和 Trace 基线无法预先限定单一文件，因此使用工作区独占锁，期间所有遵循本项目协议的 Agent 文件操作都会等待。
+
+### 文档与论文读取
+
+`read_file` 读取结构化文档时默认单次返回最多 30000 字符。PDF、PPTX 和 XLSX 未指定范围时从第 1 个单元开始，默认最多读取 20 页/张/表；显式范围单次最多 50 个单元。文档结果 JSON 会提供总页数、当前范围、是否截断和 `next_offset_chars`，模型可以继续读取同一范围，而不需要把整篇论文一次塞入上下文。读取源码和普通文本时仍直接返回原文，保持 Coding Agent 的兼容性。
+
+PDF 使用布局文本模式，尽量保留多栏论文的水平位置和页面边界。如果所选页面几乎没有文本，结果会设置 `ocr_required=true` 并提示可能是扫描版或图片页。首期不会静默调用外部 OCR，也不会把论文上传到第三方服务；需要 OCR 的文件后续可接入独立的本地 OCR 工具。
+
+工具只允许读取当前 workspace，持有同一个跨进程共享文件锁，并限制源文件最大 100 MiB、OOXML 解压后最大 250 MiB。旧式 `.doc`、`.ppt`、`.xls` 需要先用 Office 或 LibreOffice 转换为 `.docx`、`.pptx`、`.xlsx`；图片、音频、视频及带密码 PDF 不会被假装解析成功，而是返回明确错误。
 
 这些锁覆盖同一项目中的多个 Runtime、CLI 进程和 Subagent，并在进程异常退出时由操作系统自动释放。锁不会阻止普通编辑器、手工 PowerShell 或其他不使用本项目锁协议的程序修改文件。
 
@@ -546,13 +597,36 @@ uv run python run.py chat --help
 ```powershell
 uv run python -m unittest discover -s tests -v
 uv run python -m pytest -q
-uv run python -m compileall -q Agent bootstrap context_process gateway memory prompt sandbox skill tools run_ui tests harness-evolution run.py
+uv run python -m compileall -q Agent bootstrap context_process cron gateway memory prompt sandbox skill tool tools run_ui tests harness-evolution run.py
 uv lock --check
 npm --prefix ui install
 npm --prefix ui run build
 cargo check --manifest-path desktop/src-tauri/Cargo.toml
 uv run python run.py --help
 ```
+
+## Gateway Cron 与 Heartbeat
+
+Gateway 启动后会同时启动默认 60 秒一次的 Heartbeat。任务定义和调度状态唯一保存在 Agent Home 的 `.yy/cron/jobs.json`；每次到期都会创建全新 Session，通过现有 RuntimePool、事件流和 Inbox 执行，不会恢复上一次定时任务的会话历史。系统停机期间错过多个周期时，重启 Gateway 后最多补跑一次；同一个 Job 的旧 Run 未结束时，新周期会记为 overlap 并跳过。
+
+支持固定间隔、带时区的单次 ISO 8601 时间和标准五段 Cron。五段表达式支持通配符、列表、范围、步进、月份/星期英文名称与星期日 `0/7`，日期和星期同时受限时遵循 Vixie Cron 的 OR 语义；不支持秒字段、年份字段和 `@daily` 等别名。每个任务使用自己的 IANA 时区，未指定时采用本机时区。未来五次执行时间可在创建前预览：
+
+```powershell
+uv run python run.py cron preview "0 9 * * 1-5" --timezone Asia/Shanghai
+uv run python run.py cron add --every 30m --name "项目巡检" --prompt "检查项目状态并总结异常"
+uv run python run.py cron add --cron "0 9 * * 1-5" --timezone Asia/Shanghai --name "工作日简报" --prompt "搜索 AI 新闻并生成摘要"
+uv run python run.py cron at "2026-08-10T14:30:00+08:00" --name "单次提醒" --prompt "总结当前研究进展"
+uv run python run.py cron list
+uv run python run.py cron status
+uv run python run.py cron pause <job-id>
+uv run python run.py cron resume <job-id>
+uv run python run.py cron run <job-id>
+uv run python run.py cron remove <job-id>
+```
+
+交互式 `chat` 中也支持 `/cron ...` 命令；自然语言请求可由主 Agent 调用动态风险工具 `cronjob`。读取、校验和预览无需审批，创建、编辑、暂停、恢复、立即运行和删除仍需审批。定时 Run 没有在线发起客户端，因此写入、Bash、回滚、Skill 安装等危险工具会自动拒绝；只读文件、已审核 Skill、网络搜索、网页抓取和 Subagent 仍可使用。Cron Runtime 不包含 `cronjob`，Subagent 也不能获得它，避免任务递归创建计划。
+
+`cron_heartbeat_seconds` 默认是 `60`，控制 Gateway Heartbeat 的轮询间隔。JSON 损坏时只暂停 Cron 并把状态标记为 unhealthy，普通聊天不受影响；修复前程序不会覆盖损坏文件。停止 Gateway 会先停止 Heartbeat，再关闭运行池。本阶段不会安装系统登录自启服务，计算机重启后由下一次 CLI、Web 或桌面端启动 Gateway 时恢复调度。
 
 ## 配置、状态与安全
 
@@ -602,4 +676,4 @@ uv cache dir
 
 ### 提示 Docker CLI 或服务不可用
 
-先启动 Docker Desktop，再分别执行 `docker version` 和 `docker info`。两条命令都成功后重新运行 Agent。系统不会因为 Docker 不可用而把 Bash 改到 PowerShell、CMD 或宿主机 Bash 中执行。
+这是可恢复状态：Agent 会显示一次黄色降级提示并继续使用 checkpoint-only；`edit`、`write` 和回溯仍可用。若确实需要 Bash，启动 Docker Desktop，再分别执行 `docker version` 和 `docker info`，两条命令都成功后关闭并重新打开 Session。运行中的 Session 不会热切换到 Docker。系统在任何情况下都不会把 Bash 改到 PowerShell、CMD、WSL 或宿主机 Bash 中执行。

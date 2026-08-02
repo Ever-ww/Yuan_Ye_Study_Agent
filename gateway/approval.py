@@ -42,6 +42,9 @@ class GatewayApprovalBroker:
         if context is None:
             return False
         run_id, client_id = context
+        if client_id.startswith("cron:"):
+            # 定时任务无人值守，危险能力不得等待或继承创建者的历史授权。
+            return False
         request = ApprovalRequest(
             approval_id=uuid4().hex,
             run_id=run_id,

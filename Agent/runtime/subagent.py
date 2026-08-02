@@ -9,7 +9,7 @@ from Agent.config import RuntimeConfig
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models import build_provider
 from prompt import compose_subagent_messages
-from tools import AsyncToolRegistry, ToolContext
+from tool import AsyncToolRegistry, ToolContext
 
 
 class _NoMemory:
@@ -56,7 +56,7 @@ class RuntimeSubagentRunner:
 
         async def inject_prompt(event: HookEvent) -> None:
             event.data["messages"] = [dict(message) for message in messages]
-            event.data["tools"] = selected.schemas()
+            event.data["tools"] = selected.schemas(context)
 
         hooks.register(HookPoint.MODEL_BEFORE, inject_prompt, priority=-100)
         config = self.config.model_copy(update={"stream": False, "compression_threshold_tokens": 0})

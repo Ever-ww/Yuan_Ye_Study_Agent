@@ -3,7 +3,7 @@
 import ast
 from typing import Any
 
-from .contracts import ToolContext
+from tool.contracts import ToolContext
 
 
 class CalculatorTool:

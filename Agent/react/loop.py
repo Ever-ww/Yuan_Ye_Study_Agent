@@ -17,7 +17,7 @@ from Agent.errors import AgentExecutionLimitError, AgentInvariantError
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models.errors import is_retryable_model_error
 from Agent.retry import ModelRetryPolicy
-from tools import AsyncToolRegistry, ToolContext
+from tool import AsyncToolRegistry, ToolContext
 
 
 class ReactLoop:
@@ -55,7 +55,7 @@ class ReactLoop:
             retry_history: list[dict[str, Any]] = []
             while True:
                 attempt += 1
-                schemas = self.tools.schemas()
+                schemas = self.tools.schemas(context)
                 before = HookEvent(point=HookPoint.MODEL_BEFORE, session_id=session_id, data={
                     "task": task,
                     "messages": messages,
@@ -239,7 +239,7 @@ class ReactLoop:
             return
 
         error = AgentExecutionLimitError("模型在最大调用次数内未完成")
-        _attach_failure_context(error, messages, self.tools.schemas(), model, [])
+        _attach_failure_context(error, messages, self.tools.schemas(context), model, [])
         raise error
 
     async def _execute_tools(

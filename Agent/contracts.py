@@ -13,6 +13,7 @@ class EventType(str, Enum):
     """界面与持久化共同使用的运行事件类型。"""
 
     STARTED = "started"
+    SANDBOX_FALLBACK = "sandbox_fallback"
     TEXT = "text"
     MODEL_RETRY = "model_retry"
     MODEL_RECONNECTED = "model_reconnected"

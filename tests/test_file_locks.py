@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 from sandbox import CommandResult, DockerSandboxSession, WorkspaceLockManager
-from tools import ToolContext, default_tools
+from tool import ToolContext, default_tools
 
 
 class _Checkpoint:

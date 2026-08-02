@@ -19,7 +19,7 @@ from context_process import ContextProcessor
 from memory import HarnessLongTermMemory, MemoryStore
 from prompt import PromptComposer
 from sandbox import WorkspaceLockManager
-from tools import AsyncToolRegistry, ToolContext, default_tools
+from tool import AsyncToolRegistry, ToolContext, default_tools
 
 
 class ToolProvider:
@@ -829,6 +829,12 @@ class CoreTests(unittest.TestCase):
                 with self.assertRaises(PermissionError):
                     await tools.execute("read_file", {"path": "../secret.txt"}, context)
         asyncio.run(check())
+
+    def test_tool_framework_is_separate_from_callable_tool_modules(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        for filename in ("contracts.py", "registry.py", "defaults.py", "path_guard.py"):
+            self.assertTrue((source_root / "tool" / filename).is_file())
+            self.assertFalse((source_root / "tools" / filename).exists())
 
     def test_default_tools_are_independent_modules_and_all_execute(self) -> None:
         async def check() -> None:

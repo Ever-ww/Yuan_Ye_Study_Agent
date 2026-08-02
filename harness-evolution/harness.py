@@ -22,10 +22,23 @@ from memory import HarnessLongTermMemory, HarnessMemoryUpdate, MemoryStore
 from prompt import compose_harness_memory_messages
 from sandbox import SandboxSessionProtocol
 from skill import SkillService
-from tools import AsyncToolRegistry, SkillReadTool, default_tools, register_subagent
+from tool import (
+    AsyncToolRegistry,
+    default_tools,
+    register_subagent,
+)
+from tools import SkillReadTool, WebFetchTool, WebSearchTool
 
 
-_SECRET_KEYS = {"api_key", "authorization", "access_token", "token", "secret", "password"}
+_SECRET_KEYS = {
+    "api_key",
+    "web_search_api_key",
+    "authorization",
+    "access_token",
+    "token",
+    "secret",
+    "password",
+}
 _SOURCE_PATH = re.compile(r'File "([^"]+)"')
 
 
@@ -712,7 +725,28 @@ def create_coding_runtime(
     )
     session_id = uuid4().hex[:16]
     memory.create_session("Harness Coding Agent 本次更新", session_id=session_id)
-    tools = default_tools(isolated.workspace_root)
+    web_search = (
+        WebSearchTool(
+            isolated.web_search_api_key,
+            timeout_seconds=isolated.web_search_timeout_seconds,
+            use_system_proxy=isolated.use_system_proxy,
+            proxy_url=isolated.proxy_url,
+        )
+        if isolated.web_search_api_key
+        else None
+    )
+    web_fetch = WebFetchTool(
+        timeout_seconds=isolated.web_fetch_timeout_seconds,
+        max_bytes=isolated.web_fetch_max_bytes,
+        max_chars=isolated.web_fetch_max_chars,
+        use_system_proxy=isolated.use_system_proxy,
+        proxy_url=isolated.proxy_url,
+    )
+    tools = default_tools(
+        isolated.workspace_root,
+        web_search_tool=web_search,
+        web_fetch_tool=web_fetch,
+    )
     tools.register(SkillReadTool(skills))
     register_subagent(tools, RuntimeSubagentRunner(isolated, tools))
     runtime = AgentRuntime(

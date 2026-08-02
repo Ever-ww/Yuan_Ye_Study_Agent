@@ -12,7 +12,7 @@ from unittest.mock import patch
 from prompt import PromptComposer
 from run_ui.cli import _chat
 from skill import SkillInstallRequest, SkillService, parse_skill
-from tools import ToolContext, default_tools
+from tool import ToolContext, default_tools
 
 
 def _make_skill(

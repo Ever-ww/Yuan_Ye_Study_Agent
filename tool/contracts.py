@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict
 
 ToolRisk = Literal["read", "write", "high", "dynamic"]
 
+
 class AsyncTool(Protocol):
     """所有工具实现都必须遵守的稳定协议。"""
 
