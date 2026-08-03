@@ -33,6 +33,7 @@ from tools import SkillReadTool, WebFetchTool, WebSearchTool
 _SECRET_KEYS = {
     "api_key",
     "web_search_api_key",
+    "reference_embedding_api_key",
     "authorization",
     "access_token",
     "token",
@@ -40,6 +41,15 @@ _SECRET_KEYS = {
     "password",
 }
 _SOURCE_PATH = re.compile(r'File "([^"]+)"')
+_CODING_BASE_TOOL_NAMES = (
+    "read_file",
+    "search_workspace",
+    "edit",
+    "write",
+    "bash",
+    "sandbox_rollback",
+    "web_fetch",
+)
 
 
 def _timestamp() -> str:
@@ -709,7 +719,11 @@ def create_coding_runtime(
         "stream": False,
         "compression_threshold_tokens": config.compression_threshold_tokens or 20000,
     })
-    skills = SkillService(isolated.agent_root, isolated.workspace_root)
+    skills = SkillService(
+        isolated.agent_root,
+        isolated.workspace_root,
+        isolated.coding_source_root,
+    )
     memory_root = isolated.agent_root / ".yy" / "harness-evolution" / "memory"
     long_term = HarnessLongTermMemory(
         memory_root / "profile",
@@ -742,13 +756,22 @@ def create_coding_runtime(
         use_system_proxy=isolated.use_system_proxy,
         proxy_url=isolated.proxy_url,
     )
+    # Harness 只暴露修复代码所需的最小能力。网页抓取始终可用；配置了
+    # Brave Key 时额外加入搜索。论文、资料库、时间、计算、Cron 和 Skill
+    # 安装仍不进入 Schema。
+    selected_names = list(_CODING_BASE_TOOL_NAMES)
+    if web_search is not None:
+        selected_names.append("web_search")
     tools = default_tools(
         isolated.workspace_root,
         web_search_tool=web_search,
         web_fetch_tool=web_fetch,
-    )
+    ).select(selected_names)
     tools.register(SkillReadTool(skills))
     register_subagent(tools, RuntimeSubagentRunner(isolated, tools))
+    expected_tools = {*selected_names, "skill_read", "subagent"}
+    if set(tools.names()) != expected_tools:
+        raise RuntimeError("Harness Coding 工具目录偏离固定白名单")
     runtime = AgentRuntime(
         isolated,
         tools=tools,
@@ -763,6 +786,8 @@ def create_coding_runtime(
         retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=2),
         raise_errors=True,
         enable_extensions=False,
+        enable_cron=False,
+        enable_references=False,
     )
     runtime.coding_session_id = session_id
     runtime.harness_long_term_memory = long_term
@@ -1104,6 +1129,7 @@ class HarnessEvolutionRunner:
             enable_sandbox=False,
             raise_errors=True,
             enable_extensions=False,
+            enable_references=False,
         )
         result = await runtime.run("维护 Harness Coding Agent 长期记忆")
         if not result.completed:
@@ -1114,7 +1140,7 @@ class HarnessEvolutionRunner:
         commands = [
             ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"],
             ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "unittest", "discover", "-s", "tests", "-v"],
-            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "compileall", "-q", "Agent", "bootstrap", "context_process", "extension", "gateway", "memory", "prompt", "sandbox", "skill", "tools", "run_ui", "tests", "harness-evolution", "run.py"],
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "compileall", "-q", "Agent", "bootstrap", "context_process", "extension", "gateway", "memory", "prompt", "reference", "sandbox", "skill", "tools", "run_ui", "tests", "harness-evolution", "run.py"],
             ["uv", "lock", "--check"],
             ["git", "diff", "--check"],
         ]

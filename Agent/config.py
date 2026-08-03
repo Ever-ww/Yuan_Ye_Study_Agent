@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -40,6 +40,12 @@ class RuntimeConfig(BaseModel):
     web_fetch_timeout_seconds: StrictInt = Field(default=20, ge=5, le=60)
     web_fetch_max_bytes: StrictInt = Field(default=2_000_000, ge=100_000, le=5_000_000)
     web_fetch_max_chars: StrictInt = Field(default=30_000, ge=1_000, le=30_000)
+    paper_download_timeout_seconds: StrictInt = Field(default=60, ge=5, le=180)
+    paper_download_max_bytes: StrictInt = Field(
+        default=50_000_000,
+        ge=1_000_000,
+        le=200_000_000,
+    )
     use_system_proxy: StrictBool = False
     proxy_url: str | None = None
     stream: StrictBool = False
@@ -55,6 +61,12 @@ class RuntimeConfig(BaseModel):
     gateway_max_concurrent_runs: StrictInt = Field(default=4, ge=1, le=32)
     gateway_runtime_idle_seconds: StrictInt = Field(default=900, ge=30)
     cron_heartbeat_seconds: StrictInt = Field(default=60, ge=5)
+    reference_search_mode: Literal["rrf", "weighted", "separate"] = "rrf"
+    reference_embedding_model: str = ""
+    reference_embedding_base_url: str | None = None
+    reference_embedding_api_key: str | None = None
+    reference_keyword_weight: float = Field(default=0.4, ge=0.0, le=1.0)
+    reference_semantic_weight: float = Field(default=0.6, ge=0.0, le=1.0)
 
     @field_validator("agent_root", "workspace_root", "coding_source_root")
     @classmethod
@@ -66,6 +78,10 @@ class RuntimeConfig(BaseModel):
     def memory_dir(self) -> Path:
         """返回唯一的项目本地记忆目录。"""
         return self.agent_root / ".yy" / "memory"
+
+    @property
+    def reference_database_path(self) -> Path:
+        return self.agent_root / ".yy" / "reference" / "reference.sqlite3"
 
     @field_validator("tool_output_tail_ratio")
     @classmethod
@@ -83,6 +99,10 @@ class RuntimeConfig(BaseModel):
             raise ValueError("use_system_proxy 与 proxy_url 不能同时启用")
         if self.proxy_url and not self.proxy_url.startswith(("http://", "https://")):
             raise ValueError("proxy_url 目前只支持 http:// 或 https://")
+        if self.reference_keyword_weight + self.reference_semantic_weight <= 0:
+            raise ValueError("reference_keyword_weight 与 reference_semantic_weight 之和必须大于 0")
+        if self.reference_embedding_base_url and not self.reference_embedding_base_url.startswith(("http://", "https://")):
+            raise ValueError("reference_embedding_base_url 只支持 http:// 或 https://")
         return self
 
 
@@ -112,7 +132,7 @@ def load_runtime_config(
     ensure_project_initialized(selected_agent_root)
     values: dict[str, Any] = {}
     shared = _read_json(selected_agent_root / ".yy" / "settings.json")
-    sensitive_keys = {"api_key", "web_search_api_key"}.intersection(shared)
+    sensitive_keys = {"api_key", "web_search_api_key", "reference_embedding_api_key"}.intersection(shared)
     if sensitive_keys:
         raise ValueError(
             "禁止在 .yy/settings.json 保存 API Key；请移至已忽略的 .yy/settings.local.json",
@@ -136,10 +156,29 @@ def load_runtime_config(
 
 
 def default_agent_root() -> Path:
-    """返回安装版统一 Agent Home，并非当前用户 workspace。"""
-    from bootstrap import migrate_source_home, platform_agent_home
+    """返回统一状态容器；正式运行态固定写入 `<用户目录>/.yy`。"""
+    from bootstrap import (
+        legacy_gateway_active,
+        legacy_platform_agent_home,
+        migrate_source_home,
+        platform_agent_home,
+    )
 
     source_root = Path(__file__).resolve().parents[1]
     selected = platform_agent_home()
+    legacy = legacy_platform_agent_home()
+    canonical_initialized = (selected / ".yy" / ".initialized.json").is_file()
+    legacy_has_state = (legacy / ".yy").is_dir() or (legacy / "skills").is_dir()
+    if (
+        not canonical_initialized
+        and legacy != selected
+        and legacy_has_state
+        and legacy_gateway_active(legacy)
+    ):
+        # 升级过程中旧 Gateway 仍可能写 SQLite。先继续返回旧位置，用户执行
+        # gateway stop 后，下一次启动再安全迁移并切换到 ~/.yy。
+        return legacy
+    if legacy != selected and legacy_has_state:
+        migrate_source_home(legacy, selected)
     migrate_source_home(source_root, selected)
     return selected

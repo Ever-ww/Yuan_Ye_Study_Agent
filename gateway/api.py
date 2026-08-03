@@ -263,11 +263,12 @@ def create_gateway_api(
     async def skills(project_id: str):
         return gateway.skills(project_id).catalog()
 
-    @app.post("/api/v1/projects/{project_id}/skills/refresh", dependencies=[Depends(authorize_write)])
-    async def refresh_skills(project_id: str):
-        catalog = gateway.skills(project_id).catalog()
-        gateway.pool.refresh_skills(project_id)
-        return {"count": len(catalog)}
+    @app.post(
+        "/api/v1/projects/{project_id}/sessions/{session_id}/skills/refresh",
+        dependencies=[Depends(authorize_write)],
+    )
+    async def refresh_skills(project_id: str, session_id: str):
+        return await gateway.pool.refresh_skills(project_id, session_id)
 
     @app.get("/api/v1/projects/{project_id}/skills/audit/{review_id}", dependencies=[Depends(authorize)])
     async def audit_skill(project_id: str, review_id: str):

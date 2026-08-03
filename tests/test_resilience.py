@@ -18,7 +18,6 @@ from Agent.models.providers import _openai_reply
 from memory import MemoryStore
 from run_ui.cli import _handle_chat_failure
 from run_ui.harness_loader import load_harness_module
-from skill import SkillInstallRequest, SkillService
 from tool import AsyncToolRegistry
 
 
@@ -572,8 +571,14 @@ class ResilienceTests(unittest.TestCase):
         harness = load_harness_module()
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
-            config = load_runtime_config(root)
-            source = root / "sources" / "coding-helper"
+            config = load_runtime_config(
+                root,
+                coding_source_root=root,
+                web_search_api_key="configured-test-key",
+            )
+            worktree = root / "isolated"
+            worktree.mkdir(parents=True)
+            source = root / "skills" / "coding-helper"
             source.mkdir(parents=True)
             (source / "SKILL.md").write_text(
                 "---\n"
@@ -584,35 +589,56 @@ class ResilienceTests(unittest.TestCase):
                 "先定位错误边界，再提出最小修复。\n",
                 encoding="utf-8",
             )
-            installed = asyncio.run(
-                SkillService(root, root).install(SkillInstallRequest(source=str(source)))
-            )
-            self.assertEqual(installed.status, "installed")
-            worktree = root / "isolated"
-            worktree.mkdir()
             (worktree / "module.py").write_text("BROKEN = True\n", encoding="utf-8")
             sandbox = _FakeHarnessSandbox()
             runtime = harness.create_coding_runtime(config, worktree, sandbox=sandbox)
             runtime.provider = _CodingWriteProvider()
             self.assertIsInstance(runtime, AgentRuntime)
-            names = {schema["name"] for schema in runtime.tools.schemas()}
-            self.assertTrue({
+            schemas = runtime.tools.schemas()
+            names = {schema["name"] for schema in schemas}
+            self.assertEqual(names, {
                 "read_file",
+                "edit",
                 "write",
                 "search_workspace",
                 "bash",
                 "sandbox_rollback",
+                "web_search",
+                "web_fetch",
                 "skill_read",
                 "subagent",
-            }.issubset(names))
-            self.assertNotIn("skill_install", names)
+            })
+            self.assertTrue({
+                "calculator",
+                "current_time",
+                "download_paper",
+                "reference_search",
+                "reference_get",
+                "reference_write",
+                "cronjob",
+                "skill_install",
+            }.isdisjoint(names))
+            subagent_schema = next(
+                schema["parameters"] for schema in schemas if schema["name"] == "subagent"
+            )
+            self.assertEqual(
+                set(subagent_schema["properties"]["tools"]["items"]["enum"]),
+                names - {"subagent"},
+            )
             self.assertIsNotNone(runtime.skills)
+            self.assertEqual(runtime.skills.source_root, root.resolve())
+            self.assertEqual(runtime.skills.skills_root, (root / "skills").resolve())
+            self.assertIsNone(runtime.references)
             self.assertIsNotNone(runtime.context_processor)
             self.assertIn("coding-helper", runtime.prompts.compose("诊断")[0]["content"])
+            runtime.skills.bind_session(
+                runtime.coding_session_id,
+                runtime.skills.catalog_snapshot(),
+            )
             skill_text = asyncio.run(runtime.tools.execute(
                 "skill_read",
                 {"name": "coding-helper"},
-                runtime.tool_context,
+                runtime.tool_context.model_copy(update={"session_id": runtime.coding_session_id}),
             ))
             self.assertIn("最小修复", skill_text)
             self.assertEqual(runtime.config.workspace_root, worktree.resolve())
@@ -671,6 +697,21 @@ class ResilienceTests(unittest.TestCase):
                 agent_path.read_text(encoding="utf-8"),
                 "# 用户维护的规则\n保持只读\n",
             )
+
+    def test_coding_runtime_always_fetches_but_only_searches_with_key(self) -> None:
+        harness = load_harness_module()
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            worktree = root / "isolated"
+            worktree.mkdir()
+            runtime = harness.create_coding_runtime(
+                load_runtime_config(root),
+                worktree,
+                sandbox=_FakeHarnessSandbox(),
+            )
+            names = set(runtime.tools.names())
+            self.assertIn("web_fetch", names)
+            self.assertNotIn("web_search", names)
 
     def test_forbidden_future_changes_are_rejected(self) -> None:
         harness = load_harness_module()

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict
+from skill import SkillCatalogSnapshot
 
 if TYPE_CHECKING:
     from Agent.config import RuntimeConfig
@@ -25,6 +26,7 @@ class SystemPromptSnapshot(BaseModel):
     segment_path: Path
     initialized_at: str
     content: str
+    skill_catalog: SkillCatalogSnapshot | None = None
 
 
 class SystemPromptComposer:
@@ -49,13 +51,28 @@ class SystemPromptComposer:
             self._snapshots.clear()
         self.sandbox_mode = status.mode
 
-    def open_session(self, session_id: str, *, force: bool = False) -> SystemPromptSnapshot:
+    def open_session(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+        skill_catalog: SkillCatalogSnapshot | None = None,
+    ) -> SystemPromptSnapshot:
         """返回 Session 的缓存快照；仅 force 时重新读取文件。"""
         if not force and session_id in self._snapshots:
             return self._snapshots[session_id]
         initialized_at = self.memory.session_created_at(session_id)
         segment_path = self.memory.active_path(session_id)
-        skill_xml = self.skills.catalog_xml() if self.skills is not None else "<available_skills></available_skills>"
+        selected_catalog = (
+            skill_catalog
+            if skill_catalog is not None
+            else self.skills.catalog_snapshot() if self.skills is not None else None
+        )
+        skill_xml = (
+            self.skills.catalog_xml(selected_catalog)
+            if self.skills is not None and selected_catalog is not None
+            else "<available_skills></available_skills>"
+        )
         soul = _read(self.config.agent_root / ".yy" / "agents" / "SOUL.md")
         agent = _read(self.config.agent_root / ".yy" / "agents" / "AGENT.md")
         profile = self.memory.prompt_context(session_id)
@@ -67,7 +84,8 @@ class SystemPromptComposer:
             (
                 "# 核心规则\n你是严谨、透明的本地 Agent。工具调用必须遵守权限、工作区边界和审批要求。"
                 "网络调研中，web_search 只用于发现候选 URL；需要读取正文或核验摘要时，"
-                "应从搜索结果选择相关 URL 继续调用 web_fetch。"
+                "应从搜索结果选择相关 URL 继续调用 web_fetch。需要保存公开论文 PDF 时调用 "
+                "download_paper，成功后使用其返回路径调用 read_file；不要把 HTML 页面当作 PDF 下载。"
             ),
             "# 项目说明（AGENT）\n" + agent,
             "# 长时记忆\n" + (profile or "（暂无可用长期记忆）"),
@@ -83,12 +101,21 @@ class SystemPromptComposer:
             segment_path=segment_path,
             initialized_at=initialized_at,
             content="\n\n".join(sections),
+            skill_catalog=selected_catalog,
         )
         self._snapshots[session_id] = snapshot
+        if self.skills is not None and selected_catalog is not None:
+            self.skills.bind_session(session_id, selected_catalog)
         return snapshot
 
     def discard(self, session_id: str) -> None:
         self._snapshots.pop(session_id, None)
+        if self.skills is not None:
+            self.skills.unbind_session(session_id)
+
+    def skill_catalog(self, session_id: str) -> SkillCatalogSnapshot | None:
+        snapshot = self.open_session(session_id)
+        return snapshot.skill_catalog
 
 
 class TaskPromptComposer:
@@ -130,8 +157,24 @@ class PromptComposer:
         snapshot = self.system.open_session(session_id)
         return [{"role": "system", "content": snapshot.content}, self.task.compose(task)]
 
-    def refresh(self, session_id: str) -> SystemPromptSnapshot:
-        return self.system.open_session(session_id, force=True)
+    def refresh(
+        self,
+        session_id: str,
+        *,
+        skill_catalog: SkillCatalogSnapshot | None = None,
+    ) -> SystemPromptSnapshot:
+        if skill_catalog is None:
+            existing = self.system._snapshots.get(session_id)
+            if existing is not None:
+                skill_catalog = existing.skill_catalog
+        return self.system.open_session(
+            session_id,
+            force=True,
+            skill_catalog=skill_catalog,
+        )
+
+    def skill_catalog(self, session_id: str) -> SkillCatalogSnapshot | None:
+        return self.system.skill_catalog(session_id)
 
     def close(self, session_id: str) -> None:
         self.system.discard(session_id)

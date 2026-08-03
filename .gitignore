@@ -31,13 +31,14 @@ desktop/src-tauri/binaries/*
 
 # Yuan Ye 的全部本机配置、记忆和运行状态均由初始化命令创建，不提交。
 .yy/
+# 全局论文、原文摘录、引用例句与向量索引只保存在 Agent Home。
+.yy/reference/
 AGENT.md
 AGENT.local.md
 DEVELOPMENT_REFERENCE.md
 
-# 已安装第三方 Skill 只保留在本机；目录占位文件用于保留结构。
-skills/*
-!skills/.gitkeep
+# 仓库根目录 skills/ 保存经审核后正式发布、随源码和 GitHub 分发的 Skill。
+# 用户下载的隔离源码、审核报告、索引和更新备份只位于已忽略的 ~/.yy/skills/。
 
 # Chat 错误复现快照包含完整用户上下文，仅保留本机说明文件。
 tests/error/*.jsonl

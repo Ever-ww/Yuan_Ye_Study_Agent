@@ -32,6 +32,12 @@ from gateway.models import (
 from gateway.runtime_pool import RuntimeFactory, RuntimePool
 from gateway.store import GatewayStore
 from memory import MemoryStore
+from reference import (
+    ReferenceEmbeddingWorker,
+    ReferenceService,
+    ReferenceStore,
+    build_embedding_provider,
+)
 from skill import SkillInstallRequest, SkillService
 
 
@@ -55,6 +61,19 @@ class GatewayApplication:
             heartbeat_seconds=config.cron_heartbeat_seconds,
         )
         self.cron_service = CronService(self.cron_store, CronScheduleCalculator())
+        self.reference_store = ReferenceStore(config.reference_database_path)
+        self.reference_embedding_provider = build_embedding_provider(config)
+        self.reference_embedding_worker = ReferenceEmbeddingWorker(
+            self.reference_store,
+            self.reference_embedding_provider,
+        )
+        self.reference_service = ReferenceService(
+            self.reference_store,
+            self.reference_embedding_provider,
+            keyword_weight=config.reference_keyword_weight,
+            semantic_weight=config.reference_semantic_weight,
+            worker=self.reference_embedding_worker,
+        )
         self.pool = RuntimePool(
             agent_root=config.agent_root,
             store=self.store,
@@ -64,6 +83,7 @@ class GatewayApplication:
             runtime_factory=runtime_factory,
             extensions=self.extensions,
             cron_service=self.cron_service,
+            reference_service=self.reference_service,
         )
         self.cron_scheduler = CronScheduler(
             self.cron_store,
@@ -75,13 +95,21 @@ class GatewayApplication:
         self.code_sessions = CodeSessionManager(config)
 
     async def start(self) -> None:
-        await self.pool.start()
-        await self.cron_scheduler.start()
+        await self.reference_embedding_worker.start()
+        try:
+            await self.pool.start()
+            await self.cron_scheduler.start()
+        except Exception:
+            await self.reference_embedding_worker.close()
+            raise
 
     async def close(self) -> None:
-        await self.cron_scheduler.close()
-        await self.code_sessions.close()
-        await self.pool.close()
+        try:
+            await self.cron_scheduler.close()
+            await self.code_sessions.close()
+            await self.pool.close()
+        finally:
+            await self.reference_embedding_worker.close()
 
     async def start_code_session(self, request: CodeSessionCreateRequest):
         self.store.project(request.project_id)
@@ -214,6 +242,7 @@ class GatewayApplication:
         return SkillService(
             self.config.agent_root,
             Path(project.path),
+            self.config.coding_source_root,
         )
 
     async def manage_skill(self, request: SkillManageRequest):
@@ -226,6 +255,7 @@ class GatewayApplication:
         service = SkillService(
             self.config.agent_root,
             Path(project.path),
+            self.config.coding_source_root,
             approval=approve,
         )
         result = await service.install(SkillInstallRequest(

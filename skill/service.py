@@ -24,6 +24,7 @@ from .models import (
     InstalledSkillEntry,
     SkillAuditFinding,
     SkillAuditReport,
+    SkillCatalogSnapshot,
     SkillIndex,
     SkillInstallRequest,
     SkillInstallResult,
@@ -105,19 +106,22 @@ class SkillService:
         self,
         agent_root: Path,
         workspace_root: Path,
+        source_root: Path | None = None,
         *,
         approval: Approval | None = None,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.workspace_root = workspace_root.resolve()
+        self.source_root = (source_root or workspace_root).resolve()
         self.approval = approval
-        self.skills_root = self.agent_root / "skills"
         self.state_root = self.agent_root / ".yy" / "skills"
+        self.skills_root = self.source_root / "skills"
         self.review_root = self.state_root / "review"
         self.audit_root = self.state_root / "audit"
         self.backup_root = self.state_root / "backups"
         self.index_path = self.state_root / "index.json"
-        self._locks = WorkspaceLockManager(self.agent_root, state_root=self.agent_root)
+        self._locks = WorkspaceLockManager(self.source_root, state_root=self.agent_root)
+        self._session_snapshots: dict[str, SkillCatalogSnapshot] = {}
         self.initialize()
 
     def initialize(self) -> None:
@@ -139,44 +143,181 @@ class SkillService:
             if modified < cutoff:
                 shutil.rmtree(path, ignore_errors=True)
 
-    def catalog(self) -> tuple[SkillMetadata, ...]:
-        """扫描目录并只返回索引摘要仍匹配的 Skill。"""
+    def install_builtin(self, source_root: Path, *, repository_root: Path) -> SkillInstallResult:
+        """安装或安全更新随项目发布的受信任 Skill。
+
+        内置来源仍执行相同的结构与静态审核；硬阻断项永远不能安装。
+        只有上一个版本未被用户篡改时才自动升级，避免覆盖本地修改。
+        """
+        source_root = source_root.resolve()
+        repository_root = repository_root.resolve()
+        metadata = parse_skill(source_root)
+        review_id = hashlib.sha256(
+            f"builtin:{metadata.name}:{metadata.content_digest}".encode("utf-8"),
+        ).hexdigest()
+        source = SkillSource(kind="builtin", value=str(source_root))
+        report = self._audit(
+            review_id,
+            source,
+            source_root,
+            source_root,
+            repository_root,
+        )
+        if report.status == "blocked" or report.skill is None:
+            self._write_report(report)
+            return self._result_from_report(report, "blocked", "内置 Skill 静态审核未通过")
+
+        # 内置 Skill 已经位于正式仓库目录，不再复制到 Agent Home；这里只登记审核结果。
+        target = self.skills_root / metadata.name
+        if target.resolve() == source_root:
+            index = self._read_index()
+            previous = index.skills.get(metadata.name)
+            index.skills[metadata.name] = InstalledSkillEntry(
+                name=metadata.name,
+                content_digest=metadata.content_digest,
+                description=metadata.description,
+                source=source,
+                review_id=review_id,
+                installed_at=(
+                    previous.installed_at
+                    if previous is not None
+                    else datetime.now().astimezone()
+                ),
+            )
+            self._write_index(index)
+            installed_report = report.model_copy(
+                update={"status": "installed", "skill": metadata},
+            )
+            self._write_report(installed_report)
+            return self._result_from_report(
+                installed_report,
+                "installed",
+                f"内置 Skill 已登记：{metadata.name}",
+            )
+
+        return self._result_from_report(
+            report,
+            "conflict",
+            "内置 Skill 必须直接位于源码仓库 skills 目录",
+        )
+
+        target = self.skills_root / metadata.name
         index = self._read_index()
-        values: list[SkillMetadata] = []
-        for name, entry in sorted(index.skills.items()):
-            root = self.skills_root / name
-            if root.is_symlink():
-                continue
+        previous = index.skills.get(metadata.name)
+        if target.exists():
+            if previous is None:
+                return self._result_from_report(
+                    report,
+                    "conflict",
+                    f"已存在未登记 Skill，未覆盖：{metadata.name}",
+                )
             try:
-                metadata = parse_skill(root)
-            except (OSError, UnicodeError, ValueError):
+                current_digest = content_digest(target)
+            except (OSError, ValueError):
+                current_digest = ""
+            if current_digest != previous.content_digest:
+                return self._result_from_report(
+                    report,
+                    "conflict",
+                    f"已安装 Skill 存在本地修改，未覆盖：{metadata.name}",
+                )
+            if current_digest == metadata.content_digest:
+                return self._result_from_report(
+                    report.model_copy(update={"status": "installed"}),
+                    "installed",
+                    f"内置 Skill 已就绪：{metadata.name}",
+                )
+
+        temporary = self.skills_root / f".{metadata.name}.{uuid4().hex}.tmp"
+        backup: Path | None = None
+        try:
+            shutil.copytree(source_root, temporary)
+            if target.exists():
+                backup = self.backup_root / metadata.name / (
+                    datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+                    + "-"
+                    + previous.content_digest[:12]
+                )
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                target.replace(backup)
+            temporary.replace(target)
+            installed = parse_skill(target)
+            index.skills[metadata.name] = InstalledSkillEntry(
+                name=metadata.name,
+                content_digest=installed.content_digest,
+                description=installed.description,
+                source=source,
+                review_id=review_id,
+                installed_at=datetime.now().astimezone(),
+            )
+            self._write_index(index)
+            installed_report = report.model_copy(update={"status": "installed", "skill": installed})
+            self._write_report(installed_report)
+            if backup is not None:
+                self._trim_backups(metadata.name)
+            return self._result_from_report(
+                installed_report,
+                "installed",
+                f"内置 Skill 已安装：{metadata.name}",
+            )
+        except Exception:
+            shutil.rmtree(target, ignore_errors=True)
+            if backup is not None and backup.exists():
+                backup.replace(target)
+            raise
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
+
+    def catalog(self) -> tuple[SkillMetadata, ...]:
+        """扫描源码仓库 skills，并只返回结构与路径合法的 Skill。"""
+        values: list[SkillMetadata] = []
+        for root in sorted(self.skills_root.iterdir(), key=lambda item: item.name):
+            if root.name.startswith(".") or not root.is_dir():
                 continue
-            if metadata.content_digest != entry.content_digest:
-                continue
-            if metadata.name != entry.name or metadata.description != entry.description:
-                continue
-            values.append(metadata)
+            if root.is_symlink():
+                raise ValueError(f"正式 Skill 目录不允许符号链接：{root.name}")
+            values.append(parse_skill(root))
         return tuple(values)
 
-    def catalog_xml(self) -> str:
+    def catalog_snapshot(self) -> SkillCatalogSnapshot:
+        """生成可绑定到单个 Session 的不可变目录快照。"""
+        skills = self.catalog()
+        payload = "\n".join(f"{item.name}:{item.content_digest}" for item in skills)
+        return SkillCatalogSnapshot(
+            digest=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            skills=skills,
+        )
+
+    def bind_session(self, session_id: str, snapshot: SkillCatalogSnapshot) -> None:
+        self._session_snapshots[session_id] = snapshot
+
+    def session_snapshot(self, session_id: str) -> SkillCatalogSnapshot:
+        try:
+            return self._session_snapshots[session_id]
+        except KeyError as exc:
+            raise RuntimeError("当前 Session 尚未建立 Skill 目录快照") from exc
+
+    def unbind_session(self, session_id: str) -> None:
+        self._session_snapshots.pop(session_id, None)
+
+    def catalog_xml(self, snapshot: SkillCatalogSnapshot | None = None) -> str:
         """返回 System Prompt 使用的完整发现层 XML。"""
-        value = catalog_xml(self.catalog())
+        value = catalog_xml(snapshot.skills if snapshot is not None else self.catalog())
         if len(value.encode("utf-8")) > _MAX_CATALOG_CHARS:
             raise RuntimeError("Skill XML 目录超过 64 KiB，请移除部分 Skill")
         return value
 
-    def read(self, name: str, path: str = "SKILL.md") -> str:
+    def read(self, snapshot: SkillCatalogSnapshot, name: str, path: str = "SKILL.md") -> str:
         """读取已审核 Skill 内的单个 UTF-8 文本文件。"""
-        index = self._read_index()
-        entry = index.skills.get(name)
+        entry = snapshot.by_name().get(name)
         if entry is None:
-            raise KeyError(f"未知或未审核 Skill：{name}")
+            raise KeyError(f"当前 Session 未启用 Skill：{name}")
         installed = self.skills_root / name
         if installed.is_symlink():
-            raise RuntimeError(f"Skill {name} 内容已变化，必须重新审核")
+            raise RuntimeError(f"Skill {name} 内容已变化，请执行 /skill refresh")
         root = installed.resolve()
         if not root.is_dir() or content_digest(root) != entry.content_digest:
-            raise RuntimeError(f"Skill {name} 内容已变化，必须重新审核")
+            raise RuntimeError(f"Skill {name} 内容已变化，请执行 /skill refresh")
         relative = PurePosixPath(path.replace("\\", "/"))
         if relative.is_absolute() or not relative.parts or ".." in relative.parts:
             raise PermissionError("Skill 读取路径必须是目录内相对路径")
@@ -531,16 +672,24 @@ class SkillService:
                     "blocked",
                     "并发安装后 Skill XML 目录将超过 64 KiB",
                 )
-            if request.action == "update":
-                backup = self.backup_root / name / (
-                    datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
-                    + "-"
-                    + index.skills[name].content_digest[:12]
-                )
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                target.replace(backup)
+            temporary = self.skills_root / f".{name}.{uuid4().hex}.tmp"
+            rollback = self.skills_root / f".{name}.{uuid4().hex}.rollback"
+            old_moved = False
+            published = False
             try:
-                prepared.replace(target)
+                shutil.copytree(prepared, temporary)
+                if request.action == "update":
+                    backup = self.backup_root / name / (
+                        datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+                        + "-"
+                        + index.skills[name].content_digest[:12]
+                    )
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(target, backup)
+                    target.replace(rollback)
+                    old_moved = True
+                temporary.replace(target)
+                published = True
                 installed_metadata = parse_skill(target)
                 entry = InstalledSkillEntry(
                     name=name,
@@ -553,16 +702,22 @@ class SkillService:
                 index.skills[name] = entry
                 self._write_index(index)
             except Exception:
-                shutil.rmtree(target, ignore_errors=True)
-                if backup is not None and backup.exists():
-                    backup.replace(target)
+                if published:
+                    shutil.rmtree(target, ignore_errors=True)
+                if old_moved and rollback.exists():
+                    rollback.replace(target)
+                if backup is not None:
+                    shutil.rmtree(backup, ignore_errors=True)
                 raise
+            finally:
+                shutil.rmtree(temporary, ignore_errors=True)
+            shutil.rmtree(rollback, ignore_errors=True)
             if backup is not None:
                 self._trim_backups(name)
         return self._result_from_report(
             report,
             "installed",
-            f"Skill {name} 已安装；需要时请调用 skill_read",
+            f"Skill {name} 已发布到源码仓库；当前 Session 请执行 /skill refresh 后使用",
         )
 
     def _trim_backups(self, name: str) -> None:

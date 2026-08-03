@@ -23,21 +23,23 @@ from Agent.react import ReactLoop
 from Agent.retry import ModelRetryPolicy
 from context_process import ContextProcessor
 from memory import MemoryStore
+from paper_library import PaperLibraryService
 from prompt import PromptComposer
+from reference import ReferenceService, ReferenceStore, build_embedding_provider
 from sandbox import (
     DockerSandboxSession,
     SandboxSessionProtocol,
     WorkspaceLockManager,
     sandbox_status_of,
 )
-from skill import SkillService
+from skill import SkillRefreshResult, SkillService
 from tool import (
     AsyncToolRegistry,
     ToolContext,
     default_tools,
     register_subagent,
 )
-from tools import WebFetchTool, WebSearchTool
+from tools import PaperDownloadTool, WebFetchTool, WebSearchTool
 from .subagent import RuntimeSubagentRunner
 from .failure import RuntimeFailure
 
@@ -82,6 +84,10 @@ class AgentRuntime:
         cron=None,
         cron_project_id: str | None = None,
         enable_cron: bool = True,
+        references: ReferenceService | None = None,
+        enable_references: bool = True,
+        paper_library: PaperLibraryService | None = None,
+        enable_paper_library: bool = True,
     ) -> None:
         self.config = config or load_runtime_config()
         self.provider = provider or build_provider(
@@ -168,10 +174,21 @@ class AgentRuntime:
                 self.skills = SkillService(
                     self.config.agent_root,
                     self.config.workspace_root,
+                    self.config.coding_source_root,
                     approval=self.approval,
                 )
         else:
             self.skills = None
+        if enable_references:
+            self.references = references or ReferenceService(
+                ReferenceStore(self.config.reference_database_path),
+                build_embedding_provider(self.config),
+                keyword_weight=self.config.reference_keyword_weight,
+                semantic_weight=self.config.reference_semantic_weight,
+            )
+        else:
+            self.references = None
+        self.paper_library = paper_library
         if tools is not None:
             self.tools = tools
         else:
@@ -192,13 +209,32 @@ class AgentRuntime:
                 use_system_proxy=self.config.use_system_proxy,
                 proxy_url=self.config.proxy_url,
             )
+            paper_download = PaperDownloadTool(
+                timeout_seconds=self.config.paper_download_timeout_seconds,
+                max_bytes=self.config.paper_download_max_bytes,
+                use_system_proxy=self.config.use_system_proxy,
+                proxy_url=self.config.proxy_url,
+            )
+            if enable_paper_library:
+                self.paper_library = self.paper_library or PaperLibraryService(
+                    self.config.agent_root,
+                    self.references.store if self.references is not None else None,
+                    downloader=paper_download,
+                )
+            else:
+                self.paper_library = None
             base_tools = default_tools(
                 self.config.workspace_root,
+                agent_root=self.config.agent_root,
                 skill_service=self.skills,
                 web_search_tool=web_search,
                 web_fetch_tool=web_fetch,
+                paper_download_tool=paper_download,
                 cron_service=cron if enable_cron else None,
                 cron_project_id=cron_project_id,
+                reference_service=self.references,
+                reference_search_mode=self.config.reference_search_mode,
+                paper_library_service=self.paper_library,
             )
             if enable_subagent:
                 runner = subagent_runner or RuntimeSubagentRunner(self.config, base_tools)
@@ -309,7 +345,8 @@ class AgentRuntime:
         final_payload: dict[str, object] | None = None
         failure: BaseException | None = None
         try:
-            async for event in loop.run(messages, self.tool_context, task=task, session_id=active_id, model=model):
+            turn_tool_context = self.tool_context.model_copy(update={"session_id": active_id})
+            async for event in loop.run(messages, turn_tool_context, task=task, session_id=active_id, model=model):
                 if event.type is EventType.FINAL:
                     final_payload = dict(event.payload)
                 yield event
@@ -347,14 +384,105 @@ class AgentRuntime:
         self.prompts.refresh(active_id)
         yield RunEvent(type=EventType.FINAL, payload={"answer": "上下文缓存已刷新", "completed": True})
 
-    def refresh_skills(self) -> int:
-        """显式重新扫描已审核 Skill，并刷新当前 System Prompt。"""
+    async def refresh_skills(self, session_id: str | None = None) -> SkillRefreshResult:
+        """刷新当前 Session 的仓库 Skill 快照，并以新 JSONL 分段建立上下文边界。"""
         if self.skills is None:
             raise RuntimeError("当前 Runtime 已禁用 Skill")
-        count = len(self.skills.catalog())
-        if self._session_id is not None:
-            self.prompts.refresh(self._session_id)
-        return count
+        active_id = session_id or self._session_id
+        if not active_id or not self._session_open or active_id != self._session_id:
+            return SkillRefreshResult(
+                status="error",
+                message="当前没有可刷新的活动 Session；新 Session 会自动加载最新 Skill",
+                session_id=active_id or "none",
+            )
+        current = self.prompts.skill_catalog(active_id)
+        candidate = self.skills.catalog_snapshot()
+        self.skills.catalog_xml(candidate)
+        old_digest = current.digest if current is not None else None
+        if old_digest == candidate.digest:
+            return SkillRefreshResult(
+                status="unchanged",
+                message="Skill 目录没有变化，未创建新的 Session 分段",
+                session_id=active_id,
+                count=len(candidate.skills),
+                old_digest=old_digest,
+                new_digest=candidate.digest,
+            )
+
+        old = current.by_name() if current is not None else {}
+        new = candidate.by_name()
+        added = tuple(sorted(set(new) - set(old)))
+        removed = tuple(sorted(set(old) - set(new)))
+        updated = tuple(sorted(
+            name for name in set(old).intersection(new)
+            if old[name].content_digest != new[name].content_digest
+        ))
+        source_file = self.memory.active_filename(active_id)
+        audit = {
+            "reason": "skill_refresh",
+            "skill_catalog_old_digest": old_digest,
+            "skill_catalog_new_digest": candidate.digest,
+            "skills_added": list(added),
+            "skills_updated": list(updated),
+            "skills_removed": list(removed),
+        }
+        target_file: str | None = None
+        if self.memory.has_compressible_history(active_id):
+            if self.context_processor is None:
+                return SkillRefreshResult(
+                    status="error",
+                    message="当前 Runtime 未启用上下文压缩，Skill 刷新未生效",
+                    session_id=active_id,
+                    count=len(candidate.skills),
+                    old_digest=old_digest,
+                    new_digest=candidate.digest,
+                    added=added,
+                    updated=updated,
+                    removed=removed,
+                    source_file=source_file,
+                )
+            result = await self.context_processor.compress(
+                active_id,
+                summary_metadata=audit,
+            )
+            if result.status != "compressed":
+                self.context_processor.discard_fallback(active_id)
+                return SkillRefreshResult(
+                    status="error",
+                    message=f"Skill 刷新未生效：{result.message}",
+                    session_id=active_id,
+                    count=len(candidate.skills),
+                    old_digest=old_digest,
+                    new_digest=candidate.digest,
+                    added=added,
+                    updated=updated,
+                    removed=removed,
+                    source_file=source_file,
+                )
+            target_file = result.target_file
+        else:
+            segment = self.memory.rollover_with_summary(
+                active_id,
+                "当前会话尚无历史消息；本分段由 Skill 目录刷新创建。",
+                source_file,
+                metadata=audit,
+            )
+            target_file = segment.name
+
+        self.prompts.refresh(active_id, skill_catalog=candidate)
+        return SkillRefreshResult(
+            status="refreshed",
+            message=f"Skill 目录已刷新并切换到新分段：{target_file}",
+            session_id=active_id,
+            count=len(candidate.skills),
+            old_digest=old_digest,
+            new_digest=candidate.digest,
+            added=added,
+            updated=updated,
+            removed=removed,
+            source_file=source_file,
+            target_file=target_file,
+        )
 
     async def _compress_command(self, session_id: str | None) -> AsyncIterator[RunEvent]:
         """由主 Runtime 处理手动压缩命令，不把命令写入 Session。"""

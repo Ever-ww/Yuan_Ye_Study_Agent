@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -10,6 +11,9 @@ from pydantic import BaseModel, ConfigDict
 
 from memory import MemoryStore
 from cron import CronState, HeartbeatState
+from paper_library import PaperIndex
+from reference import ReferenceStore
+from skill import SkillService
 
 
 class InitializationResult(BaseModel):
@@ -31,6 +35,8 @@ _REQUIRED_PATHS = (
     "agents/SOUL.md",
     "agents/AGENT.md",
     "skills/index.json",
+    "reference/reference.sqlite3",
+    "papers/index.json",
     ".initialized.json",
 )
 
@@ -52,6 +58,12 @@ def initialize_project(project_root: Path) -> Path:
     )
     if not all(path.exists() for path in memory_required):
         MemoryStore(yy / "memory")
+    ReferenceStore(yy / "reference" / "reference.sqlite3")
+    papers = yy / "papers"
+    papers.mkdir(parents=True, exist_ok=True)
+    paper_index = papers / "index.json"
+    if not paper_index.exists():
+        paper_index.write_text(PaperIndex().model_dump_json(indent=2) + "\n", encoding="utf-8")
     agents = yy / "agents"
     agents.mkdir(parents=True, exist_ok=True)
     templates = {
@@ -62,7 +74,6 @@ def initialize_project(project_root: Path) -> Path:
         target = agents / name
         if not target.exists():
             target.write_text(content, encoding="utf-8")
-    (project_root / "skills").mkdir(parents=True, exist_ok=True)
     for directory in ("review", "audit", "backups"):
         (yy / "skills" / directory).mkdir(parents=True, exist_ok=True)
     for directory in ("runs",):
@@ -81,6 +92,12 @@ def initialize_project(project_root: Path) -> Path:
             json.dumps({"version": 1, "skills": {}}, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+    bundled_skills = _bundled_skills_root()
+    if bundled_skills.is_dir():
+        service = SkillService(project_root, project_root, bundled_skills.parent)
+        repository_root = bundled_skills.parent
+        for source in sorted(path for path in bundled_skills.iterdir() if path.is_dir()):
+            service.install_builtin(source, repository_root=repository_root)
     marker = yy / ".initialized.json"
     if not marker.exists():
         marker.write_text(
@@ -88,6 +105,15 @@ def initialize_project(project_root: Path) -> Path:
             encoding="utf-8",
         )
     return yy
+
+
+def _bundled_skills_root() -> Path:
+    """定位源码、wheel 或 PyInstaller sidecar 中随项目发布的 Skill。"""
+    candidates = (
+        Path(__file__).resolve().parent.parent / "skills",
+        Path(sys.prefix).resolve() / "skills",
+    )
+    return next((path for path in candidates if path.is_dir()), candidates[0])
 
 
 def is_project_initialized(project_root: Path) -> bool:

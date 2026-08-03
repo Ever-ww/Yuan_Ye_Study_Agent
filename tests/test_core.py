@@ -197,7 +197,8 @@ class CoreTests(unittest.TestCase):
             self.assertTrue((yy / "memory" / "session" / "index.json").exists())
             self.assertTrue((yy / "memory" / "profile" / "index.json").exists())
             self.assertTrue((yy / "skills" / "index.json").exists())
-            self.assertTrue((root / "skills").is_dir())
+            self.assertTrue((yy / "skills" / "review").is_dir())
+            self.assertFalse((yy / "skills" / "installed").exists())
             for name in ("USER.md", "RESEARCH.md", "OTHERS.md"):
                 self.assertTrue((yy / "memory" / "profile" / name).exists())
             local.write_text("用户配置", encoding="utf-8")
@@ -856,6 +857,7 @@ class CoreTests(unittest.TestCase):
                         "calculator",
                         "search_workspace",
                         "current_time",
+                        "profile_read",
                     },
                 )
                 context = ToolContext(

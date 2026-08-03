@@ -25,12 +25,24 @@ class SkillMetadata(BaseModel):
     content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class SkillCatalogSnapshot(BaseModel):
+    """某个 Session 固定使用的仓库 Skill 目录快照。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    skills: tuple[SkillMetadata, ...] = ()
+
+    def by_name(self) -> dict[str, SkillMetadata]:
+        return {item.name: item for item in self.skills}
+
+
 class SkillSource(BaseModel):
     """一次审核使用的不可变来源信息。"""
 
     model_config = ConfigDict(frozen=True, strict=True)
 
-    kind: Literal["github", "local"]
+    kind: Literal["github", "local", "builtin"]
     value: str = Field(min_length=1)
     ref: str | None = None
     skill_path: str | None = None
@@ -117,8 +129,26 @@ class SkillInstallResult(BaseModel):
     report_path: Path | None = None
 
 
+class SkillRefreshResult(BaseModel):
+    """当前 Session 刷新仓库 Skill 目录后的事务结果。"""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    status: Literal["refreshed", "unchanged", "error"]
+    message: str
+    session_id: str
+    count: int = Field(default=0, ge=0)
+    old_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    new_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    added: tuple[str, ...] = ()
+    updated: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
+    source_file: str | None = None
+    target_file: str | None = None
+
+
 class InstalledSkillEntry(BaseModel):
-    """`.yy/skills/index.json` 中一个已安装 Skill 的来源和摘要。"""
+    """`.yy/skills/index.json` 中一个已审核发布 Skill 的来源和摘要。"""
 
     model_config = ConfigDict(strict=True)
 
@@ -132,7 +162,7 @@ class InstalledSkillEntry(BaseModel):
 
 
 class SkillIndex(BaseModel):
-    """已安装 Skill 的可信索引。"""
+    """已审核发布 Skill 的来源与审计索引；不作为运行时正文目录。"""
 
     model_config = ConfigDict(strict=True)
 

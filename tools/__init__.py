@@ -4,6 +4,21 @@ from .bash import BashTool
 from .calculator import CalculatorTool
 from .current_time import CurrentTimeTool
 from .cronjob import CronJobTool
+from .download_paper import (
+    PaperDownloadNetworkError,
+    PaperDownloadResponse,
+    PaperDownloadSecurityError,
+    PaperDownloadServiceError,
+    PaperDownloadTool,
+)
+from .reference import ReferenceGetTool, ReferenceSearchTool, ReferenceWriteTool
+from .paper_library import (
+    PaperLibraryDownloadTool,
+    PaperLibraryLookupTool,
+    PaperLibraryReadTool,
+    PaperLibrarySaveTool,
+)
+from .profile_read import ProfileReadTool
 from .edit import EditBlock, EditTool
 from .read_file import (
     DocumentFormatUnsupportedError,
@@ -40,6 +55,19 @@ __all__ = [
     "CalculatorTool",
     "CurrentTimeTool",
     "CronJobTool",
+    "PaperDownloadNetworkError",
+    "PaperDownloadResponse",
+    "PaperDownloadSecurityError",
+    "PaperDownloadServiceError",
+    "PaperDownloadTool",
+    "ReferenceGetTool",
+    "ReferenceSearchTool",
+    "ReferenceWriteTool",
+    "PaperLibraryDownloadTool",
+    "PaperLibraryLookupTool",
+    "PaperLibraryReadTool",
+    "PaperLibrarySaveTool",
+    "ProfileReadTool",
     "EditBlock",
     "EditTool",
     "ReadFileTool",

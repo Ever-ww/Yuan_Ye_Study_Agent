@@ -9,12 +9,17 @@ from typing import Any
 
 from Agent import default_agent_root, load_runtime_config
 from gateway.api import create_gateway_api
+from gateway.application import GatewayApplication
 from gateway.client import GatewayClient
 
 
-def create_app(token: str | None = None) -> Any:
+def create_app(token: str | None = None, *, agent_root: Path | None = None) -> Any:
     """兼容测试/嵌入调用；实际 Web 与 Gateway 使用同一 FastAPI。"""
-    return create_gateway_api(access_token=token)
+    application = None
+    if agent_root is not None:
+        config = load_runtime_config(agent_root)
+        application = GatewayApplication(config)
+    return create_gateway_api(application, access_token=token)
 
 
 def serve(port: int | None = None) -> None:

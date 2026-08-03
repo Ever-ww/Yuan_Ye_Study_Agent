@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -206,9 +207,11 @@ class GatewayClient:
     async def skills(self, project_id: str) -> list[dict[str, Any]]:
         return list(await self._request("GET", f"/api/v1/projects/{project_id}/skills"))
 
-    async def refresh_skills(self, project_id: str) -> int:
-        value = await self._request("POST", f"/api/v1/projects/{project_id}/skills/refresh")
-        return int(value["count"])
+    async def refresh_skills(self, project_id: str, session_id: str) -> dict[str, Any]:
+        return dict(await self._request(
+            "POST",
+            f"/api/v1/projects/{project_id}/sessions/{session_id}/skills/refresh",
+        ))
 
     async def skill_audit(self, project_id: str, review_id: str) -> dict[str, Any]:
         return dict(await self._request(
@@ -236,8 +239,14 @@ class GatewayClient:
             "run_id": run_id,
             "after_sequence": str(after_sequence),
         })
-        # Gateway 固定为本机回环服务，不允许系统代理劫持 WebSocket。
-        async with connect(f"{ws_url}/api/v1/events?{query}", proxy=None) as socket:
+        # Gateway 固定为本机回环服务，不允许系统代理劫持 WebSocket。本机事件流
+        # 不需要后台 ping；禁用它可避免任务取消时 keepalive 与关闭握手并发写连接。
+        async with connect(
+            f"{ws_url}/api/v1/events?{query}",
+            proxy=None,
+            ping_interval=None,
+            close_timeout=2,
+        ) as socket:
             async for raw in socket:
                 value = raw.decode("utf-8") if isinstance(raw, bytes) else raw
                 yield GatewayEventEnvelope.model_validate_json(value, strict=True)
@@ -252,13 +261,18 @@ class GatewayClient:
         terminal = {"run_completed", "run_failed", "run_cancelled", "run_interrupted"}
         while True:
             try:
-                async for event in self.events(run_id, after_sequence=sequence):
-                    if event.sequence <= sequence:
-                        continue
-                    sequence = event.sequence
-                    yield event
-                    if event.type in terminal:
-                        return
+                # async for 在消费者提前返回时不会替任意异步生成器保证 aclose。
+                # 显式 aclosing 让 WebSocket 在当前任务内按顺序完成关闭握手。
+                async with contextlib.aclosing(
+                    self.events(run_id, after_sequence=sequence),
+                ) as event_stream:
+                    async for event in event_stream:
+                        if event.sequence <= sequence:
+                            continue
+                        sequence = event.sequence
+                        yield event
+                        if event.type in terminal:
+                            return
             except asyncio.CancelledError:
                 raise
             except Exception:

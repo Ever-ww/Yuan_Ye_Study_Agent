@@ -85,7 +85,12 @@ class ContextProcessor:
         self.provider_factory = provider_factory or self._build_provider
         self._fallback_sessions: set[str] = set()
 
-    async def compress(self, session_id: str) -> CompressionResult:
+    async def compress(
+        self,
+        session_id: str,
+        *,
+        summary_metadata: dict[str, object] | None = None,
+    ) -> CompressionResult:
         """最多调用三次压缩 Agent，成功后合并 Profile 并切换分段。"""
         source_file = self.memory.active_filename(session_id)
         records = self.memory.session_records(session_id)
@@ -122,6 +127,7 @@ class ContextProcessor:
                     conversation_turns=turns,
                     records_processed=len(records),
                     tool_calls_processed=tool_calls,
+                    summary_metadata=summary_metadata,
                 )
                 self._fallback_sessions.discard(session_id)
                 return CompressionResult(
@@ -186,6 +192,10 @@ class ContextProcessor:
         """返回当前进程内该 Session 是否已进入压缩失败裁剪模式。"""
         return session_id in self._fallback_sessions
 
+    def discard_fallback(self, session_id: str) -> None:
+        """供未提交任何上下文变更的维护事务撤销进程内降级标记。"""
+        self._fallback_sessions.discard(session_id)
+
     def trim_messages_if_needed(self, session_id: str, messages: list[dict[str, Any]]) -> bool:
         """压缩失败后按最旧完整对话块裁剪本轮内存消息。"""
         threshold = self.config.compression_threshold_tokens
@@ -228,6 +238,7 @@ class ContextProcessor:
             enable_subagent=False,
             enable_sandbox=False,
             enable_extensions=False,
+            enable_references=False,
         )
         result = await runtime.run("压缩当前会话上下文")
         if not result.completed:

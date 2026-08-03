@@ -34,3 +34,5 @@ class ToolContext(BaseModel):
     sandbox: Any | None = None
     # Runtime 与 Docker 共享的跨进程工作区锁；文件工具禁止自行创建旁路锁。
     file_locks: Any | None = None
+    # 当前 Trace/Session 标识只用于审计来源，不参与权限判断。
+    session_id: str | None = None

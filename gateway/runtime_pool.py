@@ -14,6 +14,7 @@ from gateway.approval import GatewayApprovalBroker
 from gateway.events import GatewayEventBus
 from gateway.models import ApprovalRequest, RunRecord, now_iso
 from gateway.store import GatewayStore
+from reference import ReferenceService
 
 
 RuntimeFactory = Callable[[Path, GatewayApprovalBroker], AgentRuntime]
@@ -39,6 +40,7 @@ class RuntimePool:
         runtime_factory: RuntimeFactory | None = None,
         extensions: ExtensionCatalog | None = None,
         cron_service=None,
+        reference_service: ReferenceService | None = None,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.store = store
@@ -48,6 +50,7 @@ class RuntimePool:
         self.runtime_factory = runtime_factory
         self.extensions = extensions
         self.cron_service = cron_service
+        self.reference_service = reference_service
         self.approvals = GatewayApprovalBroker(
             store,
             self._publish_approval,
@@ -104,14 +107,15 @@ class RuntimePool:
         for entry in entries:
             await entry.runtime.close()
 
-    def refresh_skills(self, project_id: str) -> int:
-        """刷新指定项目当前缓存 Runtime 的 Skill Prompt。"""
-        counts = [
-            entry.runtime.refresh_skills()
-            for (selected_project, _), entry in self._runtimes.items()
-            if selected_project == project_id
-        ]
-        return max(counts, default=0)
+    async def refresh_skills(self, project_id: str, session_id: str):
+        """只刷新明确指定的活动 Session。"""
+        entry = self._runtimes.get((project_id, session_id))
+        if entry is None:
+            raise RuntimeError(
+                "指定 Session 当前没有活动 Runtime；先发送一条消息恢复会话，再执行 /skill refresh",
+            )
+        entry.last_used = monotonic()
+        return await entry.runtime.refresh_skills(session_id)
 
     async def _execute(self, original: RunRecord) -> None:
         runtime: AgentRuntime | None = None
@@ -142,7 +146,7 @@ class RuntimePool:
                                         raise RuntimeError("新 Session 标识与正在运行的 Session 冲突")
                                     self._busy_sessions.add(new_key)
                                 session_key = new_key
-                                self._runtimes[new_key] = RuntimeEntry(runtime, monotonic())
+                            self._runtimes[new_key] = RuntimeEntry(runtime, monotonic())
                         await self._emit(
                             current,
                             event.type.value,
@@ -223,6 +227,8 @@ class RuntimePool:
             cron=self.cron_service if not scheduled else None,
             cron_project_id=run.project_id,
             enable_cron=not scheduled,
+            references=self.reference_service,
+            enable_references=self.reference_service is not None,
         )
 
     async def _emit(self, run: RunRecord, event_type: str, payload: dict) -> None:

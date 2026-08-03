@@ -118,6 +118,9 @@ class AsyncToolRegistry:
         if callable(ensure_available):
             ensure_available(arguments, context)
         needs_approval = self._resolved_risk(tool, arguments) != "read"
+        approval_required = getattr(tool, "approval_required", None)
+        if needs_approval and callable(approval_required):
+            needs_approval = bool(approval_required(arguments, context))
         if needs_approval:
             if context.approval is None or not await context.approval(name, arguments):
                 raise PermissionError(f"工具调用未获批准：{name}")

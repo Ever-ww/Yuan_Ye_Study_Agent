@@ -18,7 +18,7 @@ yy-agent = "run_ui.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["Agent*", "bootstrap*", "context_process*", "cron*", "gateway*", "memory*", "prompt*", "sandbox*", "skill*", "tool*", "tools*", "run_ui*"]
+include = ["Agent*", "bootstrap*", "context_process*", "cron*", "gateway*", "memory*", "paper_library*", "prompt*", "reference*", "sandbox*", "skill*", "tool*", "tools*", "run_ui*"]
 
 [tool.setuptools.package-data]
 bootstrap = ["templates/*.example"]
@@ -27,6 +27,8 @@ sandbox = ["Dockerfile"]
 
 [tool.setuptools.data-files]
 "harness-evolution" = ["harness-evolution/harness.py"]
+"skills/search-summary-paper" = ["skills/search-summary-paper/SKILL.md"]
+"skills/search-summary-paper/references" = ["skills/search-summary-paper/references/summary-template.md"]
 "extension" = ["extension/README.md"]
 "extension/hook/trace_start" = ["extension/hook/trace_start/trace_start.py"]
 "extension/hook/trace_end" = ["extension/hook/trace_end/trace_end.py"]

@@ -8,6 +8,8 @@
   "web_fetch_timeout_seconds": 20,
   "web_fetch_max_bytes": 2000000,
   "web_fetch_max_chars": 30000,
+  "paper_download_timeout_seconds": 60,
+  "paper_download_max_bytes": 50000000,
   "use_system_proxy": false,
   "proxy_url": null,
   "coding_source_root": null,
@@ -21,5 +23,11 @@
   "gateway_port": 8765,
   "gateway_max_concurrent_runs": 4,
   "gateway_runtime_idle_seconds": 900,
-  "cron_heartbeat_seconds": 60
+  "cron_heartbeat_seconds": 60,
+  "reference_search_mode": "rrf",
+  "reference_embedding_model": "",
+  "reference_embedding_base_url": "",
+  "reference_embedding_api_key": "",
+  "reference_keyword_weight": 0.4,
+  "reference_semantic_weight": 0.6
 }

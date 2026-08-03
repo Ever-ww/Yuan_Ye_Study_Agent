@@ -88,8 +88,25 @@ class DocumentReader:
         path = safe_workspace_path(context.project_root, arguments["path"])
         if context.file_locks is None:
             raise RuntimeError("当前 Runtime 未启用文件锁，禁止执行 read_file")
+        relative = path.relative_to(context.project_root.resolve()).as_posix()
+        return await self.read_path(
+            path,
+            display_path=relative,
+            arguments=arguments,
+            file_locks=context.file_locks,
+        )
+
+    async def read_path(
+        self,
+        path: Path,
+        *,
+        display_path: str,
+        arguments: dict[str, Any],
+        file_locks: Any,
+    ) -> str:
+        """解析调用方已经完成安全边界校验的文档路径。"""
         if not path.is_file():
-            raise FileNotFoundError(f"文档不存在或不是文件：{arguments['path']}")
+            raise FileNotFoundError(f"文档不存在或不是文件：{display_path}")
         file_size = path.stat().st_size
         if file_size > _MAX_FILE_BYTES:
             raise DocumentSecurityError(f"文档超过 {_MAX_FILE_BYTES // 1024 // 1024} MiB 限制")
@@ -106,7 +123,7 @@ class DocumentReader:
         end_page = arguments.get("end_page")
         include_notes = bool(arguments.get("include_notes", False))
 
-        async with context.file_locks.read(path):
+        async with file_locks.read(path):
             try:
                 extracted = await asyncio.to_thread(
                     _extract_document,
@@ -127,9 +144,8 @@ class DocumentReader:
         has_more = extracted.source_truncated or len(extracted.content) > offset + max_chars
         if not content and offset:
             raise ValueError("offset_chars 已超过当前选择范围的可提取文本长度")
-        relative = path.relative_to(context.project_root.resolve()).as_posix()
         return DocumentReadResponse(
-            path=relative,
+            path=display_path,
             format=path.suffix.lower().lstrip("."),
             mime_type=extracted.mime_type,
             file_size_bytes=file_size,

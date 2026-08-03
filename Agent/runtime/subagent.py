@@ -81,6 +81,7 @@ class RuntimeSubagentRunner:
             enable_subagent=False,
             enable_sandbox=False,
             enable_extensions=False,
+            enable_references=False,
         )
         result = await runtime.run(task)
         if not result.completed:

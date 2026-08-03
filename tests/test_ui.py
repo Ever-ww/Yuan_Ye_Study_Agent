@@ -31,8 +31,9 @@ class UiTests(unittest.TestCase):
     """验证创建应用时不会开放远程监听配置。"""
 
     def test_app_exposes_random_token(self) -> None:
-        app = create_app("test-token")
-        self.assertEqual(app.state.access_token, "test-token")
+        with tempfile.TemporaryDirectory() as value:
+            app = create_app("test-token", agent_root=Path(value))
+            self.assertEqual(app.state.access_token, "test-token")
 
     def test_cli_inbox_lists_shows_and_marks_background_results(self) -> None:
         class FakeGatewayClient:

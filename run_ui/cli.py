@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shlex
 import signal
 import sys
@@ -124,57 +125,58 @@ async def _render_gateway(
     with Live(Panel("正在排队…", title="Yuan Ye Gateway"), console=console, refresh_per_second=10) as live:
         token = _active_live.set(live)
         try:
-            async for event in client.subscribe(run.run_id):
-                if event.session_id:
-                    active_session_id = event.session_id
-                if event.type == EventType.TEXT.value:
-                    streaming_text += str(event.payload.get("content", ""))
-                elif event.type == EventType.MODEL_RETRY.value:
-                    if streaming_text:
-                        lines.append("[yellow]网络中断前的不完整流式片段已丢弃[/]")
-                        streaming_text = ""
-                    lines.append(
-                        f"[yellow]模型网络异常，{event.payload.get('delay_seconds', 2)} 秒后重试[/]"
-                    )
-                elif event.type == EventType.MODEL_RECONNECTED.value:
-                    lines.append("[green]模型网络连接已恢复[/]")
-                elif event.type == EventType.SANDBOX_FALLBACK.value:
-                    lines.append(
-                        f"[yellow]{event.payload.get('message', 'Docker 不可用，已进入 checkpoint-only；Bash 已禁用')}[/]"
-                    )
-                elif event.type == EventType.TOOL_REQUESTED.value:
-                    if streaming_text:
-                        lines.append(streaming_text)
-                        streaming_text = ""
-                    lines.append(f"[cyan]工具请求[/] {event.payload.get('name', '')}")
-                elif event.type == EventType.TOOL_COMPLETED.value:
-                    lines.append(f"[green]工具完成[/] {event.payload.get('name', '')}")
-                elif event.type == "approval_requested":
-                    approved = await InteractiveApproval(console)(
-                        str(event.payload.get("tool_name", "")),
-                        dict(event.payload.get("arguments", {})),
-                    )
-                    await client.respond_approval(
-                        str(event.payload["approval_id"]),
-                        approved,
-                    )
-                elif event.type == EventType.COMPRESSION_STARTED.value:
-                    lines.append("[cyan]正在压缩上下文…[/]")
-                elif event.type == EventType.CONTEXT_COMPRESSED.value:
-                    lines.append(f"[green]{event.payload.get('message', '上下文压缩完成')}[/]")
-                elif event.type == EventType.COMPRESSION_FALLBACK.value:
-                    lines.append(f"[yellow]{event.payload.get('message', '上下文裁剪降级')}[/]")
-                elif event.type in {"run_failed", "run_cancelled", "run_interrupted"}:
-                    terminal_error = str(event.payload.get("message", "运行结束"))
-                    lines.append(f"[red]{terminal_error}[/]")
-                elif event.type == "run_completed":
-                    answer = str(event.payload.get("answer", ""))
-                    if answer and not streaming_text:
-                        lines.append(f"[bold green]{answer}[/]")
-                display = lines[-12:] + ([streaming_text] if streaming_text else [])
-                live.update(Panel("\n".join(display) or "正在运行…", title="Yuan Ye Gateway"))
-                if event.type in {"run_completed", "run_failed", "run_cancelled", "run_interrupted"}:
-                    break
+            # 保证正常结束、Ctrl+C 与异常退出都在 asyncio.run 关闭事件循环前
+            # 完成订阅器及其底层 WebSocket 的单次、有序 aclose。
+            async with contextlib.aclosing(client.subscribe(run.run_id)) as subscription:
+                async for event in subscription:
+                    if event.session_id:
+                        active_session_id = event.session_id
+                    if event.type == EventType.TEXT.value:
+                        streaming_text += str(event.payload.get("content", ""))
+                    elif event.type == EventType.MODEL_RETRY.value:
+                        if streaming_text:
+                            lines.append("[yellow]网络中断前的不完整流式片段已丢弃[/]")
+                            streaming_text = ""
+                        lines.append(
+                            f"[yellow]模型网络异常，{event.payload.get('delay_seconds', 2)} 秒后重试[/]"
+                        )
+                    elif event.type == EventType.MODEL_RECONNECTED.value:
+                        lines.append("[green]模型网络连接已恢复[/]")
+                    elif event.type == EventType.SANDBOX_FALLBACK.value:
+                        lines.append(
+                            f"[yellow]{event.payload.get('message', 'Docker 不可用，已进入 checkpoint-only；Bash 已禁用')}[/]"
+                        )
+                    elif event.type == EventType.TOOL_REQUESTED.value:
+                        if streaming_text:
+                            lines.append(streaming_text)
+                            streaming_text = ""
+                        lines.append(f"[cyan]工具请求[/] {event.payload.get('name', '')}")
+                    elif event.type == EventType.TOOL_COMPLETED.value:
+                        lines.append(f"[green]工具完成[/] {event.payload.get('name', '')}")
+                    elif event.type == "approval_requested":
+                        approved = await InteractiveApproval(console)(
+                            str(event.payload.get("tool_name", "")),
+                            dict(event.payload.get("arguments", {})),
+                        )
+                        await client.respond_approval(
+                            str(event.payload["approval_id"]),
+                            approved,
+                        )
+                    elif event.type == EventType.COMPRESSION_STARTED.value:
+                        lines.append("[cyan]正在压缩上下文…[/]")
+                    elif event.type == EventType.CONTEXT_COMPRESSED.value:
+                        lines.append(f"[green]{event.payload.get('message', '上下文压缩完成')}[/]")
+                    elif event.type == EventType.COMPRESSION_FALLBACK.value:
+                        lines.append(f"[yellow]{event.payload.get('message', '上下文裁剪降级')}[/]")
+                    elif event.type in {"run_failed", "run_cancelled", "run_interrupted"}:
+                        terminal_error = str(event.payload.get("message", "运行结束"))
+                        lines.append(f"[red]{terminal_error}[/]")
+                    elif event.type == "run_completed":
+                        answer = str(event.payload.get("answer", ""))
+                        if answer and not streaming_text:
+                            lines.append(f"[bold green]{answer}[/]")
+                    display = lines[-12:] + ([streaming_text] if streaming_text else [])
+                    live.update(Panel("\n".join(display) or "正在运行…", title="Yuan Ye Gateway"))
         except asyncio.CancelledError:
             await client.cancel_run(run.run_id)
             raise
@@ -337,7 +339,7 @@ async def _chat_gateway(
             await _code_mode(client, project_id)
             continue
         if task == "/skill" or task.startswith("/skill "):
-            await _handle_gateway_skill_command(client, project_id, task)
+            await _handle_gateway_skill_command(client, project_id, session_id, task)
             continue
         if task == "/inbox" or task.startswith("/inbox "):
             await _handle_inbox_command(client, task)
@@ -698,6 +700,7 @@ async def _run_code_turn_with_progress(
 async def _handle_gateway_skill_command(
     client: GatewayClient,
     project_id: str,
+    session_id: str | None,
     task: str,
 ) -> None:
     """通过 Gateway 管理 Skill，命令本身不进入 Session。"""
@@ -720,8 +723,11 @@ async def _handle_gateway_skill_command(
             console.print(table)
             return
         if action == "refresh":
-            count = await client.refresh_skills(project_id)
-            console.print(f"[green]Skill 目录与 Runtime Prompt 已刷新：{count} 个[/]")
+            if not session_id:
+                raise ValueError("当前没有活动 Session；先发送一条消息，再执行 /skill refresh")
+            result = await client.refresh_skills(project_id, session_id)
+            style = "green" if result.get("status") in {"refreshed", "unchanged"} else "red"
+            console.print(f"[{style}]{result.get('message', 'Skill 刷新完成')}[/]")
             return
         if action == "audit":
             if len(parts) != 3:
@@ -877,8 +883,9 @@ async def _handle_skill_command(runtime: AgentRuntime, task: str) -> None:
         if action == "refresh":
             if len(parts) != 2:
                 raise ValueError("用法：/skill refresh")
-            count = runtime.refresh_skills()
-            console.print(f"[green]Skill 目录与 System Prompt 缓存已刷新：{count} 个可用 Skill[/]")
+            result = await runtime.refresh_skills(runtime.active_session_id)
+            style = "green" if result.status in {"refreshed", "unchanged"} else "red"
+            console.print(f"[{style}]{result.message}[/]")
             return
         if action == "audit":
             if len(parts) != 3:
@@ -967,7 +974,11 @@ async def _handle_chat_failure(config, runtime, task: str, session_id: str, fail
     harness = load_harness_module()
     writer = harness.ErrorSnapshotWriter(
         config.agent_root,
-        secrets=(config.api_key or "", config.web_search_api_key or ""),
+        secrets=(
+            config.api_key or "",
+            config.web_search_api_key or "",
+            config.reference_embedding_api_key or "",
+        ),
     )
     try:
         records = runtime.memory.session_records(session_id) if session_id and runtime.memory.has_session(session_id) else []

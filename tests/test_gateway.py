@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import tempfile
@@ -15,15 +16,36 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from Agent import EventType, RunEvent, load_runtime_config
+from skill import SkillRefreshResult
 from gateway.api import create_gateway_api
 from gateway.application import GatewayApplication
 from gateway.approval import GatewayApprovalBroker
+from gateway.client import GatewayClient
 from gateway.events import GatewayEventBus
-from gateway.models import CodeFinalizeResult, CodeSessionRecord, CodeTurnResult, RunCreateRequest
-from gateway.runtime_pool import RuntimePool
+from gateway.models import (
+    CodeFinalizeResult,
+    CodeSessionRecord,
+    CodeTurnResult,
+    GatewayEventEnvelope,
+    RunCreateRequest,
+)
+from gateway.runtime_pool import RuntimeEntry, RuntimePool
 from gateway.store import GatewayStore
-from gateway.process import GatewayProcessManager, InstanceLock, _windows_background_creationflags
-from bootstrap import initialize_project, migrate_source_home
+from gateway.process import (
+    GatewayProcessManager,
+    InstanceLock,
+    _GatewayProtocolNoiseFilter,
+    _is_benign_closed_h11_response,
+    _pid_alive,
+    _windows_background_creationflags,
+    run_gateway,
+)
+from bootstrap import (
+    initialize_project,
+    legacy_gateway_active,
+    migrate_source_home,
+    platform_agent_home,
+)
 from memory import MemoryStore
 from sandbox import SandboxStatus
 
@@ -33,6 +55,7 @@ class FakeRuntime:
         self.workspace = workspace
         self.blocker = blocker
         self.closed = 0
+        self.skill_refreshes: list[str] = []
 
     async def run_task(self, task: str, session_id: str | None = None):
         selected = session_id or ("a" * 15 + str(abs(hash(task)) % 10))
@@ -44,6 +67,14 @@ class FakeRuntime:
 
     async def close(self) -> None:
         self.closed += 1
+
+    async def refresh_skills(self, session_id: str) -> SkillRefreshResult:
+        self.skill_refreshes.append(session_id)
+        return SkillRefreshResult(
+            status="unchanged",
+            message="unchanged",
+            session_id=session_id,
+        )
 
 
 class ConcurrencyTracker:
@@ -126,6 +157,87 @@ class FakeCodeSessions:
 
 
 class GatewayTests(unittest.TestCase):
+    def test_terminal_subscription_closes_nested_event_generator(self) -> None:
+        async def check() -> None:
+            client = object.__new__(GatewayClient)
+            closed = asyncio.Event()
+            terminal = GatewayEventEnvelope(
+                event_id="event-1",
+                sequence=1,
+                timestamp="2026-08-03T22:00:00+08:00",
+                project_id="project-1",
+                run_id="run-1",
+                type="run_completed",
+                payload={"answer": "done"},
+            )
+
+            async def events(run_id: str, *, after_sequence: int = 0):
+                del run_id, after_sequence
+                try:
+                    yield terminal
+                finally:
+                    closed.set()
+
+            client.events = events
+            received = [event async for event in client.subscribe("run-1")]
+            self.assertEqual(received, [terminal])
+            self.assertTrue(closed.is_set())
+
+        asyncio.run(check())
+
+    def test_cancelled_subscription_explicitly_closes_nested_event_generator(self) -> None:
+        async def check() -> None:
+            client = object.__new__(GatewayClient)
+            closed = asyncio.Event()
+            event = GatewayEventEnvelope(
+                event_id="event-1",
+                sequence=1,
+                timestamp="2026-08-03T22:00:00+08:00",
+                project_id="project-1",
+                run_id="run-1",
+                type="text",
+                payload={"content": "partial"},
+            )
+
+            async def events(run_id: str, *, after_sequence: int = 0):
+                del run_id, after_sequence
+                try:
+                    yield event
+                    await asyncio.Future()
+                finally:
+                    closed.set()
+
+            client.events = events
+            subscription = client.subscribe("run-1")
+            self.assertEqual(await anext(subscription), event)
+            await subscription.aclose()
+            self.assertTrue(closed.is_set())
+
+        asyncio.run(check())
+
+    def test_default_agent_home_is_user_home_and_override_remains_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = Path(value)
+            with (
+                patch.dict(os.environ, {"YY_AGENT_HOME": ""}),
+                patch("bootstrap.home.Path.home", return_value=home),
+            ):
+                self.assertEqual(platform_agent_home(), home.resolve())
+            override = home / "custom"
+            with patch.dict(os.environ, {"YY_AGENT_HOME": str(override)}):
+                self.assertEqual(platform_agent_home(), override.resolve())
+
+    def test_legacy_gateway_lock_defers_live_state_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            lock = InstanceLock(root / ".yy" / "gateway" / "instance.lock")
+            lock.acquire()
+            try:
+                self.assertTrue(legacy_gateway_active(root))
+            finally:
+                lock.close()
+            self.assertFalse(legacy_gateway_active(root))
+
     def test_windows_gateway_background_flags_never_allocate_console(self) -> None:
         flags = _windows_background_creationflags()
         detached = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
@@ -134,6 +246,10 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(flags & detached, 0)
         self.assertEqual(flags & no_window, no_window)
         self.assertEqual(flags & process_group, process_group)
+
+    def test_pid_probe_works_for_current_and_missing_process(self) -> None:
+        self.assertTrue(_pid_alive(os.getpid()))
+        self.assertFalse(_pid_alive(2_147_483_647))
 
     def test_gateway_process_manager_uses_no_window_flags_and_closes_handles(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -150,6 +266,66 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(options["creationflags"], _windows_background_creationflags())
             self.assertTrue(options["close_fds"])
             self.assertFalse(options["start_new_session"])
+            self.assertEqual(options["env"]["PYTHONUTF8"], "1")
+            self.assertEqual(options["env"]["PYTHONIOENCODING"], "utf-8")
+
+    def test_concurrent_gateway_starter_waits_instead_of_spawning_again(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            manager = GatewayProcessManager(Path(value), 18769)
+            first = InstanceLock(manager.startup_lock_path)
+            first.acquire()
+            try:
+                with (
+                    patch.object(manager, "_healthy", side_effect=[False, True, True]),
+                    patch("gateway.process.subprocess.Popen") as popen,
+                ):
+                    status = manager.ensure_running(timeout_seconds=0.2)
+            finally:
+                first.close()
+            self.assertTrue(status["running"])
+            popen.assert_not_called()
+
+    def test_unhealthy_locked_instance_is_not_replaced_by_another_child(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            manager = GatewayProcessManager(Path(value), 18771)
+            existing = InstanceLock(manager.lock_path)
+            existing.acquire()
+            try:
+                with (
+                    patch.object(manager, "_healthy", return_value=False),
+                    patch("gateway.process.subprocess.Popen") as popen,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "持有状态锁"):
+                        manager.ensure_running(timeout_seconds=0.05)
+            finally:
+                existing.close()
+            popen.assert_not_called()
+
+    def test_closed_h11_response_noise_is_filtered_narrowly(self) -> None:
+        import h11
+
+        closed = h11.LocalProtocolError(
+            "can't handle event type Response when role=SERVER and state=CLOSED"
+        )
+        self.assertTrue(_is_benign_closed_h11_response({"exception": closed}))
+        self.assertFalse(_is_benign_closed_h11_response({"exception": RuntimeError("closed")}))
+
+        protocol_filter = _GatewayProtocolNoiseFilter()
+        noisy = logging.LogRecord(
+            "uvicorn.error", logging.WARNING, __file__, 1,
+            "Invalid HTTP request received.", (), None,
+        )
+        unrelated = logging.LogRecord(
+            "uvicorn.error", logging.WARNING, __file__, 1,
+            "Application error", (), None,
+        )
+        self.assertFalse(protocol_filter.filter(noisy))
+        self.assertTrue(protocol_filter.filter(unrelated))
+
+    def test_duplicate_gateway_child_exits_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            with patch.object(InstanceLock, "acquire", side_effect=RuntimeError("held")):
+                self.assertIsNone(run_gateway(Path(value), 18770))
 
     def test_gateway_status_reports_checkpoint_only_capabilities(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -401,6 +577,27 @@ class GatewayTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             asyncio.run(check(Path(value)))
 
+    def test_skill_refresh_targets_only_requested_session_runtime(self) -> None:
+        async def check(root: Path) -> None:
+            store = GatewayStore(root / ".yy" / "gateway")
+            pool = RuntimePool(
+                agent_root=root,
+                store=store,
+                events=GatewayEventBus(),
+            )
+            first, second = FakeRuntime(root), FakeRuntime(root)
+            pool._runtimes[("project", "a" * 16)] = RuntimeEntry(first, 0.0)
+            pool._runtimes[("project", "b" * 16)] = RuntimeEntry(second, 0.0)
+
+            result = await pool.refresh_skills("project", "a" * 16)
+
+            self.assertEqual(result.session_id, "a" * 16)
+            self.assertEqual(first.skill_refreshes, ["a" * 16])
+            self.assertEqual(second.skill_refreshes, [])
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(check(Path(value)))
+
     def test_client_disconnect_denies_pending_approval(self) -> None:
         async def check(root: Path) -> bool:
             store = GatewayStore(root / ".yy" / "gateway")
@@ -498,6 +695,11 @@ class GatewayTests(unittest.TestCase):
             memory.record_user(session_id, "迁移")
             (source / "skills" / "demo").mkdir(parents=True)
             (source / "skills" / "demo" / "SKILL.md").write_text("demo", encoding="utf-8")
+            (target / ".yy").mkdir(parents=True)
+            (target / ".yy" / "settings.local.json").write_text(
+                "目标配置不得覆盖",
+                encoding="utf-8",
+            )
             migrate_source_home(source, target)
             workspace_key = hashlib.sha256(
                 os.path.normcase(str(source.resolve())).encode(),
@@ -506,7 +708,13 @@ class GatewayTests(unittest.TestCase):
             self.assertTrue((source / ".yy" / "memory" / "session" / "index.json").exists())
             self.assertTrue((partition / "index.json").exists())
             self.assertIn(session_id, (partition / "index.json").read_text(encoding="utf-8"))
-            self.assertTrue((target / "skills" / "demo" / "SKILL.md").exists())
+            self.assertTrue(
+                (target / ".yy" / "skills" / "installed" / "demo" / "SKILL.md").exists()
+            )
+            self.assertEqual(
+                (target / ".yy" / "settings.local.json").read_text(encoding="utf-8"),
+                "目标配置不得覆盖",
+            )
             self.assertTrue((target / ".yy" / "agent-home-migration.json").exists())
 
     def test_instance_lock_rejects_second_gateway(self) -> None:
@@ -520,8 +728,27 @@ class GatewayTests(unittest.TestCase):
                     second.acquire()
             finally:
                 first.close()
+            self.assertEqual(lock_path.read_text(encoding="ascii").strip(), str(os.getpid()))
             second.acquire()
             second.close()
+
+    def test_status_preserves_unhealthy_owner_metadata_for_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            manager = GatewayProcessManager(Path(value), 18772)
+            owner = InstanceLock(manager.lock_path)
+            owner.acquire()
+            manager.instance_path.write_text(
+                json.dumps({"pid": os.getpid(), "port": 18772}),
+                encoding="utf-8",
+            )
+            try:
+                with patch.object(manager, "_healthy", return_value=False):
+                    status = manager.status()
+                self.assertFalse(status["running"])
+                self.assertEqual(status["pid"], os.getpid())
+                self.assertTrue(manager.instance_path.exists())
+            finally:
+                owner.close()
 
     def test_gateway_log_rotation_keeps_bounded_backups(self) -> None:
         with tempfile.TemporaryDirectory() as value:

@@ -269,13 +269,23 @@ class MemoryStore:
     def invalidate_session_cache(self, session_id: str) -> None:
         self._message_cache.pop(session_id, None)
 
-    def rollover_with_summary(self, session_id: str, summary: str, source_file: str) -> Path:
+    def rollover_with_summary(
+        self,
+        session_id: str,
+        summary: str,
+        source_file: str,
+        *,
+        metadata: dict[str, object] | None = None,
+    ) -> Path:
         """创建以 summary 记录开头的新会话分段。"""
-        result = self.sessions.rollover(session_id, [{
+        record: dict[str, object] = {
             "role": "summary",
             "content": summary,
             "source_file": source_file,
-        }])
+        }
+        if metadata:
+            record.update(metadata)
+        result = self.sessions.rollover(session_id, [record])
         self.refresh_messages(session_id)
         return result
 
@@ -289,10 +299,16 @@ class MemoryStore:
         conversation_turns: int,
         records_processed: int,
         tool_calls_processed: int,
+        summary_metadata: dict[str, object] | None = None,
     ) -> tuple[Path | None, Path]:
         """协调 Profile 与新分段写入；切段失败时恢复旧 Profile 状态。"""
         if not self.session_profiles_enabled:
-            return None, self.rollover_with_summary(session_id, context_summary, source_file)
+            return None, self.rollover_with_summary(
+                session_id,
+                context_summary,
+                source_file,
+                metadata=summary_metadata,
+            )
         profile_path = self.profiles.directory / f"{session_id}.md"
         profile_backup = profile_path.read_bytes() if profile_path.exists() else None
         index_backup = self.profiles.index_path.read_bytes() if self.profiles.index_path.exists() else None
@@ -305,7 +321,12 @@ class MemoryStore:
                 records_processed=records_processed,
                 tool_calls_processed=tool_calls_processed,
             )
-            segment = self.rollover_with_summary(session_id, context_summary, source_file)
+            segment = self.rollover_with_summary(
+                session_id,
+                context_summary,
+                source_file,
+                metadata=summary_metadata,
+            )
             return committed_profile, segment
         except Exception:
             if profile_backup is None:

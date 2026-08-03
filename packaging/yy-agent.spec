@@ -16,6 +16,7 @@ a = Analysis(
     binaries=[],
     datas=[
         (str(root / "bootstrap" / "templates"), "bootstrap/templates"),
+        (str(root / "skills"), "skills"),
         (str(root / "sandbox" / "Dockerfile"), "sandbox"),
         (str(root / "ui" / "dist"), "ui/dist"),
         (str(root / "run_ui" / "templates"), "run_ui/templates"),

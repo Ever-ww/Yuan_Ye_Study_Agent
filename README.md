@@ -12,7 +12,7 @@ Yuan Ye Study Agent 是一个本地优先、单一异步 Runtime 驱动的学习
 
 所谓 **Harness 自进化**，不是让模型不受控制地改写自己，而是建立一条可审计的成长闭环：传统框架依赖硬编码固定逻辑，面对长对话、Token 波动、复杂子任务、新增交互场景容易失效，只能靠人工改代码、重启服务来适配。本 Agent 在发现代码类缺陷并取得用户确认后，会在隔离环境中生成和校验代码补丁。这是对“身体”和“大脑”的共同进化，而不是只优化“大脑”（Skill）。
 
-CLI chat 能保存完整错误现场，并在用户确认后创建隔离 Git worktree，再启动一个复用正式 `AgentRuntime` 类的 Coding Agent。Coding Runtime 的 `workspace_root`、ToolContext、Docker 挂载（可用时）和文件工具全部指向该 worktree；控制器会在运行前校验这一边界。它拥有专属 Memory、项目结构 Profile、上下文压缩、已审核 Skill、`skill_read`、文件读写/搜索、checkpoint 回溯和 Subagent；Docker 可用时还提供 Bash，但不提供 `skill_install`。用户确认启动 Harness 后，隔离 worktree 内的既有 Coding 工具自动获批；变更仍必须通过固定测试，才会提交并本地快进合并。测试失败或无变更时删除 worktree，Harness 不会 stash 脏主工作区，也不会自动推送 GitHub。
+CLI chat 能保存完整错误现场，并在用户确认后创建隔离 Git worktree，再启动一个复用正式 `AgentRuntime` 类的 Coding Agent。Coding Runtime 的 `workspace_root`、ToolContext、Docker 挂载（可用时）和文件工具全部指向该 worktree；控制器会在运行前校验这一边界。Skill 则始终读取 Yuan Ye 主源码仓库的 `skills/`，不会改从临时 worktree 或 `~/.yy/skills/` 加载。它拥有专属 Memory、项目结构 Profile、上下文压缩和已审核 Skill，工具严格限定为 `read_file`、`search_workspace`、`edit`、`write`、`sandbox_rollback`、`web_fetch`、`skill_read`、`subagent`，配置 Brave Key 后增加 `web_search`，Docker 可用时增加 `bash`。论文、Reference、Cron、计算、时间和 Skill 安装均不会进入 Harness Schema。用户确认启动 Harness 后，隔离 worktree 内的既有 Coding 工具自动获批；变更仍必须通过固定测试，才会提交并本地快进合并。测试失败或无变更时删除 worktree，Harness 不会 stash 脏主工作区，也不会自动推送 GitHub。
 
 Coding Agent 的记忆位于 Agent 根目录的 `.yy/harness-evolution/memory/`，与普通聊天 Memory 和目标 workspace 分离。每次 Harness 更新创建全新的 Session JSONL，不恢复上一项修复的临时对话；同一次更新发生压缩时，继续使用相同 Session 哈希生成 `_002.jsonl`、`_003.jsonl`。跨更新只共享 `profile/AGENT.md`、`PROJECT.md`、`CHANGES.md` 和 `LESSONS.md` 四个长期文件。
 
@@ -27,12 +27,13 @@ Agent/      模型适配、异步 ReAct、Runtime、Hook 协议与配置
 extension/  十阶段全局多文件 Hook Extension 与开发契约
 gateway/    单实例后台进程、Runtime 池、本机 API、事件重放、审批与 Inbox
 memory/     记忆领域 Python 服务
+paper_library/ 全局论文索引、下载、去重、分页解析与总结持久化
 context_process/ Token 阈值压缩、Profile 合并与失败裁剪
 harness-evolution/ 错误快照、隔离 worktree、诊断与验证流水线
 prompt/     单一 System Prompt、任务时间与上下文缓存组合
 sandbox/    Trace 级 Docker、独立本地 Git checkpoint 与跨进程文件锁
 skill/      Skill 获取、格式解析、静态审核、可信索引与安装事务
-skills/     本机已安装的第三方 Skill 内容（仅提交 .gitkeep）
+skills/     System Prompt 与 skill_read 唯一读取的正式 Skill 目录（由 Git 跟踪）
 tool/       工具共用框架（不包含模型可直接调用的工具）
   contracts.py         AsyncTool 协议与 ToolContext
   registry.py          Schema 校验、注册与权限审批
@@ -48,6 +49,9 @@ tools/      仅保存模型可直接调用的受控工具实现
   search_workspace.py  工作区文本搜索
   web_search.py        Brave API 网络搜索（仅返回结构化索引摘要）
   web_fetch.py         受 SSRF 边界保护的公开网页正文抓取
+  download_paper.py    审批后下载公开论文 PDF 并创建 checkpoint
+  profile_read.py      受控读取 Agent Home 长期 Profile
+  paper_library.py     全局论文库查重、批量下载、分页读取与总结写入
   current_time.py      本地时间查询
   subagent.py          受父 Agent 限权的临时子 Agent
   skill_read.py        渐进读取已审核 Skill 文本
@@ -59,10 +63,11 @@ packaging/  PyInstaller sidecar 构建与平台文件名准备
 tests/      核心行为与 UI 安全测试
 .yy/gateway/ SQLite、可重放 Run 事件、Inbox、日志、令牌与单实例状态
 .yy/memory/ Agent Home 中的会话 JSONL、会话索引与长期 Profile（不提交）
+.yy/papers/ 全局论文 PDF、中文总结与审计索引（不提交）
 run.py      唯一源码树入口
 ```
 
-`memory/` 永远不保存用户数据。首次运行在平台 Agent Home 创建 `.yy/memory/`：会话消息按 workspace 隔离后写入 `session/` 下的 JSONL，长期 Profile 写入所有 workspace 共享的 `profile/` Markdown。启动 Agent 时所在的目录不会生成记忆或模型配置文件。
+`memory/` 永远不保存用户数据。首次运行在用户 `~/.yy` 创建 `memory/`：会话消息按 workspace 隔离后写入 `session/` 下的 JSONL，长期 Profile 写入所有 workspace 共享的 `profile/` Markdown。启动 Agent 时所在的目录不会生成记忆或模型配置文件。
 
 ## 从零开始
 
@@ -130,15 +135,17 @@ docker info
 uv run python run.py
 ```
 
-第一次启动会初始化平台用户数据目录中的 Agent Home：
-
-- Windows：`%LOCALAPPDATA%\YuanYeAgent`
-- macOS：`~/Library/Application Support/YuanYeAgent`
-- Linux：`$XDG_DATA_HOME/yuan-ye-agent`，未设置时为 `~/.local/share/yuan-ye-agent`
+第一次启动会在当前用户名下初始化唯一状态目录：Windows、macOS 和 Linux 均使用
+`~/.yy/`（Windows 示例：`C:\Users\你的用户名\.yy`）。workspace、源码仓库和平台
+AppData 不再创建新的运行期 `.yy`。
 
 可在启动前通过 `YY_AGENT_HOME` 显式覆盖。初始化会创建 `.yy/settings.local.json`、Agent 身份与项目说明、Memory、Skill、Gateway 和 Sandbox 状态目录。后续启动只补齐缺失项，不会覆盖已有配置或记忆。
 
-源码树中若已经存在旧 `.yy` 或已安装 `skills`，首次迁移会把它们复制到 Agent Home，原文件不删除；迁移结果记录在 `.yy/agent-home-migration.json`。旧的未分区 Session 会归入该源码 workspace 的哈希分区，全局 Profile 仍保持共享。
+升级时会先从旧 `%LOCALAPPDATA%\YuanYeAgent\.yy`（macOS/Linux 对应旧平台目录）迁移，
+再补充源码树中的旧 `.yy` 和 `skills`。已有目标文件不会被覆盖，旧目录不会自动删除；
+迁移来源记录在 `~/.yy/agent-home-migration.json`。旧 Gateway 仍在持锁时暂不复制活跃
+SQLite，继续使用旧位置；执行一次 `gateway stop` 后，下次启动自动完成迁移。旧的未分区
+Session 会归入原 workspace 的哈希分区，全局 Profile 仍保持共享。
 
 如果你误删了 `.yy` 中的必要文件，可手动修复初始化：
 
@@ -158,7 +165,7 @@ cd D:\Ever_workspace\My_Project
 uv run --project $AgentRoot yy-agent chat
 ```
 
-上述命令从平台 Agent Home 的 `.yy/settings.local.json` 读取模型配置，并把该 workspace 的会话写入 Agent Home 的 `.yy/memory/session/<workspace-hash>/`；`My_Project` 不会生成 `.yy`。其他 workspace 看不到也不能恢复这些 Session，但 USER、RESEARCH、OTHERS 和普通扩展 Profile 仍全局共享。`read_file`、`edit`、`write`、搜索、Docker Bash 和回溯只允许操作 `My_Project`，checkpoint 捕获的也是该目录。checkpoint 对象库按 workspace 隔离保存在 Agent Home，不会写进用户项目的 `.git`。
+上述命令从用户 `~/.yy/settings.local.json` 读取模型配置，并把该 workspace 的会话写入 `~/.yy/memory/session/<workspace-hash>/`；`My_Project` 不会生成 `.yy`。其他 workspace 看不到也不能恢复这些 Session，但 USER、RESEARCH、OTHERS 和普通扩展 Profile 仍全局共享。`read_file`、`edit`、`write`、搜索、Docker Bash 和回溯只允许操作 `My_Project`，checkpoint 捕获的也是该目录。checkpoint 对象库按 workspace 隔离保存在 `~/.yy`，不会写进用户项目的 `.git`。
 
 ### 7. 先进行离线启动验证
 
@@ -184,7 +191,7 @@ uv run python run.py init
 然后编辑 Agent Home 下的 `.yy/settings.local.json`。Windows PowerShell 可先定位文件：
 
 ```powershell
-$AgentHome = if ($env:YY_AGENT_HOME) { $env:YY_AGENT_HOME } else { Join-Path $env:LOCALAPPDATA "YuanYeAgent" }
+$AgentHome = if ($env:YY_AGENT_HOME) { $env:YY_AGENT_HOME } else { $HOME }
 notepad (Join-Path $AgentHome ".yy\settings.local.json")
 ```
 
@@ -202,6 +209,8 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
   "web_fetch_timeout_seconds": 20,
   "web_fetch_max_bytes": 2000000,
   "web_fetch_max_chars": 30000,
+  "paper_download_timeout_seconds": 60,
+  "paper_download_max_bytes": 50000000,
   "use_system_proxy": false,
   "proxy_url": null,
   "coding_source_root": null,
@@ -280,6 +289,23 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
 }
 ```
 
+论文 PDF 使用独立的高风险 `download_paper` 工具。它接收公开 HTTP(S) PDF URL 和
+workspace 内的 `.pdf` 保存路径，经用户审批后下载；DNS、重定向、实际连接地址和代理规则
+沿用 `web_fetch` 的公开网络边界。响应必须是 PDF MIME（部分站点可使用
+`application/octet-stream`）且内容具有 PDF 文件头，默认最大 50 MB。文件通过临时文件原子
+替换，成功后创建 checkpoint，并返回 `path` 和 `next_tool=read_file`。ArXiv 的
+`/abs/<id>` 摘要地址会自动转换为官方 `/pdf/<id>` 下载地址。可调整：
+
+```json
+{
+  "paper_download_timeout_seconds": 60,
+  "paper_download_max_bytes": 50000000
+}
+```
+
+典型论文链路为 `web_search → web_fetch（阅读摘要/落地页）→ download_paper → read_file`。
+Google Scholar 仍只是候选链接来源；工具不会绕过验证码、登录、订阅或出版商访问控制。
+
 典型链路是 `web_search → web_fetch → 最终回答`。搜索结果 JSON 会明确返回 `next_tool=web_fetch` 和下一步说明；ReAct 循环把完整搜索结果作为 `role=tool` 保留给下一次模型调用，使模型可以从 `results` 选择 URL、继续抓取正文，再依据正文完成回答。抓取内容同样属于不可信外部输入，模型不得把网页中的提示文字视为系统指令。
 
 `stream` 控制模型文本是否使用 SSE 实时输出，默认 `false`。设为 `true` 后，OpenAI-compatible Provider（包括 DeepSeek）会逐段显示生成文本；设为 `false` 时等待完整响应后再显示最终答案。Anthropic 当前仍采用完整响应模式。
@@ -329,6 +355,12 @@ uv run python run.py gateway stop
 Gateway 停止时先拒绝新任务，并给正在运行的任务一个短暂收尾窗口，随后取消剩余任务并关闭 Runtime 与 Docker。异常重启后，数据库中未完成的任务会标记为 `interrupted`；已经写入的 Session JSONL 和工具结果仍然保留。
 
 Windows 下 CLI 首次发现 Gateway 未运行时，会使用 `CREATE_NO_WINDOW` 在后台启动服务，不会另外打开空白 Windows Terminal；后台 stdout/stderr 统一写入 `gateway.log`。
+
+CLI、Web 和桌面端同时启动时会先竞争独立的 `startup.lock`，只有一个客户端创建后台
+进程，其余客户端等待同一健康接口。正式实例通过 `instance.lock` 与保留的 PID 标识；
+一次健康请求超时不会再删除 PID。若进程失联，`gateway stop` 仍会先请求优雅关闭，超时
+后只终止锁中明确记录的 Gateway PID。Windows 后台进程强制使用 UTF-8 日志，并过滤
+h11 在连接已经关闭后重复发送 400 所产生的特定无害回调栈。
 
 Gateway 状态位于 Agent Home 的 `.yy/gateway/`：SQLite 保存项目、运行、审批和 Inbox 元数据；`runs/<run-id>.jsonl` 保存带单调序号的可重放 UI 事件；`gateway.log` 最多保留当前文件与 5 份轮转日志。Session 对话正文仍只由 Memory 写一份，不会复制到 Gateway 事件文件。
 
@@ -470,7 +502,7 @@ Agent 自身 workspace：
 
 ## Skill 获取、审核与渐进加载
 
-Skill 遵循 [Agent Skills 规范](https://agentskills.io/specification)。一个 Skill 至少要有带 YAML frontmatter 的 `SKILL.md`，其中 `name` 必须与目录名一致。框架实现位于 `skill/`；安装后的第三方内容位于 Agent 根目录 `skills/<name>/`。`skills/` 和 `.yy/skills/` 都不会上传 Git，仓库只保留 `skills/.gitkeep`。
+Skill 遵循 [Agent Skills 规范](https://agentskills.io/specification)。一个 Skill 至少要有带 YAML frontmatter 的 `SKILL.md`，其中 `name` 必须与目录名一致。框架实现位于 `skill/`；源码仓库的 `skills/<name>/` 是 System Prompt 与 `skill_read` 的唯一正式来源，并由 Git 正常跟踪。`~/.yy/skills/` 只保存下载审核隔离区、报告、发布索引和更新备份，不参与模型上下文读取。
 
 在 `chat` 中使用以下命令：
 
@@ -503,7 +535,7 @@ Skill 遵循 [Agent Skills 规范](https://agentskills.io/specification)。一�
 
 也可以用自然语言让主 Agent 安装 Skill。此时模型调用高风险 `skill_install`，先确认下载意图；如果审核还发现可接受风险，再进行第二次确认。Subagent 不能获得 `skill_install`。
 
-安装或更新成功后不会修改当前 Runtime 的 Skill 缓存。只有显式执行 `/skill refresh` 成功后，Gateway 才重新扫描可信索引并刷新当前项目中已缓存 Runtime 的 System Prompt。System Prompt 只加入如下发现信息，不加载正文：
+`/skill install|update` 会先把来源下载到 `~/.yy/skills/review/`，完成安全审核和必要的人工确认后，再原子发布到源码仓库 `skills/<name>/`。发布不会修改当前 Runtime 的 Skill 缓存。只有显式执行 `/skill refresh` 成功后，Gateway 才刷新当前 Session：目录发生变化时先压缩旧上下文，再创建相同 Session 哈希的下一 JSONL 分段并加载新 Skill；目录未变化时不创建空分段。System Prompt 只加入如下发现信息，不加载正文：
 
 ```xml
 <available_skills>
@@ -515,7 +547,7 @@ Skill 遵循 [Agent Skills 规范](https://agentskills.io/specification)。一�
 </available_skills>
 ```
 
-模型需要完整说明、`references/` 或脚本文本时调用只读 `skill_read`。该工具不执行任何脚本，并拒绝绝对路径、`..`、符号链接、二进制和超大结果。Skill 自带脚本若确有必要，只能在 Docker 可用时通过 Bash 执行，仍受 Schema、审批、沙箱和 checkpoint 约束；checkpoint-only 模式不会执行这些脚本。手工复制到 `skills/`、安装后被修改或内容摘要不匹配的 Skill 都不会进入 Prompt，也不能读取；必须重新走审核安装。
+模型需要完整说明、`references/` 或脚本文本时调用只读 `skill_read`。该工具只读取当前 Session 快照中登记的仓库 Skill，不执行任何脚本，并拒绝绝对路径、`..`、符号链接、二进制和超大结果。Session 运行期间若仓库 Skill 摘要发生变化，读取会被拒绝并提示 `/skill refresh`。Skill 自带脚本若确有必要，只能在 Docker 可用时通过 Bash 执行，仍受 Schema、审批、沙箱和 checkpoint 约束；checkpoint-only 模式不会执行这些脚本。
 
 ## Hook、Turn 与 Session
 
@@ -634,8 +666,8 @@ uv run python run.py cron remove <job-id>
 - 配置文件会严格校验字段类型、数值范围和未知字段。拼错配置名会在启动时明确报错，不再被静默忽略。
 - 工具 JSON Schema 会在注册时编译为严格 Pydantic 参数模型；Hook 改写后的最终参数会再次校验，拒绝类型偷换、未知字段和非法枚举。
 - 上下文压缩模型的 JSON 输出由 Pydantic 校验：普通 Session 同时返回 `profile_markdown` 与 `context_summary_markdown`；Harness 只返回摘要，禁止压缩过程创建 Session 哈希 Profile。
-- 平台 Agent Home 中的 `.yy/` 是完整本机状态目录，由 `uv run python run.py init` 创建；外部 workspace 不会因此生成 `.yy`。
-- Skill 框架代码位于 `skill/`；可信索引、审核报告、暂存和备份位于 Agent Home 的 `.yy/skills/`，已安装内容位于 Agent Home 的 `skills/`。
+- 用户主目录中的 `~/.yy/` 是唯一完整本机状态目录，由 `uv run python run.py init` 创建；外部 workspace 和源码仓库不会因此生成运行期 `.yy`。
+- Skill 框架代码位于 `skill/`；正式内容位于源码仓库 `skills/`。`~/.yy/skills/` 只保存可信索引、审核报告、暂存和备份，旧 `installed/` 即使存在也不会进入 Prompt。
 - Agent Home 的 `.yy/sandbox/checkpoints/` 保存按 workspace 隔离的独立本地 Git 对象库和 Pydantic 审计索引；它捕获 workspace，但不会修改 workspace 的 Git 分支，也不会被上传。
 - Agent Home 的 `.yy/sandbox/locks/` 保存按 workspace 隔离的空锁载体文件；Windows 使用 `LockFileEx`，Linux/macOS 使用 `flock`，进程退出后不依赖删除文件即可释放锁。
 - `tests/error/*.jsonl` 只保存代码类缺陷的完整上下文、请求与异常栈，可能包含隐私，只在本机保留并由 Git 忽略。
@@ -677,3 +709,73 @@ uv cache dir
 ### 提示 Docker CLI 或服务不可用
 
 这是可恢复状态：Agent 会显示一次黄色降级提示并继续使用 checkpoint-only；`edit`、`write` 和回溯仍可用。若确实需要 Bash，启动 Docker Desktop，再分别执行 `docker version` 和 `docker info`，两条命令都成功后关闭并重新打开 Session。运行中的 Session 不会热切换到 Docker。系统在任何情况下都不会把 Bash 改到 PowerShell、CMD、WSL 或宿主机 Bash 中执行。
+
+## 全局论文 Reference 资料库
+
+首次初始化会在用户 `~/.yy` 创建全局资料库，而不是在当前 workspace 创建数据库：
+
+```text
+~/.yy/reference/reference.sqlite3
+```
+
+该 SQLite 数据库保存论文元数据、DOI/ArXiv 标识、作者、标签、本地 PDF 路径与 SHA-256、
+可核验的论文原文摘录，以及用于写作的引用例句。普通文件关联可以指向原 workspace；
+`search-summary-paper` 下载的 PDF 位于全局 `.yy/papers/`。PDF 本体都不会写入数据库。
+原文摘录与写作例句分别保存，并通过支撑关系关联，避免把模型生成的表述误认为论文原文。
+资料库在所有 workspace 之间共享，但文件、摘录和例句会记录来源 workspace 与 Session。
+
+主 Agent 默认获得三个工具：`reference_search` 和 `reference_get` 是只读工具；
+`reference_write` 可新增/更新论文、保存摘录和引用例句、关联 PDF、归档/恢复论文及重新生成向量，
+普通调用必须通过现有审批界面确认；已批准的论文批次只允许对该 Session 和候选论文继续写入，
+不会为同一批次的总结、摘录和引用重复提示。数据库只支持软归档，不向模型提供不可恢复的硬删除。
+
+全文检索使用 SQLite FTS5。可选的语义检索使用 OpenAI-compatible `/embeddings`：
+
+```json
+{
+  "reference_search_mode": "rrf",
+  "reference_embedding_model": "text-embedding-3-small",
+  "reference_embedding_base_url": "https://api.openai.com/v1",
+  "reference_embedding_api_key": "你的 Embedding API Key",
+  "reference_keyword_weight": 0.4,
+  "reference_semantic_weight": 0.6
+}
+```
+
+`reference_search_mode` 可设为 `rrf`、`weighted` 或 `separate`，默认是 RRF。
+Embedding 专用地址和 Key 留空时回退聊天模型的 `base_url` 与 `api_key`，但模型名必须显式配置。
+写入论文、摘录或引用例句后，Gateway 会持久化后台任务并自动生成向量；失败按
+2、4、8、16、32 秒最多重试五次，正文不会回滚。Embedding 不可用时全文检索仍正常工作。
+启用 Embedding 表示标题、摘要、原文摘录、引用例句和搜索查询会发送给所配置的外部接口。
+
+`reference_embedding_api_key` 只能保存在 `.yy/settings.local.json`，共享设置、日志、Session
+和错误快照均不会保存它。`.yy/reference/`、SQLite 主文件、WAL 和备份均由 Git 忽略。
+
+## Search Summary Paper 与全局论文库
+
+首次初始化会审核并登记仓库内置 `search-summary-paper` Skill，并创建：
+
+```text
+~/.yy/papers/index.json
+~/.yy/papers/<安全化论文标题>/<安全化论文标题>.pdf
+~/.yy/papers/<安全化论文标题>/<安全化论文标题>.md
+```
+
+当用户要求检索、下载或总结研究论文时，该 Skill 先用只读 `profile_read` 读取
+`~/.yy/memory/profile/RESEARCH.md`。文件为空时会停止并提示填写，不根据当前聊天猜测研究
+方向。默认筛选 5 篇，也可以在问题中指定数量、关键词或年份范围。
+
+检索使用 `web_search` 与 `web_fetch` 核对 arXiv、Semantic Scholar、OpenAlex、Crossref、
+PubMed 和公开出版商页面。Google Scholar 仅作为公开候选链接来源，不直接抓取，也不会绕过
+登录、验证码或付费墙。模型先调用 `paper_library_lookup` 查重，再用
+`paper_library_download` 一次提交整批候选，因此整批下载只出现一次审批。
+
+`index.json` 同时记录成功、重复、不可访问、解析失败和 `ocr_required`；身份优先使用 DOI、
+arXiv ID、规范 URL，最后才使用题名与年份。下载前查索引，下载后再用 PDF SHA-256 查重。
+相同文件不会被覆盖，只补齐缺失总结或 Reference 数据。全局论文库使用 Agent Home 专用锁和
+原子替换，不属于当前 workspace，也不进入 workspace checkpoint。
+
+模型通过 `paper_library_read` 按页读取完整 PDF，并通过 `paper_library_save` 保存中文结构化
+总结。扫描件没有可提取文字时只记录 `ocr_required`，不会伪造全文总结。准确原文 passage、
+页码和模型生成的引用示例继续分别写入 `~/.yy/reference/reference.sqlite3`；全局 PDF 只能通过
+受控 `paper_id` 关联，`reference_write` 不接受任意 Agent Home 绝对路径。

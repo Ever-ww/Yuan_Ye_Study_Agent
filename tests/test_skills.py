@@ -9,10 +9,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from Agent import AgentRuntime, load_runtime_config
+from context_process import CompressionResult
 from prompt import PromptComposer
 from run_ui.cli import _chat
 from skill import SkillInstallRequest, SkillService, parse_skill
-from tool import ToolContext, default_tools
+from tool import AsyncToolRegistry, ToolContext, default_tools
 
 
 def _make_skill(
@@ -34,6 +36,55 @@ def _make_skill(
 
 
 class SkillTests(unittest.TestCase):
+    def test_catalog_uses_repository_and_ignores_agent_home_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            agent_root, workspace, source_root = base / "home", base / "workspace", base / "repo"
+            workspace.mkdir()
+            _make_skill(source_root / "skills", "repository-skill")
+            _make_skill(agent_root / ".yy" / "skills" / "installed", "legacy-skill")
+
+            service = SkillService(agent_root, workspace, source_root)
+
+            self.assertEqual([item.name for item in service.catalog()], ["repository-skill"])
+            self.assertEqual(service.skills_root, source_root / "skills")
+
+    def test_install_audits_in_agent_home_and_publishes_to_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            agent_root, workspace, source_root = base / "home", base / "workspace", base / "repo"
+            source = _make_skill(workspace / "downloads", "published-skill")
+            service = SkillService(agent_root, workspace, source_root)
+
+            result = asyncio.run(service.install(SkillInstallRequest(source=str(source))))
+
+            self.assertEqual(result.status, "installed")
+            self.assertTrue((source_root / "skills" / "published-skill" / "SKILL.md").is_file())
+            self.assertFalse((agent_root / ".yy" / "skills" / "installed").exists())
+            self.assertFalse(any(service.review_root.iterdir()))
+            self.assertTrue((service.audit_root / f"{result.review_id}.json").is_file())
+            self.assertIn("/skill refresh", result.message)
+
+    def test_repository_skill_is_source_of_truth_and_legacy_install_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            legacy = _make_skill(root / "skills", "legacy-skill", body="旧版内容")
+            installed = root / ".yy" / "skills" / "installed" / "legacy-skill"
+            installed.mkdir(parents=True)
+            (installed / "SKILL.md").write_text("保留目标内容", encoding="utf-8")
+
+            service = SkillService(root, root)
+
+            self.assertIn(
+                "旧版内容",
+                (service.skills_root / "legacy-skill" / "SKILL.md").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                (installed / "SKILL.md").read_text(encoding="utf-8"),
+                "保留目标内容",
+            )
+            self.assertTrue(legacy.is_dir())
+
     def test_parse_and_prompt_only_expose_xml_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
@@ -57,7 +108,7 @@ class SkillTests(unittest.TestCase):
             service = SkillService(root, root)
             result = asyncio.run(service.install(SkillInstallRequest(source=str(source))))
             self.assertEqual(result.status, "installed")
-            self.assertTrue((root / "skills" / "clean-skill" / "SKILL.md").is_file())
+            self.assertTrue((service.skills_root / "clean-skill" / "SKILL.md").is_file())
             self.assertEqual(service.catalog()[0].name, "clean-skill")
             self.assertFalse(any(service.review_root.iterdir()))
             self.assertTrue((service.audit_root / f"{result.review_id}.json").is_file())
@@ -120,7 +171,7 @@ class SkillTests(unittest.TestCase):
             result = asyncio.run(service.install(SkillInstallRequest(source=str(source))))
             self.assertEqual(result.status, "blocked")
             self.assertEqual(approvals, 0)
-            self.assertFalse((root / "skills" / "blocked-skill").exists())
+            self.assertFalse((service.skills_root / "blocked-skill").exists())
 
     def test_skill_read_rejects_traversal_binary_and_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -133,15 +184,18 @@ class SkillTests(unittest.TestCase):
             service = SkillService(root, root)
             result = asyncio.run(service.install(SkillInstallRequest(source=str(source))))
             self.assertEqual(result.status, "installed")
-            self.assertEqual(service.read("read-skill", "references/guide.md"), "引用正文")
+            snapshot = service.catalog_snapshot()
+            self.assertEqual(service.read(snapshot, "read-skill", "references/guide.md"), "引用正文")
             with self.assertRaises(PermissionError):
-                service.read("read-skill", "../outside.txt")
+                service.read(snapshot, "read-skill", "../outside.txt")
             with self.assertRaisesRegex(ValueError, "二进制"):
-                service.read("read-skill", "binary.bin")
-            (root / "skills" / "read-skill" / "references" / "guide.md").write_text("篡改", encoding="utf-8")
-            self.assertEqual(service.catalog(), ())
-            with self.assertRaisesRegex(RuntimeError, "重新审核"):
-                service.read("read-skill")
+                service.read(snapshot, "read-skill", "binary.bin")
+            (service.skills_root / "read-skill" / "references" / "guide.md").write_text(
+                "篡改", encoding="utf-8",
+            )
+            self.assertNotEqual(service.catalog_snapshot().digest, snapshot.digest)
+            with self.assertRaisesRegex(RuntimeError, "/skill refresh"):
+                service.read(snapshot, "read-skill")
 
     def test_multiple_candidates_require_explicit_skill_path(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -182,7 +236,8 @@ class SkillTests(unittest.TestCase):
             )))
             self.assertEqual(result.status, "installed")
             self.assertEqual(approvals, ["skill_review"])
-            self.assertIn("第二版", service.read("update-skill"))
+            snapshot = service.catalog_snapshot()
+            self.assertIn("第二版", service.read(snapshot, "update-skill"))
             backups = list((service.backup_root / "update-skill").iterdir())
             self.assertEqual(len(backups), 1)
             self.assertIn("第一版", (backups[0] / "SKILL.md").read_text(encoding="utf-8"))
@@ -271,6 +326,110 @@ class SkillTests(unittest.TestCase):
         ):
             asyncio.run(_chat(None))
         self.assertEqual(runtime.tasks, [])
+
+    def test_skill_refresh_rolls_same_session_and_records_catalog_change(self) -> None:
+        async def run(root: Path) -> None:
+            source_root, workspace = root / "repo", root / "workspace"
+            workspace.mkdir()
+            _make_skill(source_root / "skills", "first-skill")
+            config = load_runtime_config(
+                root,
+                workspace_root=workspace,
+                coding_source_root=source_root,
+            )
+            runtime = AgentRuntime(
+                config,
+                provider=object(),
+                tools=AsyncToolRegistry(),
+                enable_context_processing=False,
+                enable_subagent=False,
+                enable_sandbox=False,
+                enable_extensions=False,
+                enable_references=False,
+                enable_paper_library=False,
+            )
+            session_id = await runtime._ensure_session("", None)
+            runtime.prompts.compose("preview", session_id)
+            first_file = runtime.memory.active_filename(session_id)
+            _make_skill(source_root / "skills", "second-skill")
+            context_only = runtime.prompts.refresh(session_id)
+            self.assertNotIn("second-skill", context_only.content)
+
+            refreshed = await runtime.refresh_skills(session_id)
+            self.assertEqual(refreshed.status, "refreshed")
+            self.assertEqual(refreshed.session_id, session_id)
+            self.assertEqual(refreshed.added, ("second-skill",))
+            self.assertNotEqual(refreshed.target_file, first_file)
+            self.assertTrue(str(refreshed.target_file).endswith("_002.jsonl"))
+            record = runtime.memory.session_records(session_id)[0]
+            self.assertEqual(record["role"], "summary")
+            self.assertEqual(record["reason"], "skill_refresh")
+            self.assertEqual(record["skills_added"], ["second-skill"])
+
+            unchanged = await runtime.refresh_skills(session_id)
+            self.assertEqual(unchanged.status, "unchanged")
+            self.assertEqual(runtime.memory.active_filename(session_id), refreshed.target_file)
+            await runtime.close()
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(run(Path(value)))
+
+    def test_skill_refresh_failure_keeps_segment_and_prompt_snapshot(self) -> None:
+        class FailingProcessor:
+            def __init__(self) -> None:
+                self.discarded: list[str] = []
+
+            async def compress(self, session_id: str, **kwargs):
+                del kwargs
+                return CompressionResult(
+                    status="fallback",
+                    session_id=session_id,
+                    attempts=3,
+                    source_file="source.jsonl",
+                    message="failed",
+                )
+
+            def discard_fallback(self, session_id: str) -> None:
+                self.discarded.append(session_id)
+
+        async def run(root: Path) -> None:
+            source_root, workspace = root / "repo", root / "workspace"
+            workspace.mkdir()
+            _make_skill(source_root / "skills", "first-skill")
+            config = load_runtime_config(
+                root,
+                workspace_root=workspace,
+                coding_source_root=source_root,
+            )
+            processor = FailingProcessor()
+            runtime = AgentRuntime(
+                config,
+                provider=object(),
+                tools=AsyncToolRegistry(),
+                context_processor=processor,
+                enable_subagent=False,
+                enable_sandbox=False,
+                enable_extensions=False,
+                enable_references=False,
+                enable_paper_library=False,
+            )
+            session_id = await runtime._ensure_session("", None)
+            runtime.prompts.compose("preview", session_id)
+            runtime.memory.record_user(session_id, "question")
+            runtime.memory.record_assistant(session_id, "answer")
+            old_file = runtime.memory.active_filename(session_id)
+            old_digest = runtime.prompts.skill_catalog(session_id).digest
+            _make_skill(source_root / "skills", "second-skill")
+
+            result = await runtime.refresh_skills(session_id)
+            self.assertEqual(result.status, "error")
+            self.assertEqual(runtime.memory.active_filename(session_id), old_file)
+            self.assertEqual(runtime.prompts.skill_catalog(session_id).digest, old_digest)
+            self.assertEqual(processor.discarded, [session_id])
+            await runtime.close()
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(run(Path(value)))
 
 
 if __name__ == "__main__":

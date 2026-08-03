@@ -29,9 +29,12 @@ class SkillReadTool:
         self.service = service
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> str:
-        del context
+        if not context.session_id:
+            raise RuntimeError("skill_read 需要绑定到活动 Session")
+        snapshot = self.service.session_snapshot(context.session_id)
         return await asyncio.to_thread(
             self.service.read,
+            snapshot,
             arguments["name"],
             arguments.get("path") or "SKILL.md",
         )
