@@ -113,6 +113,11 @@ class SystemPromptComposer:
         if self.skills is not None:
             self.skills.unbind_session(session_id)
 
+    def discard_all(self) -> None:
+        """在长期 Profile 更新后使所有 Session 快照失效。"""
+        for session_id in tuple(self._snapshots):
+            self.discard(session_id)
+
     def skill_catalog(self, session_id: str) -> SkillCatalogSnapshot | None:
         snapshot = self.open_session(session_id)
         return snapshot.skill_catalog
@@ -178,6 +183,9 @@ class PromptComposer:
 
     def close(self, session_id: str) -> None:
         self.system.discard(session_id)
+
+    def invalidate_all(self) -> None:
+        self.system.discard_all()
 
     def set_sandbox_status(self, status: "SandboxStatus") -> None:
         self.system.set_sandbox_status(status)

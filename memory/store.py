@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .profile import ProfileStore
 from .session import SessionStore
@@ -47,10 +47,16 @@ class MemoryStore:
         """创建会话并返回稳定哈希。"""
         return self.sessions.create(first_message, session_id)
 
-    def record_user(self, session_id: str, content: str) -> None:
+    def record_user(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        origin: Literal["interactive", "cron", "maintenance"] = "interactive",
+    ) -> None:
         """记录一条用户输入。"""
         cache = self._ensure_cache(session_id)
-        self.sessions.append(session_id, "user", content)
+        self.sessions.append(session_id, "user", content, {"origin": origin})
         cache.append({"role": "user", "content": content})
 
     def record_assistant(

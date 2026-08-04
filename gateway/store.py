@@ -223,6 +223,15 @@ class GatewayStore:
             rows = connection.execute(query, parameters).fetchall()
         return [RunRecord(**dict(row)) for row in rows]
 
+    def automated_session_ids(self) -> set[str]:
+        """返回旧记录中已知由 Cron/Dream 维护任务产生的 Session。"""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT session_id FROM runs "
+                "WHERE session_id IS NOT NULL AND (client_id LIKE 'cron:%' OR client_id LIKE 'dream:%')",
+            ).fetchall()
+        return {str(row["session_id"]) for row in rows}
+
     def append_event(
         self,
         run_id: str,

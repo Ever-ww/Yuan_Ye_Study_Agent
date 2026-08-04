@@ -59,6 +59,7 @@ class RuntimePool:
         self._semaphore = asyncio.Semaphore(max_concurrent_runs)
         self._runtimes: dict[tuple[str, str], RuntimeEntry] = {}
         self._busy_sessions: set[tuple[str, str]] = set()
+        self._pending_profile_refresh: set[tuple[str, str]] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._closing = False
         self._lock = asyncio.Lock()
@@ -116,6 +117,19 @@ class RuntimePool:
             )
         entry.last_used = monotonic()
         return await entry.runtime.refresh_skills(session_id)
+
+    def is_idle(self) -> bool:
+        """Dream 只在没有排队或运行任务时读取 Session 与修改 Profile。"""
+        return not self._busy_sessions and not any(not task.done() for task in self._tasks.values())
+
+    async def invalidate_profile_context(self, after_active_turn: bool = True) -> None:
+        """Profile 更新后刷新空闲 Runtime；活动 Turn 在结束后再刷新。"""
+        async with self._lock:
+            for key, entry in self._runtimes.items():
+                if after_active_turn and key in self._busy_sessions:
+                    self._pending_profile_refresh.add(key)
+                else:
+                    entry.runtime.invalidate_context_cache()
 
     async def _execute(self, original: RunRecord) -> None:
         runtime: AgentRuntime | None = None
@@ -198,6 +212,11 @@ class RuntimePool:
             if session_key is not None:
                 async with self._lock:
                     self._busy_sessions.discard(session_key)
+                    if session_key in self._pending_profile_refresh:
+                        entry = self._runtimes.get(session_key)
+                        if entry is not None:
+                            entry.runtime.invalidate_context_cache()
+                        self._pending_profile_refresh.discard(session_key)
             self._tasks.pop(original.run_id, None)
 
     async def _runtime_for(self, run: RunRecord, workspace: Path) -> AgentRuntime:
@@ -227,6 +246,7 @@ class RuntimePool:
             cron=self.cron_service if not scheduled else None,
             cron_project_id=run.project_id,
             enable_cron=not scheduled,
+            session_origin="cron" if scheduled else "interactive",
             references=self.reference_service,
             enable_references=self.reference_service is not None,
         )

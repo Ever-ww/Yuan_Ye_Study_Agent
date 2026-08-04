@@ -61,6 +61,11 @@ class RuntimeConfig(BaseModel):
     gateway_max_concurrent_runs: StrictInt = Field(default=4, ge=1, le=32)
     gateway_runtime_idle_seconds: StrictInt = Field(default=900, ge=30)
     cron_heartbeat_seconds: StrictInt = Field(default=60, ge=5)
+    dream_enabled: StrictBool = True
+    dream_schedule: str = Field(default="0 3 * * *", min_length=1, max_length=100)
+    dream_timezone: str = Field(default="local", min_length=1, max_length=100)
+    dream_model: str | None = Field(default=None, min_length=1)
+    dream_batch_tokens: StrictInt = Field(default=12000, ge=1000, le=200000)
     reference_search_mode: Literal["rrf", "weighted", "separate"] = "rrf"
     reference_embedding_model: str = ""
     reference_embedding_base_url: str | None = None
@@ -103,6 +108,16 @@ class RuntimeConfig(BaseModel):
             raise ValueError("reference_keyword_weight 与 reference_semantic_weight 之和必须大于 0")
         if self.reference_embedding_base_url and not self.reference_embedding_base_url.startswith(("http://", "https://")):
             raise ValueError("reference_embedding_base_url 只支持 http:// 或 https://")
+        from croniter import croniter
+        from zoneinfo import ZoneInfo
+        from tzlocal import get_localzone_name
+
+        if len(self.dream_schedule.split()) != 5 or not croniter.is_valid(self.dream_schedule):
+            raise ValueError("dream_schedule 必须是合法的五段 Cron 表达式")
+        try:
+            ZoneInfo(get_localzone_name() if self.dream_timezone == "local" else self.dream_timezone)
+        except Exception as exc:
+            raise ValueError(f"dream_timezone 不是有效时区：{self.dream_timezone}") from exc
         return self
 
 

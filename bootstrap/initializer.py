@@ -37,6 +37,8 @@ _REQUIRED_PATHS = (
     "skills/index.json",
     "reference/reference.sqlite3",
     "papers/index.json",
+    "dream/state.json",
+    "dream/memories.json",
     ".initialized.json",
 )
 
@@ -84,6 +86,27 @@ def initialize_project(project_root: Path) -> Path:
     if not cron_state.exists():
         cron_state.write_text(
             CronState(heartbeat=HeartbeatState()).model_dump_json(indent=2) + "\n",
+            encoding="utf-8",
+        )
+    dream_directory = yy / "dream"
+    for directory in ("runs", "backups", "transactions"):
+        (dream_directory / directory).mkdir(parents=True, exist_ok=True)
+    dream_state = dream_directory / "state.json"
+    if not dream_state.exists():
+        dream_state.write_text(json.dumps({
+            "version": 1,
+            "initialized_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "last_completed_date": None,
+            "processed_evidence": {},
+            "successful_runs": [],
+            "last_run_id": None,
+            "last_status": None,
+            "last_error": None,
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    dream_memories = dream_directory / "memories.json"
+    if not dream_memories.exists():
+        dream_memories.write_text(
+            json.dumps({"version": 1, "memories": {}}, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
     skill_index = yy / "skills" / "index.json"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
@@ -88,6 +89,7 @@ class AgentRuntime:
         enable_references: bool = True,
         paper_library: PaperLibraryService | None = None,
         enable_paper_library: bool = True,
+        session_origin: Literal["interactive", "cron", "maintenance"] = "interactive",
     ) -> None:
         self.config = config or load_runtime_config()
         self.provider = provider or build_provider(
@@ -250,6 +252,7 @@ class AgentRuntime:
         self.prompts = PromptComposer(self.config, self.memory, self.skills, sandbox_enabled=self.sandbox is not None)
         self.hooks = hooks or build_default_hooks(
             self.config.memory_dir, self.memory, self.context_processor, self.prompts,
+            session_origin=session_origin,
         )
         if self._owns_sandbox and self.sandbox is not None:
             register_sandbox_callbacks(self.hooks, self.sandbox)
@@ -277,6 +280,10 @@ class AgentRuntime:
     def active_session_id(self) -> str | None:
         """返回当前打开的 Session，供 CLI 在失败后保存复现现场。"""
         return self._session_id
+
+    def invalidate_context_cache(self) -> None:
+        """让下一次模型调用重新读取长期 Profile，不影响正在运行的消息列表。"""
+        self.prompts.invalidate_all()
 
     async def run_task(self, task: str, session_id: str | None = None) -> AsyncIterator[RunEvent]:
         """处理一次用户输入；一个 Turn 覆盖完整的用户任务。"""

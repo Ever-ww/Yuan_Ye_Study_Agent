@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Literal
 
 from Agent.contracts import ModelReply
 from Agent.hook import HookEvent, HookPoint, HookRegistry
@@ -11,7 +12,13 @@ from memory.store import MemoryStore
 from prompt import PromptComposer
 
 
-def register_memory_callbacks(registry: HookRegistry, memory: MemoryStore, prompts: PromptComposer | None = None) -> None:
+def register_memory_callbacks(
+    registry: HookRegistry,
+    memory: MemoryStore,
+    prompts: PromptComposer | None = None,
+    *,
+    session_origin: Literal["interactive", "cron", "maintenance"] = "interactive",
+) -> None:
     """注册会话创建、上下文加载和最终回复持久化回调。"""
     base_systems: dict[str, dict[str, object]] = {}
 
@@ -57,7 +64,7 @@ def register_memory_callbacks(registry: HookRegistry, memory: MemoryStore, promp
         if first_model_call:
             messages[:] = rebuild_messages()
             event.data["persist_current_user_operation"] = (
-                lambda: memory.record_user(event.session_id, task)
+                lambda: memory.record_user(event.session_id, task, origin=session_origin)
             )
         event.data["reload_messages_after_compression"] = lambda: rebuild_messages(refresh_system=True)
 

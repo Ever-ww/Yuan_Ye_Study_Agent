@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
 
@@ -39,6 +40,7 @@ from reference import (
     build_embedding_provider,
 )
 from skill import SkillInstallRequest, SkillService
+from dream import DreamRunResult, DreamScheduler, DreamService
 
 
 class GatewayApplication:
@@ -91,6 +93,16 @@ class GatewayApplication:
             self.store.run,
         )
         self.cron_service.set_waker(self.cron_scheduler.wake)
+        self.dream_service = DreamService(
+            config,
+            excluded_sessions=self.store.automated_session_ids,
+        )
+        self.dream_scheduler = DreamScheduler(
+            self.dream_service,
+            self.pool.is_idle,
+            self._record_dream_result,
+            heartbeat_seconds=config.cron_heartbeat_seconds,
+        )
         self._browser_codes: dict[str, float] = {}
         self.code_sessions = CodeSessionManager(config)
 
@@ -99,12 +111,14 @@ class GatewayApplication:
         try:
             await self.pool.start()
             await self.cron_scheduler.start()
+            await self.dream_scheduler.start()
         except Exception:
             await self.reference_embedding_worker.close()
             raise
 
     async def close(self) -> None:
         try:
+            await self.dream_scheduler.close()
             await self.cron_scheduler.close()
             await self.code_sessions.close()
             await self.pool.close()
@@ -170,6 +184,88 @@ class GatewayApplication:
 
     async def cron_status(self):
         return await self.cron_service.status(error=self.cron_scheduler.last_error)
+
+    def dream_status(self):
+        return self.dream_scheduler.status()
+
+    async def run_dream(self, selected: str | None = None):
+        if not self.pool.is_idle():
+            raise RuntimeError("普通 Agent 任务仍在运行，Dream 将在任务结束后执行")
+        target = date.fromisoformat(selected) if selected else datetime.now().astimezone().date() - timedelta(days=1)
+        result = await self.dream_service.process_day(target)
+        await self._record_dream_result(result, False)
+        return result
+
+    async def backfill_dream(self, start: str, end: str):
+        if not self.pool.is_idle():
+            raise RuntimeError("普通 Agent 任务仍在运行，不能开始 Dream backfill")
+        results = await self.dream_service.backfill(date.fromisoformat(start), date.fromisoformat(end))
+        for result in results:
+            await self._record_dream_result(result, False)
+        return results
+
+    async def rollback_dream(self, run_id: str | None = None):
+        if not self.pool.is_idle():
+            raise RuntimeError("普通 Agent 任务仍在运行，不能回滚 Dream")
+        result = await self.dream_service.rollback(run_id)
+        if result.restored:
+            await self.pool.invalidate_profile_context(after_active_turn=True)
+            try:
+                run = self.store.run(result.run_id)
+                envelope = self.store.append_event(
+                    run.run_id,
+                    run.project_id,
+                    run.session_id,
+                    "dream_rolled_back",
+                    result.model_dump(mode="json"),
+                )
+                await self.events.publish(envelope)
+            except KeyError:
+                pass
+        return result
+
+    async def _record_dream_result(self, result: DreamRunResult, automatic: bool) -> None:
+        """把维护运行转换为可重放 Gateway 事件；仅自动任务进入 Inbox。"""
+        try:
+            run = self.store.create_run(
+                "dream",
+                "dream:scheduler" if automatic else "dream:manual",
+                f"Dream {result.date}",
+                None,
+                run_id=result.run_id,
+            )
+        except Exception:
+            # 同一个结果对象不能重复制造第二份 Gateway 运行。
+            return
+        run = self.store.update_run(run.run_id, status="running", started_at=result.created_at)
+        envelope = self.store.append_event(
+            run.run_id, run.project_id, None, "dream_started", {"date": result.date},
+        )
+        await self.events.publish(envelope)
+        terminal_type = {
+            "completed": "dream_completed",
+            "noop": "dream_noop",
+            "failed": "dream_failed",
+        }[result.status]
+        run_status = "failed" if result.status == "failed" else "completed"
+        run = self.store.update_run(
+            run.run_id,
+            status=run_status,
+            finished_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+            **({"error": result.message} if run_status == "failed" else {"answer": result.message}),
+        )
+        envelope = self.store.append_event(
+            run.run_id, run.project_id, None, terminal_type, result.model_dump(mode="json"),
+        )
+        await self.events.publish(envelope)
+        if result.status == "completed":
+            await self.pool.invalidate_profile_context(after_active_turn=True)
+        if automatic and result.status != "noop":
+            item = self.store.create_inbox(run)
+            envelope = self.store.append_event(
+                run.run_id, run.project_id, None, "inbox_created", item.model_dump(mode="json"),
+            )
+            await self.events.publish(envelope)
 
     def cron_preview(self, schedule: CronSchedule, count: int = 5):
         return self.cron_service.preview(schedule, count=count)

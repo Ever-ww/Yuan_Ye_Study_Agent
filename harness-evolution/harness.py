@@ -1140,7 +1140,7 @@ class HarnessEvolutionRunner:
         commands = [
             ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"],
             ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "unittest", "discover", "-s", "tests", "-v"],
-            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "compileall", "-q", "Agent", "bootstrap", "context_process", "extension", "gateway", "memory", "prompt", "reference", "sandbox", "skill", "tools", "run_ui", "tests", "harness-evolution", "run.py"],
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "compileall", "-q", "Agent", "bootstrap", "context_process", "dream", "extension", "gateway", "memory", "prompt", "reference", "sandbox", "skill", "tools", "run_ui", "tests", "harness-evolution", "run.py"],
             ["uv", "lock", "--check"],
             ["git", "diff", "--check"],
         ]

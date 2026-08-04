@@ -332,6 +332,7 @@ async def _chat_gateway(
                 "/compress；/context refresh；/skill list|install|update|audit|refresh；/exit；"
                 "/inbox [all|show <ID>|read <ID>|read-all]；"
                 "/cron list|status|add|at|preview|edit|pause|resume|run|remove；"
+                "/dream status|run|backfill|rollback；"
                 "运行中 Ctrl+C 取消当前 Run，空闲时 Ctrl+C 退出客户端。"
             )
             continue
@@ -346,6 +347,9 @@ async def _chat_gateway(
             continue
         if task == "/cron" or task.startswith("/cron "):
             await _handle_cron_command(client, project_id, task)
+            continue
+        if task == "/dream" or task.startswith("/dream "):
+            await _handle_dream_command(client, task)
             continue
         if not task:
             continue
@@ -778,6 +782,57 @@ async def _handle_gateway_skill_command(
             console.print(f"[dim]审核报告：{result['report_path']}[/]")
     except Exception as exc:
         console.print(f"[red]{str(exc) or type(exc).__name__}[/]")
+
+
+async def _handle_dream_command(client: GatewayClient, task: str) -> None:
+    """管理每日全局 Profile 巩固，不写入普通 Session。"""
+    try:
+        parts = shlex.split(task)
+        action = parts[1].lower() if len(parts) > 1 else "status"
+        if action == "status" and len(parts) in {1, 2}:
+            status = await client.dream_status()
+            console.print(Panel(
+                f"启用：{'是' if status.enabled else '否'}\n"
+                f"运行中：{'是' if status.running else '否'}\n"
+                f"计划：{status.schedule}（{status.timezone}）\n"
+                f"下次运行：{status.next_run_at or '-'}\n"
+                f"最近完成日期：{status.last_completed_date or '-'}\n"
+                f"最近状态：{status.last_status or '-'}\n"
+                f"最近错误：{status.last_error or '-'}",
+                title="Dream 状态",
+            ))
+            return
+        if action == "run" and len(parts) in {2, 3}:
+            result = await client.run_dream(parts[2] if len(parts) == 3 else None)
+            _render_dream_result(result)
+            return
+        if action == "backfill" and len(parts) == 4:
+            results = await client.backfill_dream(parts[2], parts[3])
+            for result in results:
+                _render_dream_result(result)
+            return
+        if action == "rollback" and len(parts) in {2, 3}:
+            result = await client.rollback_dream(parts[2] if len(parts) == 3 else None)
+            style = "green" if result.restored else "yellow"
+            console.print(f"[{style}]{result.message}[/]")
+            return
+        raise ValueError(
+            "用法：/dream status；/dream run [YYYY-MM-DD]；"
+            "/dream backfill <开始日期> <结束日期>；/dream rollback [run-id]"
+        )
+    except Exception as exc:
+        console.print(f"[red]{str(exc) or type(exc).__name__}[/]")
+
+
+def _render_dream_result(result) -> None:
+    style = "green" if result.status == "completed" else "yellow" if result.status == "noop" else "red"
+    console.print(Panel(
+        f"{result.message}\n日期：{result.date}\n运行：{result.run_id}\n"
+        f"Session：{result.sessions_processed}；证据：{result.evidence_processed}；"
+        f"记忆变更：{result.memories_changed}",
+        title="Dream",
+        border_style=style,
+    ))
 
 
 async def _chat(

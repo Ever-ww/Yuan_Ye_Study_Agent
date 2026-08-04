@@ -6,7 +6,7 @@ import inspect
 from collections import defaultdict
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -136,13 +136,19 @@ def build_default_hooks(
     memory: MemoryStore | None = None,
     context_processor: ContextProcessor | None = None,
     prompts: Any | None = None,
+    session_origin: Literal["interactive", "cron", "maintenance"] = "interactive",
 ) -> HookRegistry:
     """组合项目与记忆回调；Memory 仍只是普通回调集合。"""
     from memory.callbacks import register_memory_callbacks
     from memory.store import MemoryStore
 
     registry = HookRegistry()
-    register_memory_callbacks(registry, memory or MemoryStore(memory_dir), prompts)
+    register_memory_callbacks(
+        registry,
+        memory or MemoryStore(memory_dir),
+        prompts,
+        session_origin=session_origin,
+    )
     if context_processor is not None:
         from context_process import register_context_callbacks
         register_context_callbacks(registry, context_processor)

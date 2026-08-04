@@ -19,6 +19,14 @@ from cron import (
     CronSchedule,
     CronStatus,
 )
+from dream import (
+    DreamBackfillRequest,
+    DreamRollbackRequest,
+    DreamRollbackResult,
+    DreamRunRequest,
+    DreamRunResult,
+    DreamStatus,
+)
 
 from gateway.models import (
     ApprovalDecision,
@@ -108,6 +116,30 @@ class GatewayClient:
     async def _cron_action(self, job_id: str, action: str) -> CronJob:
         value = await self._request("POST", f"/api/v1/cron/jobs/{job_id}/{action}")
         return CronJob.model_validate(value)
+
+    async def dream_status(self) -> DreamStatus:
+        return DreamStatus.model_validate(await self._request("GET", "/api/v1/dream/status"))
+
+    async def run_dream(self, selected_date: str | None = None) -> DreamRunResult:
+        request = DreamRunRequest(date=selected_date)
+        value = await self._request(
+            "POST", "/api/v1/dream/run", json=request.model_dump(mode="json"),
+        )
+        return DreamRunResult.model_validate(value)
+
+    async def backfill_dream(self, start: str, end: str) -> tuple[DreamRunResult, ...]:
+        request = DreamBackfillRequest(start=start, end=end)
+        values = await self._request(
+            "POST", "/api/v1/dream/backfill", json=request.model_dump(mode="json"),
+        )
+        return tuple(DreamRunResult.model_validate(value) for value in values)
+
+    async def rollback_dream(self, run_id: str | None = None) -> DreamRollbackResult:
+        request = DreamRollbackRequest(run_id=run_id)
+        value = await self._request(
+            "POST", "/api/v1/dream/rollback", json=request.model_dump(mode="json"),
+        )
+        return DreamRollbackResult.model_validate(value)
 
     async def sessions(self, project_id: str) -> list[dict[str, Any]]:
         return list(await self._request("GET", f"/api/v1/projects/{project_id}/sessions"))

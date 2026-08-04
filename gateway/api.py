@@ -8,6 +8,7 @@ from typing import Any
 
 from Agent import load_runtime_config
 from cron import CronJobCreateRequest, CronJobEditRequest, CronPreviewRequest
+from dream import DreamBackfillRequest, DreamRollbackRequest, DreamRunRequest
 from gateway.application import GatewayApplication
 from gateway.models import (
     ApprovalDecision,
@@ -123,6 +124,7 @@ def create_gateway_api(
     async def status():
         sandbox_status = await probe_docker_status()
         cron_status = await gateway.cron_status()
+        dream_status = gateway.dream_status()
         return {
             "gateway": "running",
             "version": 1,
@@ -144,6 +146,7 @@ def create_gateway_api(
             ),
             "max_concurrent_runs": config.gateway_max_concurrent_runs,
             "cron": cron_status.model_dump(mode="json"),
+            "dream": dream_status.model_dump(mode="json"),
         }
 
     @app.get("/api/v1/bootstrap", dependencies=[Depends(authorize)])
@@ -198,6 +201,22 @@ def create_gateway_api(
     @app.delete("/api/v1/cron/jobs/{job_id}", dependencies=[Depends(authorize_write)])
     async def remove_cron(job_id: str):
         return await gateway.remove_cron(job_id)
+
+    @app.get("/api/v1/dream/status", dependencies=[Depends(authorize)])
+    async def dream_status():
+        return gateway.dream_status()
+
+    @app.post("/api/v1/dream/run", dependencies=[Depends(authorize_write)])
+    async def run_dream(payload: DreamRunRequest):
+        return await gateway.run_dream(payload.date)
+
+    @app.post("/api/v1/dream/backfill", dependencies=[Depends(authorize_write)])
+    async def backfill_dream(payload: DreamBackfillRequest):
+        return await gateway.backfill_dream(payload.start, payload.end)
+
+    @app.post("/api/v1/dream/rollback", dependencies=[Depends(authorize_write)])
+    async def rollback_dream(payload: DreamRollbackRequest):
+        return await gateway.rollback_dream(payload.run_id)
 
     @app.get("/api/v1/projects/{project_id}/sessions", dependencies=[Depends(authorize)])
     async def list_sessions(project_id: str):

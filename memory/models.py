@@ -20,6 +20,7 @@ class SessionRecord(BaseModel):
     tool_call_id: str | None = None
     name: str | None = None
     reasoning: str | None = None
+    origin: Literal["interactive", "cron", "maintenance"] | None = None
 
     @model_validator(mode="after")
     def _validate_role_payload(self) -> "SessionRecord":

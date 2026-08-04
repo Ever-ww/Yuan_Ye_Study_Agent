@@ -26,6 +26,7 @@ Coding Agent 的记忆位于 Agent 根目录的 `.yy/harness-evolution/memory/`�
 Agent/      模型适配、异步 ReAct、Runtime、Hook 协议与配置
 extension/  十阶段全局多文件 Hook Extension 与开发契约
 gateway/    单实例后台进程、Runtime 池、本机 API、事件重放、审批与 Inbox
+dream/      每日 Session 归档、长期记忆巩固、审计、调度与回滚
 memory/     记忆领域 Python 服务
 paper_library/ 全局论文索引、下载、去重、分页解析与总结持久化
 context_process/ Token 阈值压缩、Profile 合并与失败裁剪
@@ -62,6 +63,7 @@ desktop/    Tauri 2 原生窗口与 Gateway sidecar 启动外壳
 packaging/  PyInstaller sidecar 构建与平台文件名准备
 tests/      核心行为与 UI 安全测试
 .yy/gateway/ SQLite、可重放 Run 事件、Inbox、日志、令牌与单实例状态
+.yy/dream/  每日巩固状态、结构化记忆、运行审计、事务与 Profile 备份（不提交）
 .yy/memory/ Agent Home 中的会话 JSONL、会话索引与长期 Profile（不提交）
 .yy/papers/ 全局论文 PDF、中文总结与审计索引（不提交）
 run.py      唯一源码树入口
@@ -224,7 +226,12 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
   "gateway_port": 8765,
   "gateway_max_concurrent_runs": 4,
   "gateway_runtime_idle_seconds": 900,
-  "cron_heartbeat_seconds": 60
+  "cron_heartbeat_seconds": 60,
+  "dream_enabled": true,
+  "dream_schedule": "0 3 * * *",
+  "dream_timezone": "local",
+  "dream_model": null,
+  "dream_batch_tokens": 12000
 }
 '@ | Set-Content -Encoding utf8 (Join-Path $AgentHome ".yy\settings.local.json")
 ```
@@ -383,6 +390,7 @@ uv run python run.py chat
 - `/inbox` 列出未读后台结果；`/inbox all` 列出全部结果；表格 ID 支持唯一前缀。
 - `/inbox show <ID>` 查看完整结果；`/inbox read <ID>` 标记单条已读；`/inbox read-all` 标记全部已读。
 - `/cron list|status|add|at|preview|edit|pause|resume|run|remove` 在聊天内管理后台定时任务，命令本身不会写入普通 Session。
+- `/dream status|run|backfill|rollback` 查看、手动运行、历史回填或顺序回滚每日记忆巩固；命令本身不会写入普通 Session。
 
 ### 1.1 使用 `/code` 开发 Hook Extension
 
@@ -629,7 +637,7 @@ uv run python run.py chat --help
 ```powershell
 uv run python -m unittest discover -s tests -v
 uv run python -m pytest -q
-uv run python -m compileall -q Agent bootstrap context_process cron gateway memory prompt sandbox skill tool tools run_ui tests harness-evolution run.py
+uv run python -m compileall -q Agent bootstrap context_process cron dream gateway memory prompt sandbox skill tool tools run_ui tests harness-evolution run.py
 uv lock --check
 npm --prefix ui install
 npm --prefix ui run build
@@ -659,6 +667,31 @@ uv run python run.py cron remove <job-id>
 交互式 `chat` 中也支持 `/cron ...` 命令；自然语言请求可由主 Agent 调用动态风险工具 `cronjob`。读取、校验和预览无需审批，创建、编辑、暂停、恢复、立即运行和删除仍需审批。定时 Run 没有在线发起客户端，因此写入、Bash、回滚、Skill 安装等危险工具会自动拒绝；只读文件、已审核 Skill、网络搜索、网页抓取和 Subagent 仍可使用。Cron Runtime 不包含 `cronjob`，Subagent 也不能获得它，避免任务递归创建计划。
 
 `cron_heartbeat_seconds` 默认是 `60`，控制 Gateway Heartbeat 的轮询间隔。JSON 损坏时只暂停 Cron 并把状态标记为 unhealthy，普通聊天不受影响；修复前程序不会覆盖损坏文件。停止 Gateway 会先停止 Heartbeat，再关闭运行池。本阶段不会安装系统登录自启服务，计算机重启后由下一次 CLI、Web 或桌面端启动 Gateway 时恢复调度。
+
+## Dream 每日记忆巩固
+
+Gateway 默认在本地时间每天凌晨 03:00 处理前一个完整自然日的对话。Dream 会遍历 `~/.yy/memory/session/` 下所有 workspace、Session 和 JSONL 分段，以 user 消息作为唯一长期事实证据；assistant 只用于理解语境，reasoning、summary、system、工具调用、工具输出、Cron 与维护 Session 均不会成为用户画像证据。进入模型前还会脱敏 API Key、Token 与 Authorization 等凭据。
+
+Dream 使用独立、非流式且无 Tool/Skill/Memory/Sandbox/Extension 的临时 `AgentRuntime`，先按 Token 预算提取带证据哈希的候选，再与现有长期记忆合并。默认只更新 `USER.md`、`RESEARCH.md`、`OTHERS.md` 及用户新增的普通 Profile Markdown 中由以下标记包围的区域；标记外的手写内容保持原样：
+
+```markdown
+<!-- dream:managed:start -->
+## Dream 长期记忆
+
+- 用户偏好中文技术说明。 <!-- dream:id=mem_xxx -->
+<!-- dream:managed:end -->
+```
+
+结构化记忆保存在 `~/.yy/dream/memories.json`，运行报告、模型错误、输入/输出 Token、证据计数与备份位于 `~/.yy/dream/runs/` 和 `~/.yy/dream/backups/`。原始 Session 永不修改或删除；冲突记忆只标为 `superseded`，不做不可恢复删除。同一天没有新证据时返回 `noop`，不会调用合并模型或重写 Profile。成功后，当前正在执行的 Turn 继续使用原 System Prompt，下一次用户输入才重建 Profile 上下文。
+
+```text
+/dream status
+/dream run [YYYY-MM-DD]
+/dream backfill <开始日期> <结束日期>
+/dream rollback [run-id]
+```
+
+`run` 默认处理昨天；`backfill` 按日期从旧到新执行，单次最多 31 天；`rollback` 只能依次回滚最近一次成功运行，以免跳过后续依赖状态。Gateway 离线错过计划时间后会按日期补跑，但首次启用只处理昨天，不自动消费全部旧历史。普通 Agent Run 尚未结束时 Dream 会等待；自动运行结果会进入 Inbox。
 
 ## 配置、状态与安全
 
