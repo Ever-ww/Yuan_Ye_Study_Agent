@@ -18,6 +18,9 @@ from .models import (
 )
 from .process import GatewayProcessManager
 from .runtime_pool import RuntimePool
+from .state_controller import StateController, StateConflictError, StateInvariantError
+from .outbox import OutboxDispatcher
+from .recovery import RecoveryCoordinator
 from .store import GatewayStore
 from cron import CronJob, CronSchedule, CronService, CronStatus
 
@@ -39,6 +42,11 @@ __all__ = [
     "ProjectRecord",
     "RunRecord",
     "RuntimePool",
+    "StateController",
+    "StateConflictError",
+    "StateInvariantError",
+    "OutboxDispatcher",
+    "RecoveryCoordinator",
     "CronJob",
     "CronSchedule",
     "CronService",

@@ -18,6 +18,7 @@ from .service import DreamService
 
 IdleCheck = Callable[[], bool]
 ResultCallback = Callable[[DreamRunResult, bool], Awaitable[None]]
+DayRunner = Callable[[date], Awaitable[DreamRunResult]]
 
 
 class DreamScheduler:
@@ -31,12 +32,14 @@ class DreamScheduler:
         *,
         heartbeat_seconds: int = 60,
         clock: Callable[[], datetime] | None = None,
+        run_day: DayRunner | None = None,
     ) -> None:
         self.service = service
         self.is_idle = is_idle
         self.on_result = on_result
         self.heartbeat_seconds = heartbeat_seconds
         self.clock = clock or (lambda: datetime.now().astimezone())
+        self.run_day = run_day or self.service.process_day
         self._task: asyncio.Task[None] | None = None
         self._wake = asyncio.Event()
         self._closing = False
@@ -72,7 +75,7 @@ class DreamScheduler:
             due = self._due_date(now)
             if due is None:
                 return None
-            result = await self.service.process_day(due)
+            result = await self.run_day(due)
             await self.on_result(result, True)
             if result.status == "failed":
                 self.last_error = result.message

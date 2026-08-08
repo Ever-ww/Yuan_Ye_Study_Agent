@@ -4,10 +4,19 @@ from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar, Token
+from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from gateway.models import ApprovalRequest, now_iso
+from Agent.state import (
+    CreateApprovalCommand,
+    DecideApprovalCommand,
+    DurableApproval,
+    ExpireApprovalCommand,
+)
+from gateway.durable_execution import current_operation_id
+from gateway.state_controller import StateController
 from gateway.store import GatewayStore
 
 
@@ -24,10 +33,14 @@ class GatewayApprovalBroker:
         store: GatewayStore,
         publish: PublishApproval,
         wait_for_client: WaitForClient | None = None,
+        state_controller: StateController | None = None,
+        approval_timeout_seconds: int = 600,
     ) -> None:
         self.store = store
         self.publish = publish
         self.wait_for_client = wait_for_client
+        self.state_controller = state_controller
+        self.approval_timeout_seconds = max(1, approval_timeout_seconds)
         self._pending: dict[str, tuple[ApprovalRequest, asyncio.Future[bool]]] = {}
         self._lock = asyncio.Lock()
 
@@ -56,30 +69,87 @@ class GatewayApprovalBroker:
         future = asyncio.get_running_loop().create_future()
         async with self._lock:
             self._pending[request.approval_id] = (request, future)
-        self.store.save_approval(request)
+        if self.state_controller is not None:
+            operation_id = current_operation_id()
+            if operation_id is None:
+                raise RuntimeError("Durable Approval 缺少对应的 Operation")
+            expires = (
+                datetime.now().astimezone() + timedelta(seconds=self.approval_timeout_seconds)
+            ).isoformat(timespec="seconds")
+            state = self.state_controller.state(run_id)
+            self.state_controller.apply(CreateApprovalCommand(
+                command_id=uuid4().hex,
+                run_id=run_id,
+                expected_revision=state.revision,
+                gateway_epoch=self.state_controller.gateway_epoch,
+                approval=DurableApproval(
+                    approval_id=request.approval_id,
+                    operation_id=operation_id,
+                    run_id=run_id,
+                    client_id=client_id,
+                    tool_name=tool_name,
+                    arguments_hash=_arguments_hash(arguments),
+                    arguments_json=_arguments_json(arguments),
+                    created_at=request.created_at,
+                    expires_at=expires,
+                ),
+            ))
+        else:
+            self.store.save_approval(request)
         try:
             await self.publish(request)
             if self.wait_for_client is not None and not await self.wait_for_client(client_id):
-                self.store.decide_approval(request.approval_id, False)
+                await self.decide(request.approval_id, client_id, False)
                 if not future.done():
                     future.set_result(False)
-            return await future
+            try:
+                return await asyncio.wait_for(future, timeout=self.approval_timeout_seconds)
+            except asyncio.TimeoutError:
+                if self.state_controller is not None:
+                    state = self.state_controller.state(run_id)
+                    self.state_controller.apply(ExpireApprovalCommand(
+                        command_id=uuid4().hex,
+                        run_id=run_id,
+                        expected_revision=state.revision,
+                        gateway_epoch=self.state_controller.gateway_epoch,
+                        approval_id=request.approval_id,
+                    ))
+                else:
+                    self.store.decide_approval(request.approval_id, False)
+                return False
         finally:
-            # 发布失败、Run 取消或 Gateway 关闭都必须把数据库中的 pending 终结掉。
-            self.store.decide_approval(request.approval_id, False)
+            # SQLite Approval 才是权威状态；任务取消或 Gateway 重启不自动拒绝。
             async with self._lock:
                 self._pending.pop(request.approval_id, None)
 
     async def decide(self, approval_id: str, client_id: str, approved: bool) -> bool:
         async with self._lock:
             pending = self._pending.get(approval_id)
-            if pending is None:
-                raise KeyError(f"审批不存在或已经结束：{approval_id}")
-            request, future = pending
-            if request.client_id != client_id:
-                raise PermissionError("只有发起任务的客户端可以处理本次审批")
-            self.store.decide_approval(approval_id, approved)
-            if not future.done():
+            if self.state_controller is not None:
+                approval = self.state_controller.approval(approval_id)
+                if approval.client_id != client_id:
+                    raise PermissionError("只有发起任务的客户端可以处理本次审批")
+                state = self.state_controller.state(approval.run_id)
+                result = self.state_controller.apply(DecideApprovalCommand(
+                    command_id=f"approval:{approval_id}:{'approve' if approved else 'deny'}",
+                    run_id=approval.run_id,
+                    expected_revision=state.revision,
+                    gateway_epoch=self.state_controller.gateway_epoch,
+                    approval_id=approval_id,
+                    approved=approved,
+                    decided_by=client_id,
+                    reason="客户端决定",
+                ))
+                approved = result.approval is not None and result.approval.status.value == "approved"
+                future = pending[1] if pending is not None else None
+            else:
+                if pending is None:
+                    raise KeyError(f"审批不存在或已经结束：{approval_id}")
+                request, future = pending
+                if request.client_id != client_id:
+                    raise PermissionError("只有发起任务的客户端可以处理本次审批")
+                self.store.decide_approval(approval_id, approved)
+            if future is not None and not future.done():
                 future.set_result(approved)
             return approved
 
@@ -91,15 +161,46 @@ class GatewayApprovalBroker:
                 if request.client_id == client_id
             ]
             for approval_id, future in selected:
-                self.store.decide_approval(approval_id, False)
+                if self.state_controller is not None:
+                    approval = self.state_controller.approval(approval_id)
+                    state = self.state_controller.state(approval.run_id)
+                    self.state_controller.apply(DecideApprovalCommand(
+                        command_id=f"approval:{approval_id}:disconnect-deny",
+                        run_id=approval.run_id,
+                        expected_revision=state.revision,
+                        gateway_epoch=self.state_controller.gateway_epoch,
+                        approval_id=approval_id,
+                        approved=False,
+                        decided_by=client_id,
+                        reason="发起客户端断开",
+                    ))
+                else:
+                    self.store.decide_approval(approval_id, False)
                 if not future.done():
                     future.set_result(False)
         return len(selected)
 
     async def deny_all(self) -> None:
+        if self.state_controller is not None:
+            # Gateway 重启后未过期审批继续等待；只取消进程内 waiter。
+            async with self._lock:
+                for _, future in self._pending.values():
+                    if not future.done():
+                        future.cancel()
+            return
         async with self._lock:
             selected = list(self._pending.items())
             for approval_id, (_, future) in selected:
                 self.store.decide_approval(approval_id, False)
                 if not future.done():
                     future.set_result(False)
+
+
+def _arguments_json(arguments: dict[str, Any]) -> str:
+    import json
+    return json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _arguments_hash(arguments: dict[str, Any]) -> str:
+    import hashlib
+    return hashlib.sha256(_arguments_json(arguments).encode("utf-8")).hexdigest()

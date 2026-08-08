@@ -25,6 +25,7 @@ class GatewayEventBus:
         self._lock = asyncio.Lock()
         self._client_counts: dict[str, int] = {}
         self._client_ready: dict[str, asyncio.Event] = {}
+        self._published_ids: set[str] = set()
 
     async def subscribe(self, client_id: str, run_id: str | None = None) -> tuple[int, asyncio.Queue[GatewayEventEnvelope]]:
         async with self._lock:
@@ -66,6 +67,12 @@ class GatewayEventBus:
 
     async def publish(self, event: GatewayEventEnvelope) -> None:
         async with self._lock:
+            if event.event_id in self._published_ids:
+                return
+            self._published_ids.add(event.event_id)
+            # 本机 Gateway 的事件量有限；保留最近一批 ID 防止无界增长。
+            if len(self._published_ids) > 100_000:
+                self._published_ids = {event.event_id}
             subscriptions = tuple(self._subscriptions.values())
         for subscription in subscriptions:
             if subscription.run_id and subscription.run_id != event.run_id:

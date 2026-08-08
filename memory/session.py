@@ -44,15 +44,36 @@ class SessionStore:
         (self.directory / filename).touch()
         return session_id
 
-    def append(self, session_id: str, role: str, content: str | None, metadata: dict[str, object] | None = None) -> None:
+    def append(self, session_id: str, role: str, content: str | None, metadata: dict[str, object] | None = None) -> str:
         """向当前最新 JSONL 分段追加一条带时间戳的对话消息。"""
-        record = {"role": role, "content": content, "timestamp": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")}
+        record = {
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "record_id": uuid4().hex,
+        }
         if metadata:
             record.update(metadata)
-        validated = SessionRecord.model_validate(record).model_dump(mode="python", exclude_unset=True)
+        record_id = str(record["record_id"])
+        self.append_once(session_id, record)
+        return record_id
+
+    def append_once(self, session_id: str, record: dict[str, Any]) -> bool:
+        """按稳定 record_id 幂等追加；用于 FINALIZING 与崩溃恢复补写。"""
+        selected = dict(record)
+        selected.setdefault("timestamp", datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+        selected.setdefault("record_id", uuid4().hex)
+        record_id = str(selected["record_id"])
+        if not record_id:
+            raise ValueError("Session record_id 不能为空")
         path = self._active_path(session_id)
+        if self._contains_record_id(path, record_id):
+            return False
+        validated = SessionRecord.model_validate(selected).model_dump(mode="python", exclude_unset=True)
         with path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(validated, ensure_ascii=False) + "\n")
+            handle.flush()
+        return True
 
     def restore(self, session_id: str) -> list[dict[str, Any]]:
         """恢复最新分段并移除时间戳、模型指标等审计字段。"""
@@ -175,6 +196,21 @@ class SessionStore:
         return SessionIndex.model_validate_json(
             self.index_path.read_text(encoding="utf-8"), strict=True,
         ).model_dump(mode="python")
+
+    @staticmethod
+    def _contains_record_id(path: Path, record_id: str) -> bool:
+        if not path.exists():
+            return False
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if value.get("record_id") == record_id:
+                return True
+        return False
 
     def _write_index(self, value: dict) -> None:
         """原子替换索引，避免中断留下半个 JSON 文件。"""

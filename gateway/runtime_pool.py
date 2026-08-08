@@ -4,15 +4,33 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from time import monotonic
+from uuid import uuid4
 
 from Agent import AgentRuntime, EventType, ExtensionCatalog, ModelRetryPolicy, load_runtime_config
+from Agent.state import (
+    BindSessionCommand,
+    ExecutionOutcome,
+    ExecutionState,
+    FinalizeInboxCommand,
+    RecordRuntimeEventCommand,
+    RequestCancellationCommand,
+    TaskState,
+    TerminalTarget,
+    TransitionCommand,
+    is_runnable,
+)
 from gateway.approval import GatewayApprovalBroker
+from gateway.durable_execution import DurableModelHooks, DurableToolCoordinator
 from gateway.events import GatewayEventBus
 from gateway.models import ApprovalRequest, RunRecord, now_iso
+from gateway.outbox import OutboxDispatcher
+from gateway.state_controller import StateController
 from gateway.store import GatewayStore
 from reference import ReferenceService
 
@@ -41,6 +59,8 @@ class RuntimePool:
         extensions: ExtensionCatalog | None = None,
         cron_service=None,
         reference_service: ReferenceService | None = None,
+        state_controller: StateController | None = None,
+        outbox: OutboxDispatcher | None = None,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.store = store
@@ -51,10 +71,14 @@ class RuntimePool:
         self.extensions = extensions
         self.cron_service = cron_service
         self.reference_service = reference_service
+        self.state_controller = state_controller
+        self.outbox = outbox
+        self.tool_operations = DurableToolCoordinator(state_controller) if state_controller else None
         self.approvals = GatewayApprovalBroker(
             store,
             self._publish_approval,
             self.events.wait_connected,
+            state_controller=state_controller,
         )
         self._semaphore = asyncio.Semaphore(max_concurrent_runs)
         self._runtimes: dict[tuple[str, str], RuntimeEntry] = {}
@@ -72,6 +96,13 @@ class RuntimePool:
     async def submit(self, run: RunRecord) -> None:
         if self._closing:
             raise RuntimeError("Gateway 正在关闭，不能接收新任务")
+        if self.state_controller is not None:
+            state = self.state_controller.state(run.run_id)
+            operation = self.state_controller.active_operation(run.run_id)
+            if state.gateway_epoch != self.state_controller.gateway_epoch:
+                raise RuntimeError("Run fencing token 不属于当前 Gateway epoch")
+            if not is_runnable(state, operation, now=datetime.now().astimezone()):
+                raise RuntimeError(f"Run 当前不可调度：{state.task_state.value}")
         if run.session_id:
             key = (run.project_id, run.session_id)
             async with self._lock:
@@ -82,6 +113,20 @@ class RuntimePool:
         self._tasks[run.run_id] = task
 
     async def cancel(self, run_id: str) -> bool:
+        if self.state_controller is not None:
+            state = self.state_controller.state(run_id)
+            if state.task_state not in {
+                TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.INTERRUPTED,
+            } and not state.cancellation_requested:
+                self.state_controller.apply(RequestCancellationCommand(
+                    command_id=uuid4().hex,
+                    run_id=run_id,
+                    expected_revision=state.revision,
+                    gateway_epoch=self.state_controller.gateway_epoch,
+                    reason="客户端请求取消",
+                ))
+                if self.outbox:
+                    self.outbox.wake()
         task = self._tasks.get(run_id)
         if task is None or task.done():
             return False
@@ -133,26 +178,52 @@ class RuntimePool:
 
     async def _execute(self, original: RunRecord) -> None:
         runtime: AgentRuntime | None = None
+        operation_token = None
+        answer = ""
         session_key: tuple[str, str] | None = (
             (original.project_id, original.session_id) if original.session_id else None
         )
         try:
             await self._emit(original, "run_queued", {"message": "任务已进入 Gateway 队列"})
             async with self._semaphore:
-                current = self.store.update_run(
-                    original.run_id,
-                    status="running",
-                    started_at=now_iso(),
-                )
+                if self.state_controller is not None:
+                    await self._transition(original.run_id, task_state=TaskState.STARTING, reason="Scheduler 认领 Run")
+                    selected = self.state_controller.state(original.run_id)
+                    await self._transition(
+                        original.run_id,
+                        task_state=TaskState.RUNNING,
+                        execution_state=ExecutionState.THINKING if selected.execution is None else None,
+                        reason="Runtime 初始化完成",
+                    )
+                else:
+                    self.store.update_run(
+                        original.run_id,
+                        status="running",
+                        started_at=now_iso(),
+                    )
+                current = self.store.run(original.run_id)
                 await self._emit(current, "run_started", {"message": "任务开始运行"})
                 project = self.store.project(current.project_id)
                 runtime = await self._runtime_for(current, Path(project.path))
+                if self.tool_operations is not None:
+                    operation_token = self.tool_operations.bind(current.run_id)
                 token = self.approvals.bind_run(current.run_id, current.client_id)
                 try:
                     async for event in runtime.run_task(current.task, current.session_id):
                         if event.type is EventType.STARTED:
                             session_id = str(event.payload["session_id"])
-                            current = self.store.update_run(current.run_id, session_id=session_id)
+                            if self.state_controller is not None:
+                                state = self.state_controller.state(current.run_id)
+                                self.state_controller.apply(BindSessionCommand(
+                                    command_id=uuid4().hex,
+                                    run_id=current.run_id,
+                                    expected_revision=state.revision,
+                                    gateway_epoch=self.state_controller.gateway_epoch,
+                                    session_id=session_id,
+                                ))
+                            else:
+                                current = self.store.update_run(current.run_id, session_id=session_id)
+                            current = self.store.run(current.run_id)
                             new_key = (current.project_id, session_id)
                             if session_key is None:
                                 async with self._lock:
@@ -161,50 +232,82 @@ class RuntimePool:
                                     self._busy_sessions.add(new_key)
                                 session_key = new_key
                             self._runtimes[new_key] = RuntimeEntry(runtime, monotonic())
+                        if event.type is EventType.FINAL:
+                            answer = str(event.payload.get("answer", ""))
                         await self._emit(
                             current,
                             event.type.value,
                             dict(event.payload),
                         )
-                    current = self.store.run(current.run_id)
-                    final_events = self.store.read_events(current.run_id)
-                    answer = next(
-                        (
-                            str(item.payload.get("answer", ""))
-                            for item in reversed(final_events)
-                            if item.type == EventType.FINAL.value
-                        ),
-                        "",
-                    )
-                    current = self.store.update_run(
-                        current.run_id,
-                        status="completed",
-                        answer=answer,
-                        finished_at=now_iso(),
-                    )
+                    if self.state_controller is not None:
+                        await self._finish_run(current.run_id, ExecutionOutcome.SUCCESS, answer or "任务完成")
+                        current = self.store.run(current.run_id)
+                    else:
+                        current = self.store.update_run(
+                            current.run_id,
+                            status="completed",
+                            answer=answer,
+                            finished_at=now_iso(),
+                        )
                     await self._emit(current, "run_completed", {"answer": answer})
                 finally:
                     self.approvals.reset_run(token)
         except asyncio.CancelledError:
-            current = self.store.update_run(
-                original.run_id,
-                status="cancelled",
-                finished_at=now_iso(),
-            )
+            if self.state_controller is not None:
+                state = self.state_controller.state(original.run_id)
+                if state.task_state is not TaskState.RECOVERY_REQUIRED:
+                    await self._finish_run(original.run_id, ExecutionOutcome.CANCELLED, "当前运行已取消")
+                current = self.store.run(original.run_id)
+            else:
+                current = self.store.update_run(
+                    original.run_id,
+                    status="cancelled",
+                    finished_at=now_iso(),
+                )
             await self._emit(current, "run_cancelled", {"message": "当前运行已取消"})
         except Exception as exc:
-            current = self.store.update_run(
-                original.run_id,
-                status="failed",
-                error=str(exc) or type(exc).__name__,
-                finished_at=now_iso(),
-            )
+            message = str(exc) or type(exc).__name__
+            if self.state_controller is not None:
+                state = self.state_controller.state(original.run_id)
+                if state.task_state is not TaskState.RECOVERY_REQUIRED:
+                    await self._finish_run(original.run_id, ExecutionOutcome.ERROR, message)
+                current = self.store.run(original.run_id)
+            else:
+                current = self.store.update_run(
+                    original.run_id,
+                    status="failed",
+                    error=message,
+                    finished_at=now_iso(),
+                )
             await self._emit(current, "run_failed", {"message": current.error or "运行失败"})
         finally:
+            if operation_token is not None and self.tool_operations is not None:
+                self.tool_operations.reset(operation_token)
             current = self.store.run(original.run_id)
             if current.status in {"completed", "failed", "cancelled", "interrupted"}:
-                item = self.store.create_inbox(current)
-                await self._emit(current, "inbox_created", item.model_dump(mode="json"))
+                if self.state_controller is None:
+                    item = self.store.create_inbox(current)
+                else:
+                    item = next(
+                        (entry for entry in self.store.list_inbox() if entry.run_id == current.run_id),
+                        None,
+                    )
+                if item is not None:
+                    if self.state_controller is None:
+                        await self._emit(current, "inbox_created", item.model_dump(mode="json"))
+                    else:
+                        state = self.state_controller.state(current.run_id)
+                        self.state_controller.apply(RecordRuntimeEventCommand(
+                            command_id=f"finalize:{current.run_id}:inbox-announcement",
+                            run_id=current.run_id,
+                            expected_revision=state.revision,
+                            gateway_epoch=self.state_controller.gateway_epoch,
+                            event_type="inbox_created",
+                            payload=item.model_dump(mode="json"),
+                        ))
+                        if self.outbox:
+                            self.outbox.wake()
+                            await self.outbox.drain_once()
             if runtime is not None and session_key is not None:
                 entry = self._runtimes.get(session_key)
                 if entry is not None:
@@ -219,6 +322,94 @@ class RuntimePool:
                         self._pending_profile_refresh.discard(session_key)
             self._tasks.pop(original.run_id, None)
 
+    async def _transition(
+        self,
+        run_id: str,
+        *,
+        task_state: TaskState | None = None,
+        execution_state: ExecutionState | None = None,
+        outcome: ExecutionOutcome | None = None,
+        finish_reason: str | None = None,
+        terminal_target: TerminalTarget | None = None,
+        reason: str,
+        error: str | None = None,
+        result_summary: str | None = None,
+    ):
+        assert self.state_controller is not None
+        state = self.state_controller.state(run_id)
+        result = self.state_controller.apply(TransitionCommand(
+            command_id=uuid4().hex,
+            run_id=run_id,
+            expected_revision=state.revision,
+            gateway_epoch=self.state_controller.gateway_epoch,
+            task_state=task_state,
+            execution_state=execution_state,
+            outcome=outcome,
+            finish_reason=finish_reason,
+            terminal_target=terminal_target,
+            reason=reason,
+            error=error,
+            result_summary=result_summary,
+        ))
+        if self.outbox:
+            self.outbox.wake()
+        return result.state
+
+    async def _finish_run(self, run_id: str, outcome: ExecutionOutcome, reason: str) -> None:
+        assert self.state_controller is not None
+        state = self.state_controller.state(run_id)
+        if state.task_state in {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.INTERRUPTED}:
+            return
+        if state.execution is not None and state.execution.state is not ExecutionState.FINISHED:
+            state = await self._transition(
+                run_id,
+                execution_state=ExecutionState.FINISHED,
+                outcome=outcome,
+                finish_reason=reason,
+                reason="Agent 内层执行结束",
+            )
+        if outcome is ExecutionOutcome.CANCELLED and state.task_state is not TaskState.CANCELLING:
+            state = await self._transition(run_id, task_state=TaskState.CANCELLING, reason="执行取消收尾")
+        target = {
+            ExecutionOutcome.SUCCESS: TerminalTarget.SUCCEEDED,
+            ExecutionOutcome.ERROR: TerminalTarget.FAILED,
+            ExecutionOutcome.EXHAUSTED: TerminalTarget.FAILED,
+            ExecutionOutcome.CANCELLED: TerminalTarget.CANCELLED,
+        }[outcome]
+        state = await self._transition(
+            run_id,
+            task_state=TaskState.FINALIZING,
+            terminal_target=target,
+            reason="进入幂等 FINALIZING",
+            error=reason if outcome in {ExecutionOutcome.ERROR, ExecutionOutcome.EXHAUSTED} else None,
+            result_summary=reason if outcome is ExecutionOutcome.SUCCESS else None,
+        )
+        run = self.store.run(run_id)
+        operation_id = hashlib.sha256(f"{run_id}:finalize:inbox".encode("utf-8")).hexdigest()
+        state = self.state_controller.state(run_id)
+        self.state_controller.apply(FinalizeInboxCommand(
+            command_id=f"finalize:{run_id}:inbox",
+            run_id=run_id,
+            expected_revision=state.revision,
+            gateway_epoch=self.state_controller.gateway_epoch,
+            operation_id=operation_id,
+            title=run.task[:120],
+            summary=reason,
+            status={
+                ExecutionOutcome.SUCCESS: "completed",
+                ExecutionOutcome.ERROR: "failed",
+                ExecutionOutcome.EXHAUSTED: "failed",
+                ExecutionOutcome.CANCELLED: "cancelled",
+            }[outcome],
+        ))
+        if self.outbox:
+            self.outbox.wake()
+        await self._transition(
+            run_id,
+            task_state=TaskState(target.value),
+            reason="FINALIZING 完成",
+        )
+
     async def _runtime_for(self, run: RunRecord, workspace: Path) -> AgentRuntime:
         if run.session_id:
             entry = self._runtimes.get((run.project_id, run.session_id))
@@ -226,8 +417,19 @@ class RuntimePool:
                 entry.last_used = monotonic()
                 return entry.runtime
         if self.runtime_factory is not None:
-            return self.runtime_factory(workspace, self.approvals)
-        return self._default_runtime(workspace, self.approvals, run)
+            runtime = self.runtime_factory(workspace, self.approvals)
+        else:
+            runtime = self._default_runtime(workspace, self.approvals, run)
+        if (
+            self.tool_operations is not None
+            and hasattr(runtime, "tool_context")
+            and hasattr(runtime, "hooks")
+        ):
+            runtime.tool_context = runtime.tool_context.model_copy(
+                update={"operation_coordinator": self.tool_operations},
+            )
+            DurableModelHooks(self.state_controller, getattr(runtime, "memory", None)).register(runtime.hooks)
+        return runtime
 
     def _default_runtime(
         self,
@@ -252,6 +454,21 @@ class RuntimePool:
         )
 
     async def _emit(self, run: RunRecord, event_type: str, payload: dict) -> None:
+        if self.state_controller is not None:
+            state = self.state_controller.state(run.run_id)
+            self.state_controller.apply(RecordRuntimeEventCommand(
+                command_id=uuid4().hex,
+                run_id=run.run_id,
+                expected_revision=state.revision,
+                gateway_epoch=self.state_controller.gateway_epoch,
+                event_type=event_type,
+                payload=payload,
+                mark_progress=event_type in {"text", "model_reconnected", "tool_completed"},
+            ))
+            if self.outbox is not None:
+                self.outbox.wake()
+                await self.outbox.drain_once()
+            return
         envelope = self.store.append_event(
             run.run_id,
             run.project_id,

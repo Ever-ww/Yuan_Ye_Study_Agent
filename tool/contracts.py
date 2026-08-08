@@ -19,8 +19,12 @@ class AsyncTool(Protocol):
     description: str
     schema: dict[str, Any]
     risk: ToolRisk
+    # 可选声明；未声明时 Registry 根据风险采用保守等级。
+    idempotency: str
 
     async def run(self, arguments: dict[str, Any], context: "ToolContext") -> str: ...
+
+    async def reconcile(self, operation: Any, context: "ToolContext") -> Any: ...
 
 
 class ToolContext(BaseModel):
@@ -36,3 +40,5 @@ class ToolContext(BaseModel):
     file_locks: Any | None = None
     # 当前 Trace/Session 标识只用于审计来源，不参与权限判断。
     session_id: str | None = None
+    # Durable Runtime 注入的两阶段副作用协调器；普通/维护 Runtime 可为空。
+    operation_coordinator: Any | None = None

@@ -95,12 +95,12 @@ class DreamService:
         self._output_tokens = 0
         self._ensure()
 
-    async def process_day(self, selected_date: date) -> DreamRunResult:
+    async def process_day(self, selected_date: date, *, run_id: str | None = None) -> DreamRunResult:
         async with self._lock:
             async with self.file_locks.write(self.state_path):
                 self._running = True
                 try:
-                    return await self._process_day(selected_date)
+                    return await self._process_day(selected_date, run_id=run_id)
                 finally:
                     self._running = False
 
@@ -153,10 +153,10 @@ class DreamService:
             next_run_at=next_run_at,
         )
 
-    async def _process_day(self, selected_date: date) -> DreamRunResult:
+    async def _process_day(self, selected_date: date, *, run_id: str | None = None) -> DreamRunResult:
         self._input_tokens = 0
         self._output_tokens = 0
-        run_id = uuid4().hex
+        run_id = run_id or uuid4().hex
         created_at = _now()
         archive = self.archive.iter_day(
             selected_date,

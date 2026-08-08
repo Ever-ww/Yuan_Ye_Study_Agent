@@ -118,6 +118,7 @@ def create_gateway_api(
             "status": "ok",
             "service": "yuan-ye-agent-gateway",
             "version": 1,
+            **gateway.state_controller.health(),
         }
 
     @app.get("/api/v1/status", dependencies=[Depends(authorize)])
@@ -264,7 +265,7 @@ def create_gateway_api(
 
     @app.get("/api/v1/runs/{run_id}/events", dependencies=[Depends(authorize)])
     async def run_events(run_id: str, after_sequence: int = 0):
-        return gateway.store.read_events(run_id, after_sequence)
+        return gateway.run_events(run_id, after_sequence)
 
     @app.post("/api/v1/approvals/{approval_id}", dependencies=[Depends(authorize_write)])
     async def approval(approval_id: str, decision: ApprovalDecision):
@@ -344,7 +345,7 @@ def create_gateway_api(
         try:
             last_sent = after_sequence
             if run_id:
-                for event in gateway.store.read_events(run_id, after_sequence):
+                for event in gateway.run_events(run_id, after_sequence):
                     await socket.send_text(event.model_dump_json())
                     last_sent = max(last_sent, event.sequence)
             while True:

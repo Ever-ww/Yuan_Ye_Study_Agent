@@ -21,6 +21,10 @@ class SessionRecord(BaseModel):
     name: str | None = None
     reasoning: str | None = None
     origin: Literal["interactive", "cron", "maintenance"] | None = None
+    record_id: str | None = Field(default=None, min_length=1)
+    run_id: str | None = Field(default=None, min_length=1)
+    turn_id: str | None = Field(default=None, min_length=1)
+    operation_id: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def _validate_role_payload(self) -> "SessionRecord":

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from typing import Annotated, Any, Iterable, Literal
+import inspect
+from typing import Annotated, Any, Awaitable, Callable, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
@@ -121,10 +122,37 @@ class AsyncToolRegistry:
         approval_required = getattr(tool, "approval_required", None)
         if needs_approval and callable(approval_required):
             needs_approval = bool(approval_required(arguments, context))
-        if needs_approval:
-            if context.approval is None or not await context.approval(name, arguments):
-                raise PermissionError(f"工具调用未获批准：{name}")
-        return await tool.run(arguments, context)
+        coordinator = context.operation_coordinator
+        operation = None
+        if coordinator is not None:
+            operation = await coordinator.prepare(
+                tool=tool,
+                name=name,
+                arguments=arguments,
+                risk=self._resolved_risk(tool, arguments),
+            )
+        try:
+            if needs_approval:
+                if coordinator is not None:
+                    await coordinator.waiting_human(operation)
+                approved = bool(
+                    context.approval is not None
+                    and await context.approval(name, arguments)
+                )
+                if coordinator is not None:
+                    await coordinator.approval_decided(operation, approved=approved)
+                if not approved:
+                    raise PermissionError(f"工具调用未获批准：{name}")
+            if coordinator is None:
+                return await tool.run(arguments, context)
+            return await coordinator.execute(
+                operation,
+                lambda: tool.run(arguments, context),
+            )
+        except BaseException as exc:
+            if coordinator is not None:
+                await coordinator.preexecution_failed_if_safe(operation, exc)
+            raise
 
     def prepare_arguments(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """在 Schema 校验前执行工具声明的兼容性规范化。"""
@@ -138,6 +166,27 @@ class AsyncToolRegistry:
         if not isinstance(prepared, dict):
             raise ValueError(f"工具 {name} 的 prepare_arguments 必须返回对象")
         return prepared
+
+    async def reconcile(self, name: str, operation: Any, context: ToolContext):
+        """查询一次未知外部副作用的真实结果，并保留证据和结果来源。"""
+        tool = self._tools.get(name)
+        if tool is None:
+            raise ValueError(f"未知工具：{name}")
+        callback = getattr(tool, "reconcile", None)
+        if not callable(callback):
+            from Agent.state import ReconcileResult, ReconcileStatus
+            from datetime import datetime
+            return ReconcileResult(
+                status=ReconcileStatus.UNKNOWN,
+                evidence="工具未实现 reconcile()",
+                result_source="not_supported",
+                checked_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+            )
+        raw = callback(operation, context)
+        if inspect.isawaitable(raw):
+            raw = await raw
+        from Agent.state import ReconcileResult
+        return raw if isinstance(raw, ReconcileResult) else ReconcileResult.model_validate(raw)
 
     def _validate(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """用工具 Schema 对应的 Pydantic 模型严格校验实际执行参数。"""

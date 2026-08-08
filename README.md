@@ -359,7 +359,12 @@ uv run python run.py gateway logs --lines 100
 uv run python run.py gateway stop
 ```
 
-Gateway 停止时先拒绝新任务，并给正在运行的任务一个短暂收尾窗口，随后取消剩余任务并关闭 Runtime 与 Docker。异常重启后，数据库中未完成的任务会标记为 `interrupted`；已经写入的 Session JSONL 和工具结果仍然保留。
+Gateway 停止时先拒绝新任务，并给正在运行的任务一个短暂收尾窗口，随后通过
+`CANCELLING → FINALIZING → CANCELLED` 关闭 Runtime 与 Docker。异常重启不会把全部未完成
+任务粗暴改成 `interrupted`：可证明安全的任务从持久化 State 与 SafeCheckpoint 恢复，等待审批
+的任务继续等待到 `expires_at`，外部副作用不确定时进入非终态 `RECOVERY_REQUIRED`。
+只有数据库损坏、Checkpoint 丢失或版本不兼容等无法建立可信恢复路径的情况才进入永久终态
+`INTERRUPTED`。
 
 Windows 下 CLI 首次发现 Gateway 未运行时，会使用 `CREATE_NO_WINDOW` 在后台启动服务，不会另外打开空白 Windows Terminal；后台 stdout/stderr 统一写入 `gateway.log`。
 
@@ -369,7 +374,31 @@ CLI、Web 和桌面端同时启动时会先竞争独立的 `startup.lock`，只�
 后只终止锁中明确记录的 Gateway PID。Windows 后台进程强制使用 UTF-8 日志，并过滤
 h11 在连接已经关闭后重复发送 400 所产生的特定无害回调栈。
 
-Gateway 状态位于 Agent Home 的 `.yy/gateway/`：SQLite 保存项目、运行、审批和 Inbox 元数据；`runs/<run-id>.jsonl` 保存带单调序号的可重放 UI 事件；`gateway.log` 最多保留当前文件与 5 份轮转日志。Session 对话正文仍只由 Memory 写一份，不会复制到 Gateway 事件文件。
+Gateway 状态位于 Agent Home 的 `.yy/gateway/`。SQLite 中的 `agent_states` 是当前 Runtime
+State 的唯一权威来源；`state_transitions` 只保存真实 FSM 迁移，`operation_ledger` 保存模型、
+工具、审批与收尾操作，`gateway_events + event_outbox` 负责可靠事件投递。EventBus 与
+`runs/<run-id>.jsonl` 两个 Sink 分别确认，全部成功后 Outbox 才标记 delivered；JSONL 使用稳定
+`event_id` 与文件级索引防重复。`gateway.log` 最多保留当前文件与 5 份轮转日志。Session 对话
+正文仍只由 Memory 写一份，不会复制到 Gateway 事件文件。
+
+### Durable Runtime FSM
+
+每个 Run 使用不可变 `AgentState`。外层 FSM 管理
+`CREATED/QUEUED/STARTING/RUNNING/RECOVERING/RECOVERY_REQUIRED/CANCELLING/FINALIZING`
+及四个终态；内层 FSM 管理 `THINKING/WAITING_HUMAN/ACTING/OBSERVING/FINISHED`。
+`FINISHED` 只表示 Agent Loop 已结束，结果由 `SUCCESS/ERROR/CANCELLED/EXHAUSTED` 单独表达；
+所有正常终止都必须经过可重入的 `FINALIZING`。
+
+所有状态修改统一进入 `StateController.apply(command)`，同时执行 command 幂等、revision CAS、
+Gateway epoch fencing、FSM guard、SQLite 事务、兼容 Run 投影、Gateway Event 和 Outbox。
+Scheduler 统一调用 `is_runnable(state, operation)`；`WAITING_HUMAN`、`RECOVERY_REQUIRED` 和未知
+副作用不会继续消耗模型 Token。
+
+外部工具固定执行 `prepared → running → completed/failed` 两阶段持久化边界。若进程在真实
+副作用完成后、Ledger 提交前退出，Operation 保持 `running/unknown`，系统先调用工具可选的
+`reconcile()`；无法确认时绝不自动猜测或重放非幂等操作。Session JSONL 每条记录包含稳定
+`record_id`，Gateway Run 下还会记录 `run_id/turn_id/operation_id`；恢复补写使用
+`append_once()`。SafeCheckpoint 只会在 Ledger 结果与必需 Session 记录都已确定后建立。
 
 ### 1. 创建新会话
 

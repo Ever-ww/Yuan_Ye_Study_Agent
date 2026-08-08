@@ -22,7 +22,7 @@ class MemoryStore:
         agent_root: Path | None = None,
         partition_by_workspace: bool = True,
         profiles: ProfileStore | None = None,
-    ) -> None:
+    ) -> str:
         self.root = root.resolve()
         self.agent_root = (agent_root or _infer_agent_root(self.root)).resolve()
         self.workspace_root = (workspace_root or self.agent_root).resolve()
@@ -53,11 +53,13 @@ class MemoryStore:
         content: str,
         *,
         origin: Literal["interactive", "cron", "maintenance"] = "interactive",
+        audit: dict[str, object] | None = None,
     ) -> None:
         """记录一条用户输入。"""
         cache = self._ensure_cache(session_id)
-        self.sessions.append(session_id, "user", content, {"origin": origin})
+        record_id = self.sessions.append(session_id, "user", content, {"origin": origin, **(audit or {})})
         cache.append({"role": "user", "content": content})
+        return record_id
 
     def record_assistant(
         self,
@@ -68,7 +70,8 @@ class MemoryStore:
         model_calls: list[dict[str, object]] | None = None,
         task_latency_ms: float | None = None,
         reasoning: str | None = None,
-    ) -> None:
+        audit: dict[str, object] | None = None,
+    ) -> str:
         """记录最终助手回复，以及本次用户任务的模型、时延和 Token 指标。"""
         metadata: dict[str, object] = {}
         if model is not None:
@@ -79,9 +82,11 @@ class MemoryStore:
             metadata["task_latency_ms"] = task_latency_ms
         if reasoning:
             metadata["reasoning"] = reasoning
+        metadata.update(audit or {})
         cache = self._ensure_cache(session_id)
-        self.sessions.append(session_id, "assistant", content, metadata)
+        record_id = self.sessions.append(session_id, "assistant", content, metadata)
         cache.append({"role": "assistant", "content": content})
+        return record_id
 
     def record_model_tool_calls(
         self,
@@ -92,7 +97,8 @@ class MemoryStore:
         model: dict[str, object],
         model_call: dict[str, object],
         reasoning: str | None = None,
-    ) -> None:
+        audit: dict[str, object] | None = None,
+    ) -> str:
         """记录模型原始返回的标准 assistant.tool_calls 消息。"""
         metadata: dict[str, object] = {
             "tool_calls": tool_calls,
@@ -101,9 +107,11 @@ class MemoryStore:
         }
         if reasoning:
             metadata["reasoning"] = reasoning
+        metadata.update(audit or {})
         cache = self._ensure_cache(session_id)
-        self.sessions.append(session_id, "assistant", content, metadata)
+        record_id = self.sessions.append(session_id, "assistant", content, metadata)
         cache.append({"role": "assistant", "content": content, "tool_calls": tool_calls})
+        return record_id
 
     def record_tool_result(
         self,
@@ -114,18 +122,21 @@ class MemoryStore:
         content: str,
         status: str,
         arguments: dict[str, Any],
-    ) -> None:
+        audit: dict[str, object] | None = None,
+    ) -> str:
         """记录工具成功结果或错误反馈。"""
         cache = self._ensure_cache(session_id)
-        self.sessions.append(session_id, "tool", content, {
+        record_id = self.sessions.append(session_id, "tool", content, {
             "tool_call_id": tool_call_id,
             "name": name,
             "status": status,
             "arguments": arguments,
+            **(audit or {}),
         })
         cache.append({
             "role": "tool", "tool_call_id": tool_call_id, "name": name, "content": content,
         })
+        return record_id
 
     def record_cancellation(self, session_id: str) -> bool:
         """补齐未完成工具链并记录用户取消，保证后续消息角色合法。"""

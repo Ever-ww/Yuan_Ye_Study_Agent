@@ -64,7 +64,12 @@ def register_memory_callbacks(
         if first_model_call:
             messages[:] = rebuild_messages()
             event.data["persist_current_user_operation"] = (
-                lambda: memory.record_user(event.session_id, task, origin=session_origin)
+                lambda: memory.record_user(
+                    event.session_id,
+                    task,
+                    origin=session_origin,
+                    audit=_audit(event),
+                )
             )
         event.data["reload_messages_after_compression"] = lambda: rebuild_messages(refresh_system=True)
 
@@ -84,13 +89,14 @@ def register_memory_callbacks(
         answer = str(event.data.get("answer", ""))
         if not answer:
             return
-        memory.record_assistant(
+        event.data["session_record_id"] = memory.record_assistant(
             event.session_id,
             answer,
             model=dict(event.data.get("model", {})),
             model_calls=list(event.data.get("model_calls", [])),
             task_latency_ms=float(event.data.get("task_latency_ms", 0.0)),
             reasoning=str(event.data["reasoning"]) if isinstance(event.data.get("reasoning"), str) else None,
+            audit=_audit(event),
         )
 
     async def persist_model_tool_calls(event: HookEvent) -> None:
@@ -110,13 +116,14 @@ def register_memory_callbacks(
             "type": "function",
             "function": {"name": call.name, "arguments": json.dumps(call.arguments, ensure_ascii=False)},
         } for call in reply.tool_calls]
-        memory.record_model_tool_calls(
+        event.data["session_record_id"] = memory.record_model_tool_calls(
             event.session_id,
             content=reply.text or None,
             tool_calls=calls,
             model=dict(event.data.get("model", {})),
             model_call=dict(event.data.get("model_call", {})),
             reasoning=reply.reasoning,
+            audit=_audit(event),
         )
 
     async def persist_tool_result(event: HookEvent) -> None:
@@ -130,13 +137,14 @@ def register_memory_callbacks(
             else str(result) if error is None
             else f"工具执行失败：{str(error) or type(error).__name__}"
         )
-        memory.record_tool_result(
+        event.data["session_record_id"] = memory.record_tool_result(
             event.session_id,
             tool_call_id=str(event.data.get("tool_call_id", "")),
             name=str(event.data.get("name", "")),
             content=content,
             status="cancelled" if cancelled else "success" if error is None else "error",
             arguments=dict(event.data.get("arguments", {})),
+            audit=_audit(event),
         )
 
     async def prepare_history(event: HookEvent) -> None:
@@ -158,3 +166,14 @@ def register_memory_callbacks(
     registry.register(HookPoint.TOOL_AFTER, persist_tool_result, priority=100)
     registry.register(HookPoint.TURN_END, persist_answer, priority=100)
     registry.register(HookPoint.TRACE_END, clear_context_state, priority=100)
+
+
+def _audit(event: HookEvent) -> dict[str, object]:
+    value = event.data.get("durable_audit")
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: selected
+        for key in ("run_id", "turn_id", "operation_id")
+        if isinstance((selected := value.get(key)), str) and selected
+    }

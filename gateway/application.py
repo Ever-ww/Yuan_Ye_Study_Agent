@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import secrets
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
+from uuid import uuid4
 
 from Agent import ExtensionLoader, RuntimeConfig
+from Agent.state import (
+    FinalizeInboxCommand,
+    RecordRuntimeEventCommand,
+    TaskState,
+    TerminalTarget,
+    TransitionCommand,
+    WorkloadKind,
+    is_runnable,
+)
 from cron import (
     CronJob,
     CronJobCreateRequest,
@@ -21,6 +33,9 @@ from cron import (
 )
 from gateway.code_sessions import CodeSessionManager
 from gateway.events import GatewayEventBus
+from gateway.outbox import OutboxDispatcher
+from gateway.recovery import RecoveryCoordinator
+from gateway.state_controller import StateController
 from gateway.models import (
     ApprovalDecision,
     CodeSessionCreateRequest,
@@ -56,6 +71,17 @@ class GatewayApplication:
         self.config = config
         self.store = store or GatewayStore(config.agent_root / ".yy" / "gateway")
         self.events = GatewayEventBus()
+        self.gateway_epoch = uuid4().hex
+        self.state_controller = StateController(
+            self.store.database_path,
+            gateway_epoch=self.gateway_epoch,
+            migration_backup_path=self.store.migration_backup_path,
+        )
+        self.outbox = OutboxDispatcher(
+            self.store.database_path,
+            self.store.runs_directory,
+            self.events.publish,
+        )
         source_root = config.coding_source_root or Path(__file__).resolve().parents[1]
         self.extensions = ExtensionLoader(source_root).scan()
         self.cron_store = CronStore(
@@ -86,7 +112,10 @@ class GatewayApplication:
             extensions=self.extensions,
             cron_service=self.cron_service,
             reference_service=self.reference_service,
+            state_controller=self.state_controller,
+            outbox=self.outbox,
         )
+        self.recovery = RecoveryCoordinator(self.state_controller, self.store, self.pool.submit)
         self.cron_scheduler = CronScheduler(
             self.cron_store,
             self._submit_cron_run,
@@ -102,17 +131,21 @@ class GatewayApplication:
             self.pool.is_idle,
             self._record_dream_result,
             heartbeat_seconds=config.cron_heartbeat_seconds,
+            run_day=lambda selected: self._execute_dream_day(selected, automatic=True),
         )
         self._browser_codes: dict[str, float] = {}
         self.code_sessions = CodeSessionManager(config)
 
     async def start(self) -> None:
+        await self.outbox.start()
         await self.reference_embedding_worker.start()
         try:
             await self.pool.start()
+            await self.recovery.recover()
             await self.cron_scheduler.start()
             await self.dream_scheduler.start()
         except Exception:
+            await self.outbox.close()
             await self.reference_embedding_worker.close()
             raise
 
@@ -124,19 +157,94 @@ class GatewayApplication:
             await self.pool.close()
         finally:
             await self.reference_embedding_worker.close()
+            await self.outbox.close()
 
     async def start_code_session(self, request: CodeSessionCreateRequest):
         self.store.project(request.project_id)
-        return await self.code_sessions.start(request.project_id, request.client_id)
+        return await self._run_code_workload(
+            WorkloadKind.CODE_SESSION_START,
+            request.project_id,
+            request.client_id,
+            "启动 Coding Session",
+            lambda: self.code_sessions.start(request.project_id, request.client_id),
+        )
 
     async def run_code_turn(self, session_id: str, request: CodeTurnRequest):
-        return await self.code_sessions.run_turn(session_id, request.client_id, request.task)
+        project_id = self._code_project(session_id)
+        return await self._run_code_workload(
+            WorkloadKind.CODE_TURN,
+            project_id,
+            request.client_id,
+            request.task,
+            lambda: self.code_sessions.run_turn(session_id, request.client_id, request.task),
+        )
 
     async def finalize_code_session(self, session_id: str, client_id: str):
-        return await self.code_sessions.finalize(session_id, client_id)
+        project_id = self._code_project(session_id)
+        return await self._run_code_workload(
+            WorkloadKind.CODE_FINALIZE,
+            project_id,
+            client_id,
+            "合并并结束 Coding Session",
+            lambda: self.code_sessions.finalize(session_id, client_id),
+        )
 
     async def abort_code_session(self, session_id: str, client_id: str):
-        return await self.code_sessions.abort(session_id, client_id)
+        project_id = self._code_project(session_id)
+        return await self._run_code_workload(
+            WorkloadKind.CODE_ABORT,
+            project_id,
+            client_id,
+            "放弃 Coding Session",
+            lambda: self.code_sessions.abort(session_id, client_id),
+        )
+
+    async def _run_code_workload(self, kind, project_id, client_id, task, operation):
+        state = self._begin_workload_run(
+            run_id=uuid4().hex,
+            workload=kind,
+            project_id=project_id,
+            client_id=client_id,
+            task=task,
+        )
+        if not is_runnable(state, None, now=datetime.now().astimezone()):
+            raise RuntimeError(f"Code workload 不可调度：{state.task_state.value}")
+        try:
+            result = await operation()
+        except Exception as exc:
+            self._finish_workload(state.run_id, TerminalTarget.FAILED, str(exc) or type(exc).__name__)
+            raise
+        self._finish_workload(state.run_id, TerminalTarget.SUCCEEDED, "Coding workload 完成")
+        return result
+
+    def _finish_workload(self, run_id: str, target: TerminalTarget, summary: str) -> None:
+        state = self.state_controller.state(run_id)
+        state = self.state_controller.apply(TransitionCommand(
+            command_id=uuid4().hex,
+            run_id=run_id,
+            expected_revision=state.revision,
+            gateway_epoch=self.gateway_epoch,
+            task_state=TaskState.FINALIZING,
+            terminal_target=target,
+            reason="非 Agent workload 进入 FINALIZING",
+            error=summary if target is TerminalTarget.FAILED else None,
+            result_summary=summary if target is TerminalTarget.SUCCEEDED else None,
+        )).state
+        self.state_controller.apply(TransitionCommand(
+            command_id=uuid4().hex,
+            run_id=run_id,
+            expected_revision=state.revision,
+            gateway_epoch=self.gateway_epoch,
+            task_state=TaskState(target.value),
+            reason="非 Agent workload FINALIZING 完成",
+        ))
+        self.outbox.wake()
+
+    def _code_project(self, session_id: str) -> str:
+        owner = getattr(self.code_sessions, "owner", None)
+        if callable(owner):
+            return str(owner(session_id)[0])
+        return "code"
 
     def code_session_events(self, session_id: str, after_sequence: int = 0):
         return self.code_sessions.events(session_id, after_sequence)
@@ -192,17 +300,75 @@ class GatewayApplication:
         if not self.pool.is_idle():
             raise RuntimeError("普通 Agent 任务仍在运行，Dream 将在任务结束后执行")
         target = date.fromisoformat(selected) if selected else datetime.now().astimezone().date() - timedelta(days=1)
-        result = await self.dream_service.process_day(target)
+        result = await self._execute_dream_day(target, automatic=False)
         await self._record_dream_result(result, False)
         return result
 
     async def backfill_dream(self, start: str, end: str):
         if not self.pool.is_idle():
             raise RuntimeError("普通 Agent 任务仍在运行，不能开始 Dream backfill")
-        results = await self.dream_service.backfill(date.fromisoformat(start), date.fromisoformat(end))
+        first, last = date.fromisoformat(start), date.fromisoformat(end)
+        if last < first or (last - first).days >= 31:
+            raise ValueError("Dream backfill 日期无效或超过 31 天")
+        collected = []
+        current = first
+        while current <= last:
+            collected.append(await self._execute_dream_day(current, automatic=False))
+            current = date.fromordinal(current.toordinal() + 1)
+        results = tuple(collected)
         for result in results:
             await self._record_dream_result(result, False)
         return results
+
+    async def _execute_dream_day(self, selected: date, *, automatic: bool) -> DreamRunResult:
+        run_id = uuid4().hex
+        state = self._begin_workload_run(
+            run_id=run_id,
+            workload=WorkloadKind.DREAM,
+            project_id="dream",
+            client_id="dream:scheduler" if automatic else "dream:manual",
+            task=f"Dream {selected.isoformat()}",
+        )
+        if not is_runnable(state, None, now=datetime.now().astimezone()):
+            raise RuntimeError(f"Dream workload 不可调度：{state.task_state.value}")
+        return await self.dream_service.process_day(selected, run_id=run_id)
+
+    def _begin_workload_run(
+        self,
+        *,
+        run_id: str,
+        workload: WorkloadKind,
+        project_id: str,
+        client_id: str,
+        task: str,
+    ):
+        request_hash = hashlib.sha256(task.encode("utf-8")).hexdigest()
+        state, duplicate = self.state_controller.create_run(
+            run_id=run_id,
+            workload_kind=workload,
+            project_id=project_id,
+            client_id=client_id,
+            task=task,
+            idempotency_key=f"{workload.value}:{run_id}",
+            request_hash=request_hash,
+        )
+        if duplicate:
+            return state
+        for target, reason in (
+            (TaskState.QUEUED, "维护任务进入队列"),
+            (TaskState.STARTING, "维护任务开始初始化"),
+            (TaskState.RUNNING, "维护任务开始执行"),
+        ):
+            state = self.state_controller.apply(TransitionCommand(
+                command_id=uuid4().hex,
+                run_id=state.run_id,
+                expected_revision=state.revision,
+                gateway_epoch=self.gateway_epoch,
+                task_state=target,
+                reason=reason,
+            )).state
+        self.outbox.wake()
+        return state
 
     async def rollback_dream(self, run_id: str | None = None):
         if not self.pool.is_idle():
@@ -212,14 +378,16 @@ class GatewayApplication:
             await self.pool.invalidate_profile_context(after_active_turn=True)
             try:
                 run = self.store.run(result.run_id)
-                envelope = self.store.append_event(
-                    run.run_id,
-                    run.project_id,
-                    run.session_id,
-                    "dream_rolled_back",
-                    result.model_dump(mode="json"),
-                )
-                await self.events.publish(envelope)
+                state = self.state_controller.state(run.run_id)
+                self.state_controller.apply(RecordRuntimeEventCommand(
+                    command_id=uuid4().hex,
+                    run_id=run.run_id,
+                    expected_revision=state.revision,
+                    gateway_epoch=self.gateway_epoch,
+                    event_type="dream_rolled_back",
+                    payload=result.model_dump(mode="json"),
+                ))
+                self.outbox.wake()
             except KeyError:
                 pass
         return result
@@ -227,83 +395,163 @@ class GatewayApplication:
     async def _record_dream_result(self, result: DreamRunResult, automatic: bool) -> None:
         """把维护运行转换为可重放 Gateway 事件；仅自动任务进入 Inbox。"""
         try:
-            run = self.store.create_run(
-                "dream",
-                "dream:scheduler" if automatic else "dream:manual",
-                f"Dream {result.date}",
-                None,
+            state = self.state_controller.state(result.run_id)
+        except KeyError:
+            state = self._begin_workload_run(
                 run_id=result.run_id,
+                workload=WorkloadKind.DREAM,
+                project_id="dream",
+                client_id="dream:scheduler" if automatic else "dream:manual",
+                task=f"Dream {result.date}",
             )
-        except Exception:
-            # 同一个结果对象不能重复制造第二份 Gateway 运行。
-            return
-        run = self.store.update_run(run.run_id, status="running", started_at=result.created_at)
-        envelope = self.store.append_event(
-            run.run_id, run.project_id, None, "dream_started", {"date": result.date},
-        )
-        await self.events.publish(envelope)
+        state = self.state_controller.apply(RecordRuntimeEventCommand(
+            command_id=uuid4().hex,
+            run_id=state.run_id,
+            expected_revision=state.revision,
+            gateway_epoch=self.gateway_epoch,
+            event_type="dream_started",
+            payload={"date": result.date},
+            mark_progress=True,
+        )).state
         terminal_type = {
             "completed": "dream_completed",
             "noop": "dream_noop",
             "failed": "dream_failed",
         }[result.status]
-        run_status = "failed" if result.status == "failed" else "completed"
-        run = self.store.update_run(
-            run.run_id,
-            status=run_status,
-            finished_at=datetime.now().astimezone().isoformat(timespec="seconds"),
-            **({"error": result.message} if run_status == "failed" else {"answer": result.message}),
-        )
-        envelope = self.store.append_event(
-            run.run_id, run.project_id, None, terminal_type, result.model_dump(mode="json"),
-        )
-        await self.events.publish(envelope)
+        target = TerminalTarget.FAILED if result.status == "failed" else TerminalTarget.SUCCEEDED
+        state = self.state_controller.apply(TransitionCommand(
+            command_id=uuid4().hex,
+            run_id=state.run_id,
+            expected_revision=state.revision,
+            gateway_epoch=self.gateway_epoch,
+            task_state=TaskState.FINALIZING,
+            terminal_target=target,
+            reason="Dream maintenance 进入 FINALIZING",
+            error=result.message if target is TerminalTarget.FAILED else None,
+            result_summary=result.message if target is TerminalTarget.SUCCEEDED else None,
+        )).state
+        state = self.state_controller.apply(RecordRuntimeEventCommand(
+            command_id=uuid4().hex,
+            run_id=state.run_id,
+            expected_revision=state.revision,
+            gateway_epoch=self.gateway_epoch,
+            event_type=terminal_type,
+            payload=result.model_dump(mode="json"),
+        )).state
+        if automatic and result.status != "noop":
+            operation_id = hashlib.sha256(f"{state.run_id}:finalize:inbox".encode("utf-8")).hexdigest()
+            state = self.state_controller.apply(FinalizeInboxCommand(
+                command_id=f"finalize:{state.run_id}:inbox",
+                run_id=state.run_id,
+                expected_revision=state.revision,
+                gateway_epoch=self.gateway_epoch,
+                operation_id=operation_id,
+                title=f"Dream {result.date}",
+                summary=result.message,
+                status="failed" if result.status == "failed" else "completed",
+            )).state
+        state = self.state_controller.apply(TransitionCommand(
+            command_id=uuid4().hex,
+            run_id=state.run_id,
+            expected_revision=state.revision,
+            gateway_epoch=self.gateway_epoch,
+            task_state=TaskState(target.value),
+            reason="Dream maintenance FINALIZING 完成",
+        )).state
+        self.outbox.wake()
+        run = self.store.run(state.run_id)
         if result.status == "completed":
             await self.pool.invalidate_profile_context(after_active_turn=True)
-        if automatic and result.status != "noop":
-            item = self.store.create_inbox(run)
-            envelope = self.store.append_event(
-                run.run_id, run.project_id, None, "inbox_created", item.model_dump(mode="json"),
-            )
-            await self.events.publish(envelope)
+        self.outbox.wake()
 
     def cron_preview(self, schedule: CronSchedule, count: int = 5):
         return self.cron_service.preview(schedule, count=count)
 
     async def start_run(self, request: RunCreateRequest) -> RunRecord:
         self.store.project(request.project_id)
-        run = self.store.create_run(
-            request.project_id,
-            request.client_id,
-            request.task,
-            request.session_id,
+        request_body = json.dumps(
+            {
+                "project_id": request.project_id,
+                "client_id": request.client_id,
+                "task": request.task,
+                "session_id": request.session_id,
+                "deadline_at": request.deadline_at,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
         )
+        request_hash = hashlib.sha256(request_body.encode("utf-8")).hexdigest()
+        state, duplicate = self.state_controller.create_run(
+            run_id=uuid4().hex,
+            workload_kind=WorkloadKind.CHAT,
+            project_id=request.project_id,
+            client_id=request.client_id,
+            task=request.task,
+            session_id=request.session_id,
+            idempotency_key=request.idempotency_key or uuid4().hex,
+            request_hash=request_hash,
+            deadline_at=request.deadline_at,
+        )
+        run = self.store.run(state.run_id)
+        if duplicate:
+            return run
+        state = self.state_controller.apply(TransitionCommand(
+            command_id=uuid4().hex,
+            run_id=state.run_id,
+            expected_revision=state.revision,
+            gateway_epoch=self.gateway_epoch,
+            task_state=TaskState.QUEUED,
+            reason="Gateway 接收任务",
+        )).state
+        self.outbox.wake()
+        run = self.store.run(state.run_id)
         try:
             await self.pool.submit(run)
         except Exception:
-            self.store.update_run(
-                run.run_id,
-                status="failed",
-                finished_at=_now(),
-                error="任务未能进入运行队列",
-            )
+            # Run 已持久化；由 RecoveryCoordinator 或取消/收尾命令继续处理。
             raise
         return run
 
     async def _submit_cron_run(self, job: CronJob, run_id: str) -> None:
         self.store.project(job.project_id)
-        run = self.store.create_run(
-            job.project_id,
-            f"cron:{job.job_id}",
-            job.prompt,
-            None,
+        request_hash = hashlib.sha256(
+            json.dumps(
+                {"job_id": job.job_id, "project_id": job.project_id, "prompt": job.prompt},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8"),
+        ).hexdigest()
+        state, duplicate = self.state_controller.create_run(
             run_id=run_id,
+            workload_kind=WorkloadKind.CRON,
+            project_id=job.project_id,
+            client_id=f"cron:{job.job_id}",
+            task=job.prompt,
+            idempotency_key=f"cron:{run_id}",
+            request_hash=request_hash,
         )
+        run = self.store.run(state.run_id)
+        if duplicate:
+            return
+        state = self.state_controller.apply(TransitionCommand(
+            command_id=uuid4().hex,
+            run_id=state.run_id,
+            expected_revision=state.revision,
+            gateway_epoch=self.gateway_epoch,
+            task_state=TaskState.QUEUED,
+            reason="Cron Scheduler 提交任务",
+        )).state
+        self.outbox.wake()
+        run = self.store.run(state.run_id)
         await self.pool.submit(run)
 
     async def cancel_run(self, run_id: str) -> bool:
         self.store.run(run_id)
         return await self.pool.cancel(run_id)
+
+    def run_events(self, run_id: str, after_sequence: int = 0):
+        events = self.state_controller.events(run_id, after_sequence)
+        return events if events else self.store.read_events(run_id, after_sequence)
 
     async def decide_approval(self, approval_id: str, decision: ApprovalDecision) -> bool:
         return await self.pool.approvals.decide(

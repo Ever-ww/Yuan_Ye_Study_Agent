@@ -409,7 +409,7 @@ class GatewayTests(unittest.TestCase):
             self.assertFalse(item.read)
             self.assertTrue(store.mark_inbox_read(item.item_id).read)
 
-    def test_restart_marks_unfinished_run_interrupted_and_inboxed(self) -> None:
+    def test_store_restart_does_not_guess_unfinished_run_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             directory = root / ".yy" / "gateway"
@@ -418,9 +418,9 @@ class GatewayTests(unittest.TestCase):
             run = store.create_run(project.project_id, "client", "未完成任务", None)
             store.append_event(run.run_id, project.project_id, None, "run_queued", {})
             restarted = GatewayStore(directory)
-            self.assertEqual(restarted.run(run.run_id).status, "interrupted")
-            self.assertEqual(restarted.read_events(run.run_id)[-1].type, "run_interrupted")
-            self.assertEqual(restarted.list_inbox()[0].run_id, run.run_id)
+            self.assertEqual(restarted.run(run.run_id).status, "queued")
+            self.assertEqual(restarted.read_events(run.run_id)[-1].type, "run_queued")
+            self.assertEqual(restarted.list_inbox(), [])
 
     def test_api_runs_through_gateway_and_replays_events(self) -> None:
         with tempfile.TemporaryDirectory() as value:

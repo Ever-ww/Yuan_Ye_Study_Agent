@@ -134,6 +134,12 @@ class CodeSessionManager:
                 records.append(value)
         return records
 
+    def owner(self, session_id: str) -> tuple[str, str]:
+        owner = self._owners.get(session_id)
+        if owner is None:
+            raise KeyError(f"未知 Coding Session：{session_id}")
+        return owner
+
     def _owned(self, session_id: str, client_id: str):
         controller = self._sessions.get(session_id)
         owner = self._owners.get(session_id)

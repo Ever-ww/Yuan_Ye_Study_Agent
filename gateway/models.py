@@ -56,6 +56,14 @@ class RunRecord(BaseModel):
     finished_at: str | None = None
     answer: str | None = None
     error: str | None = None
+    task_state: str | None = None
+    execution_state: str | None = None
+    execution_outcome: str | None = None
+    finish_reason: str | None = None
+    state_revision: int = Field(default=0, ge=0)
+    workload_kind: str = "chat"
+    recovery_required: bool = False
+    terminal_target: str | None = None
 
 
 class InboxItem(BaseModel):
@@ -112,6 +120,8 @@ class RunCreateRequest(BaseModel):
     client_id: str = Field(min_length=1)
     task: str = Field(min_length=1)
     session_id: str | None = None
+    idempotency_key: str | None = Field(default=None, min_length=1)
+    deadline_at: str | None = None
 
 
 class BrowserExchangeRequest(BaseModel):

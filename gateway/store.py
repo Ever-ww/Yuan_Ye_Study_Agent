@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -26,14 +27,19 @@ class GatewayStore:
         self.directory = directory.resolve()
         self.database_path = self.directory / "gateway.sqlite3"
         self.runs_directory = self.directory / "runs"
+        self.backups_directory = self.directory / "backups"
+        self.migration_backup_path: Path | None = None
         self._lock = threading.RLock()
+        self._backup_before_migration()
         self.initialize()
 
     def initialize(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.runs_directory.mkdir(parents=True, exist_ok=True)
-        interrupted: list[dict[str, Any]] = []
         with self._connect() as connection:
+            check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+            if check != "ok":
+                raise RuntimeError(f"Gateway SQLite quick_check 失败：{check}")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS projects (
@@ -66,44 +72,7 @@ class GatewayStore:
                 );
                 """
             )
-            interrupted = [
-                dict(row)
-                for row in connection.execute(
-                    "SELECT * FROM runs WHERE status IN ('queued','running')",
-                ).fetchall()
-            ]
-            connection.execute(
-                "UPDATE runs SET status='interrupted', finished_at=? "
-                "WHERE status IN ('queued','running')",
-                (now_iso(),),
-            )
-            connection.execute(
-                "UPDATE approvals SET state='denied', decided_at=? WHERE state='pending'",
-                (now_iso(),),
-            )
-            for row in interrupted:
-                connection.execute(
-                    "INSERT OR IGNORE INTO inbox VALUES(?,?,?,?,?,?,?,?,?)",
-                    (
-                        uuid4().hex,
-                        row["run_id"],
-                        row["project_id"],
-                        row["session_id"],
-                        str(row["task"])[:120],
-                        "Gateway 异常退出，原模型请求无法继续",
-                        "interrupted",
-                        now_iso(),
-                        0,
-                    ),
-                )
-        for row in interrupted:
-            self.append_event(
-                str(row["run_id"]),
-                str(row["project_id"]),
-                str(row["session_id"]) if row["session_id"] else None,
-                "run_interrupted",
-                {"message": "Gateway 异常退出，原模型请求无法继续"},
-            )
+            self._ensure_run_columns(connection)
 
     def register_project(self, path: Path, name: str | None = None) -> ProjectRecord:
         resolved = path.resolve()
@@ -178,7 +147,8 @@ class GatewayStore:
         )
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO runs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO runs(run_id,project_id,session_id,client_id,task,status,created_at,"
+                "started_at,finished_at,answer,error) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     run.run_id, run.project_id, run.session_id, run.client_id, run.task,
                     run.status, run.created_at, None, None, None, None,
@@ -210,7 +180,7 @@ class GatewayStore:
             row = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
         if row is None:
             raise KeyError(f"未知运行：{run_id}")
-        return RunRecord(**dict(row))
+        return _run_record(row)
 
     def list_runs(self, project_id: str | None = None) -> list[RunRecord]:
         query = "SELECT * FROM runs"
@@ -221,7 +191,7 @@ class GatewayStore:
         query += " ORDER BY created_at DESC"
         with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
-        return [RunRecord(**dict(row)) for row in rows]
+        return [_run_record(row) for row in rows]
 
     def automated_session_ids(self) -> set[str]:
         """返回旧记录中已知由 Cron/Dream 维护任务产生的 Session。"""
@@ -376,10 +346,49 @@ class GatewayStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=30000")
         return connection
+
+    def _backup_before_migration(self, target_version: int = 3) -> None:
+        if not self.database_path.exists() or self.database_path.stat().st_size == 0:
+            return
+        with sqlite3.connect(self.database_path, timeout=30) as source:
+            current = int(source.execute("PRAGMA user_version").fetchone()[0])
+            if current >= target_version:
+                return
+            self.backups_directory.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+            backup = self.backups_directory / f"gateway-v{current}-to-v{target_version}-{stamp}.sqlite3"
+            with sqlite3.connect(backup) as target:
+                source.backup(target)
+            self.migration_backup_path = backup
+
+    @staticmethod
+    def _ensure_run_columns(connection: sqlite3.Connection) -> None:
+        columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
+        additions = {
+            "task_state": "TEXT",
+            "execution_state": "TEXT",
+            "execution_outcome": "TEXT",
+            "finish_reason": "TEXT",
+            "state_revision": "INTEGER NOT NULL DEFAULT 0",
+            "workload_kind": "TEXT NOT NULL DEFAULT 'chat'",
+            "recovery_required": "INTEGER NOT NULL DEFAULT 0",
+            "terminal_target": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                connection.execute(f"ALTER TABLE runs ADD COLUMN {name} {declaration}")
 
 
 def _project_id(path: Path) -> str:
     import hashlib
     normalized = str(path.resolve()).casefold()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _run_record(row: sqlite3.Row) -> RunRecord:
+    payload = dict(row)
+    if "recovery_required" in payload:
+        payload["recovery_required"] = bool(payload["recovery_required"])
+    return RunRecord(**payload)
