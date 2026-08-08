@@ -13,8 +13,11 @@ from uuid import uuid4
 
 from Agent import ExtensionLoader, RuntimeConfig
 from Agent.state import (
+    CompleteFinalizeStepCommand,
     FinalizeInboxCommand,
+    FinalizeTerminalCommand,
     RecordRuntimeEventCommand,
+    RecoveryDecisionCommand,
     TaskState,
     TerminalTarget,
     TransitionCommand,
@@ -42,6 +45,7 @@ from gateway.models import (
     CodeTurnRequest,
     ProjectRecord,
     RunCreateRequest,
+    RecoveryDecisionRequest,
     RunRecord,
     SkillManageRequest,
 )
@@ -81,6 +85,10 @@ class GatewayApplication:
             self.store.database_path,
             self.store.runs_directory,
             self.events.publish,
+            retry_max_attempts=config.outbox_retry_max_attempts,
+            retry_base_seconds=config.outbox_retry_base_seconds,
+            retry_max_seconds=config.outbox_retry_max_seconds,
+            dead_letter_enabled=config.outbox_dead_letter_enabled,
         )
         source_root = config.coding_source_root or Path(__file__).resolve().parents[1]
         self.extensions = ExtensionLoader(source_root).scan()
@@ -114,6 +122,9 @@ class GatewayApplication:
             reference_service=self.reference_service,
             state_controller=self.state_controller,
             outbox=self.outbox,
+            tool_retry_max_attempts=config.tool_retry_max_attempts,
+            tool_retry_base_seconds=config.tool_retry_base_seconds,
+            tool_retry_max_seconds=config.tool_retry_max_seconds,
         )
         self.recovery = RecoveryCoordinator(self.state_controller, self.store, self.pool.submit)
         self.cron_scheduler = CronScheduler(
@@ -137,6 +148,7 @@ class GatewayApplication:
         self.code_sessions = CodeSessionManager(config)
 
     async def start(self) -> None:
+        self.state_controller.prune_retention()
         await self.outbox.start()
         await self.reference_embedding_worker.start()
         try:
@@ -230,15 +242,47 @@ class GatewayApplication:
             error=summary if target is TerminalTarget.FAILED else None,
             result_summary=summary if target is TerminalTarget.SUCCEEDED else None,
         )).state
-        self.state_controller.apply(TransitionCommand(
-            command_id=uuid4().hex,
-            run_id=run_id,
-            expected_revision=state.revision,
-            gateway_epoch=self.gateway_epoch,
-            task_state=TaskState(target.value),
-            reason="非 Agent workload FINALIZING 完成",
-        ))
+        self._finalize_control_plane(run_id, target, summary, task_title="Coding workload")
         self.outbox.wake()
+
+    def _finalize_control_plane(
+        self,
+        run_id: str,
+        target: TerminalTarget,
+        summary: str,
+        *,
+        task_title: str,
+        create_visible_inbox: bool = True,
+    ) -> None:
+        for step_name in ("memory", "session_index", "audit"):
+            state = self.state_controller.state(run_id)
+            self.state_controller.apply(CompleteFinalizeStepCommand(
+                command_id=f"finalize:{run_id}:{step_name}", run_id=run_id,
+                expected_revision=state.revision, gateway_epoch=self.gateway_epoch,
+                step_name=step_name, result="completed",
+            ))
+        state = self.state_controller.state(run_id)
+        if create_visible_inbox:
+            operation_id = hashlib.sha256(f"{run_id}:finalize:inbox".encode("utf-8")).hexdigest()
+            self.state_controller.apply(FinalizeInboxCommand(
+                command_id=f"finalize:{run_id}:inbox", run_id=run_id,
+                expected_revision=state.revision, gateway_epoch=self.gateway_epoch,
+                operation_id=operation_id, title=task_title[:120], summary=summary,
+                status={TerminalTarget.SUCCEEDED: "completed", TerminalTarget.FAILED: "failed",
+                        TerminalTarget.CANCELLED: "cancelled"}[target],
+            ))
+        else:
+            self.state_controller.apply(CompleteFinalizeStepCommand(
+                command_id=f"finalize:{run_id}:inbox", run_id=run_id,
+                expected_revision=state.revision, gateway_epoch=self.gateway_epoch,
+                step_name="inbox", result="not_requested",
+            ))
+        state = self.state_controller.state(run_id)
+        self.state_controller.apply(FinalizeTerminalCommand(
+            command_id=f"finalize:{run_id}:terminal", run_id=run_id,
+            expected_revision=state.revision, gateway_epoch=self.gateway_epoch,
+            reason="FINALIZING 完成",
+        ))
 
     def _code_project(self, session_id: str) -> str:
         owner = getattr(self.code_sessions, "owner", None)
@@ -438,26 +482,11 @@ class GatewayApplication:
             event_type=terminal_type,
             payload=result.model_dump(mode="json"),
         )).state
-        if automatic and result.status != "noop":
-            operation_id = hashlib.sha256(f"{state.run_id}:finalize:inbox".encode("utf-8")).hexdigest()
-            state = self.state_controller.apply(FinalizeInboxCommand(
-                command_id=f"finalize:{state.run_id}:inbox",
-                run_id=state.run_id,
-                expected_revision=state.revision,
-                gateway_epoch=self.gateway_epoch,
-                operation_id=operation_id,
-                title=f"Dream {result.date}",
-                summary=result.message,
-                status="failed" if result.status == "failed" else "completed",
-            )).state
-        state = self.state_controller.apply(TransitionCommand(
-            command_id=uuid4().hex,
-            run_id=state.run_id,
-            expected_revision=state.revision,
-            gateway_epoch=self.gateway_epoch,
-            task_state=TaskState(target.value),
-            reason="Dream maintenance FINALIZING 完成",
-        )).state
+        self._finalize_control_plane(
+            state.run_id, target, result.message, task_title=f"Dream {result.date}",
+            create_visible_inbox=automatic and result.status != "noop",
+        )
+        state = self.state_controller.state(state.run_id)
         self.outbox.wake()
         run = self.store.run(state.run_id)
         if result.status == "completed":
@@ -513,6 +542,18 @@ class GatewayApplication:
             raise
         return run
 
+    def recover_run(self, run_id: str, request: RecoveryDecisionRequest):
+        result = self.state_controller.apply(RecoveryDecisionCommand(
+            command_id=request.command_id, run_id=run_id,
+            expected_revision=request.expected_revision, gateway_epoch=self.gateway_epoch,
+            action=request.action, operation_id=request.operation_id,
+            actor=request.actor, reason=request.reason,
+            observed_result=request.observed_result,
+            risk_confirmed=request.risk_confirmed,
+        ))
+        self.outbox.wake()
+        return result
+
     async def _submit_cron_run(self, job: CronJob, run_id: str) -> None:
         self.store.project(job.project_id)
         request_hash = hashlib.sha256(
@@ -554,11 +595,15 @@ class GatewayApplication:
         return events if events else self.store.read_events(run_id, after_sequence)
 
     async def decide_approval(self, approval_id: str, decision: ApprovalDecision) -> bool:
-        return await self.pool.approvals.decide(
+        approval = self.state_controller.approval(approval_id)
+        result = await self.pool.approvals.decide(
             approval_id,
             decision.client_id,
             decision.approved,
         )
+        if not self.pool.has_active_run(approval.run_id):
+            await self.recovery.recover()
+        return result
 
     async def disconnect_client(self, client_id: str) -> int:
         return await self.pool.approvals.deny_client(client_id)

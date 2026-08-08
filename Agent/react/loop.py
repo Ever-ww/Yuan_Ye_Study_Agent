@@ -105,9 +105,13 @@ class ReactLoop:
                         raise AgentInvariantError("model_before 必须保留列表形式的 messages 和 tools")
                     context_loaded = True
                     estimated_context = _estimate_tokens(json.dumps({"messages": messages, "tools": schemas}, ensure_ascii=False))
-                    await self.hooks.emit(HookEvent(point=HookPoint.MODEL_DURING, session_id=session_id, data={
+                    during = HookEvent(point=HookPoint.MODEL_DURING, session_id=session_id, data={
                         "task": task, "messages": messages, "tools": schemas, "model": model,
-                    }))
+                    })
+                    await self.hooks.emit(during)
+                    logical_model_call_id = during.data.get("logical_model_call_id")
+                    model_call_id = during.data.get("model_call_id")
+                    operation_attempt_no = int(during.data.get("attempt_no", attempt))
                 except Exception as exc:
                     _attach_failure_context(exc, messages, schemas, model, retry_history)
                     raise
@@ -124,7 +128,12 @@ class ReactLoop:
                         async for chunk in self.provider.stream(messages, schemas):
                             if chunk.text:
                                 streamed_parts.append(chunk.text)
-                                yield RunEvent(type=EventType.TEXT, payload={"content": chunk.text})
+                                yield RunEvent(type=EventType.TEXT, payload={
+                                    "content": chunk.text,
+                                    "logical_model_call_id": logical_model_call_id,
+                                    "model_call_id": model_call_id,
+                                    "attempt_no": operation_attempt_no,
+                                })
                             if chunk.reasoning:
                                 reasoning_parts.append(chunk.reasoning)
                             if chunk.tool_calls:
@@ -174,13 +183,16 @@ class ReactLoop:
                         _attach_failure_context(hook_error, messages, schemas, model, retry_history)
                         raise
                     if is_retryable_model_error(exc) and attempt < self.retry_policy.max_attempts:
+                        retry_delay = self.retry_policy.delay_seconds * (2 ** (attempt - 1))
                         yield RunEvent(type=EventType.MODEL_RETRY, payload={
                             "attempt": attempt + 1,
                             "max_attempts": self.retry_policy.max_attempts,
-                            "delay_seconds": self.retry_policy.delay_seconds,
+                            "delay_seconds": retry_delay,
+                            "logical_model_call_id": logical_model_call_id,
+                            "model_call_id": model_call_id,
                             "message": str(exc) or type(exc).__name__,
                         })
-                        await asyncio.sleep(self.retry_policy.delay_seconds)
+                        await asyncio.sleep(retry_delay)
                         continue
                     _attach_failure_context(exc, messages, schemas, model, retry_history)
                     raise
@@ -215,7 +227,12 @@ class ReactLoop:
                 raise error
             reply = _ensure_tool_call_ids(reply)
             if reply.text and not streamed:
-                yield RunEvent(type=EventType.TEXT, payload={"content": reply.text})
+                yield RunEvent(type=EventType.TEXT, payload={
+                    "content": reply.text,
+                    "logical_model_call_id": logical_model_call_id,
+                    "model_call_id": model_call_id,
+                    "attempt_no": operation_attempt_no,
+                })
 
             if reply.tool_calls:
                 prepared_calls = [(call, str(call.id)) for call in reply.tool_calls]
@@ -265,7 +282,7 @@ class ReactLoop:
                 "task": task, "name": name, "arguments": arguments, "tool_call_id": call_id,
             }))
             try:
-                result = await self.tools.execute(name, arguments, context)
+                result = await self.tools.execute(name, arguments, context, tool_call_id=call_id)
             except asyncio.CancelledError as exc:
                 await self.hooks.emit(HookEvent(point=HookPoint.TOOL_AFTER, session_id=session_id, data={
                     "task": task,

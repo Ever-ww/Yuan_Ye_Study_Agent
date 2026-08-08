@@ -38,6 +38,7 @@ from gateway.models import (
     GatewayEventEnvelope,
     ProjectCreateRequest,
     RunCreateRequest,
+    RecoveryDecisionRequest,
     RunRecord,
 )
 from gateway.process import GatewayProcessManager
@@ -152,12 +153,14 @@ class GatewayClient:
         project_id: str,
         task: str,
         session_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> RunRecord:
         payload = RunCreateRequest(
             project_id=project_id,
             client_id=self.client_id,
             task=task,
             session_id=session_id,
+            idempotency_key=idempotency_key,
         )
         value = await self._request("POST", "/api/v1/runs", json=payload.model_dump(mode="json"))
         return RunRecord.model_validate(value)
@@ -169,6 +172,18 @@ class GatewayClient:
     async def run(self, run_id: str) -> RunRecord:
         value = await self._request("GET", f"/api/v1/runs/{run_id}")
         return RunRecord.model_validate(value)
+
+    async def run_state(self, run_id: str) -> dict[str, Any]:
+        return dict(await self._request("GET", f"/api/v1/runs/{run_id}/state"))
+
+    async def run_operations(self, run_id: str) -> list[dict[str, Any]]:
+        return list(await self._request("GET", f"/api/v1/runs/{run_id}/operations"))
+
+    async def recover_run(self, run_id: str, request: RecoveryDecisionRequest) -> dict[str, Any]:
+        return dict(await self._request(
+            "POST", f"/api/v1/runs/{run_id}/recovery",
+            json=request.model_dump(mode="json"),
+        ))
 
     async def respond_approval(self, approval_id: str, approved: bool) -> bool:
         decision = ApprovalDecision(client_id=self.client_id, approved=approved)

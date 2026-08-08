@@ -16,12 +16,14 @@ from Agent.state import (
     AgentState,
     BeginOperationCommand,
     CompleteOperationCommand,
+    CompleteFinalizeStepCommand,
     CreateApprovalCommand,
     DecideApprovalCommand,
     DurableApproval,
     ExecutionOutcome,
     ExecutionState,
     FinalizeInboxCommand,
+    FinalizeTerminalCommand,
     INNER_TRANSITIONS,
     MarkOperationUnknownCommand,
     OperationKind,
@@ -118,7 +120,18 @@ class DurableRuntimeTests(unittest.TestCase):
             finish_reason="done",
         )
         self.transition(task_state=TaskState.FINALIZING, terminal_target=TerminalTarget.SUCCEEDED)
-        self.transition(task_state=TaskState.SUCCEEDED)
+        for step_name in ("memory", "session_index", "audit", "inbox"):
+            state = self.controller.state(self.state.run_id)
+            self.controller.apply(CompleteFinalizeStepCommand(
+                command_id=f"finalize:{state.run_id}:{step_name}", run_id=state.run_id,
+                expected_revision=state.revision, gateway_epoch="epoch-a",
+                step_name=step_name, result="completed",
+            ))
+        state = self.controller.state(self.state.run_id)
+        self.state = self.controller.apply(FinalizeTerminalCommand(
+            command_id=f"finalize:{state.run_id}:terminal", run_id=state.run_id,
+            expected_revision=state.revision, gateway_epoch="epoch-a",
+        )).state
         self.assertEqual(self.state.task_state, TaskState.SUCCEEDED)
         with self.assertRaises(ValueError):
             validate_outer_transition(TaskState.SUCCEEDED, TaskState.RECOVERING)
@@ -223,9 +236,22 @@ class DurableRuntimeTests(unittest.TestCase):
         self.assertEqual(unknown.state.execution.state, ExecutionState.ACTING)
 
     def test_durable_approval_repeated_decision_and_conflict(self) -> None:
+        state = self.controller.state(self.state.run_id)
+        prepared = self.controller.apply(BeginOperationCommand(
+            command_id=uuid4().hex, run_id=state.run_id, expected_revision=state.revision,
+            gateway_epoch="epoch-a", operation_id=uuid4().hex,
+            kind=OperationKind.TOOL, name="write",
+            request_hash=hashlib.sha256(b"{}").hexdigest(),
+            idempotency=ToolIdempotency.IDEMPOTENT,
+        ))
+        attempt = self.controller.current_attempt(prepared.operation.operation_id)
         approval = DurableApproval(
             approval_id=uuid4().hex,
-            operation_id=uuid4().hex,
+            operation_id=prepared.operation.operation_id,
+            attempt_id=attempt.attempt_id,
+            attempt_no=attempt.attempt_no,
+            stable_key=f"approval:{prepared.operation.stable_key}:{attempt.attempt_no}",
+            request_hash=prepared.operation.request_hash,
             run_id=self.state.run_id,
             client_id="client",
             tool_name="write",
@@ -281,7 +307,10 @@ class DurableRuntimeTests(unittest.TestCase):
             async def publish(event) -> None:
                 published.append(event.event_id)
 
-            dispatcher = OutboxDispatcher(self.store.database_path, self.store.runs_directory, publish)
+            dispatcher = OutboxDispatcher(
+                self.store.database_path, self.store.runs_directory, publish,
+                retry_base_seconds=0, retry_max_seconds=0,
+            )
             original = dispatcher.jsonl.append_once
 
             def fail_jsonl(event):

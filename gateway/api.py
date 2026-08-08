@@ -17,6 +17,7 @@ from gateway.models import (
     CodeTurnRequest,
     ProjectCreateRequest,
     RunCreateRequest,
+    RecoveryDecisionRequest,
     SkillManageRequest,
 )
 from gateway.security import GatewayCredentials, bearer_value
@@ -228,8 +229,21 @@ def create_gateway_api(
         return gateway.session_records(project_id, session_id)
 
     @app.post("/api/v1/runs", dependencies=[Depends(authorize_write)])
-    async def start_run(payload: RunCreateRequest):
-        return await gateway.start_run(payload)
+    async def start_run(
+        payload: RunCreateRequest,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ):
+        if (
+            idempotency_key is not None
+            and payload.idempotency_key is not None
+            and idempotency_key != payload.idempotency_key
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Header 与 body 的 Idempotency-Key 不一致",
+            )
+        selected = idempotency_key or payload.idempotency_key
+        return await gateway.start_run(payload.model_copy(update={"idempotency_key": selected}))
 
     @app.get("/api/v1/runs", dependencies=[Depends(authorize)])
     async def list_runs(project_id: str | None = None):
@@ -238,6 +252,32 @@ def create_gateway_api(
     @app.get("/api/v1/runs/{run_id}", dependencies=[Depends(authorize)])
     async def get_run(run_id: str):
         return gateway.store.run(run_id)
+
+    @app.get("/api/v1/runs/{run_id}/state", dependencies=[Depends(authorize)])
+    async def get_run_state(run_id: str):
+        return gateway.state_controller.state(run_id)
+
+    @app.get("/api/v1/runs/{run_id}/operations", dependencies=[Depends(authorize)])
+    async def get_run_operations(run_id: str):
+        return [
+            {
+                "operation": operation,
+                "attempts": gateway.state_controller.operation_attempts(operation.operation_id),
+            }
+            for operation in gateway.state_controller.operations(run_id)
+        ]
+
+    @app.get("/api/v1/runs/{run_id}/transitions", dependencies=[Depends(authorize)])
+    async def get_run_transitions(run_id: str):
+        return gateway.state_controller.transitions(run_id)
+
+    @app.get("/api/v1/runs/{run_id}/recovery-decisions", dependencies=[Depends(authorize)])
+    async def get_recovery_decisions(run_id: str):
+        return gateway.state_controller.recovery_decisions(run_id)
+
+    @app.post("/api/v1/runs/{run_id}/recovery", dependencies=[Depends(authorize_write)])
+    async def recover_run(run_id: str, payload: RecoveryDecisionRequest):
+        return gateway.recover_run(run_id, payload)
 
     @app.post("/api/v1/runs/{run_id}/cancel", dependencies=[Depends(authorize_write)])
     async def cancel_run(run_id: str):

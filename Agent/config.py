@@ -60,6 +60,16 @@ class RuntimeConfig(BaseModel):
     gateway_port: StrictInt = Field(default=8765, ge=1024, le=65535)
     gateway_max_concurrent_runs: StrictInt = Field(default=4, ge=1, le=32)
     gateway_runtime_idle_seconds: StrictInt = Field(default=900, ge=30)
+    model_retry_max_attempts: StrictInt = Field(default=3, ge=1, le=20)
+    model_retry_base_seconds: float = Field(default=2.0, ge=0.0, le=300.0)
+    model_retry_max_seconds: float = Field(default=30.0, ge=0.0, le=3600.0)
+    tool_retry_max_attempts: StrictInt = Field(default=3, ge=1, le=20)
+    tool_retry_base_seconds: float = Field(default=2.0, ge=0.0, le=300.0)
+    tool_retry_max_seconds: float = Field(default=60.0, ge=0.0, le=3600.0)
+    outbox_retry_max_attempts: StrictInt = Field(default=12, ge=1, le=100)
+    outbox_retry_base_seconds: float = Field(default=2.0, ge=0.1, le=300.0)
+    outbox_retry_max_seconds: float = Field(default=900.0, ge=1.0, le=86400.0)
+    outbox_dead_letter_enabled: StrictBool = True
     cron_heartbeat_seconds: StrictInt = Field(default=60, ge=5)
     dream_enabled: StrictBool = True
     dream_schedule: str = Field(default="0 3 * * *", min_length=1, max_length=100)

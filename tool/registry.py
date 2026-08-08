@@ -101,7 +101,14 @@ class AsyncToolRegistry:
             raise ValueError(f"工具 {tool.name} 计算出了无效风险等级：{risk}")
         return risk
 
-    async def execute(self, name: str, arguments: dict[str, Any], context: ToolContext) -> str:
+    async def execute(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        context: ToolContext,
+        *,
+        tool_call_id: str | None = None,
+    ) -> str:
         """重新校验 Hook 处理后的参数，获批后执行工具。"""
         tool = self._tools.get(name)
         if tool is None:
@@ -130,6 +137,8 @@ class AsyncToolRegistry:
                 name=name,
                 arguments=arguments,
                 risk=self._resolved_risk(tool, arguments),
+                context=context,
+                tool_call_id=tool_call_id or f"direct_{name}",
             )
         try:
             if needs_approval:
@@ -139,8 +148,11 @@ class AsyncToolRegistry:
                     context.approval is not None
                     and await context.approval(name, arguments)
                 )
+                denied_result = None
                 if coordinator is not None:
-                    await coordinator.approval_decided(operation, approved=approved)
+                    denied_result = await coordinator.approval_decided(operation, approved=approved)
+                if not approved and denied_result is not None:
+                    return denied_result
                 if not approved:
                     raise PermissionError(f"工具调用未获批准：{name}")
             if coordinator is None:

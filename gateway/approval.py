@@ -9,13 +9,14 @@ from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from gateway.models import ApprovalRequest, now_iso
+from gateway.audit import AuditSanitizer
 from Agent.state import (
     CreateApprovalCommand,
     DecideApprovalCommand,
     DurableApproval,
     ExpireApprovalCommand,
 )
-from gateway.durable_execution import current_operation_id
+from gateway.durable_execution import current_attempt_id, current_operation_id
 from gateway.state_controller import StateController
 from gateway.store import GatewayStore
 
@@ -71,8 +72,13 @@ class GatewayApprovalBroker:
             self._pending[request.approval_id] = (request, future)
         if self.state_controller is not None:
             operation_id = current_operation_id()
-            if operation_id is None:
+            attempt_id = current_attempt_id()
+            if operation_id is None or attempt_id is None:
                 raise RuntimeError("Durable Approval 缺少对应的 Operation")
+            operation = self.state_controller.operation(operation_id)
+            attempt = self.state_controller.current_attempt(operation_id)
+            if attempt.attempt_id != attempt_id:
+                raise RuntimeError("Durable Approval Attempt 已变化")
             expires = (
                 datetime.now().astimezone() + timedelta(seconds=self.approval_timeout_seconds)
             ).isoformat(timespec="seconds")
@@ -85,11 +91,15 @@ class GatewayApprovalBroker:
                 approval=DurableApproval(
                     approval_id=request.approval_id,
                     operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    attempt_no=attempt.attempt_no,
+                    stable_key=f"approval:{operation.stable_key}:{attempt.attempt_no}",
+                    request_hash=operation.request_hash,
                     run_id=run_id,
                     client_id=client_id,
                     tool_name=tool_name,
                     arguments_hash=_arguments_hash(arguments),
-                    arguments_json=_arguments_json(arguments),
+                    arguments_json=_arguments_audit_json(arguments),
                     created_at=request.created_at,
                     expires_at=expires,
                 ),
@@ -204,3 +214,11 @@ def _arguments_json(arguments: dict[str, Any]) -> str:
 def _arguments_hash(arguments: dict[str, Any]) -> str:
     import hashlib
     return hashlib.sha256(_arguments_json(arguments).encode("utf-8")).hexdigest()
+
+
+def _arguments_audit_json(arguments: dict[str, Any]) -> str:
+    import json
+    return json.dumps(
+        AuditSanitizer.sanitize(arguments),
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )

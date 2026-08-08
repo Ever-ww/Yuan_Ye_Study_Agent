@@ -124,6 +124,19 @@ class RunCreateRequest(BaseModel):
     deadline_at: str | None = None
 
 
+class RecoveryDecisionRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    command_id: str = Field(min_length=1)
+    expected_revision: int = Field(ge=0)
+    action: Literal["retry", "confirm_succeeded", "fail", "cancel"]
+    operation_id: str | None = None
+    actor: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    observed_result: str | None = None
+    risk_confirmed: bool = False
+
+
 class BrowserExchangeRequest(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 

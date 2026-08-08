@@ -7,14 +7,18 @@ from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
 from Agent.state import (
-    AbandonOperationCommand,
+    AbandonOperationAttemptCommand,
     AdoptGatewayEpochCommand,
+    ApprovalStatus,
+    CompleteFinalizeStepCommand,
     ExecutionOutcome,
     ExecutionState,
     FinalizeInboxCommand,
-    MarkOperationUnknownCommand,
+    FinalizeTerminalCommand,
+    MarkOperationAttemptUnknownCommand,
     OperationKind,
     OperationStatus,
+    SkipOperationAttemptCommand,
     TaskState,
     TerminalTarget,
     TransitionCommand,
@@ -53,8 +57,24 @@ class RecoveryCoordinator:
                 counts["recovery_required"] += 1
                 continue
             if state.execution and state.execution.state is ExecutionState.WAITING_HUMAN:
-                counts["waiting_human"] += 1
-                continue
+                approval = self.controller.approval(state.approval_id) if state.approval_id else None
+                if approval is None or approval.status is ApprovalStatus.PENDING:
+                    counts["waiting_human"] += 1
+                    continue
+                operation = self.controller.operation(approval.operation_id)
+                attempt = self.controller.current_attempt(operation.operation_id)
+                if attempt.status is OperationStatus.PREPARED:
+                    state = self.controller.apply(SkipOperationAttemptCommand(
+                        command_id=f"recovery:{approval.approval_id}:skip", run_id=state.run_id,
+                        expected_revision=state.revision, gateway_epoch=self.controller.gateway_epoch,
+                        attempt_id=attempt.attempt_id,
+                        skip_reason=f"approval_{approval.status.value}_after_gateway_restart",
+                    )).state
+                self._transition(
+                    state.run_id, execution=ExecutionState.OBSERVING,
+                    reason="审批已决定；旧进程未执行 Tool，从 observation 恢复",
+                )
+                state = self.controller.state(state.run_id)
             if state.task_state is TaskState.FINALIZING:
                 self._complete_finalizing(state)
                 counts["finalized"] += 1
@@ -89,13 +109,14 @@ class RecoveryCoordinator:
                 if operation and operation.kind is OperationKind.MODEL and operation.status in {
                     OperationStatus.PREPARED, OperationStatus.RUNNING,
                 }:
+                    attempt = self.controller.current_attempt(operation.operation_id)
                     current = self.controller.state(state.run_id)
-                    self.controller.apply(AbandonOperationCommand(
+                    self.controller.apply(AbandonOperationAttemptCommand(
                         command_id=uuid4().hex,
                         run_id=current.run_id,
                         expected_revision=current.revision,
                         gateway_epoch=self.controller.gateway_epoch,
-                        operation_id=operation.operation_id,
+                        attempt_id=attempt.attempt_id,
                         reason="Gateway 重启，旧模型 HTTP attempt 不可继续",
                     ))
 
@@ -114,25 +135,29 @@ class RecoveryCoordinator:
         if operation is None:
             self._require_recovery(run_id, "ACTING 缺少 Operation Ledger 记录")
             return False
-        if operation.status in {OperationStatus.COMPLETED, OperationStatus.FAILED}:
+        attempt = self.controller.current_attempt(operation.operation_id)
+        if attempt.status in {
+            OperationStatus.COMPLETED, OperationStatus.FAILED,
+            OperationStatus.SKIPPED, OperationStatus.ABANDONED,
+        }:
             self._transition(run_id, execution=ExecutionState.OBSERVING, reason="恢复已确定的工具结果")
             return True
-        if operation.status is OperationStatus.PREPARED:
+        if attempt.status is OperationStatus.PREPARED:
             # 副作用确定尚未发出，但当前 React 栈已丢失；必须从 SafeCheckpoint 恢复。
             state = self.controller.state(run_id)
             if state.safe_checkpoint is None:
                 self._require_recovery(run_id, "prepared Tool 缺少 SafeCheckpoint")
                 return False
             return True
-        if operation.status is OperationStatus.RUNNING:
+        if attempt.status is OperationStatus.RUNNING:
             state = self.controller.state(run_id)
-            self.controller.apply(MarkOperationUnknownCommand(
+            self.controller.apply(MarkOperationAttemptUnknownCommand(
                 command_id=uuid4().hex,
                 run_id=run_id,
                 expected_revision=state.revision,
                 gateway_epoch=self.controller.gateway_epoch,
-                operation_id=operation.operation_id,
-                unknown_reason="Gateway 在外部副作用执行期间退出",
+                attempt_id=attempt.attempt_id,
+                failure_reason="Gateway 在外部副作用执行期间退出",
             ))
         self._require_recovery(run_id, "工具副作用结果未知，必须 reconcile 或人工处理")
         return False
@@ -160,9 +185,8 @@ class RecoveryCoordinator:
         if state.terminal_target is None:
             self._transition(state.run_id, task=TaskState.INTERRUPTED, reason="FINALIZING 缺少 terminal_target")
             return
-        self._ensure_inbox(state.run_id, state.terminal_target)
-        state = self.controller.state(state.run_id)
-        self._transition(state.run_id, task=TaskState(state.terminal_target.value), reason="重入 FINALIZING 完成")
+        self._complete_preterminal_steps(state.run_id, state.terminal_target)
+        self._finalize_terminal(state.run_id)
 
     def _finish_cancel(self, run_id: str) -> None:
         state = self.controller.state(run_id)
@@ -175,8 +199,8 @@ class RecoveryCoordinator:
             run_id, task=TaskState.FINALIZING, terminal=TerminalTarget.CANCELLED,
             reason="恢复取消 FINALIZING",
         )
-        self._ensure_inbox(run_id, TerminalTarget.CANCELLED)
-        self._transition(run_id, task=TaskState.CANCELLED, reason="恢复取消完成")
+        self._complete_preterminal_steps(run_id, TerminalTarget.CANCELLED)
+        self._finalize_terminal(run_id)
 
     def _finish_from_outcome(self, run_id: str, outcome: ExecutionOutcome | None) -> None:
         target = {
@@ -194,8 +218,33 @@ class RecoveryCoordinator:
         if target is TerminalTarget.CANCELLED and state.task_state is not TaskState.CANCELLING:
             self._transition(run_id, task=TaskState.CANCELLING, reason="恢复取消路径")
         self._transition(run_id, task=TaskState.FINALIZING, terminal=target, reason="恢复 FINISHED Run")
+        self._complete_preterminal_steps(run_id, target)
+        self._finalize_terminal(run_id)
+
+    def _complete_preterminal_steps(self, run_id: str, target: TerminalTarget) -> None:
+        completed = {
+            operation.stable_key
+            for operation in self.controller.operations(run_id)
+            if operation.status is OperationStatus.COMPLETED
+        }
+        for step_name in ("memory", "session_index", "audit"):
+            if f"finalize:{step_name}" in completed:
+                continue
+            state = self.controller.state(run_id)
+            self.controller.apply(CompleteFinalizeStepCommand(
+                command_id=f"finalize:{run_id}:{step_name}", run_id=run_id,
+                expected_revision=state.revision, gateway_epoch=self.controller.gateway_epoch,
+                step_name=step_name, result="completed",
+            ))
         self._ensure_inbox(run_id, target)
-        self._transition(run_id, task=TaskState(target.value), reason="恢复 FINALIZING 完成")
+
+    def _finalize_terminal(self, run_id: str) -> None:
+        state = self.controller.state(run_id)
+        self.controller.apply(FinalizeTerminalCommand(
+            command_id=f"finalize:{run_id}:terminal", run_id=run_id,
+            expected_revision=state.revision, gateway_epoch=self.controller.gateway_epoch,
+            reason="Recovery FINALIZING 完成",
+        ))
 
     def _ensure_inbox(self, run_id: str, target: TerminalTarget) -> None:
         state = self.controller.state(run_id)
@@ -228,7 +277,16 @@ class RecoveryCoordinator:
     def _has_unknown_effect(self, run_id: str) -> bool:
         state = self.controller.state(run_id)
         operation = self.controller.operation(state.current_operation_id) if state.current_operation_id else None
-        return operation is not None and operation.status in {OperationStatus.RUNNING, OperationStatus.UNKNOWN}
+        if operation is None:
+            return False
+        attempt = self.controller.current_attempt(operation.operation_id)
+        return attempt.side_effecting and (
+            attempt.status is OperationStatus.RUNNING
+            or (
+                attempt.status is OperationStatus.UNKNOWN
+                and attempt.recovery_resolution.value == "unresolved"
+            )
+        )
 
     def _transition(
         self,

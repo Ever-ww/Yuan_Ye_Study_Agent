@@ -15,6 +15,7 @@ from .models import (
     InboxItem,
     ProjectRecord,
     RunRecord,
+    RecoveryDecisionRequest,
 )
 from .process import GatewayProcessManager
 from .runtime_pool import RuntimePool
@@ -41,6 +42,7 @@ __all__ = [
     "InboxItem",
     "ProjectRecord",
     "RunRecord",
+    "RecoveryDecisionRequest",
     "RuntimePool",
     "StateController",
     "StateConflictError",

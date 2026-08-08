@@ -12,10 +12,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
 from Agent import EventType, RunEvent, load_runtime_config
+from Agent.state import TaskState, TransitionCommand, WorkloadKind
 from skill import SkillRefreshResult
 from gateway.api import create_gateway_api
 from gateway.application import GatewayApplication
@@ -30,6 +32,7 @@ from gateway.models import (
     RunCreateRequest,
 )
 from gateway.runtime_pool import RuntimeEntry, RuntimePool
+from gateway.state_controller import StateController
 from gateway.store import GatewayStore
 from gateway.process import (
     GatewayProcessManager,
@@ -553,6 +556,7 @@ class GatewayTests(unittest.TestCase):
             store = GatewayStore(root / ".yy" / "gateway")
             project = store.register_project(root)
             blocker = asyncio.Event()
+            controller = StateController(store.database_path, gateway_epoch="test")
             pool = RuntimePool(
                 agent_root=root,
                 store=store,
@@ -560,10 +564,23 @@ class GatewayTests(unittest.TestCase):
                 max_concurrent_runs=4,
                 idle_timeout_seconds=30,
                 runtime_factory=lambda workspace, approval: FakeRuntime(workspace, blocker),
+                state_controller=controller,
             )
             await pool.start()
-            first = store.create_run(project.project_id, "one", "first", "b" * 16)
-            second = store.create_run(project.project_id, "two", "second", "b" * 16)
+            run_ids = (uuid4().hex, uuid4().hex)
+            for run_id, client, task in zip(run_ids, ("one", "two"), ("first", "second")):
+                state, _ = controller.create_run(
+                    run_id=run_id, workload_kind=WorkloadKind.CHAT,
+                    project_id=project.project_id, client_id=client, task=task,
+                    session_id="b" * 16, idempotency_key=uuid4().hex,
+                    request_hash=hashlib.sha256(task.encode()).hexdigest(),
+                )
+                controller.apply(TransitionCommand(
+                    command_id=uuid4().hex, run_id=run_id,
+                    expected_revision=state.revision, gateway_epoch="test",
+                    task_state=TaskState.QUEUED, reason="test queue",
+                ))
+            first, second = (store.run(run_id) for run_id in run_ids)
             await pool.submit(first)
             with self.assertRaisesRegex(RuntimeError, "同一个 Session"):
                 await pool.submit(second)
@@ -580,10 +597,12 @@ class GatewayTests(unittest.TestCase):
     def test_skill_refresh_targets_only_requested_session_runtime(self) -> None:
         async def check(root: Path) -> None:
             store = GatewayStore(root / ".yy" / "gateway")
+            controller = StateController(store.database_path, gateway_epoch="test")
             pool = RuntimePool(
                 agent_root=root,
                 store=store,
                 events=GatewayEventBus(),
+                state_controller=controller,
             )
             first, second = FakeRuntime(root), FakeRuntime(root)
             pool._runtimes[("project", "a" * 16)] = RuntimeEntry(first, 0.0)
@@ -650,6 +669,7 @@ class GatewayTests(unittest.TestCase):
             store = GatewayStore(root / ".yy" / "gateway")
             project = store.register_project(root)
             tracker = ConcurrencyTracker()
+            controller = StateController(store.database_path, gateway_epoch="test")
             pool = RuntimePool(
                 agent_root=root,
                 store=store,
@@ -657,12 +677,25 @@ class GatewayTests(unittest.TestCase):
                 max_concurrent_runs=4,
                 idle_timeout_seconds=30,
                 runtime_factory=lambda workspace, approval: TrackingRuntime(workspace, tracker),
+                state_controller=controller,
             )
             await pool.start()
-            runs = [
-                store.create_run(project.project_id, f"client-{index}", f"task-{index}", None)
-                for index in range(5)
-            ]
+            runs = []
+            for index in range(5):
+                run_id = uuid4().hex
+                task = f"task-{index}"
+                state, _ = controller.create_run(
+                    run_id=run_id, workload_kind=WorkloadKind.CHAT,
+                    project_id=project.project_id, client_id=f"client-{index}", task=task,
+                    idempotency_key=uuid4().hex,
+                    request_hash=hashlib.sha256(task.encode()).hexdigest(),
+                )
+                controller.apply(TransitionCommand(
+                    command_id=uuid4().hex, run_id=run_id,
+                    expected_revision=state.revision, gateway_epoch="test",
+                    task_state=TaskState.QUEUED, reason="test queue",
+                ))
+                runs.append(store.run(run_id))
             for run in runs:
                 await pool.submit(run)
             await asyncio.wait_for(tracker.started.wait(), 2)

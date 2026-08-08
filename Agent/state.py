@@ -64,8 +64,22 @@ class OperationStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    SKIPPED = "skipped"
     UNKNOWN = "unknown"
     ABANDONED = "abandoned"
+
+
+class OperationFailureKind(str, Enum):
+    TERMINAL = "terminal"
+    RETRYABLE = "retryable"
+    UNKNOWN_EFFECT = "unknown_effect"
+
+
+class AttemptRecoveryResolution(str, Enum):
+    UNRESOLVED = "unresolved"
+    RETRY_AUTHORIZED = "retry_authorized"
+    CONFIRMED_SUCCEEDED = "confirmed_succeeded"
+    CONFIRMED_FAILED = "confirmed_failed"
 
 
 class OperationKind(str, Enum):
@@ -108,6 +122,8 @@ TERMINAL_STATES = frozenset({
     TaskState.CANCELLED,
     TaskState.INTERRUPTED,
 })
+
+PRE_TERMINAL_FINALIZE_STEPS = ("memory", "session_index", "audit", "inbox")
 
 OUTER_TRANSITIONS = MappingProxyType({
     TaskState.CREATED: frozenset({TaskState.QUEUED, TaskState.FINALIZING}),
@@ -179,6 +195,9 @@ class SafeCheckpoint(BaseModel):
     turn_id: str | None = None
     state_revision: int = Field(ge=0)
     last_determined_operation_id: str | None = None
+    last_determined_attempt_id: str | None = None
+    current_operation_id: str | None = None
+    current_attempt_id: str | None = None
     session_segment: str = Field(min_length=1)
     last_record_id: str = Field(min_length=1)
     created_at: str
@@ -205,6 +224,7 @@ class AgentState(BaseModel):
     terminal_target: TerminalTarget | None = None
     turn_id: str | None = None
     current_operation_id: str | None = None
+    current_attempt_id: str | None = None
     model_call_id: str | None = None
     tool_call_id: str | None = None
     approval_id: str | None = None
@@ -246,6 +266,195 @@ class AgentState(BaseModel):
         return self
 
 
+class RetryPolicySnapshot(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    max_attempts: int = Field(ge=1)
+    base_seconds: float = Field(ge=0.0)
+    max_seconds: float = Field(ge=0.0)
+    automatic: bool = True
+    requires_reconcile: bool = False
+    requires_human_confirmation: bool = False
+
+
+class ImmutableOperationMetadata(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    operation_id: str = Field(min_length=1)
+    parent_operation_id: str | None = None
+    run_id: str = Field(min_length=1)
+    turn_id: str | None = None
+    kind: OperationKind
+    name: str = Field(min_length=1)
+    stable_key: str = Field(min_length=1)
+    request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    idempotency: ToolIdempotency = ToolIdempotency.NON_IDEMPOTENT
+    side_effecting: bool = True
+    logical_model_call_id: str | None = None
+    source_model_call_id: str | None = None
+    tool_call_id: str | None = None
+    external_idempotency_key: str | None = None
+
+
+class OperationAttempt(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    attempt_id: str = Field(min_length=1)
+    operation_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    attempt_no: int = Field(ge=1)
+    request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    side_effecting: bool
+    status: OperationStatus = OperationStatus.PREPARED
+    failure_kind: OperationFailureKind | None = None
+    failure_reason: str | None = None
+    recovery_resolution: AttemptRecoveryResolution | None = None
+    result: str | None = None
+    result_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    result_source: str | None = None
+    skip_reason: str | None = None
+    abandonment_reason: str | None = None
+    started_at: str | None = None
+    heartbeat_at: str | None = None
+    heartbeat_expires_at: str | None = None
+    completed_at: str | None = None
+    model_call_id: str | None = None
+    external_request_id: str | None = None
+    reconcile_status: ReconcileStatus | None = None
+    reconcile_evidence: str | None = None
+    risk_confirmed_by: str | None = None
+    risk_confirmation_reason: str | None = None
+    created_at: str
+    updated_at: str
+
+    @model_validator(mode="after")
+    def validate_status_evidence(self) -> "OperationAttempt":
+        if self.status is OperationStatus.FAILED:
+            if self.failure_kind not in {OperationFailureKind.TERMINAL, OperationFailureKind.RETRYABLE}:
+                raise ValueError("FAILED Attempt 必须声明 TERMINAL 或 RETRYABLE")
+        elif self.status is OperationStatus.UNKNOWN:
+            if self.failure_kind is not OperationFailureKind.UNKNOWN_EFFECT:
+                raise ValueError("UNKNOWN Attempt 必须声明 UNKNOWN_EFFECT")
+            if self.recovery_resolution is None:
+                raise ValueError("UNKNOWN Attempt 必须包含 recovery_resolution")
+        elif self.failure_kind is not None:
+            raise ValueError("只有 FAILED/UNKNOWN Attempt 可以包含 failure_kind")
+        if self.status is OperationStatus.SKIPPED:
+            if self.result_source != "NOT_EXECUTED" or not self.skip_reason:
+                raise ValueError("SKIPPED Attempt 必须包含 NOT_EXECUTED 与 skip_reason")
+        elif self.skip_reason is not None:
+            raise ValueError("只有 SKIPPED Attempt 可以包含 skip_reason")
+        if self.status is OperationStatus.ABANDONED and not self.abandonment_reason:
+            raise ValueError("ABANDONED Attempt 必须包含 abandonment_reason")
+        if self.status is not OperationStatus.ABANDONED and self.abandonment_reason is not None:
+            raise ValueError("只有 ABANDONED Attempt 可以包含 abandonment_reason")
+        return self
+
+
+class OperationAggregate(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    status: OperationStatus
+    failure_kind: OperationFailureKind | None = None
+    failure_reason: str | None = None
+    latest_attempt_no: int = Field(ge=1)
+    next_retry_at: str | None = None
+    result: str | None = None
+    result_hash: str | None = None
+    result_source: str | None = None
+    skip_reason: str | None = None
+
+    @model_validator(mode="after")
+    def validate_status_evidence(self) -> "OperationAggregate":
+        if self.status is OperationStatus.FAILED:
+            if self.failure_kind not in {
+                OperationFailureKind.TERMINAL, OperationFailureKind.RETRYABLE,
+            }:
+                raise ValueError("FAILED Operation aggregate 必须声明 failure_kind")
+        elif self.status is OperationStatus.UNKNOWN:
+            if self.failure_kind is not OperationFailureKind.UNKNOWN_EFFECT:
+                raise ValueError("UNKNOWN Operation aggregate 必须声明 UNKNOWN_EFFECT")
+        elif self.failure_kind is not None:
+            raise ValueError("非 FAILED/UNKNOWN Operation aggregate 不能携带 failure_kind")
+        if self.status is OperationStatus.SKIPPED and not self.skip_reason:
+            raise ValueError("SKIPPED Operation aggregate 必须包含 skip_reason")
+        return self
+
+
+def reduce_operation(
+    metadata: ImmutableOperationMetadata,
+    attempts: list[OperationAttempt] | tuple[OperationAttempt, ...],
+    retry_policy: RetryPolicySnapshot,
+) -> OperationAggregate:
+    """仅由不可变元数据、Attempt 历史和策略快照生成聚合状态。"""
+
+    if not attempts:
+        raise ValueError("Logical Operation 必须至少包含一个 Attempt")
+    ordered = tuple(sorted(attempts, key=lambda item: item.attempt_no))
+    if tuple(item.attempt_no for item in ordered) != tuple(range(1, len(ordered) + 1)):
+        raise ValueError("Attempt 编号必须从 1 开始连续递增")
+    if any(
+        item.operation_id != metadata.operation_id
+        or item.run_id != metadata.run_id
+        or item.request_hash != metadata.request_hash
+        or item.side_effecting != metadata.side_effecting
+        for item in ordered
+    ):
+        raise ValueError("Attempt 必须继承 Logical Operation 的身份、request_hash 和副作用属性")
+    active = [
+        item for item in ordered
+        if item.status in {OperationStatus.PREPARED, OperationStatus.RUNNING}
+        or (
+            item.status is OperationStatus.UNKNOWN
+            and item.recovery_resolution is AttemptRecoveryResolution.UNRESOLVED
+        )
+    ]
+    if len(active) > 1:
+        raise ValueError("Logical Operation 同时最多存在一个 active Attempt")
+    latest = ordered[-1]
+    if latest.status is OperationStatus.UNKNOWN:
+        resolution = latest.recovery_resolution
+        if resolution is AttemptRecoveryResolution.CONFIRMED_SUCCEEDED:
+            return OperationAggregate(
+                status=OperationStatus.COMPLETED, latest_attempt_no=latest.attempt_no,
+                result=latest.result, result_hash=latest.result_hash,
+                result_source=latest.result_source or "human_confirmed",
+            )
+        if resolution is AttemptRecoveryResolution.CONFIRMED_FAILED:
+            return OperationAggregate(
+                status=OperationStatus.FAILED, failure_kind=OperationFailureKind.TERMINAL,
+                failure_reason=latest.failure_reason or "human_confirmed_failed",
+                latest_attempt_no=latest.attempt_no,
+            )
+    if latest.status is OperationStatus.FAILED and latest.failure_kind is OperationFailureKind.RETRYABLE:
+        if len(ordered) >= retry_policy.max_attempts:
+            return OperationAggregate(
+                status=OperationStatus.FAILED, failure_kind=OperationFailureKind.TERMINAL,
+                failure_reason="retry_exhausted", latest_attempt_no=latest.attempt_no,
+            )
+        if not latest.completed_at:
+            raise ValueError("RETRYABLE Attempt 必须包含 completed_at")
+        completed = datetime.fromisoformat(latest.completed_at.replace("Z", "+00:00"))
+        delay = min(retry_policy.max_seconds, retry_policy.base_seconds * (2 ** (latest.attempt_no - 1)))
+        next_retry = completed.timestamp() + delay
+        next_retry_at = datetime.fromtimestamp(next_retry, tz=completed.tzinfo).isoformat()
+        return OperationAggregate(
+            status=OperationStatus.FAILED, failure_kind=OperationFailureKind.RETRYABLE,
+            failure_reason=latest.failure_reason, latest_attempt_no=latest.attempt_no,
+            next_retry_at=next_retry_at,
+        )
+    return OperationAggregate(
+        status=latest.status,
+        failure_kind=latest.failure_kind,
+        failure_reason=latest.failure_reason,
+        latest_attempt_no=latest.attempt_no,
+        result=latest.result,
+        result_hash=latest.result_hash,
+        result_source=latest.result_source,
+        skip_reason=latest.skip_reason,
+    )
+
+
 class OperationRecord(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
@@ -255,9 +464,25 @@ class OperationRecord(BaseModel):
     turn_id: str | None = None
     kind: OperationKind
     name: str = Field(min_length=1)
+    stable_key: str = Field(default="legacy", min_length=1)
     request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     idempotency: ToolIdempotency = ToolIdempotency.NON_IDEMPOTENT
+    side_effecting: bool = True
+    logical_model_call_id: str | None = None
+    source_model_call_id: str | None = None
+    tool_call_id: str | None = None
+    external_idempotency_key: str | None = None
+    retry_policy_snapshot: RetryPolicySnapshot = Field(
+        default_factory=lambda: RetryPolicySnapshot(
+            max_attempts=1, base_seconds=0.0, max_seconds=0.0,
+            automatic=False, requires_reconcile=False, requires_human_confirmation=False,
+        ),
+    )
     status: OperationStatus = OperationStatus.PREPARED
+    failure_kind: OperationFailureKind | None = None
+    failure_reason: str | None = None
+    latest_attempt_no: int = Field(default=1, ge=1)
+    next_retry_at: str | None = None
     result: str | None = None
     result_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     result_source: str | None = None
@@ -274,12 +499,27 @@ class OperationRecord(BaseModel):
     created_at: str
     updated_at: str
 
+    def immutable_metadata(self) -> ImmutableOperationMetadata:
+        return ImmutableOperationMetadata(
+            operation_id=self.operation_id, parent_operation_id=self.parent_operation_id,
+            run_id=self.run_id, turn_id=self.turn_id, kind=self.kind, name=self.name,
+            stable_key=self.stable_key, request_hash=self.request_hash,
+            idempotency=self.idempotency, side_effecting=self.side_effecting,
+            logical_model_call_id=self.logical_model_call_id,
+            source_model_call_id=self.source_model_call_id, tool_call_id=self.tool_call_id,
+            external_idempotency_key=self.external_idempotency_key,
+        )
+
 
 class DurableApproval(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
     approval_id: str = Field(min_length=1)
     operation_id: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1)
+    attempt_no: int = Field(default=1, ge=1)
+    stable_key: str = Field(min_length=1)
+    request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     run_id: str = Field(min_length=1)
     client_id: str = Field(min_length=1)
     tool_name: str = Field(min_length=1)
@@ -360,6 +600,17 @@ class FinalizeInboxCommand(StateCommand):
     status: Literal["completed", "failed", "cancelled"]
 
 
+class CompleteFinalizeStepCommand(StateCommand):
+    step_name: Literal["memory", "session_index", "audit", "inbox"]
+    result: str = "completed"
+
+
+class FinalizeTerminalCommand(StateCommand):
+    """Atomically commits terminal State, projection, transition, event and outbox."""
+
+    reason: str = Field(default="FINALIZING completed", min_length=1)
+
+
 class BeginOperationCommand(StateCommand):
     operation_id: str = Field(min_length=1)
     parent_operation_id: str | None = None
@@ -368,6 +619,87 @@ class BeginOperationCommand(StateCommand):
     name: str = Field(min_length=1)
     request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     idempotency: ToolIdempotency
+
+
+class CreateOperationWithAttemptCommand(StateCommand):
+    operation_id: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1)
+    parent_operation_id: str | None = None
+    turn_id: str | None = None
+    kind: OperationKind
+    name: str = Field(min_length=1)
+    stable_key: str = Field(min_length=1)
+    request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    idempotency: ToolIdempotency
+    side_effecting: bool
+    logical_model_call_id: str | None = None
+    source_model_call_id: str | None = None
+    tool_call_id: str | None = None
+    model_call_id: str | None = None
+    external_request_id: str | None = None
+    external_idempotency_key: str | None = None
+    retry_policy_snapshot: RetryPolicySnapshot
+
+
+class BeginOperationAttemptCommand(StateCommand):
+    operation_id: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1)
+    expected_latest_attempt_no: int = Field(ge=1)
+    request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model_call_id: str | None = None
+    external_request_id: str | None = None
+    risk_confirmed_by: str | None = None
+    risk_confirmation_reason: str | None = None
+
+
+class StartOperationAttemptCommand(StateCommand):
+    attempt_id: str = Field(min_length=1)
+    heartbeat_expires_at: str | None = None
+
+
+class CompleteOperationAttemptCommand(StateCommand):
+    attempt_id: str = Field(min_length=1)
+    result: str
+    result_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    result_source: str = Field(min_length=1)
+
+
+class FailOperationAttemptCommand(StateCommand):
+    attempt_id: str = Field(min_length=1)
+    failure_kind: OperationFailureKind
+    failure_reason: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_failure(self) -> "FailOperationAttemptCommand":
+        if self.failure_kind is OperationFailureKind.UNKNOWN_EFFECT:
+            raise ValueError("UNKNOWN_EFFECT 必须使用 MarkOperationAttemptUnknownCommand")
+        return self
+
+
+class MarkOperationAttemptUnknownCommand(StateCommand):
+    attempt_id: str = Field(min_length=1)
+    failure_reason: str = Field(min_length=1)
+
+
+class SkipOperationAttemptCommand(StateCommand):
+    attempt_id: str = Field(min_length=1)
+    skip_reason: str = Field(min_length=1)
+
+
+class AbandonOperationAttemptCommand(StateCommand):
+    attempt_id: str = Field(min_length=1)
+    abandonment_reason: str = Field(min_length=1)
+
+
+class HeartbeatOperationAttemptCommand(StateCommand):
+    attempt_id: str = Field(min_length=1)
+    heartbeat_at: str
+    heartbeat_expires_at: str
+
+
+class ReconcileOperationAttemptCommand(StateCommand):
+    attempt_id: str = Field(min_length=1)
+    result: ReconcileResult
 
 
 class StartOperationCommand(StateCommand):
@@ -385,6 +717,7 @@ class CompleteOperationCommand(StateCommand):
 class FailOperationCommand(StateCommand):
     operation_id: str = Field(min_length=1)
     error: str = Field(min_length=1)
+    failure_kind: OperationFailureKind = OperationFailureKind.TERMINAL
 
 
 class MarkOperationUnknownCommand(StateCommand):
@@ -457,7 +790,19 @@ Command = (
     | RecordRuntimeEventCommand
     | BindSessionCommand
     | FinalizeInboxCommand
+    | CompleteFinalizeStepCommand
+    | FinalizeTerminalCommand
     | BeginOperationCommand
+    | CreateOperationWithAttemptCommand
+    | BeginOperationAttemptCommand
+    | StartOperationAttemptCommand
+    | CompleteOperationAttemptCommand
+    | FailOperationAttemptCommand
+    | MarkOperationAttemptUnknownCommand
+    | SkipOperationAttemptCommand
+    | AbandonOperationAttemptCommand
+    | HeartbeatOperationAttemptCommand
+    | ReconcileOperationAttemptCommand
     | StartOperationCommand
     | CompleteOperationCommand
     | FailOperationCommand
@@ -480,6 +825,7 @@ class ApplyResult(BaseModel):
 
     state: AgentState
     operation: OperationRecord | None = None
+    attempt: OperationAttempt | None = None
     approval: DurableApproval | None = None
     event_id: str | None = None
     duplicate: bool = False
@@ -498,6 +844,7 @@ def validate_inner_transition(source: ExecutionState, target: ExecutionState) ->
 def is_runnable(
     state: AgentState,
     operation: OperationRecord | None,
+    attempt: OperationAttempt | None = None,
     *,
     now: datetime,
 ) -> bool:
@@ -514,18 +861,29 @@ def is_runnable(
     if state.execution and state.execution.state is ExecutionState.WAITING_HUMAN:
         return False
     if state.execution and state.execution.state is ExecutionState.ACTING:
-        if operation is None:
+        if operation is None or attempt is None:
             return False
-        if operation.status in {OperationStatus.PREPARED, OperationStatus.COMPLETED, OperationStatus.FAILED}:
+        if attempt.status is OperationStatus.PREPARED:
             return True
-        if operation.status in {OperationStatus.UNKNOWN, OperationStatus.ABANDONED}:
+        if attempt.status in {
+            OperationStatus.COMPLETED, OperationStatus.FAILED,
+            OperationStatus.SKIPPED, OperationStatus.ABANDONED,
+        }:
+            return True
+        if attempt.status is OperationStatus.UNKNOWN:
             return False
-        if operation.status is OperationStatus.RUNNING:
-            if not operation.heartbeat_expires_at:
-                return False
-            expires = datetime.fromisoformat(operation.heartbeat_expires_at.replace("Z", "+00:00"))
-            selected = now if now.tzinfo is not None else now.astimezone()
-            return selected >= expires
+        if attempt.status is OperationStatus.RUNNING:
+            # Expiry only makes the attempt eligible for Recovery/reconcile.  It
+            # never makes the original side effect dispatchable again.
+            return False
+    if operation and operation.status is OperationStatus.FAILED:
+        if operation.failure_kind is not OperationFailureKind.RETRYABLE:
+            return True
+        if not operation.next_retry_at or not operation.retry_policy_snapshot.automatic:
+            return False
+        retry_at = datetime.fromisoformat(operation.next_retry_at.replace("Z", "+00:00"))
+        selected = now if now.tzinfo is not None else now.astimezone()
+        return selected >= retry_at
     return True
 
 
@@ -544,15 +902,23 @@ def projected_run_status(state: AgentState) -> str:
 
 
 __all__ = [
-    "AbandonOperationCommand", "AdoptGatewayEpochCommand", "AgentState", "ApplyResult", "ApprovalStatus",
+    "AbandonOperationAttemptCommand", "AbandonOperationCommand", "AdoptGatewayEpochCommand", "AgentState",
+    "ApplyResult", "ApprovalStatus", "AttemptRecoveryResolution",
+    "BeginOperationAttemptCommand",
     "BeginOperationCommand", "BindSessionCommand", "Command", "CompleteOperationCommand", "CreateSafeCheckpointCommand",
+    "CompleteOperationAttemptCommand", "CreateOperationWithAttemptCommand",
     "CreateApprovalCommand", "DecideApprovalCommand", "DurableApproval",
     "ExecutionOutcome", "ExecutionSnapshot", "ExecutionState", "ExpireApprovalCommand",
-    "FailOperationCommand", "FinalizeInboxCommand", "HeartbeatOperationCommand", "INNER_TRANSITIONS",
+    "FailOperationAttemptCommand", "FailOperationCommand", "FinalizeInboxCommand",
+    "CompleteFinalizeStepCommand", "FinalizeTerminalCommand", "PRE_TERMINAL_FINALIZE_STEPS",
+    "HeartbeatOperationAttemptCommand", "HeartbeatOperationCommand", "ImmutableOperationMetadata", "INNER_TRANSITIONS",
     "MarkOperationUnknownCommand", "OperationKind", "OperationRecord", "OperationStatus",
+    "MarkOperationAttemptUnknownCommand", "OperationAggregate", "OperationAttempt", "OperationFailureKind",
     "OUTER_TRANSITIONS", "ReconcileOperationCommand", "ReconcileResult", "ReconcileStatus", "RecoveryDecisionCommand",
-    "RecordRuntimeEventCommand", "RequestCancellationCommand", "SafeCheckpoint", "StartOperationCommand", "StateCommand",
+    "RecordRuntimeEventCommand", "ReconcileOperationAttemptCommand", "RequestCancellationCommand",
+    "RetryPolicySnapshot", "SafeCheckpoint", "SkipOperationAttemptCommand", "StartOperationAttemptCommand",
+    "StartOperationCommand", "StateCommand",
     "TaskState", "TerminalTarget", "ToolIdempotency", "TransitionCommand",
     "UpdateStateMetadataCommand", "WorkloadKind", "is_runnable", "projected_run_status",
-    "validate_inner_transition", "validate_outer_transition",
+    "reduce_operation", "validate_inner_transition", "validate_outer_transition",
 ]

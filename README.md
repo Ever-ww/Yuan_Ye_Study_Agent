@@ -331,6 +331,10 @@ Google Scholar 仍只是候选链接来源；工具不会绕过验证码、登�
 
 Gateway 默认监听 `127.0.0.1:8765`，不同 Session 最多同时运行 4 个任务，同一 Session 同时只允许一个任务。`gateway_runtime_idle_seconds=900` 表示 Session Runtime 空闲 15 分钟后关闭 Trace 与 Docker；Session JSONL 不会删除，下一次请求仍可恢复。
 
+Durable 重试参数分为 `model_retry_*`、`tool_retry_*` 和 `outbox_retry_*`。策略会在
+Logical Operation 创建时固化，后续修改配置只影响新 Operation。Outbox 默认最多尝试
+12 次，退避上限 900 秒；`outbox_dead_letter_enabled=true` 时，超限的单个 Sink 进入人工处理状态。
+
 只允许将模型 Key 写在 `.yy/settings.local.json` 或对应环境变量中；Brave Search Key 只从本机配置读取。程序会拒绝 `.yy/settings.json` 中的 `api_key` 或 `web_search_api_key` 字段；整个 `.yy/` 均为本机目录且不会提交。
 
 ### 2. 可选：使用环境变量保存密钥
@@ -391,14 +395,22 @@ State 的唯一权威来源；`state_transitions` 只保存真实 FSM 迁移，`
 
 所有状态修改统一进入 `StateController.apply(command)`，同时执行 command 幂等、revision CAS、
 Gateway epoch fencing、FSM guard、SQLite 事务、兼容 Run 投影、Gateway Event 和 Outbox。
-Scheduler 统一调用 `is_runnable(state, operation)`；`WAITING_HUMAN`、`RECOVERY_REQUIRED` 和未知
+Scheduler 统一调用 `is_runnable(state, operation, attempt)`；`WAITING_HUMAN`、`RECOVERY_REQUIRED` 和未知
 副作用不会继续消耗模型 Token。
 
-外部工具固定执行 `prepared → running → completed/failed` 两阶段持久化边界。若进程在真实
-副作用完成后、Ledger 提交前退出，Operation 保持 `running/unknown`，系统先调用工具可选的
+每个逻辑模型或工具动作由 `Logical Operation` 表示，真实请求则由不可改写的
+`OperationAttempt` 记录。Operation 与 Attempt 1 在同一 SQLite 事务中创建；重试只能新建
+Attempt，`stable_key/request_hash/retry_policy_snapshot` 在同一 Operation 中永久不变。Operation
+的状态、结果和 `next_retry_at` 只由纯函数 `reduce_operation()` 生成。
+
+外部工具固定执行 `Begin Attempt → running → completed/failed` 两阶段持久化边界。若进程在真实
+副作用完成后、Attempt 结果提交前退出，Attempt 保持 `running/unknown`，系统先调用工具可选的
 `reconcile()`；无法确认时绝不自动猜测或重放非幂等操作。Session JSONL 每条记录包含稳定
 `record_id`，Gateway Run 下还会记录 `run_id/turn_id/operation_id`；恢复补写使用
 `append_once()`。SafeCheckpoint 只会在 Ledger 结果与必需 Session 记录都已确定后建立。
+所有正常终态只能由 `FinalizeTerminalCommand` 从 `FINALIZING` 提交；State、Run 投影、
+Transition、terminal Event 和 Multi-Sink Outbox 共享一个最终事务。Outbox 按 Sink 独立退避，
+达到上限后进入 dead-letter，不会无限高频重试。
 
 ### 1. 创建新会话
 
