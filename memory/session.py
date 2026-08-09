@@ -92,7 +92,7 @@ class SessionStore:
                 call_id, name = value.get("tool_call_id"), value.get("name")
                 if isinstance(call_id, str) and isinstance(name, str):
                     records.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": content})
-        return records
+        return _normalize_recovered_history(_complete_incomplete_tool_chains(records))
 
     def latest_summary(self, session_id: str) -> str:
         """读取当前分段首条摘要；摘要由唯一 System Prompt 承载。"""
@@ -100,7 +100,6 @@ class SessionStore:
             if record.get("role") == "summary" and isinstance(record.get("content"), str):
                 return str(record["content"])
         return ""
-
     def read_records(self, session_id: str) -> list[dict[str, object]]:
         """读取最新分段的原始记录，保留时间戳供 CLI 展示。"""
         path = self._active_path(session_id)
@@ -134,7 +133,13 @@ class SessionStore:
         """为未来上下文压缩创建同哈希的新 JSONL 分段并更新最新索引。"""
         return self.rollover(session_id, [])
 
-    def rollover(self, session_id: str, initial_records: list[dict[str, Any]]) -> Path:
+    def rollover(
+        self,
+        session_id: str,
+        initial_records: list[dict[str, Any]],
+        *,
+        skill_catalog: dict[str, Any] | None = None,
+    ) -> Path:
         """先完整写入新分段，再原子切换会话索引的 latest_file。"""
         index = self._read_index()
         session = index["sessions"].get(session_id)
@@ -155,12 +160,31 @@ class SessionStore:
         temporary.replace(path)
         session["files"].append(filename)
         session["latest_file"] = filename
+        if skill_catalog is not None:
+            session["skill_catalog"] = skill_catalog
         try:
             self._write_index(index)
         except Exception:
             path.unlink(missing_ok=True)
             raise
         return path
+
+    def skill_catalog(self, session_id: str) -> dict[str, Any] | None:
+        """返回 Session 持久化的 Skill 快照；旧 Session 可能暂无此字段。"""
+        session = self._read_index()["sessions"].get(session_id)
+        if session is None:
+            raise KeyError(f"未知会话：{session_id}")
+        value = session.get("skill_catalog")
+        return dict(value) if isinstance(value, dict) else None
+
+    def set_skill_catalog(self, session_id: str, catalog: dict[str, Any]) -> None:
+        """为新 Session 原子记录初始 Skill 快照。"""
+        index = self._read_index()
+        session = index["sessions"].get(session_id)
+        if session is None:
+            raise KeyError(f"未知会话：{session_id}")
+        session["skill_catalog"] = dict(catalog)
+        self._write_index(index)
 
     def active_filename(self, session_id: str) -> str:
         """返回索引指向的当前分段文件名。"""
@@ -218,3 +242,64 @@ class SessionStore:
         temporary = self.index_path.with_suffix(".tmp")
         temporary.write_text(validated.model_dump_json(indent=2) + "\n", encoding="utf-8")
         temporary.replace(self.index_path)
+
+
+def _complete_incomplete_tool_chains(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """只修复模型上下文投影，不篡改原始 JSONL 中未知的工具执行事实。"""
+    completed: list[dict[str, Any]] = []
+    pending: dict[str, str] = {}
+
+    def close_pending() -> None:
+        for call_id, name in pending.items():
+            completed.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": name,
+                "content": (
+                    "此前运行中断，未找到该工具调用的结果记录；"
+                    "执行结果未知，不得假定工具已经执行或尚未执行。"
+                ),
+            })
+        pending.clear()
+
+    for message in records:
+        role = message.get("role")
+        if pending and role != "tool":
+            close_pending()
+        completed.append(message)
+        if role == "assistant" and isinstance(message.get("tool_calls"), list):
+            pending.clear()
+            for call in message["tool_calls"]:
+                if not isinstance(call, dict):
+                    continue
+                call_id = call.get("id")
+                function = call.get("function")
+                name = function.get("name") if isinstance(function, dict) else None
+                if isinstance(call_id, str) and isinstance(name, str):
+                    pending[call_id] = name
+        elif role == "tool":
+            call_id = message.get("tool_call_id")
+            if isinstance(call_id, str):
+                pending.pop(call_id, None)
+    close_pending()
+    return completed
+
+
+def _normalize_recovered_history(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """为旧版异常中断记录建立合法投影，避免连续 user 或 tool 后直接进入新任务。"""
+    normalized: list[dict[str, Any]] = []
+    marker = {
+        "role": "assistant",
+        "content": "此前回答在运行期间中断，没有产生可恢复的最终答复。",
+    }
+    for message in records:
+        if message.get("role") == "user" and normalized:
+            previous_role = normalized[-1].get("role")
+            if previous_role in {"user", "tool"}:
+                normalized.append(dict(marker))
+        normalized.append(message)
+    if normalized and normalized[-1].get("role") == "user":
+        normalized.append(dict(marker))
+    return normalized

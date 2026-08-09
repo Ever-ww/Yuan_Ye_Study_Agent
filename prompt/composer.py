@@ -63,11 +63,19 @@ class SystemPromptComposer:
             return self._snapshots[session_id]
         initialized_at = self.memory.session_created_at(session_id)
         segment_path = self.memory.active_path(session_id)
-        selected_catalog = (
-            skill_catalog
-            if skill_catalog is not None
-            else self.skills.catalog_snapshot() if self.skills is not None else None
+        persisted_catalog = (
+            self.memory.session_skill_catalog(session_id)
+            if self.skills is not None
+            and callable(getattr(self.memory, "session_skill_catalog", None))
+            else None
         )
+        selected_catalog = skill_catalog
+        if selected_catalog is None and persisted_catalog is not None:
+            selected_catalog = SkillCatalogSnapshot.model_validate(
+                persisted_catalog,
+            )
+        if selected_catalog is None and self.skills is not None:
+            selected_catalog = self.skills.catalog_snapshot()
         skill_xml = (
             self.skills.catalog_xml(selected_catalog)
             if self.skills is not None and selected_catalog is not None
@@ -81,6 +89,15 @@ class SystemPromptComposer:
         sections = [
             skill_xml,
             "# Agent 身份（SOUL）\n" + soul,
+            (
+                "# Skill 使用策略\n"
+                "处理每个用户任务前，必须先检查最上方 <available_skills> 目录。"
+                "只要任务与某个 Skill 的 name 或 description 明确匹配，就应优先调用 "
+                "skill_read 读取该 Skill 的 SKILL.md，并按照其中的工作流执行；"
+                "不要在尚未读取匹配 Skill 时自行改用通用工具流程。"
+                "如果需要 Skill 引用的其他文本资源，再使用 skill_read 按需读取，避免一次加载无关内容。"
+                "只有不存在匹配 Skill、Skill 读取失败，或用户明确要求不使用 Skill 时，才直接采用通用工具。"
+            ),
             (
                 "# 核心规则\n你是严谨、透明的本地 Agent。工具调用必须遵守权限、工作区边界和审批要求。"
                 "网络调研中，web_search 只用于发现候选 URL；需要读取正文或核验摘要时，"

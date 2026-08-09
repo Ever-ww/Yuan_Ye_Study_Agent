@@ -160,6 +160,22 @@ class FakeCodeSessions:
 
 
 class GatewayTests(unittest.TestCase):
+    def test_skill_refresh_uses_long_request_timeout(self) -> None:
+        async def check() -> None:
+            client = object.__new__(GatewayClient)
+            captured: dict[str, object] = {}
+
+            async def request(method: str, path: str, **kwargs):
+                captured.update(method=method, path=path, **kwargs)
+                return {"status": "unchanged"}
+
+            client._request = request
+            result = await client.refresh_skills("project", "session")
+            self.assertEqual(result["status"], "unchanged")
+            self.assertEqual(captured["timeout"], 3600)
+
+        asyncio.run(check())
+
     def test_terminal_subscription_closes_nested_event_generator(self) -> None:
         async def check() -> None:
             client = object.__new__(GatewayClient)
@@ -410,6 +426,7 @@ class GatewayTests(unittest.TestCase):
             )
             item = store.create_inbox(completed)
             self.assertFalse(item.read)
+            self.assertTrue(store.mark_run_inbox_read(run.run_id).read)
             self.assertTrue(store.mark_inbox_read(item.item_id).read)
 
     def test_store_restart_does_not_guess_unfinished_run_outcome(self) -> None:
@@ -471,6 +488,18 @@ class GatewayTests(unittest.TestCase):
                 self.assertEqual(events[-1]["type"], "inbox_created")
                 inbox = client.get("/api/v1/inbox", headers=headers).json()
                 self.assertEqual(inbox[0]["run_id"], run_id)
+                self.assertFalse(inbox[0]["read"])
+                terminal_sequence = next(
+                    event["sequence"] for event in events if event["type"] == "run_completed"
+                )
+                with client.websocket_connect(
+                    f"/api/v1/events?token=test-token&client_id=test-client"
+                    f"&run_id={run_id}&after_sequence={terminal_sequence - 1}"
+                ) as socket:
+                    delivered = socket.receive_json()
+                self.assertEqual(delivered["type"], "run_completed")
+                inbox = client.get("/api/v1/inbox", headers=headers).json()
+                self.assertTrue(inbox[0]["read"])
                 with client.websocket_connect(
                     f"/api/v1/events?token=test-token&client_id=replay-client"
                     f"&run_id={run_id}&after_sequence=1"
@@ -613,6 +642,43 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(result.session_id, "a" * 16)
             self.assertEqual(first.skill_refreshes, ["a" * 16])
             self.assertEqual(second.skill_refreshes, [])
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(check(Path(value)))
+
+    def test_skill_refresh_restores_idle_session_without_chat_message(self) -> None:
+        async def check(root: Path) -> None:
+            store = GatewayStore(root / ".yy" / "gateway")
+            project = store.register_project(root)
+            memory = MemoryStore(
+                root / ".yy" / "memory",
+                workspace_root=root,
+                agent_root=root,
+            )
+            session_id = memory.create_session("hello")
+            controller = StateController(store.database_path, gateway_epoch="test")
+            created: list[FakeRuntime] = []
+
+            def factory(workspace: Path, approvals) -> FakeRuntime:
+                del approvals
+                runtime = FakeRuntime(workspace)
+                created.append(runtime)
+                return runtime
+
+            pool = RuntimePool(
+                agent_root=root,
+                store=store,
+                events=GatewayEventBus(),
+                state_controller=controller,
+                runtime_factory=factory,
+            )
+            result = await pool.refresh_skills(project.project_id, session_id)
+
+            self.assertEqual(result.session_id, session_id)
+            self.assertEqual(len(created), 1)
+            self.assertEqual(created[0].skill_refreshes, [session_id])
+            self.assertIn((project.project_id, session_id), pool._runtimes)
+            await pool.close()
 
         with tempfile.TemporaryDirectory() as value:
             asyncio.run(check(Path(value)))

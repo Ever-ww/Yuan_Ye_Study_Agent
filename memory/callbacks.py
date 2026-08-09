@@ -84,7 +84,13 @@ def register_memory_callbacks(
         if isinstance(error, BaseException) and is_retryable_model_error(error):
             memory.record_network_failure(event.session_id)
             return
-        if error is not None or not event.data.get("completed"):
+        if error is not None:
+            memory.record_turn_failure(
+                event.session_id,
+                str(error) or type(error).__name__,
+            )
+            return
+        if not event.data.get("completed"):
             return
         answer = str(event.data.get("answer", ""))
         if not answer:

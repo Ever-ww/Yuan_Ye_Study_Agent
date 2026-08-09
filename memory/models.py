@@ -49,6 +49,7 @@ class SessionIndexEntry(BaseModel):
     created_at: str = Field(min_length=1)
     latest_file: str = Field(min_length=1)
     files: list[str] = Field(min_length=1)
+    skill_catalog: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def _latest_file_must_exist(self) -> "SessionIndexEntry":

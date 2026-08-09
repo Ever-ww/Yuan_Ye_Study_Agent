@@ -133,13 +133,60 @@ class PaperLibraryTests(unittest.TestCase):
             self.assertTrue((service.root / record.pdf_path).is_file())
             self.assertTrue((service.root / record.summary_path).is_file())
 
-            second = await service.download_batch((candidate,), session_id="session-a")
+            restarted = PaperLibraryService(root, downloader=downloader)
+            self.assertTrue(restarted.grant_allows(batch_id, paper_id, "session-a"))
+            self.assertFalse(restarted.grant_allows(batch_id, paper_id, "different-session"))
+            second = await restarted.download_batch((candidate,), session_id="session-a")
             self.assertEqual(second.items[0].status, "duplicate")
-            self.assertEqual((await service.get(paper_id)).status, "summarized")
+            self.assertEqual((await restarted.get(paper_id)).status, "summarized")
 
         with tempfile.TemporaryDirectory() as value:
             asyncio.run(run(Path(value)))
         self.assertEqual(requests, 1)
+
+    def test_legacy_successful_download_record_migrates_batch_grant(self) -> None:
+        pdf = _pdf_bytes()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"content-type": "application/pdf"}, content=pdf)
+
+        async def run(root: Path) -> None:
+            downloader = PaperDownloadTool(
+                transport=httpx.MockTransport(handler),
+                resolver=_public_resolver,
+            )
+            service = PaperLibraryService(root, downloader=downloader)
+            candidate = PaperCandidate(
+                title="Legacy Approved Paper",
+                pdf_url="https://example.com/legacy.pdf",
+                arxiv_id="2601.12345",
+            )
+            downloaded = await service.download_batch((candidate,), session_id="a" * 16)
+            service.grants_path.unlink()
+            session_dir = root / ".yy" / "memory" / "session" / ("b" * 16)
+            session_dir.mkdir(parents=True)
+            record = {
+                "role": "tool",
+                "name": "paper_library_download",
+                "status": "success",
+                "operation_id": "operation-1",
+                "timestamp": "2026-08-09 13:27:37",
+                "content": downloaded.model_dump_json(),
+                "arguments": {"candidates": [candidate.model_dump(mode="json")]},
+            }
+            (session_dir / f"2026-08-09_{'a' * 16}_001.jsonl").write_text(
+                json.dumps(record, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+            restarted = PaperLibraryService(root, downloader=downloader)
+            paper_id = downloaded.items[0].paper_id
+            self.assertTrue(restarted.grant_allows(downloaded.batch_id, paper_id, "a" * 16))
+            persisted = json.loads(restarted.grants_path.read_text(encoding="utf-8"))
+            self.assertIn(downloaded.batch_id, persisted["grants"])
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(run(Path(value)))
 
     def test_reference_library_scope_requires_batch_and_links_global_pdf(self) -> None:
         pdf = _pdf_bytes()
@@ -163,6 +210,14 @@ class PaperLibraryTests(unittest.TestCase):
             )
             downloaded = await library.download_batch((candidate,), session_id="session-b")
             library_id = downloaded.items[0].paper_id
+            # 模拟 Gateway/Runtime 重启：Reference 写入必须从 grants.json 恢复授权。
+            library = PaperLibraryService(
+                root,
+                downloader=PaperDownloadTool(
+                    transport=httpx.MockTransport(handler),
+                    resolver=_public_resolver,
+                ),
+            )
             service = ReferenceService(ReferenceStore(root / ".yy" / "reference" / "reference.sqlite3"))
             tool = ReferenceWriteTool(service, library)
             registry = AsyncToolRegistry((tool,))
@@ -176,11 +231,28 @@ class PaperLibraryTests(unittest.TestCase):
             context = ToolContext(project_root=root, approval=approve, session_id="session-b")
             paper = await registry.execute("reference_write", {
                 "action": "upsert_paper",
-                "paper": {"title": "Library Link"},
+                "paper": {
+                    "title": "Library Link",
+                    "authors": ["Ada Lovelace"],
+                    "year": 2026,
+                    "doi": "10.1000/library",
+                },
                 "batch_id": downloaded.batch_id,
                 "library_paper_id": library_id,
             }, context)
             reference_id = json.loads(paper)["paper_id"]
+            passage = await registry.execute("reference_write", {
+                "action": "add_passage",
+                "passage": {
+                    "text": "Verified source passage.",
+                    "page": 3,
+                    "locator": "p. 3, Results",
+                },
+                "scope": "paper_library",
+                "batch_id": downloaded.batch_id,
+                "library_paper_id": library_id,
+            }, context)
+            passage_id = json.loads(passage)["passage_id"]
             await registry.execute("reference_write", {
                 "action": "link_file",
                 "paper_id": reference_id,
@@ -190,8 +262,15 @@ class PaperLibraryTests(unittest.TestCase):
             }, context)
             self.assertEqual(approvals, [])
             bundle = service.get("paper", reference_id)
+            self.assertEqual(bundle["paper"]["authors"][0]["display_name"], "Ada Lovelace")
+            self.assertEqual(bundle["paper"]["publication_year"], 2026)
+            self.assertEqual(bundle["paper"]["identifiers"][0]["scheme"], "doi")
             self.assertEqual(bundle["paper"]["files"][0]["workspace_hash"], "global-paper-library")
+            self.assertEqual(bundle["passages"][0]["paper_id"], reference_id)
+            self.assertEqual(bundle["passages"][0]["page_start"], 3)
+            self.assertEqual(bundle["passages"][0]["locator"]["label"], "p. 3, Results")
             self.assertEqual((await library.get(library_id)).reference_paper_id, reference_id)
+            self.assertEqual((await library.get(library_id)).reference_passage_ids, (passage_id,))
 
         with tempfile.TemporaryDirectory() as value:
             asyncio.run(run(Path(value)))
@@ -206,6 +285,16 @@ class PaperLibraryTests(unittest.TestCase):
             metadata = {item.name: item for item in service.catalog()}
             self.assertIn("search-summary-paper", metadata)
             self.assertIn("download", metadata["search-summary-paper"].description.casefold())
+            skill_root = repository_root / "skills" / "search-summary-paper"
+            instructions = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+            template = (skill_root / "references" / "summary-template.md").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn("Reference as a citation-oriented evidence store", instructions)
+            self.assertIn("2,000–4,000 Chinese characters", instructions)
+            self.assertIn("一分钟概览", template)
+            self.assertIn("方法与模型详解", template)
+            self.assertIn("Reference 证据与引用索引", template)
 
 
 if __name__ == "__main__":

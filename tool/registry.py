@@ -9,6 +9,7 @@ from typing import Annotated, Any, Awaitable, Callable, Iterable, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
 from .contracts import AsyncTool, ToolContext, ToolRisk
+from .errors import ToolRequestError
 
 
 _STATIC_RISKS = {"read", "write", "high"}
@@ -120,11 +121,23 @@ class AsyncToolRegistry:
                     "当前 Trace 未运行 Docker 沙箱，Bash 已禁用且不会回退到宿主机 Shell",
                 )
             raise RuntimeError(f"工具在当前执行上下文中不可用：{name}")
-        arguments = self.prepare_arguments(name, arguments)
-        arguments = self._validate(name, arguments)
-        ensure_available = getattr(tool, "ensure_available", None)
-        if callable(ensure_available):
-            ensure_available(arguments, context)
+        try:
+            arguments = self.prepare_arguments(name, arguments)
+            arguments = self._validate(name, arguments)
+            ensure_available = getattr(tool, "ensure_available", None)
+            if callable(ensure_available):
+                ensure_available(arguments, context)
+        except ToolRequestError:
+            raise
+        except Exception as exc:
+            # 保留原始异常类型，方便直接调用 Registry 的代码精确处理
+            # PermissionError、BashUnavailableError 等领域错误；React 层通过此标记
+            # 识别“真实副作用尚未开始”的错误，并将其安全地作为 observation 返回模型。
+            try:
+                setattr(exc, "tool_request_error", True)
+            except Exception:  # pragma: no cover - 少数不可变第三方异常对象
+                raise ToolRequestError(str(exc) or type(exc).__name__) from exc
+            raise
         needs_approval = self._resolved_risk(tool, arguments) != "read"
         approval_required = getattr(tool, "approval_required", None)
         if needs_approval and callable(approval_required):

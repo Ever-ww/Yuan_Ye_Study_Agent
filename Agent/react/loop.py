@@ -17,7 +17,12 @@ from Agent.errors import AgentExecutionLimitError, AgentInvariantError
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models.errors import is_retryable_model_error
 from Agent.retry import ModelRetryPolicy
-from tool import AsyncToolRegistry, ToolContext
+from tool import (
+    AsyncToolRegistry,
+    ToolContext,
+    ToolExecutionObservationError,
+    ToolRequestError,
+)
 
 
 class ReactLoop:
@@ -276,7 +281,37 @@ class ReactLoop:
             name, arguments = before.data.get("name"), before.data.get("arguments")
             if not isinstance(name, str) or not isinstance(arguments, dict):
                 raise ValueError("tool_before 必须保留字符串 name 和对象 arguments")
-            arguments = self.tools.prepare_arguments(name, arguments)
+            try:
+                arguments = self.tools.prepare_arguments(name, arguments)
+            except Exception as exc:
+                error = exc if isinstance(exc, ToolRequestError) else ToolRequestError(
+                    str(exc) or type(exc).__name__,
+                )
+                await self.hooks.emit(HookEvent(
+                    point=HookPoint.TOOL_AFTER,
+                    session_id=session_id,
+                    data={
+                        "task": task,
+                        "name": name,
+                        "arguments": arguments,
+                        "tool_call_id": call_id,
+                        "result": None,
+                        "error": error,
+                    },
+                ))
+                result = f"工具请求校验失败：{str(error) or type(error).__name__}"
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": result,
+                })
+                yield RunEvent(type=EventType.TOOL_COMPLETED, payload={
+                    "name": name,
+                    "content": result,
+                    "status": "error",
+                })
+                continue
             yield RunEvent(type=EventType.TOOL_REQUESTED, payload={"name": name, "arguments": arguments})
             await self.hooks.emit(HookEvent(point=HookPoint.TOOL_DURING, session_id=session_id, data={
                 "task": task, "name": name, "arguments": arguments, "tool_call_id": call_id,
@@ -298,13 +333,36 @@ class ReactLoop:
                 await self.hooks.emit(HookEvent(point=HookPoint.TOOL_AFTER, session_id=session_id, data={
                     "task": task, "name": name, "arguments": arguments, "tool_call_id": call_id, "result": None, "error": exc,
                 }))
-                raise
+                # 只读工具失败没有未决副作用，可以作为结构化 observation 交还模型，
+                # 让它更换来源、参数或工具继续任务。写入和高风险工具仍保持 fail-closed。
+                request_error = isinstance(exc, ToolRequestError) or bool(
+                    getattr(exc, "tool_request_error", False)
+                )
+                if not request_error and not isinstance(exc, ToolExecutionObservationError) and (
+                    self.tools.risk_of(name, arguments) != "read"
+                ):
+                    raise
+                result = f"工具执行失败：{str(exc) or type(exc).__name__}"
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": result,
+                })
+                yield RunEvent(type=EventType.TOOL_COMPLETED, payload={
+                    "name": name,
+                    "content": result,
+                    "status": "error",
+                })
+                continue
             after = HookEvent(point=HookPoint.TOOL_AFTER, session_id=session_id, data={
                 "task": task, "name": name, "arguments": arguments, "tool_call_id": call_id, "result": result, "error": None,
             })
             await self.hooks.emit(after)
             result = str(after.data.get("result", result))
-            yield RunEvent(type=EventType.TOOL_COMPLETED, payload={"name": name, "content": result})
+            yield RunEvent(type=EventType.TOOL_COMPLETED, payload={
+                "name": name, "content": result, "status": "success",
+            })
             messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result})
 
 def _assistant_tool_message(reply: ModelReply) -> dict[str, Any]:

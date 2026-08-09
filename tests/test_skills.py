@@ -431,6 +431,59 @@ class SkillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             asyncio.run(run(Path(value)))
 
+    def test_skill_refresh_restores_closed_session_and_uses_persisted_catalog(self) -> None:
+        async def run(root: Path) -> None:
+            source_root, workspace = root / "repo", root / "workspace"
+            workspace.mkdir()
+            _make_skill(source_root / "skills", "first-skill")
+            config = load_runtime_config(
+                root,
+                workspace_root=workspace,
+                coding_source_root=source_root,
+            )
+
+            first = AgentRuntime(
+                config,
+                provider=object(),
+                tools=AsyncToolRegistry(),
+                enable_context_processing=False,
+                enable_subagent=False,
+                enable_sandbox=False,
+                enable_extensions=False,
+                enable_references=False,
+                enable_paper_library=False,
+            )
+            session_id = await first._ensure_session("", None)
+            first.prompts.compose("preview", session_id)
+            original = first.memory.session_skill_catalog(session_id)
+            self.assertIsNotNone(original)
+            await first.close()
+
+            _make_skill(source_root / "skills", "second-skill")
+            restored = AgentRuntime(
+                config,
+                provider=object(),
+                tools=AsyncToolRegistry(),
+                enable_context_processing=False,
+                enable_subagent=False,
+                enable_sandbox=False,
+                enable_extensions=False,
+                enable_references=False,
+                enable_paper_library=False,
+            )
+            result = await restored.refresh_skills(session_id)
+            self.assertEqual(result.status, "refreshed")
+            self.assertEqual(result.added, ("second-skill",))
+            self.assertTrue(str(result.target_file).endswith("_002.jsonl"))
+            persisted = restored.memory.session_skill_catalog(session_id)
+            self.assertEqual(persisted["digest"], result.new_digest)
+            unchanged = await restored.refresh_skills(session_id)
+            self.assertEqual(unchanged.status, "unchanged")
+            await restored.close()
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(run(Path(value)))
+
 
 if __name__ == "__main__":
     unittest.main()

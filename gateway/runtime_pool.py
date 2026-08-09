@@ -34,6 +34,7 @@ from gateway.models import ApprovalRequest, RunRecord
 from gateway.outbox import OutboxDispatcher
 from gateway.state_controller import StateController
 from gateway.store import GatewayStore
+from memory import MemoryStore
 from reference import ReferenceService
 
 
@@ -57,6 +58,7 @@ class RuntimePool:
         events: GatewayEventBus,
         max_concurrent_runs: int = 4,
         idle_timeout_seconds: int = 900,
+        approval_timeout_seconds: int = 30,
         runtime_factory: RuntimeFactory | None = None,
         extensions: ExtensionCatalog | None = None,
         cron_service=None,
@@ -89,6 +91,7 @@ class RuntimePool:
             self._publish_approval,
             self.events.wait_connected,
             state_controller=state_controller,
+            approval_timeout_seconds=approval_timeout_seconds,
         )
         self._semaphore = asyncio.Semaphore(max_concurrent_runs)
         self._runtimes: dict[tuple[str, str], RuntimeEntry] = {}
@@ -166,14 +169,49 @@ class RuntimePool:
             await entry.runtime.close()
 
     async def refresh_skills(self, project_id: str, session_id: str):
-        """只刷新明确指定的活动 Session。"""
-        entry = self._runtimes.get((project_id, session_id))
-        if entry is None:
-            raise RuntimeError(
-                "指定 Session 当前没有活动 Runtime；先发送一条消息恢复会话，再执行 /skill refresh",
-            )
-        entry.last_used = monotonic()
-        return await entry.runtime.refresh_skills(session_id)
+        """刷新指定的持久化 Session；空闲时自动恢复 Runtime。"""
+        key = (project_id, session_id)
+        created = False
+        async with self._lock:
+            if key in self._busy_sessions:
+                raise RuntimeError("当前 Session 正在执行任务，请在本轮结束后刷新 Skill")
+            self._busy_sessions.add(key)
+        try:
+            entry = self._runtimes.get(key)
+            if entry is None:
+                project = self.store.project(project_id)
+                workspace = Path(project.path)
+                memory = MemoryStore(
+                    self.agent_root / ".yy" / "memory",
+                    workspace_root=workspace,
+                    agent_root=self.agent_root,
+                )
+                if not memory.has_session(session_id):
+                    raise RuntimeError(f"项目中不存在 Session：{session_id}")
+                placeholder = RunRecord(
+                    run_id=f"skill-refresh-{uuid4().hex}",
+                    project_id=project_id,
+                    session_id=session_id,
+                    client_id="gateway:skill-refresh",
+                    task="/skill refresh",
+                    status="completed",
+                    created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                )
+                runtime = await self._runtime_for(placeholder, workspace)
+                entry = RuntimeEntry(runtime, monotonic())
+                self._runtimes[key] = entry
+                created = True
+            entry.last_used = monotonic()
+            return await entry.runtime.refresh_skills(session_id)
+        except Exception:
+            if created:
+                selected = self._runtimes.pop(key, None)
+                if selected is not None:
+                    await selected.runtime.close()
+            raise
+        finally:
+            async with self._lock:
+                self._busy_sessions.discard(key)
 
     def is_idle(self) -> bool:
         """Dream 只在没有排队或运行任务时读取 Session 与修改 Profile。"""

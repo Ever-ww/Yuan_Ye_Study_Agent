@@ -97,6 +97,11 @@ class PaperBatchGrant(PaperLibraryModel):
     created_at: datetime
 
 
+class PaperGrantIndex(PaperLibraryModel):
+    version: Literal[1] = 1
+    grants: dict[str, PaperBatchGrant] = Field(default_factory=dict)
+
+
 class PaperDownloadItem(PaperLibraryModel):
     paper_id: str
     status: PaperStatus

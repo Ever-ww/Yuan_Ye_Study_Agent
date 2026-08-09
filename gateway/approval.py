@@ -35,7 +35,7 @@ class GatewayApprovalBroker:
         publish: PublishApproval,
         wait_for_client: WaitForClient | None = None,
         state_controller: StateController | None = None,
-        approval_timeout_seconds: int = 600,
+        approval_timeout_seconds: int = 30,
     ) -> None:
         self.store = store
         self.publish = publish

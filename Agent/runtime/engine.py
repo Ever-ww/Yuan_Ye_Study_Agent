@@ -33,7 +33,7 @@ from sandbox import (
     WorkspaceLockManager,
     sandbox_status_of,
 )
-from skill import SkillRefreshResult, SkillService
+from skill import SkillCatalogSnapshot, SkillRefreshResult, SkillService
 from tool import (
     AsyncToolRegistry,
     ToolContext,
@@ -396,13 +396,32 @@ class AgentRuntime:
         if self.skills is None:
             raise RuntimeError("当前 Runtime 已禁用 Skill")
         active_id = session_id or self._session_id
-        if not active_id or not self._session_open or active_id != self._session_id:
+        if not active_id:
             return SkillRefreshResult(
                 status="error",
-                message="当前没有可刷新的活动 Session；新 Session 会自动加载最新 Skill",
-                session_id=active_id or "none",
+                message="当前没有可刷新的 Session",
+                session_id="none",
             )
-        current = self.prompts.skill_catalog(active_id)
+        if not self.memory.has_session(active_id):
+            return SkillRefreshResult(
+                status="error",
+                message=f"未知 Session：{active_id}",
+                session_id=active_id,
+            )
+        if not self._session_open:
+            await self._ensure_session("", active_id)
+        elif active_id != self._session_id:
+            return SkillRefreshResult(
+                status="error",
+                message="当前 Runtime 已打开另一个 Session",
+                session_id=active_id,
+            )
+        persisted = self.memory.session_skill_catalog(active_id)
+        current = (
+            SkillCatalogSnapshot.model_validate(persisted)
+            if persisted is not None
+            else None
+        )
         candidate = self.skills.catalog_snapshot()
         self.skills.catalog_xml(candidate)
         old_digest = current.digest if current is not None else None
@@ -451,6 +470,7 @@ class AgentRuntime:
             result = await self.context_processor.compress(
                 active_id,
                 summary_metadata=audit,
+                skill_catalog=candidate.model_dump(mode="json"),
             )
             if result.status != "compressed":
                 self.context_processor.discard_fallback(active_id)
@@ -473,6 +493,7 @@ class AgentRuntime:
                 "当前会话尚无历史消息；本分段由 Skill 目录刷新创建。",
                 source_file,
                 metadata=audit,
+                skill_catalog=candidate.model_dump(mode="json"),
             )
             target_file = segment.name
 
@@ -568,6 +589,11 @@ class AgentRuntime:
             raise
         if not self.memory.has_session(event.session_id):
             self.memory.create_session(task, session_id=event.session_id)
+        if requested_session_id is None and self.skills is not None:
+            self.memory.set_session_skill_catalog(
+                event.session_id,
+                self.skills.catalog_snapshot().model_dump(mode="json"),
+            )
         self.prompts.set_sandbox_status(sandbox_status_of(self.sandbox))
         self._session_id = event.session_id
         self._session_open = True

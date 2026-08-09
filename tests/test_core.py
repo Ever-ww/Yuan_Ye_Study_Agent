@@ -51,7 +51,43 @@ class FailingToolProvider:
     streaming = False
 
     async def complete(self, messages, tools):
+        failures = [message for message in messages if message["role"] == "tool"]
+        if failures:
+            return ModelReply(text="读取失败后已使用模型自身知识继续回答")
         return ModelReply(tool_calls=(ToolCall(name="read_file", arguments={"path": "missing-file.txt"}),))
+
+
+class InvalidWriteProvider:
+    """写工具请求校验失败后，根据结构化 observation 继续完成回答。"""
+
+    streaming = False
+
+    async def complete(self, messages, tools):
+        failures = [message for message in messages if message["role"] == "tool"]
+        if failures:
+            return ModelReply(text="已根据参数错误重新规划")
+        return ModelReply(tool_calls=(ToolCall(
+            name="validated_write",
+            arguments={"value": "invalid"},
+        ),))
+
+
+class ValidatedWriteTool:
+    name = "validated_write"
+    description = "测试真实副作用前的语义校验"
+    risk = "write"
+    schema = {
+        "type": "object",
+        "properties": {"value": {"type": "string"}},
+        "required": ["value"],
+    }
+
+    def ensure_available(self, arguments, context) -> None:
+        del arguments, context
+        raise ValueError("authors 必须使用对象格式")
+
+    async def run(self, arguments, context) -> str:  # pragma: no cover - 不应执行
+        raise AssertionError("请求校验失败后不得执行真实写入")
 
 
 class SubagentCallingProvider:
@@ -382,8 +418,9 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             defaults = load_runtime_config(root)
-            self.assertEqual(defaults.compression_threshold_tokens, 20000)
+            self.assertEqual(defaults.compression_threshold_tokens, 200000)
             self.assertEqual(defaults.sandbox_checkpoint_limit, 17)
+            self.assertEqual(defaults.approval_timeout_seconds, 30)
             (root / ".yy" / "settings.local.json").write_text(
                 '{"compression_threshold_tokens":-1}', encoding="utf-8",
             )
@@ -493,7 +530,76 @@ class CoreTests(unittest.TestCase):
             restored = memory.restore_messages(result.session_id)
             self.assertEqual(restored[1]["tool_calls"][0]["id"], restored[2]["tool_call_id"])
 
-    def test_failed_tool_result_is_persisted_before_error_propagates(self) -> None:
+    def test_restore_repairs_incomplete_multi_tool_chain_without_changing_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            memory = MemoryStore(Path(value) / ".yy" / "memory")
+            session_id = memory.create_session("research")
+            memory.record_user(session_id, "research")
+            calls = [
+                {
+                    "id": f"call_{index}", "type": "function",
+                    "function": {"name": f"tool_{index}", "arguments": "{}"},
+                }
+                for index in range(3)
+            ]
+            memory.record_model_tool_calls(
+                session_id, content=None, tool_calls=calls, model={}, model_call={},
+            )
+            memory.record_tool_result(
+                session_id, tool_call_id="call_0", name="tool_0",
+                content="failed", status="error", arguments={},
+            )
+            memory.record_user(session_id, "continue")
+
+            restored = memory.refresh_messages(session_id)
+            assistant_index = next(
+                index for index, item in enumerate(restored)
+                if item.get("role") == "assistant" and item.get("tool_calls")
+            )
+            following = restored[assistant_index + 1 : assistant_index + 4]
+            self.assertEqual([item["role"] for item in following], ["tool", "tool", "tool"])
+            self.assertEqual(
+                {item["tool_call_id"] for item in following},
+                {"call_0", "call_1", "call_2"},
+            )
+            self.assertIn("执行结果未知", following[1]["content"])
+            self.assertEqual(restored[-1]["role"], "assistant")
+            self.assertFalse(any(
+                left.get("role") == right.get("role") == "user"
+                for left, right in zip(restored, restored[1:])
+            ))
+            self.assertEqual(
+                sum(item["role"] == "tool" for item in memory.session_records(session_id)),
+                1,
+            )
+
+    def test_turn_failure_closes_pending_tools_before_terminal_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            memory = MemoryStore(Path(value) / ".yy" / "memory")
+            session_id = memory.create_session("research")
+            memory.record_user(session_id, "research")
+            calls = [
+                {
+                    "id": f"call_{index}", "type": "function",
+                    "function": {"name": f"tool_{index}", "arguments": "{}"},
+                }
+                for index in range(2)
+            ]
+            memory.record_model_tool_calls(
+                session_id, content=None, tool_calls=calls, model={}, model_call={},
+            )
+            memory.record_tool_result(
+                session_id, tool_call_id="call_0", name="tool_0",
+                content="failed", status="error", arguments={},
+            )
+            self.assertTrue(memory.record_turn_failure(session_id, "field error"))
+            records = memory.session_records(session_id)
+            self.assertEqual([item["role"] for item in records[-2:]], ["tool", "assistant"])
+            self.assertEqual(records[-2]["status"], "skipped")
+            self.assertEqual(records[-2]["tool_call_id"], "call_1")
+            self.assertEqual(records[-1]["status"], "error")
+
+    def test_failed_read_tool_is_persisted_and_model_can_continue(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             config = load_runtime_config(root)
@@ -501,11 +607,37 @@ class CoreTests(unittest.TestCase):
             result = asyncio.run(AgentRuntime(
                 config, provider=FailingToolProvider(), memory=memory, enable_sandbox=False,
             ).run("读取缺失文件"))
-            self.assertFalse(result.completed)
+            self.assertTrue(result.completed)
             records = memory.session_records(result.session_id)
-            self.assertEqual([record["role"] for record in records], ["user", "assistant", "tool"])
-            self.assertEqual(records[-1]["status"], "error")
-            self.assertIn("工具执行失败", records[-1]["content"])
+            self.assertEqual([record["role"] for record in records], ["user", "assistant", "tool", "assistant"])
+            self.assertEqual(records[-2]["status"], "error")
+            self.assertIn("工具执行失败", records[-2]["content"])
+            self.assertEqual(records[-1]["content"], "读取失败后已使用模型自身知识继续回答")
+
+    def test_write_request_validation_error_is_observed_and_model_can_continue(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(root)
+            memory = MemoryStore(config.memory_dir)
+            runtime = AgentRuntime(
+                config,
+                provider=InvalidWriteProvider(),
+                tools=AsyncToolRegistry((ValidatedWriteTool(),)),
+                memory=memory,
+                approval=lambda name, arguments: asyncio.sleep(0, result=True),
+                enable_sandbox=False,
+                enable_subagent=False,
+                enable_skills=False,
+                enable_references=False,
+                enable_paper_library=False,
+            )
+            result = asyncio.run(runtime.run("写入论文元数据"))
+            self.assertTrue(result.completed)
+            records = memory.session_records(result.session_id)
+            self.assertEqual([item["role"] for item in records], ["user", "assistant", "tool", "assistant"])
+            self.assertEqual(records[-2]["status"], "error")
+            self.assertIn("authors 必须使用对象格式", records[-2]["content"])
+            self.assertEqual(records[-1]["content"], "已根据参数错误重新规划")
 
     def test_automatic_compression_merges_profile_and_rolls_over(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -787,7 +919,8 @@ class CoreTests(unittest.TestCase):
                 enable_sandbox=False,
             )
             result = asyncio.run(runtime.run("计算"))
-            self.assertFalse(result.completed)
+            self.assertTrue(result.completed)
+            self.assertEqual(result.answer, "计算完成：4")
 
     def test_session_hooks_do_not_expose_turn_numbers(self) -> None:
         async def check() -> list[HookEvent]:
@@ -1212,6 +1345,10 @@ class CoreTests(unittest.TestCase):
             system = provider.messages[0]["content"]
             self.assertTrue(system.startswith("<available_skills>"))
             self.assertLess(system.index("身份内容"), system.index("项目内容"))
+            self.assertLess(system.index("身份内容"), system.index("# Skill 使用策略"))
+            self.assertLess(system.index("# Skill 使用策略"), system.index("# 核心规则"))
+            self.assertIn("必须先检查最上方 <available_skills> 目录", system)
+            self.assertIn("优先调用 skill_read", system)
             self.assertNotIn("根目录不得进入模型", system)
             self.assertIn(f"Session ID：{result.session_id}", system)
             self.assertIn("分段绝对路径：", system)

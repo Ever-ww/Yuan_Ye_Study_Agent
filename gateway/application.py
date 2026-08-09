@@ -116,6 +116,7 @@ class GatewayApplication:
             events=self.events,
             max_concurrent_runs=config.gateway_max_concurrent_runs,
             idle_timeout_seconds=config.gateway_runtime_idle_seconds,
+            approval_timeout_seconds=config.approval_timeout_seconds,
             runtime_factory=runtime_factory,
             extensions=self.extensions,
             cron_service=self.cron_service,

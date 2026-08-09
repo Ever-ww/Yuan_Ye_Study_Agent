@@ -218,7 +218,7 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
   "coding_source_root": null,
   "stream": false,
   "max_steps": 8,
-  "compression_threshold_tokens": 20000,
+  "compression_threshold_tokens": 200000,
   "tool_output_max_chars": 10000,
   "tool_output_head_ratio": 0.2,
   "tool_output_tail_ratio": 0.2,
@@ -226,6 +226,7 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
   "gateway_port": 8765,
   "gateway_max_concurrent_runs": 4,
   "gateway_runtime_idle_seconds": 900,
+  "approval_timeout_seconds": 30,
   "cron_heartbeat_seconds": 60,
   "dream_enabled": true,
   "dream_schedule": "0 3 * * *",
@@ -323,7 +324,7 @@ Google Scholar 仍只是候选链接来源；工具不会绕过验证码、登�
 程序依次使用显式配置、`.yy/agent-home-migration.json` 中记录的 `source_root`，
 最后才使用当前 Python 源码根目录。它与普通聊天所操作的 `workspace_root` 是两个独立边界。
 
-`compression_threshold_tokens` 默认是 `20000`。所有具备持久化 Memory 的 Runtime 会在每次 `model_before` 估算即将发送的完整 messages 与 Tool Schema；达到阈值时先压缩已经落盘的历史，再把当前新问题作为独立 `user` 消息写入新分段并调用模型。工具调用及结果会在下一次模型请求前一起参与检查。设为 `0` 可关闭自动压缩，但仍可手动使用 `/compress`。
+`compression_threshold_tokens` 默认是 `200000`（200k tokens）。所有具备持久化 Memory 的 Runtime 会在每次 `model_before` 估算即将发送的完整 messages 与 Tool Schema；达到阈值时先压缩已经落盘的历史，再把当前新问题作为独立 `user` 消息写入新分段并调用模型。工具调用及结果会在下一次模型请求前一起参与检查。设为 `0` 可关闭自动压缩，但仍可手动使用 `/compress`。
 
 `tool_output_max_chars` 默认是 `10000`。在下一次用户任务开始时，超过该阈值的历史工具输出仅在模型上下文中裁剪：保留前 `tool_output_head_ratio`（默认 20%）和后 `tool_output_tail_ratio`（默认 20%），中段替换为审计标记。当前任务内的工具结果始终完整；Session JSONL 与错误快照也始终保存完整原文。设为 `0` 可关闭此裁剪。
 
@@ -468,7 +469,7 @@ Code > /exit
 - `/context refresh` 重新读取 Agent、Profile 与当前 Session 文件并刷新内存上下文；命令不会写入 JSONL。
 - `/skill list`、`/skill install`、`/skill update`、`/skill audit` 和 `/skill refresh` 管理本机 Skill；安装或更新不会自动修改当前 Prompt，只有 `/skill refresh` 成功后才重新扫描并加载 Skill XML。
 - `stream=true` 时，OpenAI-compatible Provider 会通过 SSE 逐段显示文本。
-- 高风险工具会显示方向键审批菜单：使用 ↑/↓ 选择“允许本次 / 当前会话始终允许该工具 / 拒绝”，按 Enter 确认、Esc 取消，默认选中拒绝。审批由发起任务的客户端优先处理；该客户端断开时待审批操作立即拒绝，后台 Agent 可继续处理错误或结束。
+- 高风险工具会显示方向键审批菜单：使用 ↑/↓ 选择“允许本次 / 当前会话始终允许该工具 / 拒绝”，按 Enter 确认、Esc 取消，默认选中“允许本次”。30 秒内没有确认输入时仍会自动拒绝，避免危险操作悬挂；审批由发起任务的客户端优先处理，该客户端断开时也会立即拒绝。
 - `bash` 只在当前 Trace 的无网络 Docker 容器中运行。Docker 不可用时它不会出现在主模型或 Subagent 的工具 Schema 中，伪造调用也会在审批前拒绝。容器读写挂载启动时的 workspace，因此命令造成的文件变化会立即出现在宿主机；一次成功 Bash 调用无论修改多少文件都只创建一个 checkpoint，没有变化则不创建。
 - `edit` 参考 PI Agent 的精确编辑语义：一次可提交多个 `{oldText,newText}`，每个 `oldText` 必须在原文件中唯一存在，所有定位都基于修改前的原文且不能重叠；工具保留 UTF-8 BOM 与原换行风格。它适合小范围修改已有文件。
 - `write` 用于创建新文件或明确替换整个文件。`edit` 与 `write` 都在宿主机执行原子替换，每次实际变化后创建一个 checkpoint；内容未变化不会制造空快照。可让 Agent 调用高风险 `sandbox_rollback` 按步数恢复，执行前仍需审批。
@@ -584,7 +585,7 @@ Skill 遵循 [Agent Skills 规范](https://agentskills.io/specification)。一�
 
 也可以用自然语言让主 Agent 安装 Skill。此时模型调用高风险 `skill_install`，先确认下载意图；如果审核还发现可接受风险，再进行第二次确认。Subagent 不能获得 `skill_install`。
 
-`/skill install|update` 会先把来源下载到 `~/.yy/skills/review/`，完成安全审核和必要的人工确认后，再原子发布到源码仓库 `skills/<name>/`。发布不会修改当前 Runtime 的 Skill 缓存。只有显式执行 `/skill refresh` 成功后，Gateway 才刷新当前 Session：目录发生变化时先压缩旧上下文，再创建相同 Session 哈希的下一 JSONL 分段并加载新 Skill；目录未变化时不创建空分段。System Prompt 只加入如下发现信息，不加载正文：
+`/skill install|update` 会先把来源下载到 `~/.yy/skills/review/`，完成安全审核和必要的人工确认后，再原子发布到源码仓库 `skills/<name>/`。发布不会修改当前 Runtime 的 Skill 缓存。只有显式执行 `/skill refresh` 成功后，Gateway 才刷新当前 Session：目录发生变化时先压缩旧上下文，再创建相同 Session 哈希的下一 JSONL 分段并加载新 Skill；目录未变化时不创建空分段。即使该 Session 的 Runtime 已被空闲回收，Gateway 也会根据持久化 Session 自动恢复它，不需要先发送一条聊天消息。System Prompt 只加入如下发现信息，不加载正文：
 
 ```xml
 <available_skills>
@@ -843,6 +844,9 @@ Embedding 专用地址和 Key 留空时回退聊天模型的 `base_url` 与 `api
 PubMed 和公开出版商页面。Google Scholar 仅作为公开候选链接来源，不直接抓取，也不会绕过
 登录、验证码或付费墙。模型先调用 `paper_library_lookup` 查重，再用
 `paper_library_download` 一次提交整批候选，因此整批下载只出现一次审批。
+批准后的批次授权按 Session 和论文 ID 集合写入 `~/.yy/papers/grants.json`；Gateway 重启、
+Runtime 空闲回收或上下文切换后会安全恢复，不要求重复下载。旧版仅保存在内存中的授权会从
+真实成功的 Session 工具记录迁移，并同时核验候选身份、论文索引、PDF 路径与 SHA-256。
 
 `index.json` 同时记录成功、重复、不可访问、解析失败和 `ocr_required`；身份优先使用 DOI、
 arXiv ID、规范 URL，最后才使用题名与年份。下载前查索引，下载后再用 PDF SHA-256 查重。

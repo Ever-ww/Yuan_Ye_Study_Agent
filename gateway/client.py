@@ -258,6 +258,9 @@ class GatewayClient:
         return dict(await self._request(
             "POST",
             f"/api/v1/projects/{project_id}/sessions/{session_id}/skills/refresh",
+            # 刷新可能需要恢复 Runtime，并在切换 JSONL 分段前调用模型压缩历史；
+            # 不能沿用普通控制面请求的 30 秒读取超时。
+            timeout=3600,
         ))
 
     async def skill_audit(self, project_id: str, review_id: str) -> dict[str, Any]:

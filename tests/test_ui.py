@@ -20,9 +20,10 @@ from run_ui.cli import (
     _approve,
     _handle_inbox_command,
     _render,
+    _render_restored_history,
     app,
 )
-from run_ui.approval import InteractiveApproval
+from run_ui.approval import InteractiveApproval, _arguments_preview
 from run_ui.web import create_app
 from tool import ToolContext
 
@@ -34,6 +35,24 @@ class UiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             app = create_app("test-token", agent_root=Path(value))
             self.assertEqual(app.state.access_token, "test-token")
+
+    def test_restored_history_is_rendered_without_reasoning(self) -> None:
+        output = io.StringIO()
+        local_console = Console(file=output, force_terminal=False, width=160)
+        records = [
+            {"role": "user", "content": "此前问题", "timestamp": "2026-08-09 10:00:00"},
+            {
+                "role": "assistant", "content": "此前回答",
+                "timestamp": "2026-08-09 10:00:01", "reasoning": "内部推理不得显示",
+            },
+        ]
+        with patch("run_ui.cli.console", local_console):
+            _render_restored_history(records)
+        rendered = output.getvalue()
+        self.assertIn("已恢复的对话上下文", rendered)
+        self.assertIn("此前问题", rendered)
+        self.assertIn("此前回答", rendered)
+        self.assertNotIn("内部推理不得显示", rendered)
 
     def test_cli_inbox_lists_shows_and_marks_background_results(self) -> None:
         class FakeGatewayClient:
@@ -82,6 +101,7 @@ class UiTests(unittest.TestCase):
                 self.assertNotIn("已读任务", first)
                 await _handle_inbox_command(fake, "/inbox all")
                 await _handle_inbox_command(fake, "/inbox show abcdef123456")
+                self.assertTrue(fake.items[0]["read"])
                 await _handle_inbox_command(fake, "/inbox read abcdef123456")
                 self.assertTrue(fake.items[0]["read"])
                 fake.items[0]["read"] = False
@@ -247,7 +267,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual((root / "approval-test.txt").read_text(encoding="utf-8"), "审批成功")
 
     def test_arrow_menu_can_allow_tool_for_current_session(self) -> None:
-        keys = iter(["up", "enter"])
+        keys = iter(["down", "enter"])
         output = io.StringIO()
         approval = InteractiveApproval(
             Console(file=output, force_terminal=True, width=100),
@@ -262,13 +282,32 @@ class UiTests(unittest.TestCase):
         self.assertEqual(asyncio.run(approve_twice()), (True, True))
         self.assertEqual(approval.session_allowed_tools, {"write"})
 
-    def test_arrow_menu_defaults_to_deny_and_escape_cancels(self) -> None:
+    def test_approval_arguments_preview_is_limited_to_five_short_lines(self) -> None:
+        preview = _arguments_preview({
+            "candidates": [
+                {"title": f"Paper {index}", "authors": ["Author A", "Author B"]}
+                for index in range(10)
+            ],
+        })
+        lines = preview.splitlines()
+        self.assertEqual(len(lines), 5)
+        self.assertTrue(all(len(line) <= 88 for line in lines))
+        self.assertIn("已隐藏", lines[-1])
+
+    def test_arrow_menu_defaults_to_execute_but_timeout_and_escape_deny(self) -> None:
         output = io.StringIO()
         approval = InteractiveApproval(
             Console(file=output, force_terminal=True, width=100),
             key_reader=lambda: "enter",
         )
-        self.assertFalse(asyncio.run(approval("write", {"path": "denied.txt"})))
+        self.assertTrue(asyncio.run(approval("write", {"path": "allowed.txt"})))
+
+        timed_out = InteractiveApproval(
+            Console(file=io.StringIO(), force_terminal=True, width=100),
+            key_reader=lambda: "timeout",
+        )
+        self.assertFalse(asyncio.run(timed_out("write", {"path": "timed-out.txt"})))
+        self.assertTrue(timed_out.last_timed_out)
 
         escaped = InteractiveApproval(
             Console(file=io.StringIO(), force_terminal=True, width=100),

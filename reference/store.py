@@ -28,7 +28,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def now_iso() -> str:
@@ -41,17 +41,24 @@ class ReferenceStore:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path.resolve()
         self.directory = self.database_path.parent
+        self.backups_directory = self.directory / "backups"
+        self.migration_backup_path: Path | None = None
         self._lock = threading.RLock()
         self.fts_available = False
         self.initialize()
 
     def initialize(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
+        self._backup_before_migration()
         with self._lock, self._connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version > SCHEMA_VERSION:
                 raise RuntimeError(f"Reference 数据库版本 {version} 高于程序支持版本 {SCHEMA_VERSION}")
+            check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+            if check != "ok":
+                raise RuntimeError(f"Reference SQLite quick_check 失败：{check}")
             connection.executescript(_SCHEMA)
+            self._migrate(connection)
             try:
                 connection.execute(_FTS_SCHEMA)
                 connection.executescript(_FTS_TRIGGERS)
@@ -73,6 +80,9 @@ class ReferenceStore:
                 "UPDATE embedding_jobs SET status='pending',updated_at=? WHERE status='running'",
                 (now_iso(),),
             )
+            foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+            if foreign_key_errors:
+                raise RuntimeError("Reference SQLite foreign_key_check 失败")
 
     def upsert_paper(self, value: PaperUpsert) -> Paper:
         timestamp = now_iso()
@@ -82,7 +92,11 @@ class ReferenceStore:
             if paper_id is None:
                 paper_id = uuid4().hex
                 connection.execute(
-                    "INSERT INTO papers VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO papers("
+                    "paper_id,title,normalized_title,abstract,publication_year,publication_date,"
+                    "language,venue,publisher,license,canonical_url,pdf_url,citation_key,status,"
+                    "metadata_json,source_session_id,source_workspace,created_at,updated_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         paper_id, value.title.strip(), normalized_title, value.abstract.strip(),
                         value.publication_year, value.publication_date, value.language.strip(),
@@ -128,6 +142,48 @@ class ReferenceStore:
                     connection.execute("INSERT OR IGNORE INTO paper_tags(paper_id,tag_id) VALUES(?,?)", (paper_id, tag_id))
             self._refresh_paper_document(connection, paper_id)
         return self.get_paper(paper_id)
+
+    def _backup_before_migration(self) -> None:
+        """在修改旧 Reference 库前创建 SQLite 一致性备份。"""
+        if not self.database_path.is_file() or self.database_path.stat().st_size == 0:
+            return
+        with sqlite3.connect(self.database_path, timeout=30) as source:
+            tables = source.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            ).fetchall()
+            if not tables:
+                return
+            version = int(source.execute("PRAGMA user_version").fetchone()[0])
+            paper_columns = {
+                str(row[1]) for row in source.execute("PRAGMA table_info(papers)").fetchall()
+            }
+            needs_migration = version < SCHEMA_VERSION or not {
+                "source_session_id", "source_workspace",
+            }.issubset(paper_columns)
+            if not needs_migration:
+                return
+            check = str(source.execute("PRAGMA quick_check").fetchone()[0])
+            if check != "ok":
+                raise RuntimeError(f"Reference SQLite quick_check 失败：{check}")
+            self.backups_directory.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = self.backups_directory / (
+                f"reference-v{version}-to-v{SCHEMA_VERSION}-{stamp}-{uuid4().hex[:8]}.sqlite3"
+            )
+            with sqlite3.connect(backup) as target:
+                source.backup(target)
+            self.migration_backup_path = backup
+
+    @staticmethod
+    def _migrate(connection: sqlite3.Connection) -> None:
+        """修复早期 v1 papers 表缺少来源字段但版本号未变的情况。"""
+        columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(papers)").fetchall()
+        }
+        if "source_session_id" not in columns:
+            connection.execute("ALTER TABLE papers ADD COLUMN source_session_id TEXT")
+        if "source_workspace" not in columns:
+            connection.execute("ALTER TABLE papers ADD COLUMN source_workspace TEXT")
 
     def add_file(self, paper_id: str, value: PaperFile) -> PaperFile:
         with self._lock, self._connect() as connection:

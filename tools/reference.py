@@ -23,6 +23,90 @@ if TYPE_CHECKING:
     from paper_library import PaperLibraryService
 
 
+_AUTHOR_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "display_name": {"type": "string", "minLength": 1, "maxLength": 300},
+        "given_name": {"type": "string"},
+        "family_name": {"type": "string"},
+        "orcid": {"type": "string"},
+        "affiliation": {"type": "string"},
+    },
+    "required": ["display_name"],
+    "additionalProperties": False,
+}
+
+_PAPER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "abstract": {"type": "string"},
+        "publication_year": {"type": "integer", "minimum": 1000, "maximum": 3000},
+        "publication_date": {"type": "string"},
+        "language": {"type": "string"},
+        "venue": {"type": "string"},
+        "publisher": {"type": "string"},
+        "license": {"type": "string"},
+        "canonical_url": {"type": "string"},
+        "pdf_url": {"type": "string"},
+        "citation_key": {"type": "string"},
+        "identifiers": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"scheme": {"type": "string"}, "value": {"type": "string"}},
+            "required": ["scheme", "value"],
+            "additionalProperties": False,
+        }},
+        "authors": {"type": "array", "items": _AUTHOR_SCHEMA},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "metadata": {"type": "object"},
+    },
+    "required": ["title"],
+    "additionalProperties": False,
+}
+
+_PASSAGE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "paper_id": {"type": "string", "minLength": 1},
+        "text": {"type": "string", "minLength": 1, "maxLength": 100000},
+        "context_before": {"type": "string"},
+        "context_after": {"type": "string"},
+        "page_start": {"type": "integer", "minimum": 1},
+        "page_end": {"type": "integer", "minimum": 1},
+        "section": {"type": "string"},
+        "paragraph": {"type": "string"},
+        "language": {"type": "string"},
+        "translation": {"type": "string"},
+        "extraction_method": {"type": "string"},
+        "verification_status": {
+            "type": "string", "enum": ["unverified", "verified", "rejected"],
+        },
+        "locator": {"type": "object"},
+    },
+    "required": ["text"],
+    "additionalProperties": False,
+}
+
+_CITATION_EXAMPLE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "paper_id": {"type": "string", "minLength": 1},
+        "text": {"type": "string", "minLength": 1, "maxLength": 100000},
+        "language": {"type": "string"},
+        "citation_style": {"type": "string"},
+        "claim": {"type": "string"},
+        "note": {"type": "string"},
+        "created_by": {"type": "string", "enum": ["user", "assistant", "import"]},
+        "verification_status": {
+            "type": "string", "enum": ["unverified", "verified", "rejected"],
+        },
+        "source_passage_ids": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["text"],
+    "additionalProperties": False,
+}
+
+
 class ReferenceSearchTool:
     name = "reference_search"
     description = "检索全局论文资料库中的论文、可核验原文摘录与写作引用例句；支持全文和语义混合检索"
@@ -92,9 +176,9 @@ class ReferenceWriteTool:
                 "upsert_paper", "add_passage", "add_citation_example", "link_file",
                 "archive", "restore", "reembed",
             ]},
-            "paper": {"type": "object"},
-            "passage": {"type": "object"},
-            "citation_example": {"type": "object"},
+            "paper": _PAPER_SCHEMA,
+            "passage": _PASSAGE_SCHEMA,
+            "citation_example": _CITATION_EXAMPLE_SCHEMA,
             "paper_id": {"type": "string"},
             "path": {"type": "string"},
             "scope": {"type": "string", "enum": ["workspace", "paper_library"]},
@@ -112,6 +196,29 @@ class ReferenceWriteTool:
         self.service = service
         self.paper_library = paper_library
 
+    def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        prepared = dict(arguments)
+        if prepared.get("action") == "upsert_paper" and isinstance(prepared.get("paper"), dict):
+            prepared["paper"] = _normalize_paper_arguments(prepared["paper"])
+        if prepared.get("action") == "add_passage" and isinstance(prepared.get("passage"), dict):
+            prepared["passage"] = _normalize_passage_arguments(
+                prepared["passage"], self._reference_paper_id(prepared),
+            )
+        if (
+            prepared.get("action") == "add_citation_example"
+            and isinstance(prepared.get("citation_example"), dict)
+        ):
+            prepared["citation_example"] = _normalize_citation_arguments(
+                prepared["citation_example"], self._reference_paper_id(prepared),
+            )
+        return prepared
+
+    def _reference_paper_id(self, arguments: dict[str, Any]) -> str | None:
+        library_id = arguments.get("library_paper_id")
+        if self.paper_library is None or not isinstance(library_id, str):
+            return None
+        return self.paper_library.reference_paper_id(library_id)
+
     def approval_required(self, arguments: dict[str, Any], context: ToolContext) -> bool:
         batch_id = arguments.get("batch_id")
         library_paper_id = arguments.get("library_paper_id")
@@ -120,6 +227,13 @@ class ReferenceWriteTool:
         return not self._grant_allows(batch_id, library_paper_id, context)
 
     def ensure_available(self, arguments: dict[str, Any], context: ToolContext) -> None:
+        action = str(arguments.get("action", ""))
+        if action == "upsert_paper":
+            _paper(arguments.get("paper"), context)
+        elif action == "add_passage":
+            _passage(arguments.get("passage"), context)
+        elif action == "add_citation_example":
+            _citation_example(arguments.get("citation_example"), context)
         batch_id = arguments.get("batch_id")
         library_paper_id = arguments.get("library_paper_id")
         scope = arguments.get("scope", "workspace")
@@ -218,6 +332,71 @@ def _paper(value: Any, context: ToolContext) -> PaperUpsert:
     cleaned.setdefault("source_session_id", context.session_id)
     cleaned.setdefault("source_workspace", str(context.project_root.resolve()))
     return PaperUpsert.model_validate(cleaned, strict=True)
+
+
+def _normalize_paper_arguments(value: dict[str, Any]) -> dict[str, Any]:
+    """兼容常见论文元数据别名，并冻结为 Reference 的正式请求格式。"""
+    cleaned = {key: item for key, item in value.items() if item is not None}
+    if "publication_year" not in cleaned and "year" in cleaned:
+        cleaned["publication_year"] = cleaned.pop("year")
+    if "canonical_url" not in cleaned and "source_url" in cleaned:
+        cleaned["canonical_url"] = cleaned.pop("source_url")
+    identifiers = list(cleaned.get("identifiers") or [])
+    for alias, scheme in (("doi", "doi"), ("arxiv_id", "arxiv")):
+        selected = cleaned.pop(alias, None)
+        if isinstance(selected, str) and selected.strip():
+            identifiers.append({"scheme": scheme, "value": selected.strip()})
+    if identifiers:
+        deduplicated: dict[tuple[str, str], dict[str, str]] = {}
+        for item in identifiers:
+            if isinstance(item, dict):
+                scheme = str(item.get("scheme", "")).strip()
+                selected = str(item.get("value", "")).strip()
+                if scheme and selected:
+                    deduplicated[(scheme.casefold(), selected.casefold())] = {
+                        "scheme": scheme, "value": selected,
+                    }
+        cleaned["identifiers"] = list(deduplicated.values())
+    authors = []
+    for item in cleaned.get("authors") or []:
+        if isinstance(item, str):
+            authors.append({"display_name": item})
+        elif isinstance(item, dict):
+            selected = dict(item)
+            if "display_name" not in selected and isinstance(selected.get("name"), str):
+                selected["display_name"] = selected.pop("name")
+            authors.append(selected)
+        else:
+            authors.append(item)
+    cleaned["authors"] = authors
+    return cleaned
+
+
+def _normalize_passage_arguments(
+    value: dict[str, Any],
+    reference_paper_id: str | None,
+) -> dict[str, Any]:
+    cleaned = {key: item for key, item in value.items() if item is not None}
+    if "paper_id" not in cleaned and reference_paper_id:
+        cleaned["paper_id"] = reference_paper_id
+    page = cleaned.pop("page", None)
+    if isinstance(page, int):
+        cleaned.setdefault("page_start", page)
+        cleaned.setdefault("page_end", page)
+    locator = cleaned.get("locator")
+    if isinstance(locator, str):
+        cleaned["locator"] = {"label": locator}
+    return cleaned
+
+
+def _normalize_citation_arguments(
+    value: dict[str, Any],
+    reference_paper_id: str | None,
+) -> dict[str, Any]:
+    cleaned = {key: item for key, item in value.items() if item is not None}
+    if "paper_id" not in cleaned and reference_paper_id:
+        cleaned["paper_id"] = reference_paper_id
+    return cleaned
 
 
 def _passage(value: Any, context: ToolContext) -> SourcePassageCreate:

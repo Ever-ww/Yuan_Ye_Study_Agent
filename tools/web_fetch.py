@@ -18,8 +18,10 @@ from tool.contracts import ToolContext
 
 HostResolver = Callable[[str, int], Awaitable[Iterable[str]]]
 _ALLOWED_CONTENT_TYPES = {
+    "application/atom+xml",
     "application/json",
     "application/ld+json",
+    "application/rss+xml",
     "application/xhtml+xml",
     "application/xml",
     "text/html",
@@ -54,13 +56,19 @@ class WebFetchSecurityError(RuntimeError):
 class WebFetchNetworkError(RuntimeError):
     """网页连接或传输失败。"""
 
+    retryable = True
+
 
 class WebFetchServiceError(RuntimeError):
     """网页返回不可接受的状态或内容类型。"""
 
+    retryable = False
+
 
 class WebFetchResponseError(RuntimeError):
     """网页正文无法安全规范化。"""
+
+    retryable = False
 
 
 class WebFetchTool:
@@ -133,8 +141,8 @@ class WebFetchTool:
                         current_url,
                         headers={
                             "Accept": (
-                                "text/html, text/plain, application/json, application/xml;q=0.9, "
-                                "text/xml;q=0.9"
+                                "text/html, text/plain, application/json, application/atom+xml, "
+                                "application/rss+xml, application/xml;q=0.9, text/xml;q=0.9"
                             ),
                             "User-Agent": "YuanYeAgent/1.0 (+local controlled web fetch)",
                         },
@@ -331,9 +339,59 @@ def _extract_content(value: str, content_type: str) -> tuple[str | None, str]:
         except Exception as exc:
             raise WebFetchResponseError("HTML 正文解析失败") from exc
         return " ".join(parser.title_parts), " ".join(parser.content_parts)
+    if content_type in {
+        "application/atom+xml", "application/rss+xml", "application/xml", "text/xml",
+    }:
+        parser = _XMLTextExtractor()
+        try:
+            parser.feed(value)
+            parser.close()
+        except Exception as exc:
+            raise WebFetchResponseError("XML 正文解析失败") from exc
+        return parser.title, " ".join(parser.content_parts)
     if "\x00" in value:
         raise WebFetchResponseError("网页正文疑似二进制内容")
     return None, value
+
+
+class _XMLTextExtractor(HTMLParser):
+    """不解析外部实体，只提取 Atom/RSS/XML 中人类可读的文本节点。"""
+
+    _BREAKS = {"entry", "item", "feed", "channel", "title", "summary", "description", "content"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.content_parts: list[str] = []
+        self.title: str | None = None
+        self._in_title = False
+        self._title_parts: list[str] = []
+
+    @staticmethod
+    def _local_name(tag: str) -> str:
+        return tag.rsplit(":", 1)[-1].lower()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        local = self._local_name(tag)
+        if local in self._BREAKS:
+            self.content_parts.append("\n")
+        if local == "title" and self.title is None:
+            self._in_title = True
+            self._title_parts = []
+
+    def handle_endtag(self, tag: str) -> None:
+        local = self._local_name(tag)
+        if local == "title" and self._in_title:
+            selected = " ".join(" ".join(self._title_parts).split())
+            self.title = selected or None
+            self._in_title = False
+        if local in self._BREAKS:
+            self.content_parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self.content_parts.append(data)
+        if self._in_title:
+            self._title_parts.append(data)
 
 
 def _normalize_text(value: str) -> str:

@@ -33,6 +33,12 @@ class SkillCatalogSnapshot(BaseModel):
     digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     skills: tuple[SkillMetadata, ...] = ()
 
+    @field_validator("skills", mode="before")
+    @classmethod
+    def _restore_json_tuple(cls, value):
+        """JSON 数组是 tuple 的持久化表示，恢复时重新冻结目录顺序。"""
+        return tuple(value) if isinstance(value, list) else value
+
     def by_name(self) -> dict[str, SkillMetadata]:
         return {item.name: item for item in self.skills}
 

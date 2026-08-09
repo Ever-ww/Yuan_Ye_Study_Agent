@@ -90,6 +90,7 @@ class ContextProcessor:
         session_id: str,
         *,
         summary_metadata: dict[str, object] | None = None,
+        skill_catalog: dict[str, object] | None = None,
     ) -> CompressionResult:
         """最多调用三次压缩 Agent，成功后合并 Profile 并切换分段。"""
         source_file = self.memory.active_filename(session_id)
@@ -128,6 +129,7 @@ class ContextProcessor:
                     records_processed=len(records),
                     tool_calls_processed=tool_calls,
                     summary_metadata=summary_metadata,
+                    skill_catalog=skill_catalog,
                 )
                 self._fallback_sessions.discard(session_id)
                 return CompressionResult(

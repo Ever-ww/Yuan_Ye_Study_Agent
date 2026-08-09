@@ -50,13 +50,19 @@ class WebSearchResponse(BaseModel):
 class WebSearchNetworkError(RuntimeError):
     """搜索服务连接或传输失败。"""
 
+    retryable = True
+
 
 class WebSearchServiceError(RuntimeError):
     """搜索服务返回了不可接受的 HTTP 状态。"""
 
+    retryable = False
+
 
 class WebSearchResponseError(RuntimeError):
     """搜索服务返回了无法规范化的数据。"""
+
+    retryable = False
 
 
 class WebSearchTool:

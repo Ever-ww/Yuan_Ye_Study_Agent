@@ -40,6 +40,55 @@ class FakeEmbeddingProvider:
 
 
 class ReferenceTests(unittest.TestCase):
+    def test_v1_papers_schema_is_backed_up_and_migrated(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            database = Path(value) / "reference.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.executescript("""
+                    CREATE TABLE papers(
+                        paper_id TEXT PRIMARY KEY,title TEXT NOT NULL,
+                        normalized_title TEXT NOT NULL,abstract TEXT NOT NULL DEFAULT '',
+                        publication_year INTEGER,publication_date TEXT,
+                        language TEXT NOT NULL DEFAULT '',venue TEXT NOT NULL DEFAULT '',
+                        publisher TEXT NOT NULL DEFAULT '',license TEXT NOT NULL DEFAULT '',
+                        canonical_url TEXT,pdf_url TEXT,citation_key TEXT,
+                        status TEXT NOT NULL DEFAULT 'active',
+                        metadata_json TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+                    );
+                    PRAGMA user_version=1;
+                """)
+                connection.execute(
+                    "INSERT INTO papers VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "legacy", "Legacy Paper", "legacy paper", "", 2020, None,
+                        "", "", "", "", None, None, None, "active", "{}",
+                        "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00",
+                    ),
+                )
+
+            store = ReferenceStore(database)
+            connection = sqlite3.connect(database)
+            try:
+                columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(papers)").fetchall()
+                }
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+            finally:
+                connection.close()
+            self.assertIn("source_session_id", columns)
+            self.assertIn("source_workspace", columns)
+            self.assertEqual(version, 2)
+            self.assertIsNotNone(store.migration_backup_path)
+            self.assertTrue(store.migration_backup_path.is_file())
+            self.assertEqual(store.get_paper("legacy").title, "Legacy Paper")
+            created = store.upsert_paper(PaperUpsert(
+                title="New Paper",
+                source_session_id="session",
+                source_workspace="D:/workspace",
+            ))
+            self.assertEqual(created.source_session_id, "session")
+
     def test_initializer_creates_global_reference_database_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
@@ -53,7 +102,7 @@ class ReferenceTests(unittest.TestCase):
             self.assertEqual(ReferenceStore(database).get_paper(paper.paper_id).title, "Preserved")
             connection = sqlite3.connect(database)
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
             finally:
                 connection.close()
 

@@ -37,6 +37,7 @@ from Agent.state import (
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from gateway.models import now_iso
 from gateway.state_controller import StateController
+from tool.errors import ToolExecutionObservationError
 
 
 @dataclass(frozen=True)
@@ -98,7 +99,7 @@ class DurableToolCoordinator:
         frozen_request = {
             "name": name,
             "arguments": arguments,
-            "workspace_root": str(context.workspace_root.resolve()),
+            "workspace_root": str(context.project_root.resolve()),
             "risk": risk,
         }
         serialized = json.dumps(frozen_request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -254,11 +255,16 @@ class DurableToolCoordinator:
                 }:
                     await self._record_uncertain_or_failed(operation, exc, cancelled=False)
                     raise
+                retryable = _is_retryable_tool_error(exc)
                 current = self.controller.state(operation.run_id)
                 failed = self.controller.apply(FailOperationAttemptCommand(
                     command_id=uuid4().hex, run_id=current.run_id,
                     expected_revision=current.revision, gateway_epoch=self.controller.gateway_epoch,
-                    attempt_id=attempt_id, failure_kind=OperationFailureKind.RETRYABLE,
+                    attempt_id=attempt_id,
+                    failure_kind=(
+                        OperationFailureKind.RETRYABLE
+                        if retryable else OperationFailureKind.TERMINAL
+                    ),
                     failure_reason=str(exc) or type(exc).__name__,
                 ))
                 operation = failed.operation or operation
@@ -269,16 +275,20 @@ class DurableToolCoordinator:
                     or operation.next_retry_at is None
                 ):
                     current = self.controller.state(operation.run_id)
+                    # PURE/IDEMPOTENT 的失败已经由 Ledger 确认为 FAILED，不存在未知
+                    # 副作用窗口；将其作为 observation 交给模型重新规划。外部幂等和
+                    # 非幂等工具在上方走 UNKNOWN + RECOVERY_REQUIRED，绝不进入这里。
                     self.controller.apply(TransitionCommand(
                         command_id=uuid4().hex, run_id=current.run_id,
                         expected_revision=current.revision, gateway_epoch=self.controller.gateway_epoch,
-                        execution_state=ExecutionState.FINISHED, outcome=ExecutionOutcome.ERROR,
-                        finish_reason=operation.failure_reason or "tool retry exhausted",
-                        reason="Tool retry policy exhausted",
+                        execution_state=ExecutionState.OBSERVING,
+                        reason="Determined tool failure; return observation to model",
                     ))
                     _CURRENT_OPERATION.set(None)
                     _CURRENT_ATTEMPT.set(None)
-                    raise
+                    raise ToolExecutionObservationError(
+                        str(exc) or type(exc).__name__,
+                    ) from exc
                 retry_at = datetime.fromisoformat(operation.next_retry_at.replace("Z", "+00:00"))
                 await asyncio.sleep(max(0.0, (retry_at - datetime.now().astimezone()).total_seconds()))
                 current = self.controller.state(operation.run_id)
@@ -813,6 +823,14 @@ def _idempotency_of(tool: Any, risk: str) -> ToolIdempotency:
     if risk == "write":
         return ToolIdempotency.IDEMPOTENT
     return ToolIdempotency.NON_IDEMPOTENT
+
+
+def _is_retryable_tool_error(error: BaseException) -> bool:
+    """只重试明确可恢复的传输错误，避免对格式/内容错误做无意义重放。"""
+    declared = getattr(error, "retryable", None)
+    if isinstance(declared, bool):
+        return declared
+    return isinstance(error, (ConnectionError, TimeoutError, OSError))
 
 
 def _after_seconds(seconds: int) -> str:

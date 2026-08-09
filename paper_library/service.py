@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from datetime import datetime
@@ -19,6 +20,7 @@ from .models import (
     PaperCandidate,
     PaperDownloadItem,
     PaperDownloadResult,
+    PaperGrantIndex,
     PaperIndex,
     PaperLookupResult,
     PaperRecord,
@@ -48,6 +50,7 @@ class PaperLibraryService:
         self.agent_root = agent_root.resolve()
         self.root = self.agent_root / ".yy" / "papers"
         self.index_path = self.root / "index.json"
+        self.grants_path = self.root / "grants.json"
         self.reference_store = reference_store
         self.downloader = downloader
         self.locks = locks or WorkspaceLockManager(self.agent_root, state_root=self.agent_root)
@@ -67,6 +70,11 @@ class PaperLibraryService:
             raise PermissionError("论文库索引不能是符号链接")
         if not self.index_path.exists():
             self._write_index(PaperIndex())
+        if self.grants_path.is_symlink():
+            raise PermissionError("论文库批次授权索引不能是符号链接")
+        if not self.grants_path.exists():
+            self._write_grants(PaperGrantIndex(grants=self._recover_legacy_grants()))
+        self._grants = dict(self._read_grants().grants)
 
     async def lookup(self, candidates: tuple[PaperCandidate, ...]) -> tuple[PaperLookupResult, ...]:
         async with self.locks.read(self.index_path):
@@ -98,7 +106,13 @@ class PaperLibraryService:
             paper_ids=paper_ids,
             created_at=datetime.now().astimezone(),
         )
-        self._grants[batch_id] = grant
+        # 用户批准下载后先持久化授权，再开始网络与文件副作用。Runtime/Gateway
+        # 重启只会重载同一授权，不要求用户为了恢复工作流重复下载。
+        async with self.locks.write(self.grants_path):
+            grants = self._read_grants()
+            grants.grants[batch_id] = grant
+            self._write_grants(grants)
+            self._grants[batch_id] = grant
         items: list[PaperDownloadItem] = []
         for candidate in candidates:
             items.append(await self._download_one(candidate))
@@ -307,7 +321,10 @@ class PaperLibraryService:
         return record
 
     def grant_allows(self, batch_id: str, paper_id: str, session_id: str | None) -> bool:
-        grant = self._grants.get(batch_id)
+        # grants.json 使用原子替换，允许不同 Runtime/进程看到其他实例刚创建的批次。
+        grants = self._read_grants().grants
+        self._grants = dict(grants)
+        grant = grants.get(batch_id)
         return bool(
             grant is not None
             and paper_id in grant.paper_ids
@@ -344,6 +361,11 @@ class PaperLibraryService:
                 raise ValueError(f"未知 Reference 关联类型：{kind}")
             index.papers[paper_id] = record.model_copy(update=update)
             self._write_index(index)
+
+    def reference_paper_id(self, paper_id: str) -> str | None:
+        """返回论文库记录已关联的 Reference paper_id。"""
+        record = self._read_index().papers.get(paper_id)
+        return record.reference_paper_id if record is not None else None
 
     async def reference_file(self, paper_id: str) -> tuple[PaperRecord, Path]:
         record = await self.get(paper_id)
@@ -406,6 +428,84 @@ class PaperLibraryService:
         self.root.mkdir(parents=True, exist_ok=True)
         _atomic_write_text(self.index_path, index.model_dump_json(indent=2) + "\n")
 
+    def _read_grants(self) -> PaperGrantIndex:
+        try:
+            return PaperGrantIndex.model_validate_json(
+                self.grants_path.read_text(encoding="utf-8"),
+                strict=True,
+            )
+        except (OSError, ValidationError) as exc:
+            raise ValueError(f"论文库批次授权索引损坏：{exc}") from exc
+
+    def _write_grants(self, grants: PaperGrantIndex) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(self.grants_path, grants.model_dump_json(indent=2) + "\n")
+
+    def _recover_legacy_grants(self) -> dict[str, PaperBatchGrant]:
+        """从真实成功工具记录迁移旧版内存授权；不信任摘要或模型复述。"""
+        session_root = self.agent_root / ".yy" / "memory" / "session"
+        if not session_root.is_dir() or session_root.is_symlink():
+            return {}
+        index = self._read_index()
+        recovered: dict[str, PaperBatchGrant] = {}
+        filename = re.compile(r"^\d{4}-\d{2}-\d{2}_([0-9a-f]{16})_\d+\.jsonl$")
+        for path in session_root.rglob("*.jsonl"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            matched = filename.fullmatch(path.name)
+            if matched is None:
+                continue
+            session_id = matched.group(1)
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                grant = self._legacy_grant_from_record(line, session_id, index)
+                if grant is not None:
+                    recovered[grant.batch_id] = grant
+        return recovered
+
+    def _legacy_grant_from_record(
+        self,
+        line: str,
+        session_id: str,
+        index: PaperIndex,
+    ) -> PaperBatchGrant | None:
+        try:
+            record = json.loads(line)
+            if not isinstance(record, dict) or not (
+                record.get("role") == "tool"
+                and record.get("name") == "paper_library_download"
+                and record.get("status") == "success"
+                and isinstance(record.get("operation_id"), str)
+            ):
+                return None
+            result = PaperDownloadResult.model_validate_json(str(record["content"]), strict=True)
+            raw_candidates = record.get("arguments", {}).get("candidates")
+            if not isinstance(raw_candidates, list):
+                return None
+            candidates = tuple(_candidate_from_audit(item) for item in raw_candidates)
+            expected_ids = tuple(dict.fromkeys(stable_paper_id(item) for item in candidates))
+            returned_ids = tuple(item.paper_id for item in result.items)
+            if set(expected_ids) != set(returned_ids):
+                return None
+            eligible = tuple(
+                paper_id for paper_id in expected_ids
+                if _record_has_local_pdf(self, index.papers.get(paper_id))
+            )
+            if not eligible:
+                return None
+            created_at = datetime.fromisoformat(str(record["timestamp"]))
+            return PaperBatchGrant(
+                batch_id=result.batch_id,
+                session_id=session_id,
+                paper_ids=eligible,
+                created_at=created_at,
+            )
+        except (AttributeError, KeyError, TypeError, ValueError, ValidationError, json.JSONDecodeError):
+            return None
+
 
 def stable_paper_id(candidate: PaperCandidate) -> str:
     doi = normalize_doi(candidate.doi)
@@ -420,6 +520,27 @@ def stable_paper_id(candidate: PaperCandidate) -> str:
         title = re.sub(r"\s+", " ", candidate.title).strip().casefold()
         identity = f"title:{title}:{candidate.year or ''}"
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _candidate_from_audit(value: Any) -> PaperCandidate:
+    if not isinstance(value, dict):
+        raise TypeError("论文候选审计记录必须是对象")
+    cleaned = {key: item for key, item in value.items() if item is not None}
+    cleaned["authors"] = tuple(str(item) for item in cleaned.get("authors", ()))
+    return PaperCandidate.model_validate(cleaned, strict=True)
+
+
+def _record_has_local_pdf(
+    service: PaperLibraryService,
+    record: PaperRecord | None,
+) -> bool:
+    if record is None or record.pdf_path is None or record.sha256 is None:
+        return False
+    try:
+        path = service._record_pdf(record)
+        return path.is_file() and not path.is_symlink() and _sha256_file(path) == record.sha256
+    except (OSError, PermissionError):
+        return False
 
 
 def sanitize_paper_title(value: str) -> str:

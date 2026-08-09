@@ -5,7 +5,6 @@ import hashlib
 import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -41,6 +40,7 @@ from Agent import load_runtime_config
 from gateway.application import GatewayApplication
 from gateway.api import create_gateway_api
 from fastapi.testclient import TestClient
+from tool import ToolContext, ToolExecutionObservationError
 
 
 def _hash(value: str) -> str:
@@ -292,7 +292,7 @@ def test_retryable_tool_uses_new_attempts_and_executes_until_success(durable, tm
     async def run() -> None:
         operation = await coordinator.prepare(
             tool=PureTool(), name="read", arguments={"path": "x"}, risk="read",
-            context=SimpleNamespace(workspace_root=tmp_path), tool_call_id="call",
+            context=ToolContext(project_root=tmp_path), tool_call_id="call",
         )
         assert await coordinator.execute(operation, invoke) == "ok"
         attempts = controller.operation_attempts(operation.operation_id)
@@ -309,6 +309,69 @@ def test_retryable_tool_uses_new_attempts_and_executes_until_success(durable, tm
     finally:
         coordinator.reset(token)
     assert calls == 3
+
+
+@pytest.mark.parametrize(
+    ("risk", "idempotency"),
+    (("read", ToolIdempotency.PURE), ("write", ToolIdempotency.IDEMPOTENT)),
+)
+def test_non_retryable_determined_tool_failure_becomes_observation_without_retry(
+    durable,
+    tmp_path: Path,
+    risk: str,
+    idempotency: ToolIdempotency,
+) -> None:
+    controller, state = durable
+    for target in (TaskState.QUEUED, TaskState.STARTING):
+        state = controller.apply(TransitionCommand(
+            command_id=uuid4().hex, run_id=state.run_id,
+            expected_revision=state.revision, gateway_epoch="epoch",
+            task_state=target, reason="test",
+        )).state
+    state = controller.apply(TransitionCommand(
+        command_id=uuid4().hex, run_id=state.run_id,
+        expected_revision=state.revision, gateway_epoch="epoch",
+        task_state=TaskState.RUNNING,
+        execution_state=ExecutionState.THINKING,
+        reason="test",
+    )).state
+    coordinator = DurableToolCoordinator(
+        controller, retry_max_attempts=3, retry_base_seconds=0, retry_max_seconds=0,
+    )
+    token = coordinator.bind(state.run_id, "turn")
+    calls = 0
+
+    class PureTool:
+        pass
+
+    PureTool.idempotency = idempotency
+
+    class UnsupportedContentType(RuntimeError):
+        retryable = False
+
+    async def invoke() -> str:
+        nonlocal calls
+        calls += 1
+        raise UnsupportedContentType("application/octet-stream")
+
+    async def run() -> None:
+        operation = await coordinator.prepare(
+            tool=PureTool(), name="fetch", arguments={"url": "https://example.com"},
+            risk=risk, context=ToolContext(project_root=tmp_path), tool_call_id="call",
+        )
+        with pytest.raises(ToolExecutionObservationError, match="application/octet-stream"):
+            await coordinator.execute(operation, invoke)
+        attempts = controller.operation_attempts(operation.operation_id)
+        assert len(attempts) == 1
+        assert attempts[0].status is OperationStatus.FAILED
+        assert attempts[0].failure_kind is OperationFailureKind.TERMINAL
+        assert controller.state(state.run_id).execution.state is ExecutionState.OBSERVING
+
+    try:
+        asyncio.run(run())
+    finally:
+        coordinator.reset(token)
+    assert calls == 1
 
 
 def test_idempotency_header_body_conflict_returns_400(tmp_path: Path) -> None:

@@ -717,7 +717,7 @@ def create_coding_runtime(
     isolated = config.model_copy(update={
         "workspace_root": worktree_root.resolve(),
         "stream": False,
-        "compression_threshold_tokens": config.compression_threshold_tokens or 20000,
+        "compression_threshold_tokens": config.compression_threshold_tokens or 200000,
     })
     skills = SkillService(
         isolated.agent_root,

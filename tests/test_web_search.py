@@ -87,11 +87,14 @@ class WebSearchTests(unittest.TestCase):
         with self.assertRaises(WebSearchNetworkError) as network:
             asyncio.run(invoke(None))
         self.assertNotIn("do-not-leak", str(network.exception))
+        self.assertTrue(network.exception.retryable)
         with self.assertRaises(WebSearchServiceError) as service:
             asyncio.run(invoke(401, {"error": "unauthorized"}))
         self.assertNotIn("do-not-leak", str(service.exception))
-        with self.assertRaises(WebSearchResponseError):
+        self.assertFalse(service.exception.retryable)
+        with self.assertRaises(WebSearchResponseError) as response:
             asyncio.run(invoke(200, []))
+        self.assertFalse(response.exception.retryable)
 
     def test_schema_and_argument_limits_are_enforced_before_network(self) -> None:
         calls = 0

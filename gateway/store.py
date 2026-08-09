@@ -302,6 +302,19 @@ class GatewayStore:
             status=row["status"], created_at=row["created_at"], read=True,
         )
 
+    def mark_run_inbox_read(self, run_id: str) -> InboxItem | None:
+        """终态结果已送达发起客户端时，幂等确认对应 Inbox。"""
+        with self._connect() as connection:
+            connection.execute("UPDATE inbox SET is_read=1 WHERE run_id=?", (run_id,))
+            row = connection.execute("SELECT * FROM inbox WHERE run_id=?", (run_id,)).fetchone()
+        if row is None:
+            return None
+        return InboxItem(
+            item_id=row["item_id"], run_id=row["run_id"], project_id=row["project_id"],
+            session_id=row["session_id"], title=row["title"], summary=row["summary"],
+            status=row["status"], created_at=row["created_at"], read=True,
+        )
+
     def save_approval(self, request: ApprovalRequest) -> None:
         with self._connect() as connection:
             connection.execute(

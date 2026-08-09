@@ -382,17 +382,31 @@ def create_gateway_api(
         await socket.accept()
         gateway.store.client_connected(client_id)
         subscription_id, queue = await gateway.events.subscribe(client_id, run_id)
+        terminal_events = {"run_completed", "run_failed", "run_cancelled", "run_interrupted"}
+
+        def acknowledge_if_origin(event) -> None:
+            if event.type not in terminal_events:
+                return
+            try:
+                run = gateway.store.run(event.run_id)
+            except KeyError:
+                return
+            if run.client_id == client_id:
+                gateway.store.mark_run_inbox_read(event.run_id)
+
         try:
             last_sent = after_sequence
             if run_id:
                 for event in gateway.run_events(run_id, after_sequence):
                     await socket.send_text(event.model_dump_json())
+                    acknowledge_if_origin(event)
                     last_sent = max(last_sent, event.sequence)
             while True:
                 event = await queue.get()
                 if event.run_id == run_id and event.sequence <= last_sent:
                     continue
                 await socket.send_text(event.model_dump_json())
+                acknowledge_if_origin(event)
                 if event.run_id == run_id:
                     last_sent = event.sequence
         except (WebSocketDisconnect, asyncio.CancelledError):

@@ -29,6 +29,39 @@ async def _public_resolver(host: str, port: int) -> tuple[str, ...]:
 
 
 class WebFetchTests(unittest.TestCase):
+    def test_fetch_accepts_arxiv_atom_feed_and_extracts_readable_text(self) -> None:
+        feed = """<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <title>arXiv Query: tabular deep learning</title>
+          <entry>
+            <title>Deep Learning for Tabular Data</title>
+            <summary>A benchmark of neural networks for tables.</summary>
+            <id>http://arxiv.org/abs/2601.00001v1</id>
+          </entry>
+        </feed>"""
+
+        async def invoke() -> WebFetchResponse:
+            tool = WebFetchTool(
+                transport=httpx.MockTransport(lambda request: httpx.Response(
+                    200,
+                    headers={"content-type": "application/atom+xml; charset=utf-8"},
+                    text=feed,
+                )),
+                resolver=_public_resolver,
+            )
+            raw = await tool.run(
+                {"url": "https://export.arxiv.org/api/query?search_query=all:tabular"},
+                ToolContext(project_root=Path.cwd()),
+            )
+            return WebFetchResponse.model_validate_json(raw, strict=True)
+
+        result = asyncio.run(invoke())
+        self.assertEqual(result.title, "arXiv Query: tabular deep learning")
+        self.assertIn("Deep Learning for Tabular Data", result.content)
+        self.assertIn("A benchmark of neural networks for tables.", result.content)
+        self.assertIn("http://arxiv.org/abs/2601.00001v1", result.content)
+        self.assertNotIn("<entry>", result.content)
+
     def test_fetch_follows_safe_redirect_and_extracts_html(self) -> None:
         requests: list[httpx.Request] = []
 

@@ -192,6 +192,26 @@ class MemoryStore:
             status="network_error",
         )
 
+    def record_turn_failure(self, session_id: str, message: str) -> bool:
+        """闭合本轮尚未执行的并行工具调用，并保存可继续恢复的失败标记。"""
+        cache = self._ensure_cache(session_id)
+        pending = self._pending_tool_calls(cache)
+        for call_id, name in pending:
+            self.record_tool_result(
+                session_id,
+                tool_call_id=call_id,
+                name=name,
+                content="同一批次的前序工具执行失败，本工具未执行。",
+                status="skipped",
+                arguments={},
+            )
+        detail = (message or "运行时错误").strip()
+        return self._record_terminal_marker(
+            session_id,
+            f"本次回答因运行错误未完成：{detail}",
+            status="error",
+        )
+
     def record_cancelled_partial(self, session_id: str, content: str) -> bool:
         """保存 Ctrl+C 前已流式生成的文本，不接纳未完成的工具调用字段。"""
         if not content:
@@ -280,6 +300,12 @@ class MemoryStore:
     def session_created_at(self, session_id: str) -> str:
         return self.sessions.created_at(session_id)
 
+    def session_skill_catalog(self, session_id: str) -> dict[str, object] | None:
+        return self.sessions.skill_catalog(session_id)
+
+    def set_session_skill_catalog(self, session_id: str, catalog: dict[str, object]) -> None:
+        self.sessions.set_skill_catalog(session_id, catalog)
+
     def latest_summary(self, session_id: str) -> str:
         return self.sessions.latest_summary(session_id)
 
@@ -293,6 +319,7 @@ class MemoryStore:
         source_file: str,
         *,
         metadata: dict[str, object] | None = None,
+        skill_catalog: dict[str, object] | None = None,
     ) -> Path:
         """创建以 summary 记录开头的新会话分段。"""
         record: dict[str, object] = {
@@ -302,7 +329,11 @@ class MemoryStore:
         }
         if metadata:
             record.update(metadata)
-        result = self.sessions.rollover(session_id, [record])
+        result = self.sessions.rollover(
+            session_id,
+            [record],
+            skill_catalog=skill_catalog,
+        )
         self.refresh_messages(session_id)
         return result
 
@@ -317,6 +348,7 @@ class MemoryStore:
         records_processed: int,
         tool_calls_processed: int,
         summary_metadata: dict[str, object] | None = None,
+        skill_catalog: dict[str, object] | None = None,
     ) -> tuple[Path | None, Path]:
         """协调 Profile 与新分段写入；切段失败时恢复旧 Profile 状态。"""
         if not self.session_profiles_enabled:
@@ -325,6 +357,7 @@ class MemoryStore:
                 context_summary,
                 source_file,
                 metadata=summary_metadata,
+                skill_catalog=skill_catalog,
             )
         profile_path = self.profiles.directory / f"{session_id}.md"
         profile_backup = profile_path.read_bytes() if profile_path.exists() else None
@@ -343,6 +376,7 @@ class MemoryStore:
                 context_summary,
                 source_file,
                 metadata=summary_metadata,
+                skill_catalog=skill_catalog,
             )
             return committed_profile, segment
         except Exception:
@@ -366,6 +400,33 @@ class MemoryStore:
         self.sessions.append(session_id, "assistant", content, {"status": status})
         cache.append({"role": "assistant", "content": content})
         return True
+
+    @staticmethod
+    def _pending_tool_calls(cache: list[dict[str, Any]]) -> list[tuple[str, str]]:
+        assistant_index = next((
+            index for index in range(len(cache) - 1, -1, -1)
+            if cache[index].get("role") == "assistant" and cache[index].get("tool_calls")
+        ), None)
+        if assistant_index is None:
+            return []
+        completed = {
+            str(message.get("tool_call_id"))
+            for message in cache[assistant_index + 1 :]
+            if message.get("role") == "tool"
+        }
+        pending: list[tuple[str, str]] = []
+        calls = cache[assistant_index].get("tool_calls")
+        if not isinstance(calls, list):
+            return pending
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            call_id = str(call.get("id") or "")
+            function = call.get("function")
+            name = str(function.get("name") or "") if isinstance(function, dict) else ""
+            if call_id and name and call_id not in completed:
+                pending.append((call_id, name))
+        return pending
 
 
 def _infer_agent_root(memory_root: Path) -> Path:

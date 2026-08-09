@@ -122,6 +122,7 @@ async def _render_gateway(
     streaming_text = ""
     active_session_id = session_id or ""
     terminal_error = ""
+    approval_selector = InteractiveApproval(console)
     with Live(Panel("正在排队…", title="Yuan Ye Gateway"), console=console, refresh_per_second=10) as live:
         token = _active_live.set(live)
         try:
@@ -152,16 +153,22 @@ async def _render_gateway(
                             streaming_text = ""
                         lines.append(f"[cyan]工具请求[/] {event.payload.get('name', '')}")
                     elif event.type == EventType.TOOL_COMPLETED.value:
-                        lines.append(f"[green]工具完成[/] {event.payload.get('name', '')}")
+                        if event.payload.get("status") == "error":
+                            lines.append(f"[red]工具失败[/] {event.payload.get('name', '')}")
+                        else:
+                            lines.append(f"[green]工具完成[/] {event.payload.get('name', '')}")
                     elif event.type == "approval_requested":
-                        approved = await InteractiveApproval(console)(
+                        approved = await approval_selector(
                             str(event.payload.get("tool_name", "")),
                             dict(event.payload.get("arguments", {})),
                         )
-                        await client.respond_approval(
-                            str(event.payload["approval_id"]),
-                            approved,
-                        )
+                        # Gateway 的持久化 expires_at 是超时权威来源；本地菜单超时后
+                        # 不再发送一个可能与 TIMEOUT 状态竞争的重复拒绝决定。
+                        if not approval_selector.last_timed_out:
+                            await client.respond_approval(
+                                str(event.payload["approval_id"]),
+                                approved,
+                            )
                     elif event.type == EventType.COMPRESSION_STARTED.value:
                         lines.append("[cyan]正在压缩上下文…[/]")
                     elif event.type == EventType.CONTEXT_COMPRESSED.value:
@@ -231,7 +238,10 @@ async def _render(
                             streaming_text = ""
                         lines.append(f"[cyan]工具请求[/] {event.payload['name']}")
                     elif event.type is EventType.TOOL_COMPLETED:
-                        lines.append(f"[green]工具完成[/] {event.payload['name']}")
+                        if event.payload.get("status") == "error":
+                            lines.append(f"[red]工具失败[/] {event.payload['name']}")
+                        else:
+                            lines.append(f"[green]工具完成[/] {event.payload['name']}")
                     elif event.type is EventType.COMPRESSION_STARTED:
                         lines.append("[cyan]正在压缩上下文…[/]")
                     elif event.type is EventType.CONTEXT_COMPRESSED:
@@ -313,7 +323,9 @@ async def _chat_gateway(
         sessions = await client.sessions(project_id)
         if not any(item.get("session_id") == session_id for item in sessions):
             raise ValueError(f"当前 workspace 未找到 Session：{session_id}")
-        console.print(f"[green]已恢复会话[/] {session_id}")
+        records = await client.session(project_id, session_id)
+        console.print(f"[green]已恢复会话[/] {session_id}（{len(records)} 条记录）")
+        _render_restored_history(records)
     interrupt_controller.bind(asyncio.get_running_loop())
     unread = await client.inbox(unread_only=True)
     if unread:
@@ -512,6 +524,8 @@ async def _handle_inbox_command(client: GatewayClient, task: str) -> None:
         item = await _resolve_inbox_item(client, parts[2])
         if item is not None:
             _render_inbox_item(item)
+            if not bool(item.get("read")):
+                await client.mark_inbox_read(str(item["item_id"]))
         return
     if action == "read" and len(parts) == 3:
         item = await _resolve_inbox_item(client, parts[2])
@@ -550,6 +564,49 @@ async def _resolve_inbox_item(
         console.print(f"[red]Inbox ID 前缀不唯一，请输入更多字符：{item_id_or_prefix}[/]")
         return None
     return dict(matches[0])
+
+
+def _render_restored_history(records: list[dict[str, object]]) -> None:
+    """按正常聊天流重放此前对话，同时隐藏 reasoning 等内部审计字段。"""
+    if not records:
+        console.print("[dim]该会话当前没有历史记录。[/]")
+        return
+    console.print("[dim]── 已恢复的对话上下文 ──[/]")
+    for record in records:
+        role = str(record.get("role", ""))
+        content = record.get("content")
+        timestamp = str(record.get("timestamp", ""))
+        time_suffix = f" [dim]{timestamp}[/]" if timestamp else ""
+        if role == "user":
+            console.print(f"[bold blue]你 >[/] {str(content or '')}{time_suffix}")
+        elif role == "assistant" and content is not None:
+            console.print(Panel(
+                str(content),
+                title="Yuan Ye Agent",
+                subtitle=timestamp or None,
+                border_style="cyan",
+            ))
+        elif role == "assistant":
+            calls = record.get("tool_calls")
+            names = []
+            if isinstance(calls, list):
+                for call in calls:
+                    function = call.get("function") if isinstance(call, dict) else None
+                    if isinstance(function, dict) and function.get("name"):
+                        names.append(str(function["name"]))
+            label = "、".join(names) if names else "未知工具"
+            console.print(f"[dim]  工具请求 {label}{time_suffix}[/]")
+        elif role == "tool":
+            name = str(record.get("name", "tool"))
+            status = str(record.get("status", "unknown"))
+            style = "green" if status == "success" else "yellow" if status in {"skipped", "cancelled"} else "red"
+            console.print(f"[{style}]  工具 {name}：{status}[/{style}]{time_suffix}")
+        elif role == "summary":
+            console.print(Panel(
+                str(content or ""), title="上下文摘要", subtitle=timestamp or None,
+                border_style="dim",
+            ))
+    console.print("[dim]── 继续对话 ──[/]")
 
 
 def _render_inbox_table(items: list[dict[str, object]], *, unread_only: bool) -> None:
@@ -729,7 +786,10 @@ async def _handle_gateway_skill_command(
         if action == "refresh":
             if not session_id:
                 raise ValueError("当前没有活动 Session；先发送一条消息，再执行 /skill refresh")
-            result = await client.refresh_skills(project_id, session_id)
+            with console.status(
+                "[cyan]正在恢复 Session、检查 Skill 并按需切换上下文分段…[/]",
+            ):
+                result = await client.refresh_skills(project_id, session_id)
             style = "green" if result.get("status") in {"refreshed", "unchanged"} else "red"
             console.print(f"[{style}]{result.get('message', 'Skill 刷新完成')}[/]")
             return
