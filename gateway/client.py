@@ -27,6 +27,7 @@ from dream import (
     DreamRunResult,
     DreamStatus,
 )
+from backup import BackupCreateRequest, BackupRecord
 
 from gateway.models import (
     ApprovalDecision,
@@ -66,6 +67,21 @@ class GatewayClient:
             response = await client.get(f"{self.base_url}/api/v1/status")
             response.raise_for_status()
             return dict(response.json())
+
+    async def create_backup(self, passphrase: str, output: Path | None = None) -> BackupRecord:
+        request = BackupCreateRequest(passphrase=passphrase, output=output)
+        value = await self._request(
+            "POST", "/api/v1/backup/create",
+            json=request.model_dump(mode="json"), timeout=3600,
+        )
+        return BackupRecord.model_validate(value)
+
+    async def backups(self) -> tuple[BackupRecord, ...]:
+        values = await self._request("GET", "/api/v1/backup/list")
+        return tuple(BackupRecord.model_validate(value) for value in values)
+
+    async def backup_status(self) -> dict[str, Any]:
+        return dict(await self._request("GET", "/api/v1/backup/status"))
 
     async def register_project(self, path: Path, name: str | None = None) -> dict[str, Any]:
         payload = ProjectCreateRequest(path=str(path.resolve()), name=name)

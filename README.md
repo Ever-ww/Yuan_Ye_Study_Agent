@@ -24,6 +24,7 @@ Coding Agent 的记忆位于 Agent 根目录的 `.yy/harness-evolution/memory/`�
 
 ```text
 Agent/      模型适配、异步 ReAct、Runtime、Hook 协议与配置
+backup/     Agent Home 写入屏障、协作冻结、流式加密快照与整体恢复
 extension/  十阶段全局多文件 Hook Extension 与开发契约
 gateway/    单实例后台进程、Runtime 池、本机 API、事件重放、审批与 Inbox
 dream/      每日 Session 归档、长期记忆巩固、审计、调度与回滚
@@ -62,7 +63,8 @@ ui/         Web 与 Tauri 共用的 React/TypeScript 工作台
 desktop/    Tauri 2 原生窗口与 Gateway sidecar 启动外壳
 packaging/  PyInstaller sidecar 构建与平台文件名准备
 tests/      核心行为与 UI 安全测试
-.yy/gateway/ SQLite、可重放 Run 事件、Inbox、日志、令牌与单实例状态
+.yy/gateway/ SQLite、可重放 Run 事件与 Inbox（进程控制文件位于外部控制面）
+.yy-backups/ 加密备份、Restore Journal/Fence、维护锁与 Gateway 进程控制（位于 Agent Home 外）
 .yy/dream/  每日巩固状态、结构化记忆、运行审计、事务与 Profile 备份（不提交）
 .yy/memory/ Agent Home 中的会话 JSONL、会话索引与长期 Profile（不提交）
 .yy/papers/ 全局论文 PDF、中文总结与审计索引（不提交）
@@ -364,6 +366,28 @@ uv run python run.py gateway logs --lines 100
 uv run python run.py gateway stop
 ```
 
+### Agent Home Backup / Restore
+
+Backup 对统一的 `~/.yy` 创建完整加密快照。运行中的 Gateway 会先进入 `DRAINING`，拒绝新的写入；Runtime、Cron、Dream、Outbox、Embedding 与 Harness 到达可持久化边界后进入 `FROZEN`。Outbox 不要求清空 backlog，已经持久化的 `UNKNOWN` Tool Attempt 也允许冻结。被动 Store 不实现虚假的生命周期接口，但所有 Gateway 写请求和核心 State mutation 都受同一个 WriteGate 约束。
+
+```powershell
+uv run python run.py backup create
+uv run python run.py backup list
+uv run python run.py backup status
+uv run python run.py backup verify D:\backups\example.yybackup
+uv run python run.py backup restore D:\backups\example.yybackup
+uv run python run.py backup recover
+uv run python run.py backup rollback
+```
+
+手动命令使用隐藏输入读取口令；`backup create` 还会要求二次输入。口令不会进入 argv、RuntimeConfig、ToolContext、Harness 或普通子进程。自动备份默认每天本地时间 04:00 运行，只从受信任 Backup Secret Provider（源码运行可用 `YY_BACKUP_PASSPHRASE`）取得口令；Gateway 读取后立即从全局环境移除。缺少口令时记录 `backup_skipped` 并进入 Inbox，绝不生成明文备份。
+
+归档格式使用流式 ZIP64 与 AES-256-GCM，明文 Header 作为 AAD；程序会先限制 Header 与 scrypt 资源参数，再执行 KDF。正常创建过程不生成完整明文 ZIP，也不把整个归档读入内存。正式文件先以 `.partial` 写入，完成认证、校验和 fsync 后原子发布为 `.yybackup`。SQLite 使用 Backup API 生成干净快照，不归档 WAL/SHM。
+
+Restore 是整体替换而不是状态合并。破坏性替换前会显示 Backup ID、版本、大小、外部依赖和峰值空间，并要求输入短 ID；随后创建并验证救援备份。控制面位于 `~/.yy-backups/`，不随 `.yy` 一起替换：Fence 阻止普通 Gateway 启动，append-only 哈希链 Journal 对关键 rename 采用 `intent → filesystem action → committed`。如果强杀发生在 rename 与 commit 之间，`backup recover` 只依据记录的身份和指纹协调；无法证明时进入 `RECOVERY_REQUIRED`，不会猜测。
+
+Harness worktree 本体和旧 `.git` 指针不会进入跨机器归档。维护冻结时只导出 repository identity、required commits、tracked/staged diff、untracked bundle、Session metadata 与验证证据；目标机器缺少仓库或 Commit 时会标记为 offline/incompatible，而不会按同名目录误关联。
+
 Gateway 停止时先拒绝新任务，并给正在运行的任务一个短暂收尾窗口，随后通过
 `CANCELLING → FINALIZING → CANCELLED` 关闭 Runtime 与 Docker。异常重启不会把全部未完成
 任务粗暴改成 `interrupted`：可证明安全的任务从持久化 State 与 SafeCheckpoint 恢复，等待审批
@@ -371,7 +395,7 @@ Gateway 停止时先拒绝新任务，并给正在运行的任务一个短暂收
 只有数据库损坏、Checkpoint 丢失或版本不兼容等无法建立可信恢复路径的情况才进入永久终态
 `INTERRUPTED`。
 
-Windows 下 CLI 首次发现 Gateway 未运行时，会使用 `CREATE_NO_WINDOW` 在后台启动服务，不会另外打开空白 Windows Terminal；后台 stdout/stderr 统一写入 `gateway.log`。
+Windows 下 CLI 首次发现 Gateway 未运行时，会使用 `CREATE_NO_WINDOW` 在后台启动服务，不会另外打开空白 Windows Terminal；后台 stdout/stderr 统一写入 Agent Home 外部控制面的 `gateway.log`。
 
 CLI、Web 和桌面端同时启动时会先竞争独立的 `startup.lock`，只有一个客户端创建后台
 进程，其余客户端等待同一健康接口。正式实例通过 `instance.lock` 与保留的 PID 标识；
@@ -379,11 +403,13 @@ CLI、Web 和桌面端同时启动时会先竞争独立的 `startup.lock`，只�
 后只终止锁中明确记录的 Gateway PID。Windows 后台进程强制使用 UTF-8 日志，并过滤
 h11 在连接已经关闭后重复发送 400 所产生的特定无害回调栈。
 
-Gateway 状态位于 Agent Home 的 `.yy/gateway/`。SQLite 中的 `agent_states` 是当前 Runtime
+Gateway 的持久业务状态位于 Agent Home 的 `.yy/gateway/`；Token、PID、锁、停止请求和日志位于
+`<agent_root>/.yy-backups/control/gateway/`，因此 Restore 替换 `.yy` 时不会丢失进程级隔离状态。
+SQLite 中的 `agent_states` 是当前 Runtime
 State 的唯一权威来源；`state_transitions` 只保存真实 FSM 迁移，`operation_ledger` 保存模型、
 工具、审批与收尾操作，`gateway_events + event_outbox` 负责可靠事件投递。EventBus 与
 `runs/<run-id>.jsonl` 两个 Sink 分别确认，全部成功后 Outbox 才标记 delivered；JSONL 使用稳定
-`event_id` 与文件级索引防重复。`gateway.log` 最多保留当前文件与 5 份轮转日志。Session 对话
+`event_id` 与文件级索引防重复。外部控制面的 `gateway.log` 最多保留当前文件与 5 份轮转日志。Session 对话
 正文仍只由 Memory 写一份，不会复制到 Gateway 事件文件。
 
 ### Durable Runtime FSM

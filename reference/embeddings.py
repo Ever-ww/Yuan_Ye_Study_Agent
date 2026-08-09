@@ -11,6 +11,7 @@ from typing import Protocol
 import httpx
 
 from .store import ReferenceStore
+from backup import QuiesceResult
 
 
 class EmbeddingProvider(Protocol):
@@ -95,6 +96,8 @@ class ReferenceEmbeddingWorker:
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._closing = False
+        self._maintenance_epoch: int | None = None
+        self._job_lock = asyncio.Lock()
 
     async def start(self) -> None:
         if self.provider is None or self._task is not None:
@@ -117,26 +120,52 @@ class ReferenceEmbeddingWorker:
     def wake(self) -> None:
         self._wake.set()
 
+    async def quiesce(self, maintenance_epoch: int) -> QuiesceResult:
+        if self._maintenance_epoch is not None and maintenance_epoch <= self._maintenance_epoch:
+            return QuiesceResult(participant="reference_embedding",
+                                  maintenance_epoch=maintenance_epoch,
+                                  acknowledged=maintenance_epoch == self._maintenance_epoch,
+                                  stale=maintenance_epoch < self._maintenance_epoch)
+        self._maintenance_epoch = maintenance_epoch
+        self._wake.set()
+        async with self._job_lock:
+            pass
+        return QuiesceResult(participant="reference_embedding",
+                              maintenance_epoch=maintenance_epoch,
+                              acknowledged=True, safe_boundary="embedding_job_persisted")
+
+    async def resume(self, maintenance_epoch: int) -> None:
+        if self._maintenance_epoch == maintenance_epoch:
+            self._maintenance_epoch = None
+            self._wake.set()
+
     async def _run(self) -> None:
         assert self.provider is not None
         while not self._closing:
-            job = self.store.claim_embedding_job(self.provider.model)
+            if self._maintenance_epoch is not None:
+                self._wake.clear()
+                await self._wake.wait()
+                continue
+            job = None
+            async with self._job_lock:
+                if self._maintenance_epoch is not None:
+                    continue
+                job = self.store.claim_embedding_job(self.provider.model)
+                if job is not None:
+                    try:
+                        document = self.store.search_document(job.document_id)
+                        vector = (await self.provider.embed((str(document["search_text"]),)))[0]
+                        self.store.complete_embedding(job, pack_vector(vector), len(vector))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        self.store.fail_embedding(job, f"{type(exc).__name__}: {str(exc)[:800]}")
             if job is None:
                 self._wake.clear()
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=2.0)
                 except asyncio.TimeoutError:
                     pass
-                continue
-            try:
-                document = self.store.search_document(job.document_id)
-                vector = (await self.provider.embed((str(document["search_text"]),)))[0]
-                self.store.complete_embedding(job, pack_vector(vector), len(vector))
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # 不保存响应正文或凭据，只记录可诊断的异常类型与脱敏消息。
-                self.store.fail_embedding(job, f"{type(exc).__name__}: {str(exc)[:800]}")
 
 
 def pack_vector(vector: Sequence[float]) -> bytes:

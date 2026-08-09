@@ -8,8 +8,12 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 from typing import Any
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from backup import AgentHomeWriteGate
 
 from Agent.state import (
     AbandonOperationAttemptCommand,
@@ -92,10 +96,12 @@ class StateController:
         *,
         gateway_epoch: str,
         migration_backup_path: Path | None = None,
+        write_gate: "AgentHomeWriteGate | None" = None,
     ) -> None:
         self.database_path = database_path.resolve()
         self.gateway_epoch = gateway_epoch
         self.migration_backup_path = migration_backup_path
+        self.write_gate = write_gate
         self._backup_before_state_migration()
         try:
             self.initialize()
@@ -432,6 +438,8 @@ class StateController:
             return state, False
 
     def apply(self, command: Command) -> ApplyResult:
+        if self.write_gate is not None:
+            self.write_gate.check_mutation_admission()
         command_json = command.model_dump_json()
         command_hash = hashlib.sha256(command_json.encode("utf-8")).hexdigest()
         with self._connection() as connection:

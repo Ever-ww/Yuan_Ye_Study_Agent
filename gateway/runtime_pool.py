@@ -36,6 +36,7 @@ from gateway.state_controller import StateController
 from gateway.store import GatewayStore
 from memory import MemoryStore
 from reference import ReferenceService
+from backup import AgentHomeWriteGate, QuiesceResult
 
 
 RuntimeFactory = Callable[[Path, GatewayApprovalBroker], AgentRuntime]
@@ -68,6 +69,7 @@ class RuntimePool:
         tool_retry_max_attempts: int = 3,
         tool_retry_base_seconds: float = 2.0,
         tool_retry_max_seconds: float = 60.0,
+        write_gate: AgentHomeWriteGate | None = None,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.store = store
@@ -80,6 +82,7 @@ class RuntimePool:
         self.reference_service = reference_service
         self.state_controller = state_controller
         self.outbox = outbox
+        self.write_gate = write_gate
         self.tool_operations = DurableToolCoordinator(
             state_controller,
             retry_max_attempts=tool_retry_max_attempts,
@@ -101,13 +104,14 @@ class RuntimePool:
         self._closing = False
         self._lock = asyncio.Lock()
         self._reaper: asyncio.Task[None] | None = None
+        self._maintenance_epoch: int | None = None
 
     async def start(self) -> None:
         if self._reaper is None:
             self._reaper = asyncio.create_task(self._reap_idle(), name="gateway-runtime-reaper")
 
     async def submit(self, run: RunRecord) -> None:
-        if self._closing:
+        if self._closing or self._maintenance_epoch is not None:
             raise RuntimeError("Gateway 正在关闭，不能接收新任务")
         state = self.state_controller.state(run.run_id)
         operation = self.state_controller.active_operation(run.run_id)
@@ -125,8 +129,27 @@ class RuntimePool:
                 if key in self._busy_sessions:
                     raise RuntimeError("同一个 Session 同时只能运行一个任务")
                 self._busy_sessions.add(key)
-        task = asyncio.create_task(self._execute(run), name=f"gateway-run-{run.run_id}")
+        started = asyncio.Event()
+        task = asyncio.create_task(
+            self._execute_with_write_scope(run, started),
+            name=f"gateway-run-{run.run_id}",
+        )
         self._tasks[run.run_id] = task
+        await started.wait()
+        if task.done() and task.exception() is not None:
+            raise task.exception()
+
+    async def _execute_with_write_scope(self, run: RunRecord, started: asyncio.Event) -> None:
+        if self.write_gate is None:
+            started.set()
+            await self._execute(run)
+            return
+        try:
+            async with self.write_gate.operation("runtime_pool", run.run_id):
+                started.set()
+                await self._execute(run)
+        finally:
+            started.set()
 
     async def cancel(self, run_id: str) -> bool:
         state = self.state_controller.state(run_id)
@@ -170,6 +193,8 @@ class RuntimePool:
 
     async def refresh_skills(self, project_id: str, session_id: str):
         """刷新指定的持久化 Session；空闲时自动恢复 Runtime。"""
+        if self._maintenance_epoch is not None:
+            raise RuntimeError("Agent Home 正在维护，不能刷新 Skill")
         key = (project_id, session_id)
         created = False
         async with self._lock:
@@ -220,6 +245,30 @@ class RuntimePool:
     def has_active_run(self, run_id: str) -> bool:
         task = self._tasks.get(run_id)
         return task is not None and not task.done()
+
+    async def quiesce(self, maintenance_epoch: int) -> QuiesceResult:
+        if self._maintenance_epoch is not None and maintenance_epoch <= self._maintenance_epoch:
+            return QuiesceResult(
+                participant="runtime_pool",
+                maintenance_epoch=maintenance_epoch,
+                acknowledged=maintenance_epoch == self._maintenance_epoch,
+                stale=maintenance_epoch < self._maintenance_epoch,
+                safe_boundary="all_active_runs_durable" if maintenance_epoch == self._maintenance_epoch else None,
+            )
+        self._maintenance_epoch = maintenance_epoch
+        active = [task for task in self._tasks.values() if not task.done()]
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
+        return QuiesceResult(
+            participant="runtime_pool",
+            maintenance_epoch=maintenance_epoch,
+            acknowledged=True,
+            safe_boundary="all_active_runs_durable",
+        )
+
+    async def resume(self, maintenance_epoch: int) -> None:
+        if self._maintenance_epoch == maintenance_epoch:
+            self._maintenance_epoch = None
 
     async def invalidate_profile_context(self, after_active_turn: bool = True) -> None:
         """Profile 更新后刷新空闲 Runtime；活动 Turn 在结束后再刷新。"""

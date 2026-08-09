@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Awaitable, Callable
 
 from gateway.audit import AuditSanitizer
 from gateway.models import GatewayEventEnvelope, now_iso
+from backup import QuiesceResult
 
 
 PublishEvent = Callable[[GatewayEventEnvelope], Awaitable[None]]
@@ -45,6 +47,7 @@ class JsonlEventSink:
         with path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(event.model_dump_json() + "\n")
             handle.flush()
+            os.fsync(handle.fileno())
         known.add(event.event_id)
         with self._index_path(event.run_id).open("a", encoding="ascii", newline="\n") as handle:
             handle.write(event.event_id + "\n")
@@ -87,6 +90,7 @@ class OutboxDispatcher:
         self._task: asyncio.Task[None] | None = None
         self._wake = asyncio.Event()
         self._drain_lock = asyncio.Lock()
+        self._paused_epoch: int | None = None
 
     async def start(self) -> None:
         if self._task is None:
@@ -101,6 +105,33 @@ class OutboxDispatcher:
         self._task = None
 
     def wake(self) -> None:
+        self._wake.set()
+
+    async def quiesce(self, maintenance_epoch: int) -> QuiesceResult:
+        if self._paused_epoch is not None and maintenance_epoch <= self._paused_epoch:
+            return QuiesceResult(
+                participant="outbox",
+                maintenance_epoch=maintenance_epoch,
+                acknowledged=maintenance_epoch == self._paused_epoch,
+                stale=maintenance_epoch < self._paused_epoch,
+                safe_boundary="sink_attempt_persisted" if maintenance_epoch == self._paused_epoch else None,
+            )
+        self._paused_epoch = maintenance_epoch
+        self._wake.set()
+        # The current publish is allowed to finish and persist its sink status.
+        async with self._drain_lock:
+            pass
+        return QuiesceResult(
+            participant="outbox",
+            maintenance_epoch=maintenance_epoch,
+            acknowledged=True,
+            safe_boundary="sink_attempt_persisted_backlog_preserved",
+        )
+
+    async def resume(self, maintenance_epoch: int) -> None:
+        if self._paused_epoch != maintenance_epoch:
+            return
+        self._paused_epoch = None
         self._wake.set()
 
     async def drain_once(self) -> int:
@@ -137,6 +168,10 @@ class OutboxDispatcher:
 
     async def _run(self) -> None:
         while True:
+            if self._paused_epoch is not None:
+                self._wake.clear()
+                await self._wake.wait()
+                continue
             processed = await self.drain_once()
             if processed:
                 await asyncio.sleep(0)

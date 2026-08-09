@@ -5,6 +5,7 @@ import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from Agent import load_runtime_config
 from cron import CronJobCreateRequest, CronJobEditRequest, CronPreviewRequest
@@ -22,6 +23,7 @@ from gateway.models import (
 )
 from gateway.security import GatewayCredentials, bearer_value
 from sandbox import probe_docker_status
+from backup import BackupCreateRequest, MaintenanceBlockedError, external_control_root
 
 
 def create_gateway_api(
@@ -37,7 +39,9 @@ def create_gateway_api(
 
     config = application.config if application is not None else load_runtime_config()
     gateway = application or GatewayApplication(config)
-    token = access_token or GatewayCredentials(config.agent_root / ".yy" / "gateway").load_or_create()
+    token = access_token or GatewayCredentials(
+        external_control_root(config.agent_root) / "control" / "gateway",
+    ).load_or_create()
     csrf_token = secrets.token_urlsafe(32)
 
     @asynccontextmanager
@@ -79,12 +83,12 @@ def create_gateway_api(
             raise HTTPException(401, "Gateway 访问凭据无效")
         return supplied
 
-    def authorize_write(
+    async def authorize_write(
         request: Request,
         authorization: str | None = Header(default=None),
         yy_gateway: str | None = Cookie(default=None),
         x_csrf_token: str | None = Header(default=None),
-    ) -> str:
+    ):
         supplied = authorize(authorization, yy_gateway)
         if bearer_value(authorization) is None and not secrets.compare_digest(x_csrf_token or "", csrf_token):
             raise HTTPException(403, "CSRF 校验失败")
@@ -96,7 +100,14 @@ def create_gateway_api(
             "http://tauri.localhost",
         }:
             raise HTTPException(403, "Origin 不在本机客户端白名单")
-        return supplied
+        try:
+            async with gateway.write_gate.operation(
+                "gateway-api",
+                f"{request.method}:{request.url.path}:{uuid4().hex}",
+            ):
+                yield supplied
+        except MaintenanceBlockedError as exc:
+            raise HTTPException(503, str(exc), headers={"Retry-After": "5"}) from exc
 
     @app.middleware("http")
     async def security_headers(request, call_next):
@@ -120,6 +131,24 @@ def create_gateway_api(
             "service": "yuan-ye-agent-gateway",
             "version": 1,
             **gateway.state_controller.health(),
+        }
+
+    @app.post("/api/v1/backup/create", dependencies=[Depends(authorize)])
+    async def create_backup(request: BackupCreateRequest):
+        # This endpoint deliberately does not acquire a normal write scope: it is
+        # the maintenance initiator and must transition the gate to DRAINING.
+        return await gateway.create_backup(request.passphrase, request.output)
+
+    @app.get("/api/v1/backup/list", dependencies=[Depends(authorize)])
+    async def list_backups():
+        return gateway.backup_service.list()
+
+    @app.get("/api/v1/backup/status", dependencies=[Depends(authorize)])
+    async def backup_status():
+        return {
+            "maintenance": gateway.maintenance.snapshot.model_dump(mode="json"),
+            **gateway.backup_scheduler.status(),
+            "backup_directory": str(gateway.backup_service.backup_directory),
         }
 
     @app.get("/api/v1/status", dependencies=[Depends(authorize)])

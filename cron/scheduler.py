@@ -12,6 +12,7 @@ from uuid import uuid4
 from .models import CronJob, parse_time, utc_iso, utc_now
 from .schedule import CronScheduleCalculator
 from .store import CronStore
+from backup import AgentHomeWriteGate, QuiesceResult
 
 
 RunLookup = Callable[[str], Any]
@@ -28,6 +29,7 @@ class CronScheduler:
         *,
         calculator: CronScheduleCalculator | None = None,
         clock: Clock = utc_now,
+        write_gate: AgentHomeWriteGate | None = None,
     ) -> None:
         self.store = store
         self.submit_run = submit_run
@@ -39,6 +41,8 @@ class CronScheduler:
         self._tick_lock = asyncio.Lock()
         self._closing = False
         self.last_error: str | None = None
+        self._maintenance_epoch: int | None = None
+        self.write_gate = write_gate
 
     async def start(self) -> None:
         if self._task is not None:
@@ -77,7 +81,15 @@ class CronScheduler:
         self._wake.set()
 
     async def tick(self) -> tuple[str, ...]:
+        if self.write_gate is not None:
+            async with self.write_gate.operation("cron", f"tick:{self._now().isoformat()}"):
+                return await self._tick_impl()
+        return await self._tick_impl()
+
+    async def _tick_impl(self) -> tuple[str, ...]:
         async with self._tick_lock:
+            if self._maintenance_epoch is not None:
+                return ()
             now = self._now()
             claimed: list[tuple[CronJob, str]] = []
 
@@ -137,6 +149,23 @@ class CronScheduler:
             except Exception as exc:
                 await self._submission_failed(job, run_id, exc)
         return tuple(submitted)
+
+    async def quiesce(self, maintenance_epoch: int) -> QuiesceResult:
+        if self._maintenance_epoch is not None and maintenance_epoch <= self._maintenance_epoch:
+            return QuiesceResult(participant="cron", maintenance_epoch=maintenance_epoch,
+                                  acknowledged=maintenance_epoch == self._maintenance_epoch,
+                                  stale=maintenance_epoch < self._maintenance_epoch)
+        self._maintenance_epoch = maintenance_epoch
+        self._wake.set()
+        async with self._tick_lock:
+            pass
+        return QuiesceResult(participant="cron", maintenance_epoch=maintenance_epoch,
+                              acknowledged=True, safe_boundary="tick_persisted_no_new_jobs")
+
+    async def resume(self, maintenance_epoch: int) -> None:
+        if self._maintenance_epoch == maintenance_epoch:
+            self._maintenance_epoch = None
+            self._wake.set()
 
     async def _run(self) -> None:
         while not self._closing:

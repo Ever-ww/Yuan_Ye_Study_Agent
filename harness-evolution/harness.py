@@ -13,6 +13,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
+from backup.security import SensitiveEnvSanitizer
 
 from Agent import AgentRuntime, EventType, ExtensionLoader, ModelRetryPolicy, RuntimeConfig, RuntimeFailure
 from Agent.hook import HookEvent, HookPoint, HookRegistry
@@ -1186,6 +1187,7 @@ class HarnessEvolutionRunner:
             cwd=str(directory),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=SensitiveEnvSanitizer.subprocess_env(),
         )
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)

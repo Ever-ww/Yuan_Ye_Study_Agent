@@ -10,6 +10,7 @@ import threading
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
+from backup.security import SensitiveEnvSanitizer
 
 from .models import CheckpointAuditEvent, CheckpointRecord, CheckpointState, RollbackResult
 
@@ -290,6 +291,7 @@ class CheckpointStore:
         result = subprocess.run(
             arguments,
             cwd=self.project_root,
+            env=SensitiveEnvSanitizer.subprocess_env(),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -360,10 +362,10 @@ class CheckpointStore:
         ]
 
     def _git_environment(self) -> dict[str, str]:
-        environment = dict(os.environ)
-        environment["GIT_INDEX_FILE"] = str(self._require_index_path())
-        environment["GIT_CONFIG_NOSYSTEM"] = "1"
-        return environment
+        return SensitiveEnvSanitizer.subprocess_env({
+            "GIT_INDEX_FILE": str(self._require_index_path()),
+            "GIT_CONFIG_NOSYSTEM": "1",
+        })
 
     def _require_state(self) -> CheckpointState:
         if self._state is None:

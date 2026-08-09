@@ -77,6 +77,16 @@ class RuntimeConfig(BaseModel):
     dream_timezone: str = Field(default="local", min_length=1, max_length=100)
     dream_model: str | None = Field(default=None, min_length=1)
     dream_batch_tokens: StrictInt = Field(default=12000, ge=1000, le=200000)
+    backup_enabled: StrictBool = True
+    backup_schedule: str = Field(default="0 4 * * *", min_length=1, max_length=100)
+    backup_timezone: str = Field(default="local", min_length=1, max_length=100)
+    backup_directory: Path | None = None
+    backup_drain_timeout_seconds: StrictInt = Field(default=300, ge=10, le=3600)
+    backup_retention_daily: StrictInt = Field(default=7, ge=0, le=365)
+    backup_retention_weekly: StrictInt = Field(default=4, ge=0, le=104)
+    backup_retention_monthly: StrictInt = Field(default=12, ge=0, le=120)
+    backup_min_free_space_bytes: StrictInt | None = Field(default=None, ge=0)
+    backup_max_storage_bytes: StrictInt | None = Field(default=None, ge=1)
     reference_search_mode: Literal["rrf", "weighted", "separate"] = "rrf"
     reference_embedding_model: str = ""
     reference_embedding_base_url: str | None = None
@@ -84,7 +94,7 @@ class RuntimeConfig(BaseModel):
     reference_keyword_weight: float = Field(default=0.4, ge=0.0, le=1.0)
     reference_semantic_weight: float = Field(default=0.6, ge=0.0, le=1.0)
 
-    @field_validator("agent_root", "workspace_root", "coding_source_root")
+    @field_validator("agent_root", "workspace_root", "coding_source_root", "backup_directory")
     @classmethod
     def _resolve_project_root(cls, value: Path | None) -> Path | None:
         """在配置边界统一工作区为绝对路径。"""
@@ -129,6 +139,12 @@ class RuntimeConfig(BaseModel):
             ZoneInfo(get_localzone_name() if self.dream_timezone == "local" else self.dream_timezone)
         except Exception as exc:
             raise ValueError(f"dream_timezone 不是有效时区：{self.dream_timezone}") from exc
+        if len(self.backup_schedule.split()) != 5 or not croniter.is_valid(self.backup_schedule):
+            raise ValueError("backup_schedule 必须是合法的五段 Cron 表达式")
+        try:
+            ZoneInfo(get_localzone_name() if self.backup_timezone == "local" else self.backup_timezone)
+        except Exception as exc:
+            raise ValueError(f"backup_timezone 不是有效时区：{self.backup_timezone}") from exc
         return self
 
 
@@ -149,12 +165,17 @@ def load_runtime_config(
     **overrides: Any,
 ) -> RuntimeConfig:
     """加载 Agent 本机状态，并把启动目录作为独立工作区。"""
-    selected_agent_root = (agent_root or default_agent_root()).resolve()
+    selected_agent_root = (
+        agent_root.resolve() if agent_root is not None else prepare_default_agent_root()
+    )
     selected_workspace = (
         workspace_root.resolve()
         if workspace_root is not None
         else (selected_agent_root if agent_root is not None else Path.cwd().resolve())
     )
+    from backup import assert_restore_inactive
+
+    assert_restore_inactive(selected_agent_root)
     ensure_project_initialized(selected_agent_root)
     values: dict[str, Any] = {}
     shared = _read_json(selected_agent_root / ".yy" / "settings.json")
@@ -190,7 +211,6 @@ def default_agent_root() -> Path:
         platform_agent_home,
     )
 
-    source_root = Path(__file__).resolve().parents[1]
     selected = platform_agent_home()
     legacy = legacy_platform_agent_home()
     canonical_initialized = (selected / ".yy" / ".initialized.json").is_file()
@@ -204,7 +224,19 @@ def default_agent_root() -> Path:
         # 升级过程中旧 Gateway 仍可能写 SQLite。先继续返回旧位置，用户执行
         # gateway stop 后，下一次启动再安全迁移并切换到 ~/.yy。
         return legacy
-    if legacy != selected and legacy_has_state:
+    return selected
+
+
+def prepare_default_agent_root() -> Path:
+    """Fence-check first, then explicitly migrate legacy/source state."""
+    from backup import assert_restore_inactive
+    from bootstrap import legacy_platform_agent_home, migrate_source_home
+
+    selected = default_agent_root().resolve()
+    assert_restore_inactive(selected)
+    source_root = Path(__file__).resolve().parents[1]
+    legacy = legacy_platform_agent_home()
+    if legacy != selected and ((legacy / ".yy").is_dir() or (legacy / "skills").is_dir()):
         migrate_source_home(legacy, selected)
     migrate_source_home(source_root, selected)
     return selected

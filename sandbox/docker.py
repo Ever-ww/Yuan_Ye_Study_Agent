@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
+from backup.security import SensitiveEnvSanitizer
 
 from .checkpoint import CheckpointStore
 from .locks import WorkspaceLockManager
@@ -445,6 +446,7 @@ async def _subprocess_runner(arguments: list[str], timeout: float | None) -> Com
             *arguments,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=SensitiveEnvSanitizer.subprocess_env(),
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except asyncio.TimeoutError as exc:

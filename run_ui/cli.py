@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import getpass
 import shlex
 import signal
 import sys
@@ -23,6 +24,7 @@ from Agent import (
     RuntimeFailure,
     default_agent_root,
     load_runtime_config,
+    prepare_default_agent_root,
 )
 from bootstrap import ensure_project_initialized, initialize_project
 from memory import MemoryStore
@@ -33,6 +35,7 @@ from skill import SkillInstallRequest
 from .approval import InteractiveApproval, active_live as _active_live
 from .harness_loader import load_harness_module
 from .web import serve
+from backup import BackupService, RestoreService
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Yuan Ye Study Agent 本地入口")
 session_app = typer.Typer(help="列出、查看和恢复本地会话")
@@ -41,6 +44,8 @@ app.add_typer(session_app, name="session")
 app.add_typer(gateway_app, name="gateway")
 cron_app = typer.Typer(help="管理 Gateway 后台 Cron 与 Heartbeat")
 app.add_typer(cron_app, name="cron")
+backup_app = typer.Typer(help="创建、验证和恢复加密 Agent Home 快照")
+app.add_typer(backup_app, name="backup")
 console = Console()
 
 
@@ -81,7 +86,7 @@ class ChatInterruptController:
 @app.command()
 def init() -> None:
     """初始化本机 `.yy` 配置、会话索引和长期记忆文件。"""
-    yy = initialize_project(default_agent_root())
+    yy = initialize_project(prepare_default_agent_root())
     console.print(f"[green]初始化完成[/] {yy}")
     console.print(f"请编辑 {yy / 'settings.local.json'} 配置模型；已有文件不会被覆盖。")
 
@@ -1422,6 +1427,126 @@ def _cron_preview_local(preview) -> tuple[str, ...]:
     )
 
 
+@backup_app.command("create")
+def backup_create(
+    output: Path | None = typer.Option(None, "--output", help="输出 .yybackup 路径"),
+) -> None:
+    """通过运行中的 Gateway 协作冻结并创建手动加密快照。"""
+    first = getpass.getpass("Backup 口令: ")
+    second = getpass.getpass("再次输入口令: ")
+    if not first or first != second:
+        raise typer.BadParameter("两次口令不一致或为空")
+    record = asyncio.run(_gateway_client().create_backup(first, output))
+    console.print(f"[green]Backup 完成[/] {record.path}")
+    console.print(f"backup_id={record.backup_id} size={record.size_bytes}")
+
+
+@backup_app.command("list")
+def backup_list() -> None:
+    """列出当前备份目录中的已发布归档。"""
+    records = asyncio.run(_gateway_client().backups())
+    if not records:
+        console.print("没有备份。")
+        return
+    for record in records:
+        console.print(f"{record.created_at.isoformat()}  {record.size_bytes:>12}  {record.path}")
+
+
+@backup_app.command("status")
+def backup_status() -> None:
+    """显示备份计划与当前维护状态。"""
+    status = asyncio.run(_gateway_client().backup_status())
+    console.print_json(data=status)
+
+
+@backup_app.command("verify")
+def backup_verify(archive: Path) -> None:
+    """解密并验证GCM、Manifest、文件哈希和SQLite一致性。"""
+    password = getpass.getpass("Backup 口令: ")
+    result = BackupService(default_agent_root()).verify(archive, password)
+    console.print_json(data=result.model_dump(mode="json"))
+    if not result.valid:
+        raise typer.Exit(1)
+
+
+@backup_app.command("restore")
+def backup_restore(
+    archive: Path,
+    map_path: list[str] = typer.Option([], "--map-path", help="仅映射Manifest外部依赖：OLD=NEW"),
+    non_interactive: bool = typer.Option(False, "--non-interactive"),
+    confirm_backup_id: str | None = typer.Option(None, "--confirm-backup-id"),
+) -> None:
+    """停止Gateway，创建救援备份，然后整体替换Agent Home。"""
+    root = default_agent_root()
+    password = getpass.getpass("Backup 口令: ")
+    mappings: dict[str, str] = {}
+    for item in map_path:
+        if "=" not in item:
+            raise typer.BadParameter("--map-path 必须使用 OLD=NEW")
+        old, new = item.split("=", 1)
+        if not old or not new or old in mappings:
+            raise typer.BadParameter("--map-path 不能为空或重复")
+        mappings[old] = new
+    service = BackupService(root)
+    restore = RestoreService(root, service)
+    plan = restore.plan(archive, password, mappings)
+    console.print(
+        f"backup_id={plan.backup_id}\ncreated={plan.created_at.isoformat()}\n"
+        f"agent={plan.agent_version}\narchive={plan.archive_size} bytes\n"
+        f"logical={plan.logical_size} bytes\npeak={plan.estimated_peak_bytes} bytes\n"
+        f"available={plan.available_bytes} bytes",
+    )
+    expected = plan.backup_id[:8]
+    confirmation = confirm_backup_id if non_interactive else typer.prompt(
+        f"输入备份短ID {expected} 确认破坏性Restore",
+    )
+    if not confirmation:
+        raise typer.BadParameter("缺少精确备份ID确认")
+    manager = GatewayProcessManager(root)
+    if manager.status().get("running"):
+        manager.stop()
+    restore_id = asyncio.run(restore.restore(
+        archive, password,
+        confirmation=confirmation,
+        non_interactive=non_interactive,
+        path_mappings=mappings,
+    ))
+    console.print(f"[green]Restore 已提交[/] restore_id={restore_id}")
+
+
+@backup_app.command("recover")
+def backup_recover() -> None:
+    """按外部Journal协调未完成Restore，不猜测目录阶段。"""
+    root = default_agent_root()
+    state = asyncio.run(RestoreService(root, BackupService(root)).recover_interrupted_restore())
+    console.print(f"Restore recovery state: {state.value}")
+
+
+@backup_app.command("rollback")
+def backup_rollback() -> None:
+    """回滚当前Fence指向的未完成Restore。"""
+    root = default_agent_root()
+    state = asyncio.run(RestoreService(root, BackupService(root)).rollback())
+    console.print(f"Restore rollback state: {state.value}")
+
+
+@backup_app.command("prune")
+def backup_prune() -> None:
+    """按GFS策略仅清理可证明属于automatic的备份。"""
+    config = load_runtime_config()
+    service = BackupService(
+        config.agent_root,
+        backup_directory=config.backup_directory,
+        retention_daily=config.backup_retention_daily,
+        retention_weekly=config.backup_retention_weekly,
+        retention_monthly=config.backup_retention_monthly,
+        min_free_space_bytes=config.backup_min_free_space_bytes,
+        max_storage_bytes=config.backup_max_storage_bytes,
+    )
+    removed = service.apply_retention()
+    console.print(f"已清理 {len(removed)} 个automatic备份；手动、救援和最新有效备份未删除。")
+
+
 @app.command()
 def serve_ui(port: int | None = typer.Option(None, "--port")) -> None:
     """自动启动 Gateway 并打开本机 Web 工作台。"""
@@ -1430,8 +1555,14 @@ def serve_ui(port: int | None = typer.Option(None, "--port")) -> None:
 
 def main() -> None:
     """供源码入口和打包命令调用。"""
-    if not sys.argv[1:] or sys.argv[1] != "init":
-        result = ensure_project_initialized(default_agent_root())
+    arguments = sys.argv[1:]
+    restore_control = (
+        len(arguments) >= 2
+        and arguments[0] == "backup"
+        and arguments[1] in {"verify", "restore", "recover", "rollback"}
+    )
+    if (not arguments or arguments[0] != "init") and not restore_control:
+        result = ensure_project_initialized(prepare_default_agent_root())
         if result.initialized:
             console.print(f"[green]首次运行初始化完成[/] {result.yy_dir}")
             console.print(f"请按需编辑 {result.yy_dir / 'settings.local.json'}；后续启动不会重复初始化。")

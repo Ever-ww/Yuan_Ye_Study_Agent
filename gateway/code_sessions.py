@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import re
 import sys
+import zipfile
 from pathlib import Path
 from types import ModuleType
 
 from Agent import RuntimeConfig
+from backup import QuiesceResult, SensitiveEnvSanitizer
 from gateway.models import CodeFinalizeResult, CodeSessionRecord, CodeTurnResult
 
 
@@ -45,9 +48,11 @@ class CodeSessionManager:
         self._owners: dict[str, tuple[str, str]] = {}
         self._turn_locks: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
+        self._maintenance_epoch: int | None = None
 
     async def start(self, project_id: str, client_id: str) -> CodeSessionRecord:
         async with self._lock:
+            self._require_available()
             if self.source_root in self._sources:
                 raise RuntimeError("这个 Yuan Ye 源码仓库已经有活动的 Coding Session")
             controller = self.module.CodeSessionController(self.config)
@@ -60,20 +65,24 @@ class CodeSessionManager:
             return self._record(raw, project_id, client_id)
 
     async def run_turn(self, session_id: str, client_id: str, task: str) -> CodeTurnResult:
+        self._require_available()
         controller = self._owned(session_id, client_id)
         lock = self._turn_locks[session_id]
         if lock.locked():
             raise RuntimeError("同一个 Coding Session 同时只能运行一条需求")
         async with lock:
+            self._require_available()
             raw = await controller.run_turn(task)
         return CodeTurnResult.model_validate(raw.model_dump(mode="json"))
 
     async def finalize(self, session_id: str, client_id: str) -> CodeFinalizeResult:
+        self._require_available()
         controller = self._owned(session_id, client_id)
         lock = self._turn_locks[session_id]
         if lock.locked():
             raise RuntimeError("Coding Turn 正在运行，暂时不能退出或合并")
         async with lock:
+            self._require_available()
             raw = await controller.finalize()
         result = CodeFinalizeResult.model_validate(raw.model_dump(mode="json"))
         if not result.stay_in_code_mode:
@@ -81,15 +90,52 @@ class CodeSessionManager:
         return result
 
     async def abort(self, session_id: str, client_id: str) -> CodeFinalizeResult:
+        self._require_available()
         controller = self._owned(session_id, client_id)
         lock = self._turn_locks[session_id]
         if lock.locked():
             raise RuntimeError("Coding Turn 正在运行，暂时不能放弃会话")
         async with lock:
+            self._require_available()
             raw = await controller.abort()
         result = CodeFinalizeResult.model_validate(raw.model_dump(mode="json"))
         self._forget(session_id)
         return result
+
+    async def quiesce(self, maintenance_epoch: int) -> QuiesceResult:
+        async with self._lock:
+            if self._maintenance_epoch is not None and maintenance_epoch <= self._maintenance_epoch:
+                return QuiesceResult(
+                    participant="harness",
+                    maintenance_epoch=maintenance_epoch,
+                    acknowledged=maintenance_epoch == self._maintenance_epoch,
+                    stale=maintenance_epoch < self._maintenance_epoch,
+                )
+            self._maintenance_epoch = maintenance_epoch
+        # Do not cancel a Coding Turn. Wait for each worktree to reach a stable Git boundary.
+        for lock in tuple(self._turn_locks.values()):
+            async with lock:
+                pass
+        destination = (
+            self.config.agent_root / ".yy-backups" / "maintenance" /
+            str(maintenance_epoch) / "participants" / "harness"
+        )
+        destination.mkdir(parents=True, exist_ok=True)
+        active: list[str] = []
+        for session_id, controller in tuple(self._sessions.items()):
+            await self._export_candidate(session_id, controller, destination / session_id)
+            active.append(session_id)
+        return QuiesceResult(
+            participant="harness",
+            maintenance_epoch=maintenance_epoch,
+            acknowledged=True,
+            safe_boundary="git_candidate_snapshot_exported",
+            active_operations=tuple(active),
+        )
+
+    async def resume(self, maintenance_epoch: int) -> None:
+        if self._maintenance_epoch == maintenance_epoch:
+            self._maintenance_epoch = None
 
     async def close(self) -> None:
         """关闭 Runtime/Docker，但保留分支与 worktree，绝不在 Gateway 退出时合并。"""
@@ -139,6 +185,78 @@ class CodeSessionManager:
         if owner is None:
             raise KeyError(f"未知 Coding Session：{session_id}")
         return owner
+
+    def _require_available(self) -> None:
+        if self._maintenance_epoch is not None:
+            raise RuntimeError("Agent Home 正在维护，Coding Session 暂停接收新操作")
+
+    async def _export_candidate(self, session_id: str, controller, destination: Path) -> None:
+        record = getattr(controller, "record", None)
+        if record is None:
+            return
+        destination.mkdir(parents=True, exist_ok=True)
+        worktree = Path(record.worktree_path).resolve()
+        source = Path(record.source_root).resolve()
+        head = await self._git(worktree, "rev-parse", "HEAD")
+        tracked = await self._git(worktree, "diff", "--binary")
+        staged = await self._git(worktree, "diff", "--cached", "--binary")
+        untracked = await self._git(worktree, "ls-files", "--others", "--exclude-standard", "-z")
+        tracked_path = destination / "tracked.diff"
+        staged_path = destination / "staged.diff"
+        tracked_path.write_text(tracked, encoding="utf-8")
+        staged_path.write_text(staged, encoding="utf-8")
+        bundle_path = destination / "untracked.zip"
+        with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as bundle:
+            for name in (item for item in untracked.split("\x00") if item):
+                candidate = (worktree / name).resolve()
+                if worktree not in candidate.parents or candidate.is_symlink() or not candidate.is_file():
+                    raise RuntimeError(f"Harness untracked 文件不安全：{name}")
+                bundle.write(candidate, arcname=Path(name).as_posix())
+        origin = await self._git(source, "remote", "get-url", "origin", check=False)
+        metadata = {
+            "version": 1,
+            "code_session_id": session_id,
+            "source_repo_path": str(source),
+            "repository_identity": hashlib.sha256(
+                (origin.strip() or str(source)).encode("utf-8"),
+            ).hexdigest(),
+            "base_commit": record.base_commit,
+            "candidate_branch": record.branch,
+            "candidate_commit": record.last_verified_commit,
+            "head_commit": head.strip(),
+            "tracked_diff": tracked_path.name,
+            "staged_diff": staged_path.name,
+            "untracked_file_bundle": bundle_path.name,
+            "session_metadata": record.model_dump(mode="json"),
+            "verification_evidence": str(record.audit_path),
+            "required_commits": sorted({record.base_commit, record.last_verified_commit, head.strip()}),
+        }
+        content_hash = hashlib.sha256()
+        for path in (tracked_path, staged_path, bundle_path):
+            content_hash.update(path.read_bytes())
+        metadata["content_hash"] = content_hash.hexdigest()
+        (destination / "candidate.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    async def _git(root: Path, *arguments: str, check: bool = True) -> str:
+        process = await asyncio.create_subprocess_exec(
+            "git", "-C", str(root), *arguments,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=SensitiveEnvSanitizer.subprocess_env({
+                "GIT_TERMINAL_PROMPT": "0",
+                "GCM_INTERACTIVE": "never",
+            }),
+        )
+        stdout, stderr = await process.communicate()
+        text = stdout.decode("utf-8", errors="replace")
+        if check and process.returncode != 0:
+            raise RuntimeError(stderr.decode("utf-8", errors="replace")[-4000:])
+        return text
 
     def _owned(self, session_id: str, client_id: str):
         controller = self._sessions.get(session_id)

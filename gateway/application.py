@@ -60,6 +60,14 @@ from reference import (
 )
 from skill import SkillInstallRequest, SkillService
 from dream import DreamRunResult, DreamScheduler, DreamService
+from backup import (
+    AgentHomeMaintenanceCoordinator,
+    AgentHomeWriteGate,
+    BackupScheduler,
+    BackupService,
+    SensitiveEnvSanitizer,
+    assert_restore_inactive,
+)
 
 
 class GatewayApplication:
@@ -73,6 +81,12 @@ class GatewayApplication:
         store: GatewayStore | None = None,
     ) -> None:
         self.config = config
+        assert_restore_inactive(config.agent_root)
+        self.write_gate = AgentHomeWriteGate()
+        self.maintenance = AgentHomeMaintenanceCoordinator(config.agent_root, self.write_gate)
+        # Backup passphrase is consumed before Runtime/Tool/Harness construction and
+        # never enters RuntimeConfig or ToolContext.
+        self._backup_passphrase = SensitiveEnvSanitizer.consume_backup_passphrase()
         self.store = store or GatewayStore(config.agent_root / ".yy" / "gateway")
         self.events = GatewayEventBus()
         self.gateway_epoch = uuid4().hex
@@ -80,6 +94,7 @@ class GatewayApplication:
             self.store.database_path,
             gateway_epoch=self.gateway_epoch,
             migration_backup_path=self.store.migration_backup_path,
+            write_gate=self.write_gate,
         )
         self.outbox = OutboxDispatcher(
             self.store.database_path,
@@ -126,12 +141,14 @@ class GatewayApplication:
             tool_retry_max_attempts=config.tool_retry_max_attempts,
             tool_retry_base_seconds=config.tool_retry_base_seconds,
             tool_retry_max_seconds=config.tool_retry_max_seconds,
+            write_gate=self.write_gate,
         )
         self.recovery = RecoveryCoordinator(self.state_controller, self.store, self.pool.submit)
         self.cron_scheduler = CronScheduler(
             self.cron_store,
             self._submit_cron_run,
             self.store.run,
+            write_gate=self.write_gate,
         )
         self.cron_service.set_waker(self.cron_scheduler.wake)
         self.dream_service = DreamService(
@@ -144,9 +161,38 @@ class GatewayApplication:
             self._record_dream_result,
             heartbeat_seconds=config.cron_heartbeat_seconds,
             run_day=lambda selected: self._execute_dream_day(selected, automatic=True),
+            write_gate=self.write_gate,
         )
         self._browser_codes: dict[str, float] = {}
         self.code_sessions = CodeSessionManager(config)
+        self.maintenance.register("runtime_pool", self.pool)
+        self.maintenance.register("cron", self.cron_scheduler)
+        self.maintenance.register("dream", self.dream_scheduler)
+        self.maintenance.register("outbox", self.outbox)
+        self.maintenance.register("reference_embedding", self.reference_embedding_worker)
+        self.maintenance.register("harness", self.code_sessions)
+        self.backup_service = BackupService(
+            config.agent_root,
+            coordinator=self.maintenance,
+            secret_provider=lambda: self._backup_passphrase,
+            backup_directory=config.backup_directory,
+            source_root=source_root,
+            retention_daily=config.backup_retention_daily,
+            retention_weekly=config.backup_retention_weekly,
+            retention_monthly=config.backup_retention_monthly,
+            min_free_space_bytes=config.backup_min_free_space_bytes,
+            max_storage_bytes=config.backup_max_storage_bytes,
+        )
+        self.backup_scheduler = BackupScheduler(
+            self.backup_service,
+            self.write_gate,
+            enabled=config.backup_enabled,
+            schedule=config.backup_schedule,
+            timezone=config.backup_timezone,
+            drain_timeout_seconds=config.backup_drain_timeout_seconds,
+            on_result=self._record_backup_result,
+            heartbeat_seconds=config.cron_heartbeat_seconds,
+        )
 
     async def start(self) -> None:
         self.state_controller.prune_retention()
@@ -157,13 +203,61 @@ class GatewayApplication:
             await self.recovery.recover()
             await self.cron_scheduler.start()
             await self.dream_scheduler.start()
+            await self.backup_scheduler.start()
         except Exception:
             await self.outbox.close()
             await self.reference_embedding_worker.close()
             raise
 
+    async def create_backup(self, passphrase: str, output: Path | None = None):
+        return await self.backup_service.create(
+            passphrase=passphrase,
+            output=output,
+            kind="manual",
+            drain_timeout_seconds=self.config.backup_drain_timeout_seconds,
+        )
+
+    async def _record_backup_result(self, status: str, payload: dict[str, object]) -> None:
+        run_id = uuid4().hex
+        state = self._begin_workload_run(
+            run_id=run_id,
+            workload=WorkloadKind.MAINTENANCE,
+            project_id="backup",
+            client_id="backup:scheduler",
+            task="Automatic Agent Home backup",
+        )
+        target = TerminalTarget.SUCCEEDED if status == "backup_completed" else TerminalTarget.FAILED
+        state = self.state_controller.apply(RecordRuntimeEventCommand(
+            command_id=uuid4().hex,
+            run_id=run_id,
+            expected_revision=state.revision,
+            gateway_epoch=self.gateway_epoch,
+            event_type=status,
+            payload=payload,
+            mark_progress=True,
+        )).state
+        self.state_controller.apply(TransitionCommand(
+            command_id=uuid4().hex,
+            run_id=run_id,
+            expected_revision=state.revision,
+            gateway_epoch=self.gateway_epoch,
+            task_state=TaskState.FINALIZING,
+            terminal_target=target,
+            reason="Backup maintenance进入FINALIZING",
+            error=str(payload.get("message", "")) if target is TerminalTarget.FAILED else None,
+            result_summary=str(payload.get("path", "Backup completed")) if target is TerminalTarget.SUCCEEDED else None,
+        ))
+        self._finalize_control_plane(
+            run_id, target,
+            str(payload.get("message") or payload.get("path") or status),
+            task_title="Automatic Agent Home backup",
+            create_visible_inbox=True,
+        )
+        self.outbox.wake()
+
     async def close(self) -> None:
         try:
+            await self.backup_scheduler.close()
             await self.dream_scheduler.close()
             await self.cron_scheduler.close()
             await self.code_sessions.close()

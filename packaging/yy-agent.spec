@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules
 
 root = Path(SPECPATH).resolve().parent
 if not (root / "run.py").is_file():
@@ -22,7 +23,10 @@ a = Analysis(
         (str(root / "run_ui" / "templates"), "run_ui/templates"),
         (str(root / "harness-evolution" / "harness.py"), "harness-evolution"),
     ] + extension_datas,
-    hiddenimports=["uvicorn.logging", "uvicorn.loops.auto", "uvicorn.protocols.http.auto", "uvicorn.protocols.websockets.auto"],
+    hiddenimports=[
+        "uvicorn.logging", "uvicorn.loops.auto", "uvicorn.protocols.http.auto",
+        "uvicorn.protocols.websockets.auto",
+    ] + collect_submodules("backup") + collect_submodules("cryptography"),
 )
 pyz = PYZ(a.pure)
 exe = EXE(

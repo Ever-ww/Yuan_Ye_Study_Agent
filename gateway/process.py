@@ -17,18 +17,20 @@ from typing import IO
 import httpx
 
 from gateway.security import GatewayCredentials
+from backup import SensitiveEnvSanitizer, assert_restore_inactive, external_control_root
 
 
 class GatewayProcessManager:
     def __init__(self, agent_root: Path, port: int = 8765) -> None:
         self.agent_root = agent_root.resolve()
         self.port = port
-        self.directory = self.agent_root / ".yy" / "gateway"
+        self.directory = external_control_root(self.agent_root) / "control" / "gateway"
         self.instance_path = self.directory / "instance.json"
         self.lock_path = self.directory / "instance.lock"
         self.startup_lock_path = self.directory / "startup.lock"
         self.log_path = self.directory / "gateway.log"
         self.stop_request_path = self.directory / "stop.request"
+        # This is the external control plane, never the replaceable `.yy` tree.
         self.directory.mkdir(parents=True, exist_ok=True)
 
     @property
@@ -56,6 +58,7 @@ class GatewayProcessManager:
         }
 
     def ensure_running(self, timeout_seconds: float = 15.0) -> dict[str, object]:
+        assert_restore_inactive(self.agent_root)
         if self._healthy():
             return self._status_payload(True)
         deadline = time.monotonic() + timeout_seconds
@@ -68,6 +71,7 @@ class GatewayProcessManager:
             raise RuntimeError("等待 Gateway 启动协调锁超时") from exc
         try:
             # 拿到跨进程启动锁后必须重新探测，避免前一个客户端刚刚完成启动。
+            assert_restore_inactive(self.agent_root)
             if self._healthy():
                 return self._status_payload(True)
             self._remove_stale_metadata()
@@ -92,9 +96,12 @@ class GatewayProcessManager:
             start_new_session = os.name != "nt"
             if os.name == "nt":
                 creationflags = _windows_background_creationflags()
-            child_environment = os.environ.copy()
-            child_environment["PYTHONUTF8"] = "1"
-            child_environment["PYTHONIOENCODING"] = "utf-8"
+            child_environment = SensitiveEnvSanitizer.subprocess_env({
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+            }, allowed_names={"YY_BACKUP_PASSPHRASE"},
+               trusted_sensitive_names={"YY_BACKUP_PASSPHRASE"})
+            self.directory.mkdir(parents=True, exist_ok=True)
             with self.log_path.open("a", encoding="utf-8") as log:
                 subprocess.Popen(
                     command,
@@ -163,6 +170,7 @@ class GatewayProcessManager:
         self.stop_request_path.unlink(missing_ok=True)
 
     def token(self) -> str:
+        assert_restore_inactive(self.agent_root)
         return GatewayCredentials(self.directory).load_or_create()
 
     def _healthy(self) -> bool:
@@ -302,6 +310,7 @@ def run_gateway(agent_root: Path, port: int) -> None:
     from gateway.models import now_iso
 
     root = agent_root.resolve()
+    assert_restore_inactive(root)
     manager = GatewayProcessManager(root, port)
     instance_lock = InstanceLock(manager.lock_path)
     try:
@@ -311,6 +320,9 @@ def run_gateway(agent_root: Path, port: int) -> None:
         # 胜出进程正在启动或运行，本进程直接安静退出，不污染后台日志。
         return
     try:
+        # Restore may publish its Fence while this process was waiting for the
+        # instance lock. Re-check after acquisition and before any `.yy` write.
+        assert_restore_inactive(root)
         if not _port_available(port):
             if manager._healthy():
                 return

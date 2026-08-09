@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from pydantic import ValidationError
+from backup.security import SensitiveEnvSanitizer
 
 from sandbox import WorkspaceLockManager
 
@@ -463,8 +464,9 @@ class SkillService:
             if request.ref:
                 arguments.extend(["--branch", request.ref])
             arguments.extend([repository, str(checkout)])
-            environment = dict(os.environ)
-            environment.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"})
+            environment = SensitiveEnvSanitizer.subprocess_env({
+                "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1",
+            })
             await _run_command(arguments, cwd=self.agent_root, env=environment, timeout=_CLONE_TIMEOUT_SECONDS)
             commit = (
                 await _run_command(
