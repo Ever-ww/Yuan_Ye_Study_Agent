@@ -16,13 +16,11 @@ from Agent.state import (
     AgentState,
     BeginOperationCommand,
     CompleteOperationCommand,
-    CompleteFinalizeStepCommand,
     CreateApprovalCommand,
     DecideApprovalCommand,
     DurableApproval,
     ExecutionOutcome,
     ExecutionState,
-    FinalizeInboxCommand,
     FinalizeTerminalCommand,
     INNER_TRANSITIONS,
     MarkOperationUnknownCommand,
@@ -41,6 +39,8 @@ from Agent.state import (
     validate_outer_transition,
 )
 from gateway.events import GatewayEventBus
+from gateway.finalize import FinalizeCoordinator
+from gateway.session_reservation import SessionReservationRegistry
 from gateway.outbox import OutboxDispatcher
 from gateway.recovery import RecoveryCoordinator
 from gateway.state_controller import StateConflictError, StateController
@@ -120,19 +120,13 @@ class DurableRuntimeTests(unittest.TestCase):
             finish_reason="done",
         )
         self.transition(task_state=TaskState.FINALIZING, terminal_target=TerminalTarget.SUCCEEDED)
-        for step_name in ("memory", "session_index", "audit", "inbox"):
-            state = self.controller.state(self.state.run_id)
-            self.controller.apply(CompleteFinalizeStepCommand(
-                command_id=f"finalize:{state.run_id}:{step_name}", run_id=state.run_id,
-                expected_revision=state.revision, gateway_epoch="epoch-a",
-                step_name=step_name, result="completed",
-            ))
         state = self.controller.state(self.state.run_id)
-        self.state = self.controller.apply(FinalizeTerminalCommand(
-            command_id=f"finalize:{state.run_id}:terminal", run_id=state.run_id,
-            expected_revision=state.revision, gateway_epoch="epoch-a",
-        )).state
-        self.assertEqual(self.state.task_state, TaskState.SUCCEEDED)
+        with self.assertRaises(Exception):
+            FinalizeTerminalCommand(
+                command_id=f"finalize:{state.run_id}:terminal", run_id=state.run_id,
+                expected_revision=state.revision, gateway_epoch="epoch-a",
+            )
+        self.assertEqual(state.task_state, TaskState.FINALIZING)
         with self.assertRaises(ValueError):
             validate_outer_transition(TaskState.SUCCEEDED, TaskState.RECOVERING)
 
@@ -374,35 +368,28 @@ class DurableRuntimeTests(unittest.TestCase):
                 process.kill()
                 process.wait(timeout=5)
 
-    def test_finalizing_reentry_does_not_duplicate_inbox(self) -> None:
-        self.start_agent()
-        self.transition(
-            execution_state=ExecutionState.FINISHED,
-            outcome=ExecutionOutcome.SUCCESS,
-            finish_reason="done",
+    def test_control_only_finalizing_creates_one_deterministic_inbox(self) -> None:
+        state, _ = self.controller.create_run(
+            run_id=uuid4().hex, workload_kind=WorkloadKind.MAINTENANCE,
+            project_id=self.project.project_id, client_id="maintenance",
+            task="maintenance", idempotency_key=uuid4().hex,
+            request_hash=hashlib.sha256(b"maintenance").hexdigest(),
         )
-        self.transition(task_state=TaskState.FINALIZING, terminal_target=TerminalTarget.SUCCEEDED)
-        state = self.controller.state(self.state.run_id)
-        self.controller.apply(FinalizeInboxCommand(
-            command_id=f"finalize:{state.run_id}:inbox",
-            run_id=state.run_id,
-            expected_revision=state.revision,
-            gateway_epoch="epoch-a",
-            operation_id=hashlib.sha256(f"{state.run_id}:finalize:inbox".encode()).hexdigest(),
-            title="task",
-            summary="done",
-            status="completed",
-        ))
-        restarted = StateController(self.store.database_path, gateway_epoch="epoch-b")
-        queued: list[object] = []
-
-        async def enqueue(run) -> None:
-            queued.append(run)
-
-        asyncio.run(RecoveryCoordinator(restarted, self.store, enqueue).recover())
-        self.assertEqual(restarted.state(state.run_id).task_state, TaskState.SUCCEEDED)
-        self.assertEqual(len([item for item in self.store.list_inbox() if item.run_id == state.run_id]), 1)
-        self.assertEqual(queued, [])
+        state = self.controller.apply(TransitionCommand(
+            command_id=uuid4().hex, run_id=state.run_id,
+            expected_revision=state.revision, gateway_epoch="epoch-a",
+            task_state=TaskState.FINALIZING,
+            terminal_target=TerminalTarget.SUCCEEDED, reason="done",
+        )).state
+        finalizer = FinalizeCoordinator(
+            controller=self.controller, store=self.store, agent_root=self.root,
+            reservations=SessionReservationRegistry(),
+        )
+        finished = asyncio.run(finalizer.finalize(state.run_id))
+        self.assertEqual(finished.task_state, TaskState.SUCCEEDED)
+        self.assertEqual(
+            len([item for item in self.store.list_inbox() if item.run_id == state.run_id]), 1,
+        )
 
 
 if __name__ == "__main__":

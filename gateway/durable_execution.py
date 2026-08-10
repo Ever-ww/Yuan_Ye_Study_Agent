@@ -472,6 +472,7 @@ class DurableModelHooks:
         self._heartbeat: ContextVar[asyncio.Task[None] | None] = ContextVar("durable_model_heartbeat", default=None)
 
     def register(self, hooks: HookRegistry) -> None:
+        hooks.register(HookPoint.TURN_START, self.annotate, priority=-200)
         hooks.register(HookPoint.MODEL_BEFORE, self.annotate, priority=-200)
         hooks.register(HookPoint.MODEL_DURING, self.model_during, priority=-100)
         hooks.register(HookPoint.MODEL_AFTER, self.model_after, priority=-90)

@@ -8,12 +8,13 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+import Agent.state as state_module
 
 from Agent.state import (
     AttemptRecoveryResolution,
-    CompleteFinalizeStepCommand,
     CreateOperationWithAttemptCommand,
     FinalizeTerminalCommand,
+    StartFinalizeGenerationCommand,
     ExecutionState,
     ImmutableOperationMetadata,
     OperationAttempt,
@@ -196,27 +197,19 @@ def test_finalize_terminal_requires_all_attempt_backed_steps(durable) -> None:
         gateway_epoch="epoch", task_state=TaskState.FINALIZING,
         terminal_target=TerminalTarget.SUCCEEDED, reason="finish",
     )).state
+    state = controller.apply(StartFinalizeGenerationCommand(
+        command_id="generation-1", run_id=state.run_id,
+        expected_revision=state.revision, gateway_epoch="epoch", generation=1,
+    )).state
     with pytest.raises(Exception):
         controller.apply(FinalizeTerminalCommand(
             command_id="terminal-early", run_id=state.run_id,
             expected_revision=state.revision, gateway_epoch="epoch",
+            generation=1,
         ))
     assert controller.state(state.run_id).task_state is TaskState.FINALIZING
     assert not any(event.type == "run_terminal" for event in controller.events(state.run_id))
-    for step in ("memory", "session_index", "audit", "inbox"):
-        state = controller.state(state.run_id)
-        state = controller.apply(CompleteFinalizeStepCommand(
-            command_id=f"finalize:{state.run_id}:{step}", run_id=state.run_id,
-            expected_revision=state.revision, gateway_epoch="epoch",
-            step_name=step, result="completed",
-        )).state
-    result = controller.apply(FinalizeTerminalCommand(
-        command_id="terminal", run_id=state.run_id,
-        expected_revision=state.revision, gateway_epoch="epoch",
-    ))
-    assert result.state.task_state is TaskState.SUCCEEDED
-    events = controller.events(state.run_id)
-    assert events[-1].type == "run_terminal"
+    assert not hasattr(state_module, "CompleteFinalizeStepCommand")
 
 
 def test_client_idempotency_scope_is_composite(durable) -> None:

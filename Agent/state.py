@@ -59,6 +59,14 @@ class WorkloadKind(str, Enum):
     MAINTENANCE = "maintenance"
 
 
+class PersistenceContract(str, Enum):
+    """Durable persistence responsibility fixed when a Run is created."""
+
+    CONVERSATION_SESSION = "conversation_session"
+    SESSION_BACKED_WORKLOAD = "session_backed_workload"
+    CONTROL_ONLY = "control_only"
+
+
 class OperationStatus(str, Enum):
     PREPARED = "prepared"
     RUNNING = "running"
@@ -122,8 +130,6 @@ TERMINAL_STATES = frozenset({
     TaskState.CANCELLED,
     TaskState.INTERRUPTED,
 })
-
-PRE_TERMINAL_FINALIZE_STEPS = ("memory", "session_index", "audit", "inbox")
 
 OUTER_TRANSITIONS = MappingProxyType({
     TaskState.CREATED: frozenset({TaskState.QUEUED, TaskState.FINALIZING}),
@@ -213,6 +219,7 @@ class AgentState(BaseModel):
     gateway_epoch: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     workload_kind: WorkloadKind
+    persistence_contract: PersistenceContract = PersistenceContract.CONTROL_ONLY
     project_id: str = Field(min_length=1)
     session_id: str | None = None
     client_id: str = Field(min_length=1)
@@ -222,6 +229,7 @@ class AgentState(BaseModel):
     task_state: TaskState = TaskState.CREATED
     execution: ExecutionSnapshot | None = None
     terminal_target: TerminalTarget | None = None
+    finalize_generation: int | None = Field(default=None, ge=1)
     turn_id: str | None = None
     current_operation_id: str | None = None
     current_attempt_id: str | None = None
@@ -264,6 +272,20 @@ class AgentState(BaseModel):
             if self.execution is not None and self.execution.state is not ExecutionState.FINISHED:
                 raise ValueError("Agent Run 进入终态前内层必须 FINISHED")
         return self
+
+
+class FinalizeGenerationRecord(BaseModel):
+    """Immutable identity of one complete FINALIZING proof generation."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    run_id: str = Field(min_length=1)
+    generation: int = Field(ge=1)
+    protocol_version: Literal[2] = 2
+    terminal_target: TerminalTarget
+    persistence_contract: PersistenceContract
+    created_at: str
+    supersedes_generation: int | None = Field(default=None, ge=1)
 
 
 class RetryPolicySnapshot(BaseModel):
@@ -593,21 +615,55 @@ class BindSessionCommand(StateCommand):
     session_id: str = Field(min_length=1)
 
 
+class UpgradePersistenceContractCommand(StateCommand):
+    persistence_contract: Literal[PersistenceContract.SESSION_BACKED_WORKLOAD]
+    reason: str = Field(min_length=1)
+
+
+class StartFinalizeGenerationCommand(StateCommand):
+    generation: int = Field(ge=1)
+    supersedes_generation: int | None = Field(default=None, ge=1)
+
+
+class StartReplacementFinalizeGenerationCommand(StartFinalizeGenerationCommand):
+    invalidated_generation: int = Field(ge=1)
+    reason: str = Field(min_length=1)
+
+
+class InvalidateFinalizeGenerationCommand(StateCommand):
+    generation: int = Field(ge=1)
+    reason: str = Field(min_length=1)
+
+
 class FinalizeInboxCommand(StateCommand):
     operation_id: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1)
+    generation: int = Field(ge=1)
+    stable_key: str = Field(min_length=1)
+    request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     title: str = Field(min_length=1)
     summary: str = ""
     status: Literal["completed", "failed", "cancelled"]
 
 
-class CompleteFinalizeStepCommand(StateCommand):
-    step_name: Literal["memory", "session_index", "audit", "inbox"]
-    result: str = "completed"
+class FinalizeAuditCommand(StateCommand):
+    operation_id: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1)
+    generation: int = Field(ge=1)
+    stable_key: str = Field(min_length=1)
+    request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    receipt_id: str = Field(min_length=1)
+    receipt_generation: int = Field(ge=1)
+    receipt_json: str
+    receipt_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evidence_json: str
+    evidence_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class FinalizeTerminalCommand(StateCommand):
     """Atomically commits terminal State, projection, transition, event and outbox."""
 
+    generation: int = Field(ge=1)
     reason: str = Field(default="FINALIZING completed", min_length=1)
 
 
@@ -789,8 +845,12 @@ Command = (
     | UpdateStateMetadataCommand
     | RecordRuntimeEventCommand
     | BindSessionCommand
+    | UpgradePersistenceContractCommand
+    | StartFinalizeGenerationCommand
+    | StartReplacementFinalizeGenerationCommand
+    | InvalidateFinalizeGenerationCommand
+    | FinalizeAuditCommand
     | FinalizeInboxCommand
-    | CompleteFinalizeStepCommand
     | FinalizeTerminalCommand
     | BeginOperationCommand
     | CreateOperationWithAttemptCommand
@@ -909,16 +969,17 @@ __all__ = [
     "CompleteOperationAttemptCommand", "CreateOperationWithAttemptCommand",
     "CreateApprovalCommand", "DecideApprovalCommand", "DurableApproval",
     "ExecutionOutcome", "ExecutionSnapshot", "ExecutionState", "ExpireApprovalCommand",
-    "FailOperationAttemptCommand", "FailOperationCommand", "FinalizeInboxCommand",
-    "CompleteFinalizeStepCommand", "FinalizeTerminalCommand", "PRE_TERMINAL_FINALIZE_STEPS",
+    "FailOperationAttemptCommand", "FailOperationCommand", "FinalizeAuditCommand", "FinalizeGenerationRecord", "FinalizeInboxCommand",
+    "FinalizeTerminalCommand",
     "HeartbeatOperationAttemptCommand", "HeartbeatOperationCommand", "ImmutableOperationMetadata", "INNER_TRANSITIONS",
-    "MarkOperationUnknownCommand", "OperationKind", "OperationRecord", "OperationStatus",
+    "InvalidateFinalizeGenerationCommand", "MarkOperationUnknownCommand", "OperationKind", "OperationRecord", "OperationStatus",
     "MarkOperationAttemptUnknownCommand", "OperationAggregate", "OperationAttempt", "OperationFailureKind",
     "OUTER_TRANSITIONS", "ReconcileOperationCommand", "ReconcileResult", "ReconcileStatus", "RecoveryDecisionCommand",
     "RecordRuntimeEventCommand", "ReconcileOperationAttemptCommand", "RequestCancellationCommand",
-    "RetryPolicySnapshot", "SafeCheckpoint", "SkipOperationAttemptCommand", "StartOperationAttemptCommand",
+    "PersistenceContract", "RetryPolicySnapshot", "SafeCheckpoint", "SkipOperationAttemptCommand", "StartFinalizeGenerationCommand", "StartOperationAttemptCommand",
+    "StartReplacementFinalizeGenerationCommand",
     "StartOperationCommand", "StateCommand",
     "TaskState", "TerminalTarget", "ToolIdempotency", "TransitionCommand",
-    "UpdateStateMetadataCommand", "WorkloadKind", "is_runnable", "projected_run_status",
+    "UpdateStateMetadataCommand", "UpgradePersistenceContractCommand", "WorkloadKind", "is_runnable", "projected_run_status",
     "reduce_operation", "validate_inner_transition", "validate_outer_transition",
 ]

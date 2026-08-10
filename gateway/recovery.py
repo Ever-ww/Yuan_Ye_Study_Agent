@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
@@ -10,11 +9,8 @@ from Agent.state import (
     AbandonOperationAttemptCommand,
     AdoptGatewayEpochCommand,
     ApprovalStatus,
-    CompleteFinalizeStepCommand,
     ExecutionOutcome,
     ExecutionState,
-    FinalizeInboxCommand,
-    FinalizeTerminalCommand,
     MarkOperationAttemptUnknownCommand,
     OperationKind,
     OperationStatus,
@@ -26,6 +22,7 @@ from Agent.state import (
 )
 from gateway.store import GatewayStore
 from gateway.state_controller import StateController
+from gateway.finalize import FinalizeCoordinator
 
 
 EnqueueRun = Callable[[object], Awaitable[None]]
@@ -34,10 +31,17 @@ EnqueueRun = Callable[[object], Awaitable[None]]
 class RecoveryCoordinator:
     """不猜测未知副作用；可证明安全的 Run 才重新进入队列。"""
 
-    def __init__(self, controller: StateController, store: GatewayStore, enqueue: EnqueueRun) -> None:
+    def __init__(
+        self,
+        controller: StateController,
+        store: GatewayStore,
+        enqueue: EnqueueRun,
+        finalizer: FinalizeCoordinator | None = None,
+    ) -> None:
         self.controller = controller
         self.store = store
         self.enqueue = enqueue
+        self.finalizer = finalizer
 
     async def recover(self) -> dict[str, int]:
         counts = {"queued": 0, "waiting_human": 0, "recovery_required": 0, "finalized": 0}
@@ -76,7 +80,7 @@ class RecoveryCoordinator:
                 )
                 state = self.controller.state(state.run_id)
             if state.task_state is TaskState.FINALIZING:
-                self._complete_finalizing(state)
+                await self._complete_finalizing(state)
                 counts["finalized"] += 1
                 continue
             if state.task_state is TaskState.CANCELLING:
@@ -84,7 +88,7 @@ class RecoveryCoordinator:
                     self._transition(state.run_id, task=TaskState.RECOVERY_REQUIRED, reason="取消时副作用结果未知")
                     counts["recovery_required"] += 1
                 else:
-                    self._finish_cancel(state.run_id)
+                    await self._finish_cancel(state.run_id)
                     counts["finalized"] += 1
                 continue
             if state.workload_kind not in {WorkloadKind.CHAT, WorkloadKind.CRON}:
@@ -95,7 +99,7 @@ class RecoveryCoordinator:
                 counts["recovery_required"] += 1
                 continue
             if state.execution and state.execution.state is ExecutionState.FINISHED:
-                self._finish_from_outcome(state.run_id, state.execution.outcome)
+                await self._finish_from_outcome(state.run_id, state.execution.outcome)
                 counts["finalized"] += 1
                 continue
             if state.execution and state.execution.state is ExecutionState.ACTING:
@@ -181,14 +185,15 @@ class RecoveryCoordinator:
             state = self._transition(run_id, task=TaskState.RECOVERING, reason="进入恢复检查")
         self._transition(run_id, task=TaskState.RECOVERY_REQUIRED, reason=reason)
 
-    def _complete_finalizing(self, state) -> None:
+    async def _complete_finalizing(self, state) -> None:
         if state.terminal_target is None:
             self._transition(state.run_id, task=TaskState.INTERRUPTED, reason="FINALIZING 缺少 terminal_target")
             return
-        self._complete_preterminal_steps(state.run_id, state.terminal_target)
-        self._finalize_terminal(state.run_id)
+        if self.finalizer is None:
+            raise RuntimeError("RecoveryCoordinator requires FinalizeCoordinator for FINALIZING v2")
+        await self.finalizer.finalize(state.run_id)
 
-    def _finish_cancel(self, run_id: str) -> None:
+    async def _finish_cancel(self, run_id: str) -> None:
         state = self.controller.state(run_id)
         if state.execution and state.execution.state is not ExecutionState.FINISHED:
             self._transition(
@@ -199,10 +204,11 @@ class RecoveryCoordinator:
             run_id, task=TaskState.FINALIZING, terminal=TerminalTarget.CANCELLED,
             reason="恢复取消 FINALIZING",
         )
-        self._complete_preterminal_steps(run_id, TerminalTarget.CANCELLED)
-        self._finalize_terminal(run_id)
+        if self.finalizer is None:
+            raise RuntimeError("RecoveryCoordinator requires FinalizeCoordinator")
+        await self.finalizer.finalize(run_id)
 
-    def _finish_from_outcome(self, run_id: str, outcome: ExecutionOutcome | None) -> None:
+    async def _finish_from_outcome(self, run_id: str, outcome: ExecutionOutcome | None) -> None:
         target = {
             ExecutionOutcome.SUCCESS: TerminalTarget.SUCCEEDED,
             ExecutionOutcome.ERROR: TerminalTarget.FAILED,
@@ -218,61 +224,9 @@ class RecoveryCoordinator:
         if target is TerminalTarget.CANCELLED and state.task_state is not TaskState.CANCELLING:
             self._transition(run_id, task=TaskState.CANCELLING, reason="恢复取消路径")
         self._transition(run_id, task=TaskState.FINALIZING, terminal=target, reason="恢复 FINISHED Run")
-        self._complete_preterminal_steps(run_id, target)
-        self._finalize_terminal(run_id)
-
-    def _complete_preterminal_steps(self, run_id: str, target: TerminalTarget) -> None:
-        completed = {
-            operation.stable_key
-            for operation in self.controller.operations(run_id)
-            if operation.status is OperationStatus.COMPLETED
-        }
-        for step_name in ("memory", "session_index", "audit"):
-            if f"finalize:{step_name}" in completed:
-                continue
-            state = self.controller.state(run_id)
-            self.controller.apply(CompleteFinalizeStepCommand(
-                command_id=f"finalize:{run_id}:{step_name}", run_id=run_id,
-                expected_revision=state.revision, gateway_epoch=self.controller.gateway_epoch,
-                step_name=step_name, result="completed",
-            ))
-        self._ensure_inbox(run_id, target)
-
-    def _finalize_terminal(self, run_id: str) -> None:
-        state = self.controller.state(run_id)
-        self.controller.apply(FinalizeTerminalCommand(
-            command_id=f"finalize:{run_id}:terminal", run_id=run_id,
-            expected_revision=state.revision, gateway_epoch=self.controller.gateway_epoch,
-            reason="Recovery FINALIZING 完成",
-        ))
-
-    def _ensure_inbox(self, run_id: str, target: TerminalTarget) -> None:
-        state = self.controller.state(run_id)
-        run = self.store.run(run_id)
-        operation_id = hashlib.sha256(f"{run_id}:finalize:inbox".encode("utf-8")).hexdigest()
-        try:
-            operation = self.controller.operation(operation_id)
-        except KeyError:
-            operation = None
-        if operation is not None and operation.status is OperationStatus.COMPLETED:
-            return
-        summary = state.result_summary or state.error or (
-            state.execution.finish_reason if state.execution else ""
-        )
-        self.controller.apply(FinalizeInboxCommand(
-            command_id=f"finalize:{run_id}:inbox",
-            run_id=run_id,
-            expected_revision=state.revision,
-            gateway_epoch=self.controller.gateway_epoch,
-            operation_id=operation_id,
-            title=run.task[:120],
-            summary=summary or "",
-            status={
-                TerminalTarget.SUCCEEDED: "completed",
-                TerminalTarget.FAILED: "failed",
-                TerminalTarget.CANCELLED: "cancelled",
-            }[target],
-        ))
+        if self.finalizer is None:
+            raise RuntimeError("RecoveryCoordinator requires FinalizeCoordinator")
+        await self.finalizer.finalize(run_id)
 
     def _has_unknown_effect(self, run_id: str) -> bool:
         state = self.controller.state(run_id)

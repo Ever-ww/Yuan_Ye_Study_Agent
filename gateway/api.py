@@ -306,7 +306,7 @@ def create_gateway_api(
 
     @app.post("/api/v1/runs/{run_id}/recovery", dependencies=[Depends(authorize_write)])
     async def recover_run(run_id: str, payload: RecoveryDecisionRequest):
-        return gateway.recover_run(run_id, payload)
+        return await gateway.recover_run(run_id, payload)
 
     @app.post("/api/v1/runs/{run_id}/cancel", dependencies=[Depends(authorize_write)])
     async def cancel_run(run_id: str):

@@ -17,6 +17,7 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 
 from Agent import EventType, RunEvent, load_runtime_config
+from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.state import TaskState, TransitionCommand, WorkloadKind
 from skill import SkillRefreshResult
 from gateway.api import create_gateway_api
@@ -50,6 +51,7 @@ from bootstrap import (
     platform_agent_home,
 )
 from memory import MemoryStore
+from tool import ToolContext
 from sandbox import SandboxStatus
 
 
@@ -59,14 +61,45 @@ class FakeRuntime:
         self.blocker = blocker
         self.closed = 0
         self.skill_refreshes: list[str] = []
+        self.memory = MemoryStore(
+            workspace / ".yy" / "memory", workspace_root=workspace, agent_root=workspace,
+        )
+        self.hooks = HookRegistry()
+        self.tool_context = ToolContext(project_root=workspace)
 
     async def run_task(self, task: str, session_id: str | None = None):
         selected = session_id or ("a" * 15 + str(abs(hash(task)) % 10))
+        if not self.memory.has_session(selected):
+            self.memory.create_session(task, session_id=selected)
         yield RunEvent(type=EventType.STARTED, payload={"session_id": selected})
-        if self.blocker is not None:
-            await self.blocker.wait()
-        yield RunEvent(type=EventType.TEXT, payload={"content": "处理中"})
-        yield RunEvent(type=EventType.FINAL, payload={"answer": f"完成：{task}"})
+        started = HookEvent(point=HookPoint.TURN_START, session_id=selected, data={"task": task})
+        await self.hooks.emit(started)
+        audit = dict(started.data.get("durable_audit", {}))
+        self.memory.record_user(selected, task, audit=audit)
+        try:
+            if self.blocker is not None:
+                await self.blocker.wait()
+            answer = f"完成：{task}"
+            yield RunEvent(type=EventType.TEXT, payload={"content": "处理中"})
+            yield RunEvent(type=EventType.FINAL, payload={"answer": answer})
+            ended = HookEvent(
+                point=HookPoint.TURN_END, session_id=selected,
+                data={"completed": True, "answer": answer},
+            )
+            await self.hooks.emit(ended)
+            self.memory.record_assistant(
+                selected, answer, audit=dict(ended.data.get("durable_audit", {})),
+            )
+        except asyncio.CancelledError:
+            ended = HookEvent(
+                point=HookPoint.TURN_END, session_id=selected,
+                data={"completed": False, "cancelled": True},
+            )
+            await self.hooks.emit(ended)
+            self.memory.record_cancellation(
+                selected, audit=dict(ended.data.get("durable_audit", {})),
+            )
+            raise
 
     async def close(self) -> None:
         self.closed += 1

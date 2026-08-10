@@ -13,9 +13,6 @@ from uuid import uuid4
 
 from Agent import ExtensionLoader, RuntimeConfig
 from Agent.state import (
-    CompleteFinalizeStepCommand,
-    FinalizeInboxCommand,
-    FinalizeTerminalCommand,
     RecordRuntimeEventCommand,
     RecoveryDecisionCommand,
     TaskState,
@@ -143,7 +140,12 @@ class GatewayApplication:
             tool_retry_max_seconds=config.tool_retry_max_seconds,
             write_gate=self.write_gate,
         )
-        self.recovery = RecoveryCoordinator(self.state_controller, self.store, self.pool.submit)
+        self.recovery = RecoveryCoordinator(
+            self.state_controller,
+            self.store,
+            self.pool.submit,
+            self.pool.finalizer,
+        )
         self.cron_scheduler = CronScheduler(
             self.cron_store,
             self._submit_cron_run,
@@ -247,12 +249,7 @@ class GatewayApplication:
             error=str(payload.get("message", "")) if target is TerminalTarget.FAILED else None,
             result_summary=str(payload.get("path", "Backup completed")) if target is TerminalTarget.SUCCEEDED else None,
         ))
-        self._finalize_control_plane(
-            run_id, target,
-            str(payload.get("message") or payload.get("path") or status),
-            task_title="Automatic Agent Home backup",
-            create_visible_inbox=True,
-        )
+        await self._finalize_control_plane(run_id)
         self.outbox.wake()
 
     async def close(self) -> None:
@@ -319,12 +316,12 @@ class GatewayApplication:
         try:
             result = await operation()
         except Exception as exc:
-            self._finish_workload(state.run_id, TerminalTarget.FAILED, str(exc) or type(exc).__name__)
+            await self._finish_workload(state.run_id, TerminalTarget.FAILED, str(exc) or type(exc).__name__)
             raise
-        self._finish_workload(state.run_id, TerminalTarget.SUCCEEDED, "Coding workload 完成")
+        await self._finish_workload(state.run_id, TerminalTarget.SUCCEEDED, "Coding workload 完成")
         return result
 
-    def _finish_workload(self, run_id: str, target: TerminalTarget, summary: str) -> None:
+    async def _finish_workload(self, run_id: str, target: TerminalTarget, summary: str) -> None:
         state = self.state_controller.state(run_id)
         state = self.state_controller.apply(TransitionCommand(
             command_id=uuid4().hex,
@@ -337,47 +334,14 @@ class GatewayApplication:
             error=summary if target is TerminalTarget.FAILED else None,
             result_summary=summary if target is TerminalTarget.SUCCEEDED else None,
         )).state
-        self._finalize_control_plane(run_id, target, summary, task_title="Coding workload")
+        await self._finalize_control_plane(run_id)
         self.outbox.wake()
 
-    def _finalize_control_plane(
+    async def _finalize_control_plane(
         self,
         run_id: str,
-        target: TerminalTarget,
-        summary: str,
-        *,
-        task_title: str,
-        create_visible_inbox: bool = True,
     ) -> None:
-        for step_name in ("memory", "session_index", "audit"):
-            state = self.state_controller.state(run_id)
-            self.state_controller.apply(CompleteFinalizeStepCommand(
-                command_id=f"finalize:{run_id}:{step_name}", run_id=run_id,
-                expected_revision=state.revision, gateway_epoch=self.gateway_epoch,
-                step_name=step_name, result="completed",
-            ))
-        state = self.state_controller.state(run_id)
-        if create_visible_inbox:
-            operation_id = hashlib.sha256(f"{run_id}:finalize:inbox".encode("utf-8")).hexdigest()
-            self.state_controller.apply(FinalizeInboxCommand(
-                command_id=f"finalize:{run_id}:inbox", run_id=run_id,
-                expected_revision=state.revision, gateway_epoch=self.gateway_epoch,
-                operation_id=operation_id, title=task_title[:120], summary=summary,
-                status={TerminalTarget.SUCCEEDED: "completed", TerminalTarget.FAILED: "failed",
-                        TerminalTarget.CANCELLED: "cancelled"}[target],
-            ))
-        else:
-            self.state_controller.apply(CompleteFinalizeStepCommand(
-                command_id=f"finalize:{run_id}:inbox", run_id=run_id,
-                expected_revision=state.revision, gateway_epoch=self.gateway_epoch,
-                step_name="inbox", result="not_requested",
-            ))
-        state = self.state_controller.state(run_id)
-        self.state_controller.apply(FinalizeTerminalCommand(
-            command_id=f"finalize:{run_id}:terminal", run_id=run_id,
-            expected_revision=state.revision, gateway_epoch=self.gateway_epoch,
-            reason="FINALIZING 完成",
-        ))
+        await self.pool.finalizer.finalize(run_id)
 
     def _code_project(self, session_id: str) -> str:
         owner = getattr(self.code_sessions, "owner", None)
@@ -577,10 +541,7 @@ class GatewayApplication:
             event_type=terminal_type,
             payload=result.model_dump(mode="json"),
         )).state
-        self._finalize_control_plane(
-            state.run_id, target, result.message, task_title=f"Dream {result.date}",
-            create_visible_inbox=automatic and result.status != "noop",
-        )
+        await self._finalize_control_plane(state.run_id)
         state = self.state_controller.state(state.run_id)
         self.outbox.wake()
         run = self.store.run(state.run_id)
@@ -637,7 +598,7 @@ class GatewayApplication:
             raise
         return run
 
-    def recover_run(self, run_id: str, request: RecoveryDecisionRequest):
+    async def recover_run(self, run_id: str, request: RecoveryDecisionRequest):
         result = self.state_controller.apply(RecoveryDecisionCommand(
             command_id=request.command_id, run_id=run_id,
             expected_revision=request.expected_revision, gateway_epoch=self.gateway_epoch,
@@ -647,6 +608,14 @@ class GatewayApplication:
             risk_confirmed=request.risk_confirmed,
         ))
         self.outbox.wake()
+        if (
+            request.action == "retry"
+            and request.operation_id is None
+            and result.state.task_state is TaskState.RECOVERY_REQUIRED
+            and result.state.finalize_generation is not None
+        ):
+            await self.pool.finalizer.recover_generation(run_id, request.reason)
+            return self.state_controller.state(run_id)
         return result
 
     async def _submit_cron_run(self, job: CronJob, run_id: str) -> None:

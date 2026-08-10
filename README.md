@@ -439,6 +439,20 @@ Attempt，`stable_key/request_hash/retry_policy_snapshot` 在同一 Operation �
 Transition、terminal Event 和 Multi-Sink Outbox 共享一个最终事务。Outbox 按 Sink 独立退避，
 达到上限后进入 dead-letter，不会无限高频重试。
 
+`FINALIZING` 不再用字符串把 `memory/session_index/audit/inbox` 直接登记为完成。每次收尾使用
+独立的 v2 generation，并为四个步骤建立真实 Logical Operation 与 OperationAttempt：Memory 和
+Session Index 严格验证磁盘上的原始 Session JSONL 与分段索引，Audit 写入不可变 receipt，Inbox
+核对确定性 SQLite 行。Evidence 先经严格 Pydantic 校验、脱敏和规范化 JSON 编码；Artifact 内容
+Hash 与 Attempt Evidence Hash 各自只有一种含义。只有当前 generation 的四份 Evidence 相互引用且
+仍然有效时，最终事务才允许进入终态。
+
+同一 Session 的运行、压缩、Skill refresh、恢复和 Finalize 共用轻量
+`SessionReservationRegistry`，不同 Session 仍可并发。文件型 Finalize Attempt 必须经历
+`PREPARED → RUNNING → COMPLETED/FAILED/UNKNOWN`；Reducer 计算重试资格和 `next_retry_at`，轻量
+Retry Driver 只负责在到期后通过标准命令创建下一 Attempt。Gateway 重启会从持久化时间继续等待。
+若已完成 Evidence 后来与 Artifact 不一致，旧 Attempt 保持不可变，当前 generation 被持久化失效，
+Run 进入 `RECOVERY_REQUIRED`；恢复时只能建立新的 generation，不能把旧 bookkeeping 包装成证据。
+
 ### 1. 创建新会话
 
 ```powershell

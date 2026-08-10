@@ -29,7 +29,6 @@ from Agent.state import (
     Command,
     CompleteOperationCommand,
     CompleteOperationAttemptCommand,
-    CompleteFinalizeStepCommand,
     CreateOperationWithAttemptCommand,
     CreateApprovalCommand,
     CreateSafeCheckpointCommand,
@@ -41,8 +40,10 @@ from Agent.state import (
     ExpireApprovalCommand,
     FailOperationCommand,
     FailOperationAttemptCommand,
+    FinalizeAuditCommand,
     FinalizeInboxCommand,
     FinalizeTerminalCommand,
+    FinalizeGenerationRecord,
     HeartbeatOperationCommand,
     HeartbeatOperationAttemptCommand,
     MarkOperationUnknownCommand,
@@ -52,21 +53,27 @@ from Agent.state import (
     OperationFailureKind,
     OperationRecord,
     OperationStatus,
-    PRE_TERMINAL_FINALIZE_STEPS,
+    PersistenceContract,
     RecordRuntimeEventCommand,
     ReconcileOperationCommand,
     ReconcileOperationAttemptCommand,
     ReconcileStatus,
     RecoveryDecisionCommand,
     RequestCancellationCommand,
+    RetryPolicySnapshot,
     StartOperationCommand,
     StartOperationAttemptCommand,
+    StartFinalizeGenerationCommand,
+    StartReplacementFinalizeGenerationCommand,
+    InvalidateFinalizeGenerationCommand,
     SkipOperationAttemptCommand,
     TaskState,
+    TERMINAL_STATES,
     TerminalTarget,
     ToolIdempotency,
     TransitionCommand,
     UpdateStateMetadataCommand,
+    UpgradePersistenceContractCommand,
     WorkloadKind,
     reduce_operation,
     projected_run_status,
@@ -74,6 +81,15 @@ from Agent.state import (
     validate_outer_transition,
 )
 from gateway.audit import AuditSanitizer
+from gateway.finalize_evidence import (
+    FINALIZE_PROTOCOL_VERSION,
+    FinalizeEvidenceCodec,
+    FinalizeIdentity,
+    FinalizeRequirementPolicy,
+    FinalizeStep,
+    NotApplicableEvidence,
+    VerifiedArtifactEvidence,
+)
 from gateway.models import GatewayEventEnvelope, now_iso
 
 
@@ -88,7 +104,7 @@ class StateInvariantError(RuntimeError):
 class StateController:
     """以 SQLite 事务实现 command 幂等、CAS、FSM guard 和 Outbox。"""
 
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     def __init__(
         self,
@@ -246,6 +262,43 @@ class StateController:
                     FOREIGN KEY(operation_id) REFERENCES operation_ledger(operation_id),
                     FOREIGN KEY(attempt_id) REFERENCES operation_attempts(attempt_id)
                 );
+                CREATE TABLE IF NOT EXISTS finalize_generations (
+                    run_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL CHECK(generation >= 1),
+                    protocol_version INTEGER NOT NULL CHECK(protocol_version = 2),
+                    generation_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(run_id,generation),
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                );
+                CREATE TABLE IF NOT EXISTS finalize_generation_invalidations (
+                    invalidation_id TEXT PRIMARY KEY,
+                    command_id TEXT NOT NULL UNIQUE,
+                    run_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id,generation) REFERENCES finalize_generations(run_id,generation)
+                );
+                CREATE TABLE IF NOT EXISTS run_audit_receipts (
+                    receipt_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    finalize_generation INTEGER NOT NULL,
+                    receipt_generation INTEGER NOT NULL CHECK(receipt_generation >= 1),
+                    receipt_json TEXT NOT NULL,
+                    receipt_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(run_id,receipt_generation),
+                    FOREIGN KEY(run_id,finalize_generation)
+                        REFERENCES finalize_generations(run_id,generation)
+                );
+                CREATE TABLE IF NOT EXISTS run_current_audit_receipt (
+                    run_id TEXT PRIMARY KEY,
+                    receipt_id TEXT NOT NULL UNIQUE,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id),
+                    FOREIGN KEY(receipt_id) REFERENCES run_audit_receipts(receipt_id)
+                );
                 """
             )
             self._ensure_column(connection, "operation_ledger", "stable_key", "TEXT")
@@ -288,6 +341,30 @@ class StateController:
                      AND OLD.task_state!='finalizing'
                 BEGIN
                     SELECT RAISE(ABORT, 'normal terminal state requires FINALIZING');
+                END;
+                DROP TRIGGER IF EXISTS immutable_run_audit_receipt_update;
+                CREATE TRIGGER immutable_run_audit_receipt_update
+                BEFORE UPDATE ON run_audit_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'run audit receipt is immutable');
+                END;
+                DROP TRIGGER IF EXISTS immutable_run_audit_receipt_delete;
+                CREATE TRIGGER immutable_run_audit_receipt_delete
+                BEFORE DELETE ON run_audit_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'run audit receipt is immutable');
+                END;
+                DROP TRIGGER IF EXISTS immutable_finalize_generation_update;
+                CREATE TRIGGER immutable_finalize_generation_update
+                BEFORE UPDATE ON finalize_generations
+                BEGIN
+                    SELECT RAISE(ABORT, 'finalize generation is immutable');
+                END;
+                DROP TRIGGER IF EXISTS immutable_finalize_generation_delete;
+                CREATE TRIGGER immutable_finalize_generation_delete
+                BEFORE DELETE ON finalize_generations
+                BEGIN
+                    SELECT RAISE(ABORT, 'finalize generation is immutable');
                 END;
                 DROP TRIGGER IF EXISTS finished_attempt_is_immutable;
                 CREATE TRIGGER finished_attempt_is_immutable
@@ -336,6 +413,7 @@ class StateController:
         client_id: str,
         idempotency_key: str,
         request_hash: str,
+        persistence_contract: PersistenceContract | None = None,
         session_id: str | None = None,
         parent_run_id: str | None = None,
         deadline_at: str | None = None,
@@ -345,12 +423,14 @@ class StateController:
             gateway_epoch=self.gateway_epoch,
             run_id=run_id,
             workload_kind=workload_kind,
+            persistence_contract=persistence_contract or _default_persistence_contract(workload_kind),
             project_id=project_id,
             session_id=session_id,
             client_id=client_id,
             parent_run_id=parent_run_id,
             idempotency_key=idempotency_key,
             request_hash=request_hash,
+            turn_id=f"turn:{run_id}",
             deadline_at=deadline_at,
             last_progress_at=timestamp,
             created_at=timestamp,
@@ -384,6 +464,7 @@ class StateController:
         task: str,
         idempotency_key: str,
         request_hash: str,
+        persistence_contract: PersistenceContract | None = None,
         session_id: str | None = None,
         parent_run_id: str | None = None,
         deadline_at: str | None = None,
@@ -407,12 +488,14 @@ class StateController:
                 gateway_epoch=self.gateway_epoch,
                 run_id=run_id,
                 workload_kind=workload_kind,
+                persistence_contract=persistence_contract or _default_persistence_contract(workload_kind),
                 project_id=project_id,
                 session_id=session_id,
                 client_id=client_id,
                 parent_run_id=parent_run_id,
                 idempotency_key=idempotency_key,
                 request_hash=request_hash,
+                turn_id=f"turn:{run_id}",
                 deadline_at=deadline_at,
                 last_progress_at=timestamp,
                 created_at=timestamp,
@@ -513,92 +596,75 @@ class StateController:
                 if state.session_id is not None and state.session_id != command.session_id:
                     raise StateConflictError("Run 已绑定到另一个 Session")
                 state = state.model_copy(update={"session_id": command.session_id})
-            elif isinstance(command, FinalizeInboxCommand):
-                if state.task_state is not TaskState.FINALIZING:
-                    raise StateInvariantError("Inbox 只能在 FINALIZING 中生成")
-                item_id = hashlib.sha256(f"{state.run_id}:finalize:inbox".encode("utf-8")).hexdigest()[:32]
+            elif isinstance(command, UpgradePersistenceContractCommand):
+                if state.task_state in {TaskState.FINALIZING} | set(TERMINAL_STATES):
+                    raise StateInvariantError("Persistence contract must be fixed before FINALIZING")
+                if state.persistence_contract is not PersistenceContract.CONTROL_ONLY:
+                    if state.persistence_contract is not command.persistence_contract:
+                        raise StateConflictError("Persistence contract cannot be replaced or downgraded")
+                else:
+                    state = state.model_copy(update={
+                        "persistence_contract": command.persistence_contract,
+                    })
+            elif isinstance(command, StartReplacementFinalizeGenerationCommand):
+                if state.task_state is not TaskState.FINALIZING or state.terminal_target is None:
+                    raise StateInvariantError("Replacement finalize generation requires FINALIZING")
+                if state.finalize_generation != command.invalidated_generation:
+                    raise StateConflictError("Finalize generation changed before replacement")
+                if command.generation != command.invalidated_generation + 1:
+                    raise StateInvariantError("Finalize generation must increase by exactly one")
+                invalidated = connection.execute(
+                    "SELECT 1 FROM finalize_generation_invalidations WHERE run_id=? AND generation=?",
+                    (state.run_id, command.invalidated_generation),
+                ).fetchone()
+                if invalidated is None:
+                    raise StateInvariantError("Replacement requires a durable invalidation")
+                record = FinalizeGenerationRecord(
+                    run_id=state.run_id,
+                    generation=command.generation,
+                    terminal_target=state.terminal_target,
+                    persistence_contract=state.persistence_contract,
+                    supersedes_generation=command.invalidated_generation,
+                    created_at=timestamp,
+                )
+                self._insert_finalize_generation(connection, record)
+                state = state.model_copy(update={"finalize_generation": command.generation})
+            elif isinstance(command, StartFinalizeGenerationCommand):
+                if state.task_state is not TaskState.FINALIZING or state.terminal_target is None:
+                    raise StateInvariantError("Finalize generation requires FINALIZING")
+                if state.finalize_generation is None:
+                    if command.generation != 1 or command.supersedes_generation is not None:
+                        raise StateInvariantError("First finalize generation must be generation 1")
+                    record = FinalizeGenerationRecord(
+                        run_id=state.run_id,
+                        generation=1,
+                        terminal_target=state.terminal_target,
+                        persistence_contract=state.persistence_contract,
+                        created_at=timestamp,
+                    )
+                    self._insert_finalize_generation(connection, record)
+                    state = state.model_copy(update={"finalize_generation": 1})
+                elif state.finalize_generation != command.generation:
+                    raise StateConflictError("Finalize generation already exists")
+            elif isinstance(command, InvalidateFinalizeGenerationCommand):
+                if state.finalize_generation != command.generation:
+                    raise StateConflictError("Only the current finalize generation can be invalidated")
                 connection.execute(
-                    "INSERT OR IGNORE INTO inbox(item_id,run_id,project_id,session_id,title,summary,status,created_at,is_read) "
-                    "VALUES(?,?,?,?,?,?,?,?,0)",
+                    "INSERT INTO finalize_generation_invalidations"
+                    "(invalidation_id,command_id,run_id,generation,reason,created_at) VALUES(?,?,?,?,?,?)",
                     (
-                        item_id, state.run_id, state.project_id, state.session_id,
-                        command.title[:120], AuditSanitizer.sanitize(command.summary), command.status, timestamp,
+                        uuid4().hex, command.command_id, state.run_id, command.generation,
+                        AuditSanitizer.sanitize(command.reason), timestamp,
                     ),
                 )
-                request_hash = hashlib.sha256(
-                    f"{state.run_id}:{command.status}:{command.summary}".encode("utf-8"),
-                ).hexdigest()
-                operation = OperationRecord(
-                    operation_id=command.operation_id,
-                    run_id=state.run_id,
-                    turn_id=state.turn_id,
-                    kind=OperationKind.INBOX,
-                    name="finalize_inbox",
-                    stable_key="finalize:inbox",
-                    request_hash=request_hash,
-                    idempotency=ToolIdempotency.IDEMPOTENT,
-                    side_effecting=False,
-                    created_at=timestamp,
-                    updated_at=timestamp,
-                )
-                attempt = OperationAttempt(
-                    attempt_id=f"{command.operation_id}:attempt:1",
-                    operation_id=command.operation_id, run_id=state.run_id,
-                    attempt_no=1, request_hash=request_hash, side_effecting=False,
-                    status=OperationStatus.COMPLETED, result=item_id,
-                    result_hash=hashlib.sha256(item_id.encode("utf-8")).hexdigest(),
-                    result_source="sqlite_transaction", started_at=timestamp,
-                    completed_at=timestamp, created_at=timestamp, updated_at=timestamp,
-                )
-                operation = self._aggregate_operation(operation, [attempt], timestamp)
-            elif isinstance(command, CompleteFinalizeStepCommand):
-                if state.task_state is not TaskState.FINALIZING:
-                    raise StateInvariantError("Finalize step 只能在 FINALIZING 中执行")
-                stable_key = f"finalize:{command.step_name}"
-                operation_id = hashlib.sha256(
-                    f"{state.run_id}:{stable_key}".encode("utf-8"),
-                ).hexdigest()
-                request_hash = hashlib.sha256(
-                    f"{state.run_id}:{command.step_name}:{command.result}".encode("utf-8"),
-                ).hexdigest()
-                operation = OperationRecord(
-                    operation_id=operation_id, run_id=state.run_id, turn_id=state.turn_id,
-                    kind={
-                        "memory": OperationKind.MEMORY,
-                        "session_index": OperationKind.SESSION_INDEX,
-                        "audit": OperationKind.AUDIT,
-                        "inbox": OperationKind.INBOX,
-                    }[command.step_name],
-                    name=f"finalize_{command.step_name}", stable_key=stable_key,
-                    request_hash=request_hash, idempotency=ToolIdempotency.IDEMPOTENT,
-                    side_effecting=False, created_at=timestamp, updated_at=timestamp,
-                )
-                attempt = OperationAttempt(
-                    attempt_id=f"{operation_id}:attempt:1", operation_id=operation_id,
-                    run_id=state.run_id, attempt_no=1, request_hash=request_hash,
-                    side_effecting=False, status=OperationStatus.COMPLETED,
-                    result=AuditSanitizer.sanitize(command.result),
-                    result_hash=hashlib.sha256(command.result.encode("utf-8")).hexdigest(),
-                    result_source="sqlite_transaction", started_at=timestamp,
-                    completed_at=timestamp, created_at=timestamp, updated_at=timestamp,
-                )
-                operation = self._aggregate_operation(operation, [attempt], timestamp)
+            elif isinstance(command, FinalizeAuditCommand):
+                operation, attempt = self._finalize_audit(connection, state, command, timestamp)
+            elif isinstance(command, FinalizeInboxCommand):
+                operation, attempt = self._finalize_inbox(connection, state, command, timestamp)
             elif isinstance(command, FinalizeTerminalCommand):
                 if state.task_state is not TaskState.FINALIZING or state.terminal_target is None:
                     raise StateInvariantError("FinalizeTerminalCommand 需要 FINALIZING + terminal_target")
-                completed_steps = {
-                    row["stable_key"]
-                    for row in connection.execute(
-                        "SELECT stable_key FROM operation_ledger WHERE run_id=? AND status='completed'",
-                        (state.run_id,),
-                    ).fetchall()
-                }
-                missing = [
-                    step for step in PRE_TERMINAL_FINALIZE_STEPS
-                    if f"finalize:{step}" not in completed_steps
-                ]
-                if missing:
-                    raise StateInvariantError(f"Finalize 前置步骤未完成: {', '.join(missing)}")
+                self._validate_terminal_finalize(connection, state, command.generation)
                 state = self._apply_transition(
                     state,
                     TransitionCommand(
@@ -640,6 +706,17 @@ class StateController:
                     "last_progress_at": timestamp,
                 })
             elif isinstance(command, CompleteOperationAttemptCommand):
+                selected_attempt = self._attempt_in(connection, command.attempt_id)
+                selected_operation = self._operation_in(connection, selected_attempt.operation_id)
+                if selected_operation.stable_key.startswith("finalize:v2:"):
+                    if selected_attempt.status is not OperationStatus.RUNNING:
+                        raise StateInvariantError(
+                            "Finalize file Attempt must be RUNNING before completion",
+                        )
+                    self._validate_finalize_evidence(
+                        state, selected_operation, selected_attempt,
+                        command.result, command.result_hash,
+                    )
                 operation, attempt = self._update_attempt(
                     connection, state, command.attempt_id, timestamp,
                     allowed={OperationStatus.RUNNING, OperationStatus.UNKNOWN},
@@ -1011,6 +1088,13 @@ class StateController:
                 (run_id,),
             ).fetchall()
         return tuple(OperationRecord.model_validate_json(row["record_json"], strict=True) for row in rows)
+
+    def finalize_generation_invalidated(self, run_id: str, generation: int) -> bool:
+        with self._connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM finalize_generation_invalidations WHERE run_id=? AND generation=?",
+                (run_id, generation),
+            ).fetchone() is not None
 
     def transitions(self, run_id: str) -> tuple[dict[str, Any], ...]:
         with self._connection() as connection:
@@ -1446,6 +1530,15 @@ class StateController:
                 "risk_confirmed_by": command.actor,
                 "risk_confirmation_reason": AuditSanitizer.sanitize(command.reason),
             })
+        elif (
+            command.action == "retry"
+            and operation is None
+            and state.finalize_generation is not None
+            and state.task_state is TaskState.RECOVERY_REQUIRED
+        ):
+            # Finalize generation recovery is coordinated after this durable
+            # decision; no historical Operation/Attempt is mutated here.
+            pass
         elif command.action == "retry":
             if operation is None or attempt is None or operation.status not in {
                 OperationStatus.UNKNOWN, OperationStatus.FAILED,
@@ -1535,6 +1628,318 @@ class StateController:
             attempt,
         )
 
+    @staticmethod
+    def _insert_finalize_generation(
+        connection: sqlite3.Connection,
+        record: FinalizeGenerationRecord,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO finalize_generations"
+            "(run_id,generation,protocol_version,generation_json,created_at) VALUES(?,?,?,?,?)",
+            (
+                record.run_id, record.generation, record.protocol_version,
+                record.model_dump_json(), record.created_at,
+            ),
+        )
+
+    @staticmethod
+    def _canonical_hash(value: object) -> str:
+        selected = AuditSanitizer.sanitize(value)
+        serialized = json.dumps(
+            selected, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _validate_finalize_evidence(
+        cls,
+        state: AgentState,
+        operation: OperationRecord,
+        attempt: OperationAttempt,
+        result: str,
+        result_hash: str,
+    ) -> VerifiedArtifactEvidence | NotApplicableEvidence:
+        try:
+            evidence = FinalizeEvidenceCodec.verify(result, result_hash)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise StateInvariantError(f"Invalid Finalize Evidence: {exc}") from exc
+        if evidence.run_id != state.run_id:
+            raise StateInvariantError("Finalize Evidence run mismatch")
+        if evidence.generation != state.finalize_generation:
+            raise StateInvariantError("Finalize Evidence generation mismatch")
+        if evidence.operation_id != operation.operation_id:
+            raise StateInvariantError("Finalize Evidence operation mismatch")
+        if evidence.attempt_id != attempt.attempt_id:
+            raise StateInvariantError("Finalize Evidence attempt mismatch")
+        expected = FinalizeIdentity.for_step(state, evidence.generation, evidence.step)
+        if operation.stable_key != expected.stable_key or operation.request_hash != expected.request_hash:
+            raise StateInvariantError("Finalize Evidence identity mismatch")
+        try:
+            FinalizeRequirementPolicy.validate(state, evidence)
+        except ValueError as exc:
+            raise StateInvariantError(str(exc)) from exc
+        return evidence
+
+    @classmethod
+    def _completed_sqlite_finalize_operation(
+        cls,
+        state: AgentState,
+        *,
+        operation_id: str,
+        attempt_id: str,
+        stable_key: str,
+        request_hash: str,
+        kind: OperationKind,
+        name: str,
+        evidence_json: str,
+        evidence_hash: str,
+        timestamp: str,
+    ) -> tuple[OperationRecord, OperationAttempt]:
+        operation = OperationRecord(
+            operation_id=operation_id, run_id=state.run_id, turn_id=state.turn_id,
+            kind=kind, name=name, stable_key=stable_key, request_hash=request_hash,
+            idempotency=ToolIdempotency.IDEMPOTENT, side_effecting=False,
+            retry_policy_snapshot=RetryPolicySnapshot(
+                max_attempts=1, base_seconds=0.0, max_seconds=0.0,
+                automatic=False, requires_reconcile=False,
+                requires_human_confirmation=False,
+            ),
+            created_at=timestamp, updated_at=timestamp,
+        )
+        attempt = OperationAttempt(
+            attempt_id=attempt_id, operation_id=operation_id, run_id=state.run_id,
+            attempt_no=1, request_hash=request_hash, side_effecting=False,
+            status=OperationStatus.COMPLETED, result=evidence_json,
+            result_hash=evidence_hash, result_source="sqlite_transaction",
+            started_at=timestamp, completed_at=timestamp,
+            created_at=timestamp, updated_at=timestamp,
+        )
+        return cls._aggregate_operation(operation, [attempt], timestamp), attempt
+
+    def _finalize_audit(
+        self,
+        connection: sqlite3.Connection,
+        state: AgentState,
+        command: FinalizeAuditCommand,
+        timestamp: str,
+    ) -> tuple[OperationRecord, OperationAttempt]:
+        if state.task_state is not TaskState.FINALIZING or state.finalize_generation != command.generation:
+            raise StateInvariantError("Audit receipt requires the current FINALIZING generation")
+        identity = FinalizeIdentity.for_step(state, command.generation, FinalizeStep.AUDIT)
+        if (
+            command.operation_id != identity.operation_id
+            or command.stable_key != identity.stable_key
+            or command.request_hash != identity.request_hash
+        ):
+            raise StateInvariantError("Audit finalize identity mismatch")
+        try:
+            receipt_value = json.loads(command.receipt_json)
+        except json.JSONDecodeError as exc:
+            raise StateInvariantError("Audit receipt is not valid JSON") from exc
+        canonical_receipt = json.dumps(
+            AuditSanitizer.sanitize(receipt_value), ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False,
+        )
+        if canonical_receipt != command.receipt_json:
+            raise StateInvariantError("Audit receipt is not canonical or sanitized")
+        if hashlib.sha256(command.receipt_json.encode("utf-8")).hexdigest() != command.receipt_hash:
+            raise StateInvariantError("Audit receipt hash mismatch")
+        encoded = FinalizeEvidenceCodec.encode(FinalizeEvidenceCodec.decode(command.evidence_json))
+        if encoded.result_hash != command.evidence_hash:
+            raise StateInvariantError("Audit Evidence hash mismatch")
+        evidence = encoded.value
+        if not isinstance(evidence, VerifiedArtifactEvidence):
+            raise StateInvariantError("Audit Evidence must be verified")
+        if evidence.step is not FinalizeStep.AUDIT or evidence.artifact_hash != command.receipt_hash:
+            raise StateInvariantError("Audit Evidence does not reference the receipt")
+        if evidence.references.receipt_id != command.receipt_id:
+            raise StateInvariantError("Audit Evidence receipt_id mismatch")
+        existing = connection.execute(
+            "SELECT * FROM run_audit_receipts WHERE receipt_id=?", (command.receipt_id,),
+        ).fetchone()
+        values = (
+            command.receipt_id, state.run_id, command.generation,
+            command.receipt_generation, command.receipt_json, command.receipt_hash, timestamp,
+        )
+        if existing is None:
+            connection.execute(
+                "INSERT INTO run_audit_receipts VALUES(?,?,?,?,?,?,?)", values,
+            )
+        elif tuple(existing[key] for key in (
+            "receipt_id", "run_id", "finalize_generation", "receipt_generation",
+            "receipt_json", "receipt_hash", "created_at",
+        )) != values:
+            raise StateConflictError("Immutable audit receipt content conflict")
+        connection.execute(
+            "INSERT INTO run_current_audit_receipt(run_id,receipt_id,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(run_id) DO UPDATE SET receipt_id=excluded.receipt_id,updated_at=excluded.updated_at",
+            (state.run_id, command.receipt_id, timestamp),
+        )
+        operation, attempt = self._completed_sqlite_finalize_operation(
+            state, operation_id=command.operation_id, attempt_id=command.attempt_id,
+            stable_key=command.stable_key, request_hash=command.request_hash,
+            kind=OperationKind.AUDIT, name="finalize_audit",
+            evidence_json=encoded.serialized, evidence_hash=encoded.result_hash, timestamp=timestamp,
+        )
+        self._validate_finalize_evidence(
+            state, operation, attempt, encoded.serialized, encoded.result_hash,
+        )
+        return operation, attempt
+
+    def _finalize_inbox(
+        self,
+        connection: sqlite3.Connection,
+        state: AgentState,
+        command: FinalizeInboxCommand,
+        timestamp: str,
+    ) -> tuple[OperationRecord, OperationAttempt]:
+        if state.task_state is not TaskState.FINALIZING or state.finalize_generation != command.generation:
+            raise StateInvariantError("Inbox requires the current FINALIZING generation")
+        identity = FinalizeIdentity.for_step(state, command.generation, FinalizeStep.INBOX)
+        if (
+            command.operation_id != identity.operation_id
+            or command.stable_key != identity.stable_key
+            or command.request_hash != identity.request_hash
+        ):
+            raise StateInvariantError("Inbox finalize identity mismatch")
+        item_id = hashlib.sha256(
+            f"{state.run_id}:finalize:v2:inbox".encode("utf-8"),
+        ).hexdigest()[:32]
+        title = command.title[:120]
+        summary = AuditSanitizer.sanitize(command.summary)
+        existing = connection.execute("SELECT * FROM inbox WHERE item_id=?", (item_id,)).fetchone()
+        if existing is None:
+            connection.execute(
+                "INSERT INTO inbox(item_id,run_id,project_id,session_id,title,summary,status,created_at,is_read) "
+                "VALUES(?,?,?,?,?,?,?,?,0)",
+                (
+                    item_id, state.run_id, state.project_id, state.session_id,
+                    title, summary, command.status, timestamp,
+                ),
+            )
+            existing = connection.execute("SELECT * FROM inbox WHERE item_id=?", (item_id,)).fetchone()
+        if existing is None:
+            raise StateInvariantError("Inbox row was not durably created")
+        expected = {
+            "item_id": item_id, "run_id": state.run_id, "project_id": state.project_id,
+            "session_id": state.session_id, "title": title, "summary": summary,
+            "status": command.status, "created_at": str(existing["created_at"]),
+        }
+        actual = {key: existing[key] for key in expected}
+        if actual != expected:
+            raise StateConflictError("Deterministic Inbox item content conflict")
+        artifact_hash = self._canonical_hash(expected)
+        provisional = OperationAttempt(
+            attempt_id=command.attempt_id, operation_id=command.operation_id,
+            run_id=state.run_id, attempt_no=1, request_hash=command.request_hash,
+            side_effecting=False, created_at=timestamp, updated_at=timestamp,
+        )
+        evidence = VerifiedArtifactEvidence(
+            step=FinalizeStep.INBOX, run_id=state.run_id, generation=command.generation,
+            operation_id=command.operation_id, attempt_id=command.attempt_id,
+            artifact_kind="gateway_inbox_row", artifact_id=item_id,
+            artifact_hash=artifact_hash, verification_method="sqlite_row_canonical_hash",
+            references={"inbox_item_id": item_id},
+        )
+        encoded = FinalizeEvidenceCodec.encode(evidence)
+        operation, attempt = self._completed_sqlite_finalize_operation(
+            state, operation_id=command.operation_id, attempt_id=provisional.attempt_id,
+            stable_key=command.stable_key, request_hash=command.request_hash,
+            kind=OperationKind.INBOX, name="finalize_inbox",
+            evidence_json=encoded.serialized, evidence_hash=encoded.result_hash, timestamp=timestamp,
+        )
+        self._validate_finalize_evidence(
+            state, operation, attempt, encoded.serialized, encoded.result_hash,
+        )
+        return operation, attempt
+
+    def _validate_terminal_finalize(
+        self,
+        connection: sqlite3.Connection,
+        state: AgentState,
+        generation: int,
+    ) -> None:
+        if state.finalize_generation != generation:
+            raise StateInvariantError("FinalizeTerminalCommand generation mismatch")
+        record = connection.execute(
+            "SELECT 1 FROM finalize_generations WHERE run_id=? AND generation=?",
+            (state.run_id, generation),
+        ).fetchone()
+        if record is None:
+            raise StateInvariantError("Current finalize generation is missing")
+        invalidated = connection.execute(
+            "SELECT 1 FROM finalize_generation_invalidations WHERE run_id=? AND generation=?",
+            (state.run_id, generation),
+        ).fetchone()
+        if invalidated is not None:
+            raise StateInvariantError("Current finalize generation has been invalidated")
+        evidence_by_step: dict[FinalizeStep, VerifiedArtifactEvidence | NotApplicableEvidence] = {}
+        attempts_by_step: dict[FinalizeStep, OperationAttempt] = {}
+        for step in FinalizeStep:
+            identity = FinalizeIdentity.for_step(state, generation, step)
+            row = connection.execute(
+                "SELECT record_json FROM operation_ledger WHERE run_id=? AND kind=? AND stable_key=?",
+                (state.run_id, _finalize_operation_kind(step).value, identity.stable_key),
+            ).fetchone()
+            if row is None:
+                raise StateInvariantError(f"Missing Finalize Evidence: {step.value}")
+            operation = OperationRecord.model_validate_json(row["record_json"], strict=True)
+            if operation.operation_id != identity.operation_id or operation.status is not OperationStatus.COMPLETED:
+                raise StateInvariantError(f"Finalize Operation is not completed: {step.value}")
+            attempt = self._current_attempt_in(connection, operation.operation_id)
+            if not attempt.result or not attempt.result_hash:
+                raise StateInvariantError(f"Finalize Attempt lacks Evidence: {step.value}")
+            evidence = self._validate_finalize_evidence(
+                state, operation, attempt, attempt.result, attempt.result_hash,
+            )
+            evidence_by_step[step] = evidence
+            attempts_by_step[step] = attempt
+        index = evidence_by_step[FinalizeStep.SESSION_INDEX]
+        memory = attempts_by_step[FinalizeStep.MEMORY]
+        if isinstance(index, VerifiedArtifactEvidence):
+            if (
+                index.references.memory_attempt_id != memory.attempt_id
+                or index.references.memory_result_hash != memory.result_hash
+            ):
+                raise StateInvariantError("Session Index Evidence does not reference Memory Evidence")
+        current_receipt = connection.execute(
+            "SELECT r.* FROM run_current_audit_receipt c "
+            "JOIN run_audit_receipts r ON r.receipt_id=c.receipt_id WHERE c.run_id=?",
+            (state.run_id,),
+        ).fetchone()
+        audit = evidence_by_step[FinalizeStep.AUDIT]
+        index_attempt = attempts_by_step[FinalizeStep.SESSION_INDEX]
+        if (
+            current_receipt is None
+            or int(current_receipt["finalize_generation"]) != generation
+            or not isinstance(audit, VerifiedArtifactEvidence)
+            or audit.references.receipt_id != current_receipt["receipt_id"]
+            or audit.artifact_hash != current_receipt["receipt_hash"]
+            or audit.references.memory_attempt_id != memory.attempt_id
+            or audit.references.memory_result_hash != memory.result_hash
+            or audit.references.session_index_attempt_id != index_attempt.attempt_id
+            or audit.references.session_index_result_hash != index_attempt.result_hash
+        ):
+            raise StateInvariantError("Current audit receipt does not match Audit Evidence")
+        inbox = evidence_by_step[FinalizeStep.INBOX]
+        if not isinstance(inbox, VerifiedArtifactEvidence) or not inbox.references.inbox_item_id:
+            raise StateInvariantError("Inbox Evidence is not verified")
+        inbox_row = connection.execute(
+            "SELECT * FROM inbox WHERE item_id=?", (inbox.references.inbox_item_id,),
+        ).fetchone()
+        if inbox_row is None:
+            raise StateInvariantError("Inbox Evidence row is missing")
+        canonical_inbox = {
+            key: inbox_row[key]
+            for key in (
+                "item_id", "run_id", "project_id", "session_id", "title",
+                "summary", "status", "created_at",
+            )
+        }
+        if self._canonical_hash(canonical_inbox) != inbox.artifact_hash:
+            raise StateInvariantError("Inbox Evidence row hash mismatch")
+
     def _write_event(
         self,
         connection: sqlite3.Connection,
@@ -1582,8 +1987,12 @@ class StateController:
             UpdateStateMetadataCommand: "state_metadata_updated",
             RecordRuntimeEventCommand: command.event_type if isinstance(command, RecordRuntimeEventCommand) else "runtime_event",
             BindSessionCommand: "session_bound",
+            UpgradePersistenceContractCommand: "persistence_contract_upgraded",
+            StartFinalizeGenerationCommand: "finalize_generation_started",
+            StartReplacementFinalizeGenerationCommand: "finalize_generation_replaced",
+            InvalidateFinalizeGenerationCommand: "finalize_generation_invalidated",
+            FinalizeAuditCommand: "finalize_audit_created",
             FinalizeInboxCommand: "inbox_created",
-            CompleteFinalizeStepCommand: "finalize_step_completed",
             FinalizeTerminalCommand: "run_terminal",
             BeginOperationCommand: "operation_prepared",
             CreateOperationWithAttemptCommand: "operation_created",
@@ -1951,6 +2360,21 @@ class StateController:
 
 
 __all__ = ["StateConflictError", "StateController", "StateInvariantError"]
+
+
+def _default_persistence_contract(workload_kind: WorkloadKind) -> PersistenceContract:
+    if workload_kind in {WorkloadKind.CHAT, WorkloadKind.CRON}:
+        return PersistenceContract.CONVERSATION_SESSION
+    return PersistenceContract.CONTROL_ONLY
+
+
+def _finalize_operation_kind(step: FinalizeStep) -> OperationKind:
+    return {
+        FinalizeStep.MEMORY: OperationKind.MEMORY,
+        FinalizeStep.SESSION_INDEX: OperationKind.SESSION_INDEX,
+        FinalizeStep.AUDIT: OperationKind.AUDIT,
+        FinalizeStep.INBOX: OperationKind.INBOX,
+    }[step]
 
 
 def _age_seconds(value: str | None, now: datetime) -> float | None:

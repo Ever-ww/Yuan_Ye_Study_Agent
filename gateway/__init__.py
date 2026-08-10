@@ -19,6 +19,14 @@ from .models import (
 )
 from .process import GatewayProcessManager
 from .runtime_pool import RuntimePool
+from .finalize import FinalizeCoordinator, OperationRetryDriver
+from .finalize_evidence import (
+    FinalizeEvidenceCodec,
+    FinalizeIdentity,
+    FinalizeRequirementPolicy,
+    FinalizeStep,
+)
+from .session_reservation import SessionReservationRegistry
 from .state_controller import StateController, StateConflictError, StateInvariantError
 from .outbox import OutboxDispatcher
 from .recovery import RecoveryCoordinator
@@ -44,6 +52,13 @@ __all__ = [
     "RunRecord",
     "RecoveryDecisionRequest",
     "RuntimePool",
+    "FinalizeCoordinator",
+    "OperationRetryDriver",
+    "FinalizeEvidenceCodec",
+    "FinalizeIdentity",
+    "FinalizeRequirementPolicy",
+    "FinalizeStep",
+    "SessionReservationRegistry",
     "StateController",
     "StateConflictError",
     "StateInvariantError",

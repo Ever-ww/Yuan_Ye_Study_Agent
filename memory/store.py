@@ -138,14 +138,19 @@ class MemoryStore:
         })
         return record_id
 
-    def record_cancellation(self, session_id: str) -> bool:
+    def record_cancellation(
+        self,
+        session_id: str,
+        *,
+        audit: dict[str, object] | None = None,
+    ) -> str | None:
         """补齐未完成工具链并记录用户取消，保证后续消息角色合法。"""
         cache = self._ensure_cache(session_id)
         if not cache:
-            return False
+            return None
         last = cache[-1]
         if last.get("role") == "assistant" and not last.get("tool_calls"):
-            return False
+            return None
 
         pending: list[tuple[str, str]] = []
         assistant_index = next((
@@ -169,6 +174,12 @@ class MemoryStore:
                     if call_id and name and call_id not in completed:
                         pending.append((call_id, name))
         for call_id, name in pending:
+            synthetic_audit = {
+                **(audit or {}),
+                "record_id": self._stable_terminal_record_id(
+                    session_id, "tool_cancelled", call_id, audit,
+                ),
+            }
             self.record_tool_result(
                 session_id,
                 tool_call_id=call_id,
@@ -176,27 +187,47 @@ class MemoryStore:
                 content="工具执行已由用户按 Ctrl+C 终止",
                 status="cancelled",
                 arguments={},
+                audit=synthetic_audit,
             )
 
         return self._record_terminal_marker(
             session_id,
             "本次回答已由用户按 Ctrl+C 终止。",
             status="cancelled",
+            audit=audit,
         )
 
-    def record_network_failure(self, session_id: str) -> bool:
+    def record_network_failure(
+        self,
+        session_id: str,
+        *,
+        audit: dict[str, object] | None = None,
+    ) -> str | None:
         """网络重试耗尽时闭合当前问答，允许用户在同一 Session 重新发送。"""
         return self._record_terminal_marker(
             session_id,
             "本次回答因网络连接中断未完成，请重新发送问题。",
             status="network_error",
+            audit=audit,
         )
 
-    def record_turn_failure(self, session_id: str, message: str) -> bool:
+    def record_turn_failure(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        audit: dict[str, object] | None = None,
+    ) -> str | None:
         """闭合本轮尚未执行的并行工具调用，并保存可继续恢复的失败标记。"""
         cache = self._ensure_cache(session_id)
         pending = self._pending_tool_calls(cache)
         for call_id, name in pending:
+            synthetic_audit = {
+                **(audit or {}),
+                "record_id": self._stable_terminal_record_id(
+                    session_id, "tool_skipped", call_id, audit,
+                ),
+            }
             self.record_tool_result(
                 session_id,
                 tool_call_id=call_id,
@@ -204,24 +235,39 @@ class MemoryStore:
                 content="同一批次的前序工具执行失败，本工具未执行。",
                 status="skipped",
                 arguments={},
+                audit=synthetic_audit,
             )
         detail = (message or "运行时错误").strip()
         return self._record_terminal_marker(
             session_id,
             f"本次回答因运行错误未完成：{detail}",
             status="error",
+            audit=audit,
         )
 
-    def record_cancelled_partial(self, session_id: str, content: str) -> bool:
+    def record_cancelled_partial(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        audit: dict[str, object] | None = None,
+    ) -> str | None:
         """保存 Ctrl+C 前已流式生成的文本，不接纳未完成的工具调用字段。"""
         if not content:
-            return False
+            return None
         cache = self._ensure_cache(session_id)
         if not cache or cache[-1].get("role") not in {"user", "tool"}:
-            return False
-        self.sessions.append(session_id, "assistant", content, {"status": "cancelled"})
+            return None
+        metadata = {
+            "status": "cancelled",
+            **(audit or {}),
+            "record_id": self._stable_terminal_record_id(
+                session_id, "cancelled_partial", None, audit,
+            ),
+        }
+        record_id = self.sessions.append(session_id, "assistant", content, metadata)
         cache.append({"role": "assistant", "content": content})
-        return True
+        return record_id
 
     def restore_messages(self, session_id: str) -> list[dict[str, Any]]:
         """恢复索引指向的最新会话分段。"""
@@ -393,13 +439,44 @@ class MemoryStore:
             self._message_cache[session_id] = self.sessions.restore(session_id)
         return self._message_cache[session_id]
 
-    def _record_terminal_marker(self, session_id: str, content: str, *, status: str) -> bool:
+    def _record_terminal_marker(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        status: str,
+        audit: dict[str, object] | None = None,
+    ) -> str | None:
         cache = self._ensure_cache(session_id)
         if not cache or cache[-1].get("role") not in {"user", "tool"}:
-            return False
-        self.sessions.append(session_id, "assistant", content, {"status": status})
+            return None
+        metadata = {
+            "status": status,
+            **(audit or {}),
+            "record_id": self._stable_terminal_record_id(
+                session_id, f"terminal_{status}", None, audit,
+            ),
+        }
+        record_id = self.sessions.append(session_id, "assistant", content, metadata)
         cache.append({"role": "assistant", "content": content})
-        return True
+        return record_id
+
+    @staticmethod
+    def _stable_terminal_record_id(
+        session_id: str,
+        kind: str,
+        suffix: str | None,
+        audit: dict[str, object] | None,
+    ) -> str:
+        selected = audit or {}
+        identity = ":".join((
+            session_id,
+            str(selected.get("run_id") or "legacy"),
+            str(selected.get("turn_id") or "legacy"),
+            kind,
+            suffix or "",
+        ))
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _pending_tool_calls(cache: list[dict[str, Any]]) -> list[tuple[str, str]]:

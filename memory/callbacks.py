@@ -78,17 +78,24 @@ def register_memory_callbacks(
 
     async def persist_answer(event: HookEvent) -> None:
         if event.data.get("cancelled"):
-            memory.record_cancellation(event.session_id)
+            record_id = memory.record_cancellation(event.session_id, audit=_audit(event))
+            if record_id:
+                event.data["session_record_id"] = record_id
             return
         error = event.data.get("error")
         if isinstance(error, BaseException) and is_retryable_model_error(error):
-            memory.record_network_failure(event.session_id)
+            record_id = memory.record_network_failure(event.session_id, audit=_audit(event))
+            if record_id:
+                event.data["session_record_id"] = record_id
             return
         if error is not None:
-            memory.record_turn_failure(
+            record_id = memory.record_turn_failure(
                 event.session_id,
                 str(error) or type(error).__name__,
+                audit=_audit(event),
             )
+            if record_id:
+                event.data["session_record_id"] = record_id
             return
         if not event.data.get("completed"):
             return
@@ -110,7 +117,9 @@ def register_memory_callbacks(
         if event.data.get("cancelled"):
             partial_text = event.data.get("partial_text")
             if isinstance(partial_text, str) and partial_text:
-                memory.record_cancelled_partial(event.session_id, partial_text)
+                event.data["session_record_id"] = memory.record_cancelled_partial(
+                    event.session_id, partial_text, audit=_audit(event),
+                )
             return
         if event.data.get("error") is not None:
             return

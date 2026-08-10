@@ -15,11 +15,8 @@ from uuid import uuid4
 from Agent import AgentRuntime, EventType, ExtensionCatalog, ModelRetryPolicy, load_runtime_config
 from Agent.state import (
     BindSessionCommand,
-    CompleteFinalizeStepCommand,
     ExecutionOutcome,
     ExecutionState,
-    FinalizeInboxCommand,
-    FinalizeTerminalCommand,
     RecordRuntimeEventCommand,
     RequestCancellationCommand,
     TaskState,
@@ -30,10 +27,12 @@ from Agent.state import (
 from gateway.approval import GatewayApprovalBroker
 from gateway.durable_execution import DurableModelHooks, DurableToolCoordinator
 from gateway.events import GatewayEventBus
+from gateway.finalize import FinalizeCoordinator
 from gateway.models import ApprovalRequest, RunRecord
 from gateway.outbox import OutboxDispatcher
 from gateway.state_controller import StateController
 from gateway.store import GatewayStore
+from gateway.session_reservation import SessionReservationRegistry
 from memory import MemoryStore
 from reference import ReferenceService
 from backup import AgentHomeWriteGate, QuiesceResult
@@ -70,6 +69,8 @@ class RuntimePool:
         tool_retry_base_seconds: float = 2.0,
         tool_retry_max_seconds: float = 60.0,
         write_gate: AgentHomeWriteGate | None = None,
+        session_reservations: SessionReservationRegistry | None = None,
+        finalizer: FinalizeCoordinator | None = None,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.store = store
@@ -98,7 +99,13 @@ class RuntimePool:
         )
         self._semaphore = asyncio.Semaphore(max_concurrent_runs)
         self._runtimes: dict[tuple[str, str], RuntimeEntry] = {}
-        self._busy_sessions: set[tuple[str, str]] = set()
+        self.session_reservations = session_reservations or SessionReservationRegistry()
+        self.finalizer = finalizer or FinalizeCoordinator(
+            controller=state_controller,
+            store=store,
+            agent_root=self.agent_root,
+            reservations=self.session_reservations,
+        )
         self._pending_profile_refresh: set[tuple[str, str]] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._closing = False
@@ -124,11 +131,9 @@ class RuntimePool:
         if not is_runnable(state, operation, attempt, now=datetime.now().astimezone()):
             raise RuntimeError(f"Run 当前不可调度：{state.task_state.value}")
         if run.session_id:
-            key = (run.project_id, run.session_id)
-            async with self._lock:
-                if key in self._busy_sessions:
-                    raise RuntimeError("同一个 Session 同时只能运行一个任务")
-                self._busy_sessions.add(key)
+            await self.session_reservations.acquire(
+                run.project_id, run.session_id, owner_id=run.run_id, wait=False,
+            )
         started = asyncio.Event()
         task = asyncio.create_task(
             self._execute_with_write_scope(run, started),
@@ -196,11 +201,11 @@ class RuntimePool:
         if self._maintenance_epoch is not None:
             raise RuntimeError("Agent Home 正在维护，不能刷新 Skill")
         key = (project_id, session_id)
+        reservation_owner = f"skill-refresh:{project_id}:{session_id}:{uuid4().hex}"
+        await self.session_reservations.acquire(
+            project_id, session_id, owner_id=reservation_owner, wait=False,
+        )
         created = False
-        async with self._lock:
-            if key in self._busy_sessions:
-                raise RuntimeError("当前 Session 正在执行任务，请在本轮结束后刷新 Skill")
-            self._busy_sessions.add(key)
         try:
             entry = self._runtimes.get(key)
             if entry is None:
@@ -235,12 +240,13 @@ class RuntimePool:
                     await selected.runtime.close()
             raise
         finally:
-            async with self._lock:
-                self._busy_sessions.discard(key)
+            await self.session_reservations.release_owner(reservation_owner)
 
     def is_idle(self) -> bool:
         """Dream 只在没有排队或运行任务时读取 Session 与修改 Profile。"""
-        return not self._busy_sessions and not any(not task.done() for task in self._tasks.values())
+        return not self.session_reservations.busy_keys and not any(
+            not task.done() for task in self._tasks.values()
+        )
 
     def has_active_run(self, run_id: str) -> bool:
         task = self._tasks.get(run_id)
@@ -274,7 +280,7 @@ class RuntimePool:
         """Profile 更新后刷新空闲 Runtime；活动 Turn 在结束后再刷新。"""
         async with self._lock:
             for key, entry in self._runtimes.items():
-                if after_active_turn and key in self._busy_sessions:
+                if after_active_turn and key in self.session_reservations.busy_keys:
                     self._pending_profile_refresh.add(key)
                 else:
                     entry.runtime.invalidate_context_cache()
@@ -322,10 +328,10 @@ class RuntimePool:
                             current = self.store.run(current.run_id)
                             new_key = (current.project_id, session_id)
                             if session_key is None:
-                                async with self._lock:
-                                    if new_key in self._busy_sessions:
-                                        raise RuntimeError("新 Session 标识与正在运行的 Session 冲突")
-                                    self._busy_sessions.add(new_key)
+                                await self.session_reservations.bind(
+                                    current.project_id, session_id,
+                                    owner_id=current.run_id, wait=False,
+                                )
                                 session_key = new_key
                             self._runtimes[new_key] = RuntimeEntry(runtime, monotonic())
                         if event.type is EventType.FINAL:
@@ -380,8 +386,8 @@ class RuntimePool:
                 if entry is not None:
                     entry.last_used = monotonic()
             if session_key is not None:
+                await self.session_reservations.release_owner(original.run_id)
                 async with self._lock:
-                    self._busy_sessions.discard(session_key)
                     if session_key in self._pending_profile_refresh:
                         entry = self._runtimes.get(session_key)
                         if entry is not None:
@@ -449,44 +455,7 @@ class RuntimePool:
             error=reason if outcome in {ExecutionOutcome.ERROR, ExecutionOutcome.EXHAUSTED} else None,
             result_summary=reason if outcome is ExecutionOutcome.SUCCESS else None,
         )
-        run = self.store.run(run_id)
-        for step_name in ("memory", "session_index", "audit"):
-            current = self.state_controller.state(run_id)
-            self.state_controller.apply(CompleteFinalizeStepCommand(
-                command_id=f"finalize:{run_id}:{step_name}",
-                run_id=run_id,
-                expected_revision=current.revision,
-                gateway_epoch=self.state_controller.gateway_epoch,
-                step_name=step_name,
-                result="completed",
-            ))
-        operation_id = hashlib.sha256(f"{run_id}:finalize:inbox".encode("utf-8")).hexdigest()
-        state = self.state_controller.state(run_id)
-        self.state_controller.apply(FinalizeInboxCommand(
-            command_id=f"finalize:{run_id}:inbox",
-            run_id=run_id,
-            expected_revision=state.revision,
-            gateway_epoch=self.state_controller.gateway_epoch,
-            operation_id=operation_id,
-            title=run.task[:120],
-            summary=reason,
-            status={
-                ExecutionOutcome.SUCCESS: "completed",
-                ExecutionOutcome.ERROR: "failed",
-                ExecutionOutcome.EXHAUSTED: "failed",
-                ExecutionOutcome.CANCELLED: "cancelled",
-            }[outcome],
-        ))
-        if self.outbox:
-            self.outbox.wake()
-        state = self.state_controller.state(run_id)
-        self.state_controller.apply(FinalizeTerminalCommand(
-            command_id=f"finalize:{run_id}:terminal",
-            run_id=run_id,
-            expected_revision=state.revision,
-            gateway_epoch=self.state_controller.gateway_epoch,
-            reason="FINALIZING 完成",
-        ))
+        await self.finalizer.finalize(run_id)
         if self.outbox:
             self.outbox.wake()
 
@@ -577,7 +546,7 @@ class RuntimePool:
             selected: list[RuntimeEntry] = []
             async with self._lock:
                 for key, entry in tuple(self._runtimes.items()):
-                    if key not in self._busy_sessions and now - entry.last_used >= self.idle_timeout_seconds:
+                    if key not in self.session_reservations.busy_keys and now - entry.last_used >= self.idle_timeout_seconds:
                         selected.append(entry)
                         self._runtimes.pop(key, None)
             for entry in selected:
