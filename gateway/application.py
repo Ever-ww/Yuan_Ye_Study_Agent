@@ -122,6 +122,8 @@ class GatewayApplication:
             semantic_weight=config.reference_semantic_weight,
             worker=self.reference_embedding_worker,
         )
+        from gateway.harness_evolution import GatewayHarnessEvolutionService
+        self.harness_evolution = GatewayHarnessEvolutionService(config)
         self.pool = RuntimePool(
             agent_root=config.agent_root,
             store=self.store,
@@ -139,6 +141,7 @@ class GatewayApplication:
             tool_retry_base_seconds=config.tool_retry_base_seconds,
             tool_retry_max_seconds=config.tool_retry_max_seconds,
             write_gate=self.write_gate,
+            harness_evolution_service=self.harness_evolution,
         )
         self.recovery = RecoveryCoordinator(
             self.state_controller,

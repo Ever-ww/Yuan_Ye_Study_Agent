@@ -1,0 +1,4 @@
+interface:
+  display_name: "Harness Evolve"
+  short_description: "Evolve Yuan Ye Tool or Hook capabilities safely"
+  default_prompt: "Use the Harness to safely extend a missing Yuan Ye Tool or Hook capability."

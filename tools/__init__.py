@@ -29,6 +29,7 @@ from .read_file import (
 )
 from .search_workspace import SearchWorkspaceTool
 from .skill_install import SkillInstallTool
+from .harness_evolve import HarnessEvolveTool
 from .skill_read import SkillReadTool
 from .sandbox_rollback import SandboxRollbackTool
 from .subagent import SubagentRunner, SubagentTool
@@ -77,6 +78,7 @@ __all__ = [
     "DocumentSecurityError",
     "SearchWorkspaceTool",
     "SkillInstallTool",
+    "HarnessEvolveTool",
     "SkillReadTool",
     "SandboxRollbackTool",
     "SubagentRunner",

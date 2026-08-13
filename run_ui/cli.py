@@ -1118,11 +1118,17 @@ async def _handle_chat_failure(config, runtime, task: str, session_id: str, fail
     if not confirmed:
         return
     request = harness.HarnessEvolutionRequest(
-        project_root=config.agent_root,
+        project_root=(config.coding_source_root or Path(__file__).resolve().parents[1]),
         incident_id=snapshot.stem,
         snapshot_path=snapshot,
         task=task,
         config=config,
+        trigger="error",
+        target="source_repair",
+        source_root=(config.coding_source_root or Path(__file__).resolve().parents[1]),
+        agent_root=config.agent_root,
+        max_attempts=1,
+        merge_policy="immediate",
     )
     console.print("[cyan]Harness 正在检查主 worktree并准备隔离诊断…[/]")
     try:

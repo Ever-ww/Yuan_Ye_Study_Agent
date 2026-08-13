@@ -73,7 +73,7 @@ class AsyncToolRegistry:
         """创建严格子集；未知名称和 subagent 递归调用会被拒绝。"""
         selected: list[AsyncTool] = []
         for name in names:
-            if name in {"subagent", "skill_install", "cronjob"}:
+            if name in {"subagent", "skill_install", "cronjob", "harness_evolve"}:
                 raise ValueError(f"子 Agent 不允许选择工具：{name}")
             tool = self._tools.get(name)
             if tool is None:

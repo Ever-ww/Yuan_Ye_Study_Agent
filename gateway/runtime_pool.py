@@ -71,6 +71,7 @@ class RuntimePool:
         write_gate: AgentHomeWriteGate | None = None,
         session_reservations: SessionReservationRegistry | None = None,
         finalizer: FinalizeCoordinator | None = None,
+        harness_evolution_service=None,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.store = store
@@ -106,6 +107,7 @@ class RuntimePool:
             agent_root=self.agent_root,
             reservations=self.session_reservations,
         )
+        self.harness_evolution_service = harness_evolution_service
         self._pending_profile_refresh: set[tuple[str, str]] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._closing = False
@@ -470,6 +472,14 @@ class RuntimePool:
         else:
             runtime = self._default_runtime(workspace, self.approvals, run)
         if (
+            self.harness_evolution_service is not None
+            and not run.client_id.startswith("cron:")
+            and hasattr(runtime, "tools")
+            and "harness_evolve" not in runtime.tools.names()
+        ):
+            from tools import HarnessEvolveTool
+            runtime.tools.register(HarnessEvolveTool(self.harness_evolution_service))
+        if (
             self.tool_operations is not None
             and hasattr(runtime, "tool_context")
             and hasattr(runtime, "hooks")
@@ -502,7 +512,7 @@ class RuntimePool:
     ) -> AgentRuntime:
         config = load_runtime_config(self.agent_root, workspace_root=workspace)
         scheduled = run.client_id.startswith("cron:")
-        return AgentRuntime(
+        runtime = AgentRuntime(
             config,
             approval=approvals,
             retry_policy=ModelRetryPolicy(
@@ -518,6 +528,7 @@ class RuntimePool:
             references=self.reference_service,
             enable_references=self.reference_service is not None,
         )
+        return runtime
 
     async def _emit(self, run: RunRecord, event_type: str, payload: dict) -> None:
         state = self.state_controller.state(run.run_id)

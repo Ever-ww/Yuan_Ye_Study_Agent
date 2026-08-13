@@ -55,7 +55,7 @@ class SubagentTool:
         """只向父模型列出子 Agent 在当前沙箱状态下可委派的工具。"""
         allowed = sorted(
             name for name in self.registry.names(context)
-            if name not in {"subagent", "skill_install", "cronjob"}
+            if name not in {"subagent", "skill_install", "cronjob", "harness_evolve"}
         )
         return {
             "type": "object",
@@ -73,7 +73,7 @@ class SubagentTool:
     def ensure_available(self, arguments: dict[str, Any], context: ToolContext) -> None:
         """在父级审批前拒绝不可用能力，尤其禁止 checkpoint-only 委派 Bash。"""
         for name in arguments.get("tools", []):
-            if name in {"subagent", "skill_install", "cronjob"}:
+            if name in {"subagent", "skill_install", "cronjob", "harness_evolve"}:
                 raise ValueError(f"子 Agent 不允许选择工具：{name}")
             if not self.registry.is_available(name, context):
                 if name == "bash":
