@@ -30,7 +30,13 @@ from bootstrap import ensure_project_initialized, initialize_project
 from memory import MemoryStore
 from gateway import GatewayClient, GatewayProcessManager
 from gateway.models import GatewayEventEnvelope
-from cron import CronJobCreateRequest, CronJobEditRequest, CronSchedule, CronScheduleCalculator
+from cron import (
+    CronJobCreateRequest,
+    CronJobEditRequest,
+    CronPaperResearchPresetRequest,
+    CronSchedule,
+    CronScheduleCalculator,
+)
 from skill import SkillInstallRequest
 from .approval import InteractiveApproval, active_live as _active_live
 from .harness_loader import load_harness_module
@@ -91,6 +97,9 @@ def init() -> None:
     console.print(f"请编辑 {yy / 'settings.local.json'} 配置模型；已有文件不会被覆盖。")
 
 
+    _offer_initial_paper_research_cron(yy)
+
+
 def _memory() -> MemoryStore:
     """从当前项目配置创建 Memory 门面。"""
     config = load_runtime_config()
@@ -113,6 +122,43 @@ def _gateway_client(*, port: int | None = None) -> GatewayClient:
 async def _gateway_project(client: GatewayClient) -> dict[str, object]:
     """把当前启动目录注册为 Gateway 项目。"""
     return await client.register_project(Path.cwd())
+
+
+async def _create_initial_paper_research_cron(
+    expression: str,
+    timezone_name: str,
+):
+    client = _gateway_client()
+    project = await _gateway_project(client)
+    return await client.initialize_paper_research_cron(CronPaperResearchPresetRequest(
+        project_id=str(project["project_id"]),
+        expression=expression,
+        timezone=timezone_name,
+    ))
+
+
+def _offer_initial_paper_research_cron(yy_dir: Path) -> None:
+    """Offer the built-in schedule only during an interactive first-run flow."""
+    if not sys.stdin.isatty():
+        return
+    if not typer.confirm("是否开启每周固定时间的自动论文调研？", default=False):
+        return
+    expression = typer.prompt("五段 Cron 表达式", default="0 9 * * 1")
+    timezone_name = typer.prompt(
+        "时区",
+        default=CronScheduleCalculator.local_timezone(),
+    )
+    try:
+        job = asyncio.run(_create_initial_paper_research_cron(expression, timezone_name))
+    except Exception as exc:
+        console.print(f"[red]论文调研 Cron 初始化失败：[/] {exc}")
+        console.print("可修正配置后使用 `yy cron add` 或让 Agent 调用 cronjob 工具重新创建。")
+        return
+    console.print(
+        f"[green]已开启论文调研 Cron[/] {job.job_id}\n"
+        f"计划：{job.schedule.expression}（{job.schedule.timezone}）\n"
+        f"持久化：{yy_dir / 'cron' / 'jobs.json'}"
+    )
 
 
 async def _render_gateway(
@@ -1303,6 +1349,22 @@ def cron_add(
     console.print(f"[green]已创建[/] {result.job_id}，下次：{result.next_run_at}")
 
 
+@cron_app.command("init-paper-research")
+def cron_init_paper_research(
+    expression: str = typer.Option("0 9 * * 1", "--cron"),
+    timezone_name: str | None = typer.Option(None, "--timezone"),
+) -> None:
+    """幂等创建内置的无人值守论文调研计划。"""
+    result = asyncio.run(_create_initial_paper_research_cron(
+        expression,
+        timezone_name or CronScheduleCalculator.local_timezone(),
+    ))
+    console.print(
+        f"[green]论文调研 Cron 已就绪[/] {result.job_id}，"
+        f"下次：{result.next_run_at}"
+    )
+
+
 @cron_app.command("at")
 def cron_at(
     when: str,
@@ -1572,4 +1634,6 @@ def main() -> None:
         if result.initialized:
             console.print(f"[green]首次运行初始化完成[/] {result.yy_dir}")
             console.print(f"请按需编辑 {result.yy_dir / 'settings.local.json'}；后续启动不会重复初始化。")
+        if result.initialized:
+            _offer_initial_paper_research_cron(result.yy_dir)
     app()

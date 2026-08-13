@@ -18,7 +18,8 @@ from tool.contracts import ToolContext, ToolRisk
 class CronJobTool:
     name = "cronjob"
     description = (
-        "管理当前项目的后台定时 Agent 任务。可校验/预览五段 Cron，也可创建、编辑、暂停、恢复、立即运行或删除任务。"
+        "管理当前项目的后台定时 Agent 任务。每次触发都由独立、无会话记忆的子 Agent 执行，"
+        "因此 prompt 必须自包含；可校验/预览五段 Cron，也可创建、编辑、暂停、恢复、立即运行或删除任务。"
     )
     risk = "dynamic"
     schema: dict[str, Any] = {
@@ -33,7 +34,10 @@ class CronJobTool:
             },
             "job_id": {"type": "string"},
             "name": {"type": "string"},
-            "prompt": {"type": "string"},
+            "prompt": {
+                "type": "string",
+                "description": "无记忆 Cron 子 Agent 每次运行的完整、自包含任务说明",
+            },
             "schedule": {
                 "type": "object",
                 "properties": {
@@ -46,6 +50,12 @@ class CronJobTool:
                 "required": ["kind"],
             },
             "count": {"type": "integer"},
+            "preapproved_tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "uniqueItems": True,
+                "description": "无人值守运行中可使用的非只读工具；创建/修改时会随整个 Cron 请求进行高风险审批",
+            },
         },
         "required": ["action"],
     }
@@ -75,6 +85,7 @@ class CronJobTool:
                 name=_required(arguments, "name"),
                 prompt=_required(arguments, "prompt"),
                 schedule=_schedule(arguments),
+                preapproved_tools=tuple(arguments.get("preapproved_tools", ())),
             ))
             return job.model_dump_json(indent=2)
         job_id = _required(arguments, "job_id")
@@ -83,6 +94,10 @@ class CronJobTool:
                 name=arguments.get("name"),
                 prompt=arguments.get("prompt"),
                 schedule=_schedule(arguments) if arguments.get("schedule") else None,
+                preapproved_tools=(
+                    tuple(arguments["preapproved_tools"])
+                    if "preapproved_tools" in arguments else None
+                ),
             ))
         elif action == "pause":
             job = await self.service.pause(job_id)

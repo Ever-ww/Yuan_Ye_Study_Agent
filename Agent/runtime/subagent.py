@@ -2,36 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-from pathlib import Path
-
 from Agent.config import RuntimeConfig
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models import build_provider
 from prompt import compose_subagent_messages
 from tool import AsyncToolRegistry, ToolContext
-
-
-class _NoMemory:
-    """临时 Subagent Runtime 的无持久化占位对象。"""
-
-    def __init__(self, root: Path) -> None:
-        self.root = root
-
-    def has_session(self, session_id: str) -> bool:
-        return True
-
-    def session_created_at(self, session_id: str) -> str:
-        return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
-
-    def active_path(self, session_id: str) -> Path:
-        return self.root / ".yy" / "ephemeral-subagent.jsonl"
-
-    def prompt_context(self, session_id: str | None = None) -> str:
-        return ""
-
-    def latest_summary(self, session_id: str) -> str:
-        return ""
+from .ephemeral import EphemeralMemory
 
 
 class RuntimeSubagentRunner:
@@ -73,7 +49,7 @@ class RuntimeSubagentRunner:
             config,
             provider=provider,
             tools=selected,
-            memory=_NoMemory(config.agent_root),
+            memory=EphemeralMemory(config.agent_root),
             hooks=hooks,
             tool_context=context,
             enable_context_processing=False,

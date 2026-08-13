@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -19,6 +20,16 @@ from .models import (
 )
 from .schedule import CronScheduleCalculator
 from .store import CronStore
+
+
+_NEVER_PREAPPROVE = frozenset({
+    "bash",
+    "cronjob",
+    "harness_evolve",
+    "sandbox_rollback",
+    "skill_install",
+    "subagent",
+})
 
 
 class CronService:
@@ -56,6 +67,7 @@ class CronService:
 
     async def create(self, request: CronJobCreateRequest) -> CronJob:
         schedule = self.validate_schedule(request.schedule)
+        preapproved_tools = _validate_preapproved_tools(request.preapproved_tools)
         now = utc_now()
         next_run = self._initial_next(schedule, now)
         job_id = f"cron_{uuid4().hex}"
@@ -64,6 +76,7 @@ class CronService:
             project_id=request.project_id,
             name=request.name.strip(),
             prompt=request.prompt.strip(),
+            preapproved_tools=preapproved_tools,
             schedule=schedule,
             created_at=utc_iso(now),
             updated_at=utc_iso(now),
@@ -76,6 +89,61 @@ class CronService:
         await self.store.mutate(add)
         self.wake()
         return job
+
+    async def ensure_paper_research_preset(
+        self,
+        *,
+        project_id: str,
+        expression: str,
+        timezone_name: str,
+    ) -> CronJob:
+        """Idempotently create the first-run paper research Job in jobs.json."""
+        schedule = self.validate_schedule(CronSchedule(
+            kind="cron", expression=expression, timezone=timezone_name,
+        ))
+        digest = hashlib.sha256(f"{project_id}:paper-research".encode("utf-8")).hexdigest()[:16]
+        job_id = f"cron_paper_research_{digest}"
+        selected: CronJob | None = None
+        now = utc_now()
+
+        def ensure(state) -> None:
+            nonlocal selected
+            existing = state.jobs.get(job_id)
+            if existing is not None:
+                selected = existing
+                return
+            selected = CronJob(
+                job_id=job_id,
+                project_id=project_id,
+                name="定时论文调研",
+                prompt=(
+                    "执行一次无人值守论文调研。先调用 profile_read(name=\"RESEARCH\") 读取研究方向；"
+                    "若为空，明确说明并结束。读取并严格执行 search-summary-paper Skill，默认检索、"
+                    "下载并完整阅读 5 篇公开论文，生成详细中文总结、论文库索引和可核验 Reference。"
+                    "若 web_search 未配置，改用 web_fetch 查询 arXiv、OpenAlex 或 Semantic Scholar 的"
+                    "公开 JSON API，不得因单一检索工具不可用而直接结束。"
+                    "单个来源失败时继续其他候选，不绕过登录、验证码或付费墙。最终汇报成功、重复、"
+                    "不可访问和解析失败项。当前 Cron Agent 没有会话记忆，所有依据必须来自本次工具结果。"
+                ),
+                schedule=schedule,
+                preapproved_tools=("paper_library_download", "paper_library_save", "reference_write"),
+                created_at=utc_iso(now),
+                updated_at=utc_iso(now),
+                next_run_at=utc_iso(self._initial_next(schedule, now)),
+            )
+            state.jobs[job_id] = selected
+
+        await self.store.mutate(ensure)
+        self.wake()
+        assert selected is not None
+        return selected
+
+    async def tool_preapproved(self, job_id: str, tool_name: str) -> bool:
+        try:
+            job = await self.get(job_id)
+        except KeyError:
+            return False
+        return tool_name in job.preapproved_tools
 
     async def edit(self, job_id: str, request: CronJobEditRequest) -> CronJob:
         selected: CronJob | None = None
@@ -96,6 +164,10 @@ class CronService:
                 values["name"] = str(values["name"]).strip()
             if "prompt" in values:
                 values["prompt"] = str(values["prompt"]).strip()
+            if "preapproved_tools" in values:
+                values["preapproved_tools"] = _validate_preapproved_tools(
+                    tuple(values["preapproved_tools"]),
+                )
             values["updated_at"] = utc_iso(now)
             selected = CronJob.model_validate(job.model_copy(update=values).model_dump(), strict=True)
             state.jobs[job_id] = selected
@@ -227,6 +299,17 @@ class CronService:
         if selected is None:
             raise ValueError("计划没有下一次执行时间")
         return selected
+
+
+def _validate_preapproved_tools(values: tuple[str, ...]) -> tuple[str, ...]:
+    selected = tuple(sorted({value.strip() for value in values if value.strip()}))
+    blocked = _NEVER_PREAPPROVE.intersection(selected)
+    if blocked:
+        raise ValueError(
+            "Cron 无人值守任务不能预授权递归、自修改或任意命令能力："
+            + ", ".join(sorted(blocked))
+        )
+    return selected
 
 
 def _job(jobs: dict[str, CronJob], job_id: str) -> CronJob:

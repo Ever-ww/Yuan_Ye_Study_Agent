@@ -2363,7 +2363,7 @@ __all__ = ["StateConflictError", "StateController", "StateInvariantError"]
 
 
 def _default_persistence_contract(workload_kind: WorkloadKind) -> PersistenceContract:
-    if workload_kind in {WorkloadKind.CHAT, WorkloadKind.CRON}:
+    if workload_kind is WorkloadKind.CHAT:
         return PersistenceContract.CONVERSATION_SESSION
     return PersistenceContract.CONTROL_ONLY
 

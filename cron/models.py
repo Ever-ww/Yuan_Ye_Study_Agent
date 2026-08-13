@@ -75,6 +75,9 @@ class CronJob(BaseModel):
     project_id: str = Field(min_length=1)
     name: str = Field(min_length=1, max_length=120)
     prompt: str = Field(min_length=1, max_length=20_000)
+    # Explicit, durable unattended grant. Read tools need no grant; every other tool is denied
+    # for Cron unless its exact name was approved when the Job was created.
+    preapproved_tools: tuple[str, ...] = ()
     schedule: CronSchedule
     state: JobState = "scheduled"
     created_at: str
@@ -127,6 +130,7 @@ class CronJobCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     prompt: str = Field(min_length=1, max_length=20_000)
     schedule: CronSchedule
+    preapproved_tools: tuple[str, ...] = ()
 
 
 class CronJobEditRequest(BaseModel):
@@ -135,6 +139,7 @@ class CronJobEditRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     prompt: str | None = Field(default=None, min_length=1, max_length=20_000)
     schedule: CronSchedule | None = None
+    preapproved_tools: tuple[str, ...] | None = None
 
 
 class CronPreviewRequest(BaseModel):
@@ -142,3 +147,13 @@ class CronPreviewRequest(BaseModel):
 
     schedule: CronSchedule
     count: int = Field(default=5, ge=1, le=20)
+
+
+class CronPaperResearchPresetRequest(BaseModel):
+    """First-run choice for the built-in unattended paper research schedule."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    project_id: str = Field(min_length=1)
+    expression: str = Field(default="0 9 * * 1", min_length=1, max_length=100)
+    timezone: str = Field(default_factory=get_localzone_name, min_length=1, max_length=100)

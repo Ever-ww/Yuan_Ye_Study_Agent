@@ -36,12 +36,14 @@ class GatewayApprovalBroker:
         wait_for_client: WaitForClient | None = None,
         state_controller: StateController | None = None,
         approval_timeout_seconds: int = 30,
+        cron_tool_authorizer: Callable[[str, str], Awaitable[bool]] | None = None,
     ) -> None:
         self.store = store
         self.publish = publish
         self.wait_for_client = wait_for_client
         self.state_controller = state_controller
         self.approval_timeout_seconds = max(1, approval_timeout_seconds)
+        self.cron_tool_authorizer = cron_tool_authorizer
         self._pending: dict[str, tuple[ApprovalRequest, asyncio.Future[bool]]] = {}
         self._lock = asyncio.Lock()
 
@@ -57,6 +59,10 @@ class GatewayApprovalBroker:
             return False
         run_id, client_id = context
         if client_id.startswith("cron:"):
+            if self.cron_tool_authorizer is not None:
+                return bool(await self.cron_tool_authorizer(
+                    client_id.removeprefix("cron:"), tool_name,
+                ))
             # 定时任务无人值守，危险能力不得等待或继承创建者的历史授权。
             return False
         request = ApprovalRequest(

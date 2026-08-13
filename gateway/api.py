@@ -8,7 +8,12 @@ from typing import Any
 from uuid import uuid4
 
 from Agent import load_runtime_config
-from cron import CronJobCreateRequest, CronJobEditRequest, CronPreviewRequest
+from cron import (
+    CronJobCreateRequest,
+    CronJobEditRequest,
+    CronPaperResearchPresetRequest,
+    CronPreviewRequest,
+)
 from dream import DreamBackfillRequest, DreamRollbackRequest, DreamRunRequest
 from gateway.application import GatewayApplication
 from gateway.models import (
@@ -212,6 +217,10 @@ def create_gateway_api(
     @app.post("/api/v1/cron/jobs", dependencies=[Depends(authorize_write)])
     async def create_cron(payload: CronJobCreateRequest):
         return await gateway.create_cron(payload)
+
+    @app.post("/api/v1/cron/presets/paper-research", dependencies=[Depends(authorize_write)])
+    async def initialize_paper_research_cron(payload: CronPaperResearchPresetRequest):
+        return await gateway.initialize_paper_research_cron(payload)
 
     @app.patch("/api/v1/cron/jobs/{job_id}", dependencies=[Depends(authorize_write)])
     async def edit_cron(job_id: str, payload: CronJobEditRequest):

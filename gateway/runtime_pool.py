@@ -13,6 +13,8 @@ from time import monotonic
 from uuid import uuid4
 
 from Agent import AgentRuntime, EventType, ExtensionCatalog, ModelRetryPolicy, load_runtime_config
+from Agent.hook import HookRegistry
+from Agent.runtime.ephemeral import EphemeralMemory
 from Agent.state import (
     BindSessionCommand,
     ExecutionOutcome,
@@ -72,6 +74,7 @@ class RuntimePool:
         session_reservations: SessionReservationRegistry | None = None,
         finalizer: FinalizeCoordinator | None = None,
         harness_evolution_service=None,
+        cron_tool_authorizer=None,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.store = store
@@ -97,6 +100,7 @@ class RuntimePool:
             self.events.wait_connected,
             state_controller=state_controller,
             approval_timeout_seconds=approval_timeout_seconds,
+            cron_tool_authorizer=cron_tool_authorizer,
         )
         self._semaphore = asyncio.Semaphore(max_concurrent_runs)
         self._runtimes: dict[tuple[str, str], RuntimeEntry] = {}
@@ -291,6 +295,7 @@ class RuntimePool:
         runtime: AgentRuntime | None = None
         operation_token = None
         answer = ""
+        stateless_cron = original.client_id.startswith("cron:")
         session_key: tuple[str, str] | None = (
             (original.project_id, original.session_id) if original.session_id else None
         )
@@ -319,6 +324,12 @@ class RuntimePool:
                     async for event in runtime.run_task(current.task, current.session_id):
                         if event.type is EventType.STARTED:
                             session_id = str(event.payload["session_id"])
+                            if stateless_cron:
+                                await self._emit(
+                                    current, "cron_ephemeral_context_started",
+                                    {"ephemeral_session_id": session_id, "persisted": False},
+                                )
+                                continue
                             state = self.state_controller.state(current.run_id)
                             self.state_controller.apply(BindSessionCommand(
                                 command_id=uuid4().hex,
@@ -387,6 +398,8 @@ class RuntimePool:
                 entry = self._runtimes.get(session_key)
                 if entry is not None:
                     entry.last_used = monotonic()
+            if runtime is not None and stateless_cron:
+                await runtime.close()
             if session_key is not None:
                 await self.session_reservations.release_owner(original.run_id)
                 async with self._lock:
@@ -499,7 +512,8 @@ class RuntimePool:
                     requires_human_confirmation=False,
                 )
             DurableModelHooks(
-                self.state_controller, getattr(runtime, "memory", None),
+                self.state_controller,
+                None if run.client_id.startswith("cron:") else getattr(runtime, "memory", None),
                 retry_policy=retry_policy,
             ).register(runtime.hooks)
         return runtime
@@ -512,6 +526,32 @@ class RuntimePool:
     ) -> AgentRuntime:
         config = load_runtime_config(self.agent_root, workspace_root=workspace)
         scheduled = run.client_id.startswith("cron:")
+        if scheduled:
+            from skill import SkillService
+            config = config.model_copy(update={"stream": False, "compression_threshold_tokens": 0})
+            skills = SkillService(config.agent_root, workspace, config.coding_source_root)
+            memory = EphemeralMemory(config.agent_root)
+            hooks = HookRegistry()
+            return AgentRuntime(
+                config,
+                memory=memory,
+                hooks=hooks,
+                skills=skills,
+                approval=approvals,
+                enable_context_processing=False,
+                enable_subagent=True,
+                enable_extensions=False,
+                retry_policy=ModelRetryPolicy(
+                    max_attempts=config.model_retry_max_attempts,
+                    delay_seconds=config.model_retry_base_seconds,
+                ),
+                raise_errors=True,
+                extensions=self.extensions,
+                enable_cron=False,
+                session_origin="cron",
+                references=self.reference_service,
+                enable_references=self.reference_service is not None,
+            )
         runtime = AgentRuntime(
             config,
             approval=approvals,

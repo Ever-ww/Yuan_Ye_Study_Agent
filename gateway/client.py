@@ -14,6 +14,7 @@ from cron import (
     CronJob,
     CronJobCreateRequest,
     CronJobEditRequest,
+    CronPaperResearchPresetRequest,
     CronPreview,
     CronPreviewRequest,
     CronSchedule,
@@ -108,6 +109,17 @@ class GatewayClient:
     async def create_cron(self, request: CronJobCreateRequest) -> CronJob:
         value = await self._request(
             "POST", "/api/v1/cron/jobs", json=request.model_dump(mode="json"),
+        )
+        return CronJob.model_validate(value)
+
+    async def initialize_paper_research_cron(
+        self,
+        request: CronPaperResearchPresetRequest,
+    ) -> CronJob:
+        value = await self._request(
+            "POST",
+            "/api/v1/cron/presets/paper-research",
+            json=request.model_dump(mode="json"),
         )
         return CronJob.model_validate(value)
 

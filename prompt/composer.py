@@ -111,6 +111,9 @@ class SystemPromptComposer:
                 f"\nSession 初始化时间：{initialized_at}"
             ),
         ]
+        runtime_notice = str(getattr(self.memory, "runtime_notice", "")).strip()
+        if runtime_notice:
+            sections.insert(1, "# 当前运行模式\n" + runtime_notice)
         if summary:
             sections.append("# 当前会话压缩摘要\n" + summary)
         snapshot = SystemPromptSnapshot(

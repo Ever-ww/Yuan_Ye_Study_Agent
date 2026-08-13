@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from cron import (
     CronJobCreateRequest,
+    CronPaperResearchPresetRequest,
     CronSchedule,
     CronScheduleCalculator,
     CronScheduler,
@@ -20,6 +21,8 @@ from tool import AsyncToolRegistry
 from tools import CronJobTool
 from Agent import RuntimeConfig
 from Agent import AgentRuntime
+from Agent.runtime.ephemeral import EphemeralMemory
+from Agent.state import PersistenceContract
 from bootstrap import initialize_project
 from gateway.api import create_gateway_api
 from gateway.application import GatewayApplication
@@ -128,6 +131,35 @@ class CronStoreServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("损坏", status.last_error or "")
         self.assertEqual(self.store.path.read_text(encoding="utf-8"), "{broken")
 
+    async def test_paper_research_preset_is_idempotent_and_persisted(self) -> None:
+        first = await self.service.ensure_paper_research_preset(
+            project_id="project",
+            expression="0 9 * * 1",
+            timezone_name="Asia/Shanghai",
+        )
+        second = await self.service.ensure_paper_research_preset(
+            project_id="project",
+            expression="0 9 * * 1",
+            timezone_name="Asia/Shanghai",
+        )
+        self.assertEqual(first.job_id, second.job_id)
+        self.assertEqual(
+            first.preapproved_tools,
+            ("paper_library_download", "paper_library_save", "reference_write"),
+        )
+        self.assertEqual(len((await self.store.load()).jobs), 1)
+        self.assertIn(first.job_id, self.store.path.read_text(encoding="utf-8"))
+
+    async def test_cron_preapproval_rejects_recursive_and_self_modifying_tools(self) -> None:
+        with self.assertRaisesRegex(ValueError, "harness_evolve"):
+            await self.service.create(CronJobCreateRequest(
+                project_id="project",
+                name="unsafe",
+                prompt="modify yourself",
+                schedule=CronSchedule(kind="interval", interval_seconds=3600),
+                preapproved_tools=("harness_evolve",),
+            ))
+
     async def test_cronjob_tool_is_dynamic_and_cannot_enter_subagent_subset(self) -> None:
         tool = CronJobTool(self.service, "project")
         self.assertEqual(tool.risk_for({"action": "list"}), "read")
@@ -150,6 +182,26 @@ class CronStoreServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             broker.reset_run(token)
         self.assertEqual(published, [])
+
+    async def test_cron_uses_only_exact_durable_tool_grants(self) -> None:
+        async def publish(request):
+            raise AssertionError("unattended Cron must not publish an interactive approval")
+
+        async def authorize(job_id, tool_name):
+            return job_id == "job" and tool_name == "paper_library_save"
+
+        gateway_store = GatewayStore(self.root / ".yy" / "gateway-grant-test")
+        broker = GatewayApprovalBroker(
+            gateway_store,
+            publish,
+            cron_tool_authorizer=authorize,
+        )
+        token = broker.bind_run("run", "cron:job")
+        try:
+            self.assertTrue(await broker("paper_library_save", {}))
+            self.assertFalse(await broker("write", {}))
+        finally:
+            broker.reset_run(token)
 
     async def test_interactive_cron_command_uses_gateway_without_session_turn(self) -> None:
         class FakeClient:
@@ -241,14 +293,14 @@ class CronSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.submitted), 1)
 
         self.runs[run_id] = SimpleNamespace(
-            status="completed", session_id="fresh-session", error=None,
+            status="completed", session_id=None, error=None,
             finished_at=self.now.isoformat().replace("+00:00", "Z"),
         )
         await self.scheduler.tick()
         settled = (await self.store.load()).jobs[job.job_id]
         self.assertIsNone(settled.active_run_id)
         self.assertEqual(settled.run_count, 1)
-        self.assertEqual(settled.last_session_id, "fresh-session")
+        self.assertIsNone(settled.last_session_id)
 
     async def test_corrupt_state_does_not_prevent_scheduler_lifecycle(self) -> None:
         self.store.path.write_text("not-json", encoding="utf-8")
@@ -287,6 +339,11 @@ class CronGatewayApiTests(unittest.TestCase):
             )
             self.assertIn("cronjob", normal_runtime.tools.names())
             self.assertNotIn("cronjob", cron_runtime.tools.names())
+            self.assertIsInstance(cron_runtime.memory, EphemeralMemory)
+            self.assertEqual(cron_runtime.memory.prompt_context("any"), "")
+            cron_prompt = cron_runtime.prompts.system.open_session("ephemeral-check").content
+            self.assertIn("无记忆后台子 Agent", cron_prompt)
+            self.assertNotIn("search-summary-paper", cron_runtime.memory.prompt_context("any"))
             asyncio.run(normal_runtime.close())
             asyncio.run(cron_runtime.close())
             app = create_gateway_api(gateway, access_token="cron-test-token")
@@ -311,6 +368,26 @@ class CronGatewayApiTests(unittest.TestCase):
                     "count": 5,
                 })
                 self.assertEqual(len(preview.json()["next_runs"]), 5)
+                preset = client.post(
+                    "/api/v1/cron/presets/paper-research",
+                    headers=headers,
+                    json=CronPaperResearchPresetRequest(
+                        project_id=project.project_id,
+                        expression="0 9 * * 1",
+                        timezone="Asia/Shanghai",
+                    ).model_dump(mode="json"),
+                )
+                self.assertEqual(preset.status_code, 200, preset.text)
+                duplicate = client.post(
+                    "/api/v1/cron/presets/paper-research",
+                    headers=headers,
+                    json={
+                        "project_id": project.project_id,
+                        "expression": "0 9 * * 1",
+                        "timezone": "Asia/Shanghai",
+                    },
+                )
+                self.assertEqual(duplicate.json()["job_id"], preset.json()["job_id"])
                 blocked = client.delete(
                     f"/api/v1/projects/{project.project_id}", headers=headers,
                 )
@@ -318,13 +395,19 @@ class CronGatewayApiTests(unittest.TestCase):
                 removed = client.delete(f"/api/v1/cron/jobs/{job_id}", headers=headers)
                 self.assertEqual(removed.status_code, 200)
                 self.assertEqual(
+                    client.delete(
+                        f"/api/v1/cron/jobs/{preset.json()['job_id']}", headers=headers,
+                    ).status_code,
+                    200,
+                )
+                self.assertEqual(
                     client.delete(f"/api/v1/projects/{project.project_id}", headers=headers).status_code,
                     200,
                 )
 
 
 class CronGatewayRuntimeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_each_trigger_creates_fresh_session_and_inbox_result(self) -> None:
+    async def test_each_trigger_is_sessionless_and_still_creates_inbox_result(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             initialize_project(root)
@@ -353,7 +436,6 @@ class CronGatewayRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     prompt="scheduled hello",
                     schedule=CronSchedule(kind="interval", interval_seconds=3600),
                 ))
-                sessions: list[str] = []
                 for _ in range(2):
                     await gateway.run_cron(job.job_id)
                     run_id = (await gateway.cron_scheduler.tick())[0]
@@ -363,12 +445,13 @@ class CronGatewayRuntimeTests(unittest.IsolatedAsyncioTestCase):
                             break
                         await asyncio.sleep(0.01)
                     self.assertEqual(run.status, "completed")
-                    self.assertIsNotNone(run.session_id)
-                    sessions.append(str(run.session_id))
+                    self.assertIsNone(run.session_id)
+                    self.assertEqual(
+                        gateway.state_controller.state(run_id).persistence_contract,
+                        PersistenceContract.CONTROL_ONLY,
+                    )
                     await gateway.cron_scheduler.tick()
-                self.assertNotEqual(sessions[0], sessions[1])
                 inbox_runs = {item.run_id for item in gateway.store.list_inbox()}
-                self.assertTrue(set(sessions))
                 self.assertGreaterEqual(len(inbox_runs), 2)
             finally:
                 await gateway.pool.close()

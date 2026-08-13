@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from Agent import ExtensionLoader, RuntimeConfig
 from Agent.state import (
+    PersistenceContract,
     RecordRuntimeEventCommand,
     RecoveryDecisionCommand,
     TaskState,
@@ -25,6 +26,7 @@ from cron import (
     CronJob,
     CronJobCreateRequest,
     CronJobEditRequest,
+    CronPaperResearchPresetRequest,
     CronSchedule,
     CronScheduleCalculator,
     CronScheduler,
@@ -142,6 +144,7 @@ class GatewayApplication:
             tool_retry_max_seconds=config.tool_retry_max_seconds,
             write_gate=self.write_gate,
             harness_evolution_service=self.harness_evolution,
+            cron_tool_authorizer=self.cron_service.tool_preapproved,
         )
         self.recovery = RecoveryCoordinator(
             self.state_controller,
@@ -369,6 +372,19 @@ class GatewayApplication:
         self.cron_scheduler.wake()
         return result
 
+    async def initialize_paper_research_cron(
+        self,
+        request: CronPaperResearchPresetRequest,
+    ) -> CronJob:
+        self.store.project(request.project_id)
+        result = await self.cron_service.ensure_paper_research_preset(
+            project_id=request.project_id,
+            expression=request.expression,
+            timezone_name=request.timezone,
+        )
+        self.cron_scheduler.wake()
+        return result
+
     async def edit_cron(self, job_id: str, request: CronJobEditRequest) -> CronJob:
         current = await self.cron_service.get(job_id)
         self.store.project(current.project_id)
@@ -457,6 +473,7 @@ class GatewayApplication:
             task=task,
             idempotency_key=f"{workload.value}:{run_id}",
             request_hash=request_hash,
+            persistence_contract=PersistenceContract.CONTROL_ONLY,
         )
         if duplicate:
             return state
@@ -637,6 +654,7 @@ class GatewayApplication:
             task=job.prompt,
             idempotency_key=f"cron:{run_id}",
             request_hash=request_hash,
+            persistence_contract=PersistenceContract.CONTROL_ONLY,
         )
         run = self.store.run(state.run_id)
         if duplicate:
