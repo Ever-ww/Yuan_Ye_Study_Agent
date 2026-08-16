@@ -221,6 +221,18 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
   "stream": false,
   "max_steps": 8,
   "compression_threshold_tokens": 200000,
+  "model_context_window_tokens": 262144,
+  "compression_output_reserve_tokens": 16384,
+  "compression_safety_margin_tokens": 8192,
+  "compression_protect_last_n": 20,
+  "compression_target_ratio": 0.2,
+  "compression_hygiene_message_limit": 5000,
+  "compression_micro_compact": false,
+  "compression_provider": null,
+  "compression_model": null,
+  "compression_base_url": null,
+  "compression_api_key": null,
+  "compression_context_window_tokens": null,
   "tool_output_max_chars": 10000,
   "tool_output_head_ratio": 0.2,
   "tool_output_tail_ratio": 0.2,
@@ -327,7 +339,11 @@ Google Scholar 仍只是候选链接来源；工具不会绕过验证码、登�
 程序依次使用显式配置、`.yy/agent-home-migration.json` 中记录的 `source_root`，
 最后才使用当前 Python 源码根目录。它与普通聊天所操作的 `workspace_root` 是两个独立边界。
 
-`compression_threshold_tokens` 默认是 `200000`（200k tokens）。所有具备持久化 Memory 的 Runtime 会在每次 `model_before` 估算即将发送的完整 messages 与 Tool Schema；达到阈值时先压缩已经落盘的历史，再把当前新问题作为独立 `user` 消息写入新分段并调用模型。工具调用及结果会在下一次模型请求前一起参与检查。设为 `0` 可关闭自动压缩，但仍可手动使用 `/compress`。
+`compression_threshold_tokens` 默认是 `200000`（200k tokens），现在表示“预计输入 + 输出预留”的总请求触发线。每次 `model_before` 都会统计稳定 System Prompt、历史消息、当前 Query、临时 Runtime Context、排序后的 Tool Schema，以及默认 `16384` tokens 输出预留；达到触发线时先压缩，再重载消息并执行最终硬限制复核。默认模型窗口为 `262144`，另保留 `8192` tokens 安全余量。
+
+压缩会保护最近最多 `20` 条消息，但其总量不超过触发预算的 `20%`；当前用户 Query 永不进入摘要。受保护消息通过 `record_id + segment + SHA-256` 引用原始 Session 记录，不在新 JSONL 分段复制。消息数达到 `5000` 时也会强制预检。Provider 返回真实 input usage 后，Runtime 会以保守系数校准后续估算。明确的 context-length 拒绝最多触发一次应急压缩和一次新 Provider Attempt；仍失败则返回结构化错误，不无限重试。
+
+可通过 `compression_provider`、`compression_model`、`compression_base_url`、`compression_api_key` 和 `compression_context_window_tokens` 配置独立压缩模型；窗口不足或服务不可用时回退主模型。`compression_api_key` 只能位于本机 `settings.local.json`。`compression_micro_compact` 默认关闭，避免每 Turn 增加额外模型调用。将 `compression_threshold_tokens` 设为 `0` 可关闭自动压缩，但仍可手动使用 `/compress`；模型硬窗口检查仍然生效。
 
 `tool_output_max_chars` 默认是 `10000`。在下一次用户任务开始时，超过该阈值的历史工具输出仅在模型上下文中裁剪：保留前 `tool_output_head_ratio`（默认 20%）和后 `tool_output_tail_ratio`（默认 20%），中段替换为审计标记。当前任务内的工具结果始终完整；Session JSONL 与错误快照也始终保存完整原文。设为 `0` 可关闭此裁剪。
 

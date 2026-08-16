@@ -448,6 +448,13 @@ class CoreTests(unittest.TestCase):
             root = Path(value)
             defaults = load_runtime_config(root)
             self.assertEqual(defaults.compression_threshold_tokens, 200000)
+            self.assertEqual(defaults.model_context_window_tokens, 262144)
+            self.assertEqual(defaults.compression_output_reserve_tokens, 16384)
+            self.assertEqual(defaults.compression_safety_margin_tokens, 8192)
+            self.assertEqual(defaults.compression_protect_last_n, 20)
+            self.assertEqual(defaults.compression_target_ratio, 0.20)
+            self.assertEqual(defaults.compression_hygiene_message_limit, 5000)
+            self.assertFalse(defaults.compression_micro_compact)
             self.assertEqual(defaults.sandbox_checkpoint_limit, 17)
             self.assertEqual(defaults.sandbox_checkpoint_merged_branch_retention_days, 30)
             self.assertEqual(defaults.approval_timeout_seconds, 30)
@@ -758,11 +765,11 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(memory.active_filename(result.session_id).endswith("_002.jsonl"))
             payload = json.loads(compressor.messages[-1]["content"])
             roles = [record["role"] for record in payload["session_records"]]
-            self.assertEqual(roles, ["user", "assistant", "tool"])
-            self.assertIn("tool_calls", payload["session_records"][1])
+            self.assertEqual(roles, ["assistant", "tool"])
+            self.assertIn("tool_calls", payload["session_records"][0])
             self.assertEqual(
                 [message["role"] for message in provider.second_messages],
-                ["system"],
+                ["system", "user"],
             )
 
     def test_manual_compress_is_not_recorded_and_only_returns_status(self) -> None:

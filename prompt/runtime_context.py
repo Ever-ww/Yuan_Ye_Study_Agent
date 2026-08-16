@@ -99,12 +99,14 @@ class AgentDynamicContextBuilder:
         session_id: str,
         *,
         origin_refs: dict[str, str] | None = None,
+        track: bool = True,
     ) -> str:
         if AGENT_EPHEMERAL_CONTEXT_OPEN in original_query or AGENT_EPHEMERAL_CONTEXT_CLOSE in original_query:
             raise ValueError("The persisted user query contains a reserved Agent context marker")
         envelope = self.envelope(session_id, origin_refs=origin_refs)
-        self.last_envelope_hash = envelope.digest
-        self.injection_count += 1
+        if track:
+            self.last_envelope_hash = envelope.digest
+            self.injection_count += 1
         return (
             f"<user_query>\n{original_query}\n</user_query>\n\n"
             f"{AGENT_EPHEMERAL_CONTEXT_OPEN}\n{envelope.canonical_payload()}\n"

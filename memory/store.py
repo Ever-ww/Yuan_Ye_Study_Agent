@@ -328,6 +328,17 @@ class MemoryStore:
         """读取带时间戳的原始会话记录。"""
         return self.sessions.read_records(session_id)
 
+    def session_context_records(self, session_id: str) -> list[dict[str, object]]:
+        """读取当前摘要及其Hash校验的受保护尾部，供下一次压缩使用。"""
+        return self.sessions.context_records(session_id)
+
+    def protected_tail_refs(
+        self,
+        session_id: str,
+        records: list[dict[str, object]],
+    ) -> list[dict[str, str]]:
+        return self.sessions.make_record_refs(session_id, records)
+
     def profile_context(self, session_id: str | None = None) -> str:
         """返回全局 Profile 与指定会话独占的哈希 Profile。"""
         return self.profiles.load_for_session(session_id)
@@ -342,7 +353,7 @@ class MemoryStore:
         """判断当前分段是否包含可被摘要的对话或工具记录。"""
         return any(
             record.get("role") in {"user", "assistant", "tool"}
-            for record in self.session_records(session_id)
+            for record in self.session_context_records(session_id)
         )
 
     def active_filename(self, session_id: str) -> str:

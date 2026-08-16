@@ -17,6 +17,7 @@ from Agent.errors import AgentExecutionLimitError, AgentInvariantError
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models.errors import is_retryable_model_error
 from Agent.retry import ModelRetryPolicy
+from context_process import ContextBudgetEstimate, ContextBudgetExceeded
 from memory.persistence import SessionPersistenceProjection
 from tool import (
     AsyncToolRegistry,
@@ -54,6 +55,7 @@ class ReactLoop:
         question_tokens = _estimate_tokens(task)
         ephemeral_context_tokens: int | None = None
         task_started_at = time.perf_counter()
+        emergency_compression_count = 0
 
         successful_steps = 0
         context_loaded = False
@@ -74,6 +76,9 @@ class ReactLoop:
                     await self.hooks.emit(before)
                     compression_operation = before.data.pop("compression_operation", None)
                     render_ephemeral_context = before.data.pop("render_ephemeral_context", None)
+                    final_context_budget_check = before.data.pop("final_context_budget_check", None)
+                    recover_context_overflow = before.data.pop("recover_context_overflow", None)
+                    context_preflight = before.data.pop("context_preflight", None)
                     if callable(compression_operation):
                         yield RunEvent(
                             type=EventType.COMPRESSION_STARTED,
@@ -123,7 +128,16 @@ class ReactLoop:
                         raise AgentInvariantError("model_before 必须保留列表形式的 messages 和 tools")
                     schemas.sort(key=lambda schema: str(schema.get("name", "")))
                     context_loaded = True
-                    estimated_context = _estimate_tokens(json.dumps({"messages": messages, "tools": schemas}, ensure_ascii=False))
+                    final_budget = None
+                    if callable(final_context_budget_check):
+                        final_budget = final_context_budget_check(messages, schemas)
+                        if not isinstance(final_budget, ContextBudgetEstimate):
+                            raise AgentInvariantError("final context budget check必须返回ContextBudgetEstimate")
+                    estimated_context = (
+                        final_budget.estimated_input_tokens
+                        if isinstance(final_budget, ContextBudgetEstimate)
+                        else _estimate_tokens(json.dumps({"messages": messages, "tools": schemas}, ensure_ascii=False))
+                    )
                     during = HookEvent(point=HookPoint.MODEL_DURING, session_id=session_id, data={
                         "task": task, "messages": messages, "tools": schemas, "model": model,
                     })
@@ -197,10 +211,47 @@ class ReactLoop:
                         "retry_history": list(retry_history),
                     }
                     try:
-                        await self.hooks.emit(HookEvent(point=HookPoint.MODEL_AFTER, session_id=session_id, data=failure))
+                        failure_event = HookEvent(
+                            point=HookPoint.MODEL_AFTER,
+                            session_id=session_id,
+                            data=failure,
+                        )
+                        await self.hooks.emit(failure_event)
+                        failure = failure_event.data
                     except Exception as hook_error:
                         _attach_failure_context(hook_error, messages, schemas, model, retry_history)
                         raise
+                    if bool(failure.get("context_overflow")):
+                        retry_history[-1]["failure_kind"] = "context_overflow"
+                        if emergency_compression_count >= 1 or not callable(recover_context_overflow):
+                            error = ContextBudgetExceeded(
+                                "Provider仍拒绝压缩后的上下文；同一逻辑模型调用最多执行一次应急压缩",
+                            )
+                            _attach_failure_context(error, messages, schemas, model, retry_history)
+                            raise error from exc
+                        emergency_compression_count += 1
+                        yield RunEvent(
+                            type=EventType.COMPRESSION_STARTED,
+                            payload={"session_id": session_id, "reason": "provider_context_rejection"},
+                        )
+                        try:
+                            compression_result = await recover_context_overflow(messages, schemas)
+                        except Exception as recovery_error:
+                            error = recovery_error if isinstance(recovery_error, ContextBudgetExceeded) else ContextBudgetExceeded(
+                                f"Provider上下文拒绝后的应急压缩失败：{str(recovery_error) or type(recovery_error).__name__}",
+                            )
+                            _attach_failure_context(error, messages, schemas, model, retry_history)
+                            raise error from recovery_error
+                        compression = compression_result.payload()
+                        yield RunEvent(
+                            type=(
+                                EventType.CONTEXT_COMPRESSED
+                                if compression.get("status") == "compressed"
+                                else EventType.COMPRESSION_FALLBACK
+                            ),
+                            payload={**compression, "emergency_compression_count": emergency_compression_count},
+                        )
+                        continue
                     if is_retryable_model_error(exc) and attempt < self.retry_policy.max_attempts:
                         retry_delay = self.retry_policy.delay_seconds * (2 ** (attempt - 1))
                         yield RunEvent(type=EventType.MODEL_RETRY, payload={
@@ -215,10 +266,14 @@ class ReactLoop:
                         continue
                     _attach_failure_context(exc, messages, schemas, model, retry_history)
                     raise
-                if retry_history:
+                network_failures = [
+                    item for item in retry_history
+                    if item.get("failure_kind") != "context_overflow"
+                ]
+                if network_failures:
                     yield RunEvent(type=EventType.MODEL_RECONNECTED, payload={
                         "attempt": attempt,
-                        "recovered_failures": len(retry_history),
+                        "recovered_failures": len(network_failures),
                         "message": "模型网络连接已恢复，继续当前任务",
                     })
                 break
@@ -230,6 +285,13 @@ class ReactLoop:
                 question_tokens,
                 reply,
                 ephemeral_context_tokens=ephemeral_context_tokens,
+                context_budget=(
+                    final_budget.model_dump(mode="python")
+                    if isinstance(final_budget, ContextBudgetEstimate)
+                    else context_preflight if isinstance(context_preflight, dict)
+                    else None
+                ),
+                emergency_compression_count=emergency_compression_count,
             )
             model_calls.append(call_metric)
             after = HookEvent(point=HookPoint.MODEL_AFTER, session_id=session_id, data={
@@ -432,13 +494,15 @@ def _model_call_metric(
     reply: ModelReply,
     *,
     ephemeral_context_tokens: int | None = None,
+    context_budget: dict[str, Any] | None = None,
+    emergency_compression_count: int = 0,
 ) -> dict[str, Any]:
     """生成一次无编号模型 API 调用的审计指标。"""
     serialized_calls = json.dumps([{"name": call.name, "arguments": call.arguments} for call in reply.tool_calls], ensure_ascii=False)
     usage = reply.usage
     total_input = usage.input_tokens if usage and usage.input_tokens is not None else context_tokens
     cached_input = usage.cached_input_tokens if usage and usage.cached_input_tokens is not None else None
-    return {
+    metric = {
         "latency_ms": latency_ms,
         "input_tokens": {
             "context_total": total_input,
@@ -455,7 +519,11 @@ def _model_call_metric(
         },
         "output_tokens": usage.output_tokens if usage and usage.output_tokens is not None else _estimate_tokens(reply.text + serialized_calls),
         "output_tokens_source": "provider" if usage and usage.output_tokens is not None else "estimated",
+        "emergency_compression_count": emergency_compression_count,
     }
+    if context_budget is not None:
+        metric["context_budget"] = context_budget
+    return metric
 
 
 def _estimate_tokens(value: str) -> int:

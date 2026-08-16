@@ -213,6 +213,21 @@ class PromptComposer:
             origin_refs=origin_refs,
         )
 
+    def preview_provider_query(
+        self,
+        original_query: str,
+        session_id: str,
+        *,
+        origin_refs: dict[str, str] | None = None,
+    ) -> str:
+        """Render a token-budget preview without changing injection metrics or persistence."""
+        return self.dynamic_context.render(
+            original_query,
+            session_id,
+            origin_refs=origin_refs,
+            track=False,
+        )
+
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8").strip() if path.exists() else "（未配置）"

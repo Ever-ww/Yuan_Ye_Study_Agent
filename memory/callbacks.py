@@ -45,7 +45,10 @@ def register_memory_callbacks(
         if base_system is None:
             base_system = dict(messages[0])
             base_systems[event.session_id] = base_system
-        task = str(event.data.get("task", "")) if first_model_call else ""
+        task = str(event.data.get("task", ""))
+        render_provider_query = getattr(prompts, "render_provider_query", None)
+        preview_provider_query = getattr(prompts, "preview_provider_query", None)
+        origin_refs = _audit(event)
 
         def rebuild_messages(*, refresh_system: bool = False) -> list[dict[str, object]]:
             nonlocal base_system
@@ -71,10 +74,7 @@ def register_memory_callbacks(
                     audit=_audit(event),
                 )
             )
-            render_provider_query = getattr(prompts, "render_provider_query", None)
             if callable(render_provider_query):
-                origin_refs = _audit(event)
-
                 def render_ephemeral_context(target_messages: list[dict[str, object]]) -> None:
                     if not target_messages or target_messages[-1].get("role") != "user":
                         raise ValueError("Agent runtime context requires the current user query at the tail")
@@ -88,8 +88,29 @@ def register_memory_callbacks(
                     )
 
                 event.data["render_ephemeral_context"] = render_ephemeral_context
+                if callable(preview_provider_query):
+                    event.data["preview_ephemeral_context"] = lambda: preview_provider_query(
+                        str((current_user_message or {}).get("content", task)),
+                        event.session_id,
+                        origin_refs=origin_refs,
+                    )
         # Summary/Profile are provider-tail facts; compression must not rebuild the stable prefix.
         event.data["reload_messages_after_compression"] = lambda: rebuild_messages(refresh_system=False)
+
+        def rebuild_after_emergency() -> list[dict[str, object]]:
+            rebuilt = [dict(base_system), *memory.restore_messages(event.session_id)]
+            if callable(render_provider_query):
+                for message in reversed(rebuilt):
+                    if message.get("role") == "user" and message.get("content") == task:
+                        message["content"] = render_provider_query(
+                            task,
+                            event.session_id,
+                            origin_refs=origin_refs,
+                        )
+                        break
+            return rebuilt
+
+        event.data["reload_messages_after_emergency_compression"] = rebuild_after_emergency
 
     async def clear_context_state(event: HookEvent) -> None:
         base_systems.pop(event.session_id, None)

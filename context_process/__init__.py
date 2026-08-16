@@ -2,5 +2,21 @@
 
 from .compression import CompressionResult, ContextProcessor
 from .callbacks import register_context_callbacks
+from .budget import (
+    ContextBudgetController,
+    ContextBudgetEstimate,
+    ContextBudgetExceeded,
+    ContextCompressionPolicy,
+    ContextUsageCalibration,
+)
 
-__all__ = ["CompressionResult", "ContextProcessor", "register_context_callbacks"]
+__all__ = [
+    "CompressionResult",
+    "ContextBudgetController",
+    "ContextBudgetEstimate",
+    "ContextBudgetExceeded",
+    "ContextCompressionPolicy",
+    "ContextProcessor",
+    "ContextUsageCalibration",
+    "register_context_callbacks",
+]

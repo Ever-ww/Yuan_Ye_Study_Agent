@@ -152,7 +152,14 @@ class SessionStore:
     def restore(self, session_id: str) -> list[dict[str, Any]]:
         """恢复最新分段并移除时间戳、模型指标等审计字段。"""
         records: list[dict[str, Any]] = []
-        for value in self.read_records(session_id):
+        context_records = self.context_records(session_id)
+        summary = next((value for value in context_records if value.get("role") == "summary"), None)
+        protected_current = (
+            summary.get("protected_current_query_record_id")
+            if isinstance(summary, dict)
+            else None
+        )
+        for value in context_records:
             role, content = value.get("role"), value.get("content")
             if role == "user" and isinstance(content, str):
                 records.append({"role": "user", "content": content})
@@ -166,7 +173,79 @@ class SessionStore:
                 call_id, name = value.get("tool_call_id"), value.get("name")
                 if isinstance(call_id, str) and isinstance(name, str):
                     records.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": content})
-        return _normalize_recovered_history(_complete_incomplete_tool_chains(records))
+        return _normalize_recovered_history(
+            _complete_incomplete_tool_chains(records),
+            allow_trailing_user=isinstance(protected_current, str),
+        )
+
+    def context_records(self, session_id: str) -> list[dict[str, Any]]:
+        """Return the latest segment plus hash-verified tail records referenced by its summary."""
+        active = self.read_records(session_id)
+        summary = next((record for record in active if record.get("role") == "summary"), None)
+        refs = summary.get("protected_tail_refs", []) if isinstance(summary, dict) else []
+        if not isinstance(refs, list) or not refs:
+            return active
+        all_records = {
+            str(record.record_id): (filename, record.model_dump(mode="python", exclude_unset=True))
+            for filename, record in self.read_all_records_strict(session_id)
+            if record.record_id
+        }
+        protected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in refs:
+            if not isinstance(item, dict):
+                raise ValueError("protected_tail_refs 必须是对象数组")
+            record_id = item.get("record_id")
+            expected_hash = item.get("sha256")
+            expected_segment = item.get("segment")
+            if not isinstance(record_id, str) or not isinstance(expected_hash, str):
+                raise ValueError("protected tail 引用缺少 record_id 或 sha256")
+            if record_id in seen:
+                raise ValueError(f"protected tail 引用重复：{record_id}")
+            located = all_records.get(record_id)
+            if located is None:
+                raise ValueError(f"protected tail 记录不存在：{record_id}")
+            filename, record = located
+            if isinstance(expected_segment, str) and expected_segment != filename:
+                raise ValueError(f"protected tail segment 不匹配：{record_id}")
+            if self.record_digest(record) != expected_hash:
+                raise ValueError(f"protected tail 内容 Hash 不匹配：{record_id}")
+            if record.get("role") not in {"user", "assistant", "tool"}:
+                raise ValueError(f"protected tail 角色不可恢复：{record_id}")
+            seen.add(record_id)
+            protected.append(record)
+        current = [record for record in active if record.get("role") != "summary"]
+        return ([summary] if summary is not None else []) + protected + current
+
+    def make_record_refs(
+        self,
+        session_id: str,
+        records: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        """Build stable references without copying canonical Session records into a new segment."""
+        locations = {
+            str(record.record_id): (filename, record.model_dump(mode="python", exclude_unset=True))
+            for filename, record in self.read_all_records_strict(session_id)
+            if record.record_id
+        }
+        refs: list[dict[str, str]] = []
+        for requested in records:
+            record_id = requested.get("record_id")
+            if not isinstance(record_id, str) or record_id not in locations:
+                raise ValueError("受保护Session记录必须已经durable commit并具有record_id")
+            filename, canonical = locations[record_id]
+            if self.record_digest(canonical) != self.record_digest(requested):
+                raise ValueError(f"受保护Session记录与磁盘事实不一致：{record_id}")
+            refs.append({
+                "record_id": record_id,
+                "segment": filename,
+                "sha256": self.record_digest(canonical),
+            })
+        return refs
+
+    @classmethod
+    def record_digest(cls, record: dict[str, Any]) -> str:
+        return hashlib.sha256(cls._canonical_record(record).encode("utf-8")).hexdigest()
 
     def latest_summary(self, session_id: str) -> str:
         """读取当前分段首条摘要；摘要由唯一 System Prompt 承载。"""
@@ -373,7 +452,11 @@ def _complete_incomplete_tool_chains(
     return completed
 
 
-def _normalize_recovered_history(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _normalize_recovered_history(
+    records: list[dict[str, Any]],
+    *,
+    allow_trailing_user: bool = False,
+) -> list[dict[str, Any]]:
     """为旧版异常中断记录建立合法投影，避免连续 user 或 tool 后直接进入新任务。"""
     normalized: list[dict[str, Any]] = []
     marker = {
@@ -386,6 +469,6 @@ def _normalize_recovered_history(records: list[dict[str, Any]]) -> list[dict[str
             if previous_role in {"user", "tool"}:
                 normalized.append(dict(marker))
         normalized.append(message)
-    if normalized and normalized[-1].get("role") == "user":
+    if normalized and normalized[-1].get("role") == "user" and not allow_trailing_user:
         normalized.append(dict(marker))
     return normalized

@@ -53,6 +53,18 @@ class RuntimeConfig(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     profile: str = Field(default="general", min_length=1)
     compression_threshold_tokens: StrictInt = Field(default=200000, ge=0)
+    model_context_window_tokens: StrictInt = Field(default=262144, ge=1024)
+    compression_output_reserve_tokens: StrictInt = Field(default=16384, ge=0)
+    compression_safety_margin_tokens: StrictInt = Field(default=8192, ge=0)
+    compression_protect_last_n: StrictInt = Field(default=20, ge=0, le=1000)
+    compression_target_ratio: float = Field(default=0.20, gt=0.0, lt=1.0)
+    compression_hygiene_message_limit: StrictInt = Field(default=5000, ge=1)
+    compression_micro_compact: StrictBool = False
+    compression_provider: str | None = Field(default=None, min_length=1)
+    compression_model: str | None = Field(default=None, min_length=1)
+    compression_base_url: str | None = None
+    compression_api_key: str | None = None
+    compression_context_window_tokens: StrictInt | None = Field(default=None, ge=1024)
     tool_output_max_chars: StrictInt = Field(default=10000, ge=0)
     tool_output_head_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
     tool_output_tail_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
@@ -133,6 +145,12 @@ class RuntimeConfig(BaseModel):
             raise ValueError("reference_keyword_weight 与 reference_semantic_weight 之和必须大于 0")
         if self.reference_embedding_base_url and not self.reference_embedding_base_url.startswith(("http://", "https://")):
             raise ValueError("reference_embedding_base_url 只支持 http:// 或 https://")
+        if self.compression_base_url and not self.compression_base_url.startswith(("http://", "https://")):
+            raise ValueError("compression_base_url 只支持 http:// 或 https://")
+        if self.compression_safety_margin_tokens >= self.model_context_window_tokens:
+            raise ValueError("compression_safety_margin_tokens 必须小于 model_context_window_tokens")
+        if self.compression_output_reserve_tokens >= self.model_context_window_tokens:
+            raise ValueError("compression_output_reserve_tokens 必须小于 model_context_window_tokens")
         from croniter import croniter
         from zoneinfo import ZoneInfo
         from tzlocal import get_localzone_name
@@ -183,7 +201,12 @@ def load_runtime_config(
     ensure_project_initialized(selected_agent_root)
     values: dict[str, Any] = {}
     shared = _read_json(selected_agent_root / ".yy" / "settings.json")
-    sensitive_keys = {"api_key", "web_search_api_key", "reference_embedding_api_key"}.intersection(shared)
+    sensitive_keys = {
+        "api_key",
+        "web_search_api_key",
+        "reference_embedding_api_key",
+        "compression_api_key",
+    }.intersection(shared)
     if sensitive_keys:
         raise ValueError(
             "禁止在 .yy/settings.json 保存 API Key；请移至已忽略的 .yy/settings.local.json",

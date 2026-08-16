@@ -269,6 +269,7 @@ class GatewayHarnessEvolutionService:
             secrets=tuple(filter(None, (
                 self.config.api_key, self.config.web_search_api_key,
                 self.config.reference_embedding_api_key,
+                self.config.compression_api_key,
             ))),
         )
         snapshot = writer.capture(
