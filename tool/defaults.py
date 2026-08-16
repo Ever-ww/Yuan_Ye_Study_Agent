@@ -20,6 +20,8 @@ from tools.paper_library import (
 from tools.profile_read import ProfileReadTool
 from tools.read_file import ReadFileTool
 from tools.reference import ReferenceGetTool, ReferenceSearchTool, ReferenceWriteTool
+from tools.sandbox_checkpoint_branch import SandboxCheckpointBranchTool
+from tools.sandbox_checkpoint_history import SandboxCheckpointHistoryTool
 from tools.sandbox_rollback import SandboxRollbackTool
 from tools.search_workspace import SearchWorkspaceTool
 from tools.skill_install import SkillInstallTool
@@ -55,6 +57,7 @@ def default_tools(
     reference_search_mode: str = "rrf",
     agent_root: Path | None = None,
     paper_library_service: "PaperLibraryService | None" = None,
+    runtime_profile: str = "interactive",
 ) -> AsyncToolRegistry:
     """装配首期默认工具；项目根目录由执行上下文统一传入。"""
     selected_agent_root = (agent_root or project_root).resolve()
@@ -64,6 +67,8 @@ def default_tools(
         WriteTool(),
         BashTool(),
         SandboxRollbackTool(),
+        SandboxCheckpointHistoryTool(),
+        SandboxCheckpointBranchTool(),
         CalculatorTool(),
         SearchWorkspaceTool(),
         CurrentTimeTool(),
@@ -92,6 +97,12 @@ def default_tools(
         builtins.extend([SkillReadTool(skill_service), SkillInstallTool(skill_service)])
     if cron_service is not None and cron_project_id is not None:
         builtins.append(CronJobTool(cron_service, cron_project_id))
+    builtins = [
+        tool for tool in builtins
+        if runtime_profile in getattr(
+            tool, "runtime_profiles", ("interactive", "cron", "harness", "maintenance"),
+        )
+    ]
     registry = AsyncToolRegistry(builtins)
     if subagent_runner is not None:
         register_subagent(registry, subagent_runner)

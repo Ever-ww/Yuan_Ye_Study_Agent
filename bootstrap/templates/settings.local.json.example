@@ -20,6 +20,7 @@
   "tool_output_head_ratio": 0.2,
   "tool_output_tail_ratio": 0.2,
   "sandbox_checkpoint_limit": 17,
+  "sandbox_checkpoint_merged_branch_retention_days": 30,
   "gateway_port": 8765,
   "gateway_max_concurrent_runs": 4,
   "gateway_runtime_idle_seconds": 900,

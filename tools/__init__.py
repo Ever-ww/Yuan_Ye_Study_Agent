@@ -29,8 +29,14 @@ from .read_file import (
 )
 from .search_workspace import SearchWorkspaceTool
 from .skill_install import SkillInstallTool
+from .harness_capability import HarnessCapabilityTool
 from .harness_evolve import HarnessEvolveTool
+from .harness_manual import HarnessManualTool
+from .harness_error import HarnessErrorTool
+from .harness_dream import HarnessDreamTool
 from .skill_read import SkillReadTool
+from .sandbox_checkpoint_branch import SandboxCheckpointBranchTool
+from .sandbox_checkpoint_history import SandboxCheckpointHistoryTool
 from .sandbox_rollback import SandboxRollbackTool
 from .subagent import SubagentRunner, SubagentTool
 from .write import WriteTool
@@ -78,8 +84,14 @@ __all__ = [
     "DocumentSecurityError",
     "SearchWorkspaceTool",
     "SkillInstallTool",
+    "HarnessCapabilityTool",
     "HarnessEvolveTool",
+    "HarnessManualTool",
+    "HarnessErrorTool",
+    "HarnessDreamTool",
     "SkillReadTool",
+    "SandboxCheckpointBranchTool",
+    "SandboxCheckpointHistoryTool",
     "SandboxRollbackTool",
     "SubagentRunner",
     "SubagentTool",

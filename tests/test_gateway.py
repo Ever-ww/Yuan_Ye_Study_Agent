@@ -141,7 +141,12 @@ class TrackingRuntime(FakeRuntime):
 
 
 class FakeCodeSessions:
-    async def start(self, project_id: str, client_id: str):
+    async def start(
+        self, project_id: str, client_id: str, *,
+        origin_session_id: str | None = None, origin_run_id: str | None = None,
+        origin_context: dict | None = None,
+    ):
+        del origin_context
         return CodeSessionRecord(
             code_session_id="c" * 32,
             project_id=project_id,
@@ -152,6 +157,8 @@ class FakeCodeSessions:
             base_commit="a" * 40,
             status="active",
             verified_turns=0,
+            origin_session_id=origin_session_id,
+            origin_run_id=origin_run_id,
         )
 
     async def run_turn(self, session_id: str, client_id: str, task: str):

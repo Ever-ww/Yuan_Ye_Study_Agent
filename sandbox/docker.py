@@ -14,7 +14,10 @@ from backup.security import SensitiveEnvSanitizer
 
 from .checkpoint import CheckpointStore
 from .locks import WorkspaceLockManager
-from .models import BashResult, CheckpointRecord, RollbackResult, SandboxStatus
+from .models import (
+    BashResult, CheckpointBranchRecord, CheckpointMergeAttempt, CheckpointRecord,
+    RollbackResult, SandboxStatus,
+)
 
 
 class DockerUnavailableError(RuntimeError):
@@ -58,8 +61,17 @@ class SandboxSessionProtocol(Protocol):
     async def checkpoint_write(self, path: str) -> CheckpointRecord | None: ...
     async def checkpoint_edit(self, path: str) -> CheckpointRecord | None: ...
     async def restore_current(self) -> CheckpointRecord: ...
-    async def rollback(self, steps: int) -> RollbackResult: ...
+    async def rollback(
+        self, steps: int | None = None, *, sequence: int | None = None,
+        checkpoint_sha: str | None = None, merge_eligible: bool = True,
+        archive_reason: str = "user_rollback",
+    ) -> RollbackResult: ...
     def list_checkpoints(self) -> tuple[CheckpointRecord, ...]: ...
+    def list_checkpoint_branches(self) -> tuple[CheckpointBranchRecord, ...]: ...
+    def list_checkpoint_merge_attempts(self) -> tuple[CheckpointMergeAttempt, ...]: ...
+    async def set_checkpoint_branch_merge_eligibility(
+        self, branch_id: str, eligible: bool, reason: str,
+    ) -> CheckpointBranchRecord: ...
 
 
 class DockerSandboxSession:
@@ -236,14 +248,58 @@ class DockerSandboxSession:
             self._require_checkpoint_session()
             return await asyncio.to_thread(self.checkpoints.restore_current)
 
-    async def rollback(self, steps: int) -> RollbackResult:
+    async def rollback(
+        self,
+        steps: int | None = None,
+        *,
+        sequence: int | None = None,
+        checkpoint_sha: str | None = None,
+        merge_eligible: bool = True,
+        archive_reason: str = "user_rollback",
+    ) -> RollbackResult:
         async with self.file_locks.workspace_exclusive():
             async with self._operation_lock:
                 self._require_checkpoint_session()
-                return await asyncio.to_thread(self.checkpoints.rollback, steps)
+                if (
+                    steps is not None and sequence is None and checkpoint_sha is None
+                    and merge_eligible and archive_reason == "user_rollback"
+                ):
+                    # 保持旧测试替身和第三方Sandbox适配器的单参数调用兼容性。
+                    return await asyncio.to_thread(self.checkpoints.rollback, steps)
+                return await asyncio.to_thread(
+                    self.checkpoints.rollback,
+                    steps,
+                    sequence=sequence,
+                    checkpoint_sha=checkpoint_sha,
+                    merge_eligible=merge_eligible,
+                    archive_reason=archive_reason,
+                )
 
     def list_checkpoints(self) -> tuple[CheckpointRecord, ...]:
         return self.checkpoints.list()
+
+    def list_checkpoint_branches(self) -> tuple[CheckpointBranchRecord, ...]:
+        return self.checkpoints.list_branches()
+
+    def list_checkpoint_merge_attempts(self) -> tuple[CheckpointMergeAttempt, ...]:
+        """返回只读的 Dream 合并历史，供状态查询和人工恢复判断使用。"""
+        return self.checkpoints.list_merge_attempts()
+
+    async def set_checkpoint_branch_merge_eligibility(
+        self,
+        branch_id: str,
+        eligible: bool,
+        reason: str,
+    ) -> CheckpointBranchRecord:
+        """串行修改归档分支的 Dream 准入；不触碰工作区或项目 Git。"""
+        async with self._operation_lock:
+            self._require_checkpoint_session()
+            return await asyncio.to_thread(
+                self.checkpoints.set_merge_eligibility,
+                branch_id,
+                eligible,
+                reason,
+            )
 
     async def _require_docker(self) -> None:
         if shutil.which("docker") is None and self._run_command is _subprocess_runner:

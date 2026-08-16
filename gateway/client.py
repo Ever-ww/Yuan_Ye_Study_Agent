@@ -37,6 +37,11 @@ from gateway.models import (
     CodeSessionRecord,
     CodeTurnRequest,
     CodeTurnResult,
+    HarnessDreamDecisionRequest,
+    HarnessDreamFreezeRequest,
+    HarnessDreamRunRequest,
+    HarnessDreamRevertRequest,
+    HarnessEvolutionDecision,
     GatewayEventEnvelope,
     ProjectCreateRequest,
     RunCreateRequest,
@@ -170,6 +175,58 @@ class GatewayClient:
         )
         return DreamRollbackResult.model_validate(value)
 
+    async def harness_dream_status(self) -> dict[str, Any]:
+        return dict(await self._request("GET", "/api/v1/harness/dream/status"))
+
+    async def run_harness_dream(self, selected: str | None = None) -> dict[str, Any]:
+        payload = HarnessDreamRunRequest(
+            client_id=self.client_id, selected=selected, confirmed=True,
+        )
+        return dict(await self._request(
+            "POST", "/api/v1/harness/dream/run",
+            json=payload.model_dump(mode="json"), timeout=3600,
+        ))
+
+    async def freeze_harness_dream(self, reason: str) -> dict[str, Any]:
+        payload = HarnessDreamFreezeRequest(client_id=self.client_id, reason=reason)
+        return dict(await self._request(
+            "POST", "/api/v1/harness/dream/freeze", json=payload.model_dump(mode="json"),
+        ))
+
+    async def unfreeze_harness_dream(self) -> dict[str, Any]:
+        return dict(await self._request("POST", "/api/v1/harness/dream/unfreeze"))
+
+    async def decide_harness_dream(
+        self, operation_id: str, *, expected_revision: int, approved: bool, reason: str,
+    ) -> dict[str, Any]:
+        payload = HarnessDreamDecisionRequest(
+            client_id=self.client_id, expected_revision=expected_revision,
+            approved=approved, reason=reason,
+        )
+        return dict(await self._request(
+            "POST", f"/api/v1/harness/dream/{operation_id}/decision",
+            json=payload.model_dump(mode="json"), timeout=3600,
+        ))
+
+    async def create_harness_dream_revert(self, operation_id: str) -> dict[str, Any]:
+        payload = HarnessDreamRevertRequest(client_id=self.client_id, confirmed=True)
+        return dict(await self._request(
+            "POST", f"/api/v1/harness/dream/{operation_id}/revert",
+            json=payload.model_dump(mode="json"), timeout=3600,
+        ))
+
+    async def decide_harness_dream_revert(
+        self, proposal_id: str, *, expected_revision: int, approved: bool, reason: str,
+    ) -> dict[str, Any]:
+        payload = HarnessDreamDecisionRequest(
+            client_id=self.client_id, expected_revision=expected_revision,
+            approved=approved, reason=reason,
+        )
+        return dict(await self._request(
+            "POST", f"/api/v1/harness/dream/revert/{proposal_id}/decision",
+            json=payload.model_dump(mode="json"), timeout=3600,
+        ))
+
     async def sessions(self, project_id: str) -> list[dict[str, Any]]:
         return list(await self._request("GET", f"/api/v1/projects/{project_id}/sessions"))
 
@@ -237,8 +294,13 @@ class GatewayClient:
         value = await self._request("POST", "/api/v1/browser/code")
         return str(value["url"])
 
-    async def start_code_session(self, project_id: str) -> CodeSessionRecord:
-        payload = CodeSessionCreateRequest(project_id=project_id, client_id=self.client_id)
+    async def start_code_session(
+        self, project_id: str, origin_session_id: str | None = None,
+    ) -> CodeSessionRecord:
+        payload = CodeSessionCreateRequest(
+            project_id=project_id, client_id=self.client_id,
+            origin_session_id=origin_session_id,
+        )
         value = await self._request(
             "POST", "/api/v1/code/sessions", json=payload.model_dump(mode="json"),
         )
@@ -259,6 +321,15 @@ class GatewayClient:
             params={"client_id": self.client_id},
         )
         return CodeFinalizeResult.model_validate(value)
+
+    async def decide_harness_evolution(
+        self, proposal_id: str, confirmed: bool,
+    ) -> dict[str, Any]:
+        payload = HarnessEvolutionDecision(client_id=self.client_id, confirmed=confirmed)
+        return dict(await self._request(
+            "POST", f"/api/v1/harness/evolution/{proposal_id}/decision",
+            json=payload.model_dump(mode="json"), timeout=3600,
+        ))
 
     async def abort_code_session(self, session_id: str) -> CodeFinalizeResult:
         value = await self._request(

@@ -90,6 +90,7 @@ class AgentRuntime:
         paper_library: PaperLibraryService | None = None,
         enable_paper_library: bool = True,
         session_origin: Literal["interactive", "cron", "maintenance"] = "interactive",
+        runtime_profile: Literal["interactive", "cron", "harness", "maintenance"] | None = None,
     ) -> None:
         self.config = config or load_runtime_config()
         self.provider = provider or build_provider(
@@ -237,6 +238,7 @@ class AgentRuntime:
                 reference_service=self.references,
                 reference_search_mode=self.config.reference_search_mode,
                 paper_library_service=self.paper_library,
+                runtime_profile=runtime_profile or session_origin,
             )
             if enable_subagent:
                 runner = subagent_runner or RuntimeSubagentRunner(self.config, base_tools)

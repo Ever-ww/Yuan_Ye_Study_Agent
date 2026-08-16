@@ -21,6 +21,11 @@ from gateway.models import (
     BrowserExchangeRequest,
     CodeSessionCreateRequest,
     CodeTurnRequest,
+    HarnessDreamDecisionRequest,
+    HarnessDreamFreezeRequest,
+    HarnessDreamRunRequest,
+    HarnessDreamRevertRequest,
+    HarnessEvolutionDecision,
     ProjectCreateRequest,
     RunCreateRequest,
     RecoveryDecisionRequest,
@@ -258,6 +263,55 @@ def create_gateway_api(
     async def rollback_dream(payload: DreamRollbackRequest):
         return await gateway.rollback_dream(payload.run_id)
 
+    @app.get("/api/v1/harness/dream/status", dependencies=[Depends(authorize)])
+    async def harness_dream_status():
+        return gateway.harness_dream_status()
+
+    @app.post("/api/v1/harness/dream/run", dependencies=[Depends(authorize_write)])
+    async def run_harness_dream(payload: HarnessDreamRunRequest):
+        if not payload.confirmed:
+            raise HTTPException(400, "Explicit Harness Dream requires confirmed=true")
+        return await gateway.run_harness_dream(
+            payload.selected, automatic=False, actor=payload.client_id,
+        )
+
+    @app.post("/api/v1/harness/dream/freeze", dependencies=[Depends(authorize_write)])
+    async def freeze_harness_dream(payload: HarnessDreamFreezeRequest):
+        return gateway.freeze_harness_dream(actor=payload.client_id, reason=payload.reason)
+
+    @app.post("/api/v1/harness/dream/unfreeze", dependencies=[Depends(authorize_write)])
+    async def unfreeze_harness_dream():
+        return gateway.unfreeze_harness_dream()
+
+    @app.post(
+        "/api/v1/harness/dream/{operation_id}/decision",
+        dependencies=[Depends(authorize_write)],
+    )
+    async def decide_harness_dream(operation_id: str, payload: HarnessDreamDecisionRequest):
+        return await gateway.decide_harness_dream(operation_id, payload)
+
+    @app.post(
+        "/api/v1/harness/dream/{operation_id}/revert",
+        dependencies=[Depends(authorize_write)],
+    )
+    async def create_harness_dream_revert(
+        operation_id: str, payload: HarnessDreamRevertRequest,
+    ):
+        if not payload.confirmed:
+            raise HTTPException(400, "Harness Dream revert requires confirmed=true")
+        return await gateway.create_harness_dream_revert(
+            operation_id, actor=payload.client_id,
+        )
+
+    @app.post(
+        "/api/v1/harness/dream/revert/{proposal_id}/decision",
+        dependencies=[Depends(authorize_write)],
+    )
+    async def decide_harness_dream_revert(
+        proposal_id: str, payload: HarnessDreamDecisionRequest,
+    ):
+        return await gateway.decide_harness_dream_revert(proposal_id, payload)
+
     @app.get("/api/v1/projects/{project_id}/sessions", dependencies=[Depends(authorize)])
     async def list_sessions(project_id: str):
         return gateway.sessions(project_id)
@@ -340,6 +394,10 @@ def create_gateway_api(
     @app.get("/api/v1/code/sessions/{session_id}/events", dependencies=[Depends(authorize)])
     async def code_session_events(session_id: str, after_sequence: int = 0):
         return gateway.code_session_events(session_id, after_sequence)
+
+    @app.post("/api/v1/harness/evolution/{proposal_id}/decision", dependencies=[Depends(authorize_write)])
+    async def decide_harness_evolution(proposal_id: str, payload: HarnessEvolutionDecision):
+        return await gateway.decide_harness_evolution(proposal_id, payload)
 
     @app.get("/api/v1/runs/{run_id}/events", dependencies=[Depends(authorize)])
     async def run_events(run_id: str, after_sequence: int = 0):

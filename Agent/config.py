@@ -57,6 +57,7 @@ class RuntimeConfig(BaseModel):
     tool_output_head_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
     tool_output_tail_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
     sandbox_checkpoint_limit: StrictInt = Field(default=17, ge=1)
+    sandbox_checkpoint_merged_branch_retention_days: StrictInt = Field(default=30, ge=1, le=3650)
     gateway_port: StrictInt = Field(default=8765, ge=1024, le=65535)
     gateway_max_concurrent_runs: StrictInt = Field(default=4, ge=1, le=32)
     gateway_runtime_idle_seconds: StrictInt = Field(default=900, ge=30)
@@ -77,6 +78,9 @@ class RuntimeConfig(BaseModel):
     dream_timezone: str = Field(default="local", min_length=1, max_length=100)
     dream_model: str | None = Field(default=None, min_length=1)
     dream_batch_tokens: StrictInt = Field(default=12000, ge=1000, le=200000)
+    harness_dream_enabled: StrictBool = False
+    harness_dream_auto_restart: StrictBool = True
+    harness_dream_restart_wait_timeout_seconds: StrictInt = Field(default=300, ge=30, le=3600)
     backup_enabled: StrictBool = True
     backup_schedule: str = Field(default="0 4 * * *", min_length=1, max_length=100)
     backup_timezone: str = Field(default="local", min_length=1, max_length=100)

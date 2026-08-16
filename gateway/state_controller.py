@@ -104,7 +104,7 @@ class StateInvariantError(RuntimeError):
 class StateController:
     """以 SQLite 事务实现 command 幂等、CAS、FSM guard 和 Outbox。"""
 
-    SCHEMA_VERSION = 6
+    SCHEMA_VERSION = 7
 
     def __init__(
         self,
@@ -298,6 +298,70 @@ class StateController:
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(run_id) REFERENCES runs(run_id),
                     FOREIGN KEY(receipt_id) REFERENCES run_audit_receipts(receipt_id)
+                );
+                CREATE TABLE IF NOT EXISTS harness_dream_changesets (
+                    stable_key TEXT PRIMARY KEY,
+                    source_identity TEXT NOT NULL,
+                    dream_date TEXT NOT NULL,
+                    automatic_cycle INTEGER NOT NULL CHECK(automatic_cycle IN (0,1)),
+                    cutoff_at TEXT NOT NULL,
+                    changeset_hash TEXT NOT NULL,
+                    changeset_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN
+                        ('discovered','running','success','no_changes','deferred',
+                         'blocked','failed','unknown','restart_wait_timeout')),
+                    generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+                    active_run_id TEXT,
+                    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                    cursor_occurred_at TEXT,
+                    cursor_event_id TEXT,
+                    cursor_committed_at TEXT,
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(source_identity,dream_date,automatic_cycle)
+                );
+                CREATE TABLE IF NOT EXISTS harness_dream_generations (
+                    stable_key TEXT NOT NULL,
+                    generation INTEGER NOT NULL CHECK(generation >= 1),
+                    run_id TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    PRIMARY KEY(stable_key,generation),
+                    FOREIGN KEY(stable_key) REFERENCES harness_dream_changesets(stable_key)
+                );
+                CREATE TABLE IF NOT EXISTS harness_dream_freezes (
+                    source_identity TEXT NOT NULL,
+                    dream_date TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(source_identity,dream_date)
+                );
+                CREATE TABLE IF NOT EXISTS harness_dream_reverts (
+                    proposal_id TEXT PRIMARY KEY,
+                    stable_key TEXT NOT NULL,
+                    operation_run_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    proposal_json TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(stable_key) REFERENCES harness_dream_changesets(stable_key)
+                );
+                CREATE TABLE IF NOT EXISTS gateway_restart_requests (
+                    request_id TEXT PRIMARY KEY,
+                    stable_key TEXT NOT NULL UNIQUE,
+                    expected_pid INTEGER NOT NULL,
+                    expected_gateway_epoch TEXT NOT NULL,
+                    expected_commit TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(stable_key) REFERENCES harness_dream_changesets(stable_key)
                 );
                 """
             )
@@ -1081,6 +1145,461 @@ class StateController:
             ).fetchall()
         return [GatewayEventEnvelope.model_validate_json(row["event_json"], strict=True) for row in rows]
 
+    def claim_harness_dream(
+        self,
+        changeset: dict[str, Any],
+        *,
+        automatic_cycle: bool,
+        no_changes: bool = False,
+    ) -> tuple[dict[str, Any], bool]:
+        """Claim one immutable daily changeset before any Harness Run is created."""
+        if self.write_gate is not None:
+            self.write_gate.check_mutation_admission()
+        stable_key = str(changeset["stable_key"])
+        source_identity = str(changeset["source_identity"])
+        dream_date = str(changeset["date"])
+        timestamp = now_iso()
+        canonical = json.dumps(
+            AuditSanitizer.sanitize(changeset), ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"),
+        )
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM harness_dream_changesets WHERE "
+                "(source_identity=? AND dream_date=? AND automatic_cycle=?) OR stable_key=? "
+                "ORDER BY automatic_cycle DESC LIMIT 1",
+                (source_identity, dream_date, int(automatic_cycle), stable_key),
+            ).fetchone()
+            if existing is not None:
+                connection.commit()
+                return dict(existing), True
+            status = "no_changes" if no_changes else "discovered"
+            last_event = changeset.get("last_event") or {}
+            cursor_committed_at = timestamp if no_changes else None
+            connection.execute(
+                "INSERT INTO harness_dream_changesets("
+                "stable_key,source_identity,dream_date,automatic_cycle,cutoff_at,changeset_hash,"
+                "changeset_json,status,generation,active_run_id,revision,cursor_occurred_at,"
+                "cursor_event_id,cursor_committed_at,result_json,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?)",
+                (
+                    stable_key, source_identity, dream_date, int(automatic_cycle),
+                    str(changeset["cutoff_at"]), str(changeset["changeset_hash"]), canonical,
+                    status,
+                    str(last_event.get("occurred_at") or "") or None,
+                    str(last_event.get("merge_event_id") or "") or None,
+                    cursor_committed_at,
+                    json.dumps({"status": status}, ensure_ascii=False, sort_keys=True),
+                    timestamp, timestamp,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM harness_dream_changesets WHERE stable_key=?", (stable_key,),
+            ).fetchone()
+            connection.commit()
+            return dict(row), False
+
+    def start_harness_dream_generation(
+        self,
+        stable_key: str,
+        *,
+        run_id: str,
+        expected_revision: int,
+        allow_blocked: bool = False,
+    ) -> dict[str, Any]:
+        """CAS the global changeset lock and allocate a new immutable execution generation."""
+        if self.write_gate is not None:
+            self.write_gate.check_mutation_admission()
+        timestamp = now_iso()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM harness_dream_changesets WHERE stable_key=?", (stable_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(stable_key)
+            if int(row["revision"]) != expected_revision:
+                raise StateConflictError("Harness Dream changeset revision conflict")
+            if row["active_run_id"]:
+                raise StateConflictError("Harness Dream changeset already has an active generation")
+            allowed = {"discovered", "deferred", "failed", "restart_wait_timeout"}
+            if allow_blocked:
+                allowed.add("blocked")
+            if str(row["status"]) not in allowed:
+                raise StateConflictError(f"Harness Dream changeset cannot run from {row['status']}")
+            generation = int(row["generation"]) + 1
+            changed = connection.execute(
+                "UPDATE harness_dream_changesets SET status='running',generation=?,active_run_id=?,"
+                "revision=revision+1,updated_at=? WHERE stable_key=? AND revision=? AND active_run_id IS NULL",
+                (generation, run_id, timestamp, stable_key, expected_revision),
+            )
+            if changed.rowcount != 1:
+                raise StateConflictError("Harness Dream changeset CAS failed")
+            connection.execute(
+                "INSERT INTO harness_dream_generations VALUES(?,?,?,'running',NULL,?,NULL)",
+                (stable_key, generation, run_id, timestamp),
+            )
+            selected = connection.execute(
+                "SELECT * FROM harness_dream_changesets WHERE stable_key=?", (stable_key,),
+            ).fetchone()
+            connection.commit()
+            return dict(selected)
+
+    def finish_harness_dream_generation(
+        self,
+        stable_key: str,
+        *,
+        run_id: str,
+        expected_revision: int,
+        status: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Commit outcome, scan cursor, Gateway Event and Outbox in one transaction."""
+        allowed = {"success", "deferred", "blocked", "failed", "unknown"}
+        if status not in allowed:
+            raise ValueError(f"Unsupported Harness Dream outcome: {status}")
+        timestamp = now_iso()
+        result_json = json.dumps(
+            AuditSanitizer.sanitize(result), ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"),
+        )
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM harness_dream_changesets WHERE stable_key=?", (stable_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(stable_key)
+            if int(row["revision"]) != expected_revision or str(row["active_run_id"]) != run_id:
+                raise StateConflictError("Harness Dream completion CAS failed")
+            state = self._state_in(connection, run_id)
+            changeset = json.loads(str(row["changeset_json"]))
+            last_event = changeset.get("last_event") or {}
+            terminal_disposition = status != "unknown"
+            connection.execute(
+                "UPDATE harness_dream_changesets SET status=?,active_run_id=?,revision=revision+1,"
+                "cursor_occurred_at=?,cursor_event_id=?,cursor_committed_at=?,result_json=?,updated_at=? "
+                "WHERE stable_key=? AND revision=?",
+                (
+                    status, None if terminal_disposition else run_id,
+                    str(last_event.get("occurred_at") or "") or None,
+                    str(last_event.get("merge_event_id") or "") or None,
+                    timestamp if terminal_disposition else None,
+                    result_json, timestamp, stable_key, expected_revision,
+                ),
+            )
+            connection.execute(
+                "UPDATE harness_dream_generations SET status=?,result_json=?,completed_at=? "
+                "WHERE stable_key=? AND generation=? AND run_id=?",
+                (status, result_json, timestamp, stable_key, int(row["generation"]), run_id),
+            )
+            self._write_event(
+                connection, state, f"harness_dream_{status}",
+                {"stable_key": stable_key, "generation": int(row["generation"]), **result},
+            )
+            selected = connection.execute(
+                "SELECT * FROM harness_dream_changesets WHERE stable_key=?", (stable_key,),
+            ).fetchone()
+            connection.commit()
+            return dict(selected)
+
+    def harness_dream_changeset(
+        self, *, stable_key: str | None = None, dream_date: str | None = None,
+        source_identity: str | None = None,
+    ) -> dict[str, Any] | None:
+        if stable_key is None and dream_date is None:
+            raise ValueError("stable_key or dream_date is required")
+        with self._connection() as connection:
+            if stable_key is not None:
+                row = connection.execute(
+                    "SELECT * FROM harness_dream_changesets WHERE stable_key=?", (stable_key,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT * FROM harness_dream_changesets WHERE dream_date=? "
+                    "AND (? IS NULL OR source_identity=?) ORDER BY automatic_cycle DESC LIMIT 1",
+                    (dream_date, source_identity, source_identity),
+                ).fetchone()
+        return dict(row) if row is not None else None
+
+    def harness_dream_generations(self, stable_key: str) -> tuple[dict[str, Any], ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM harness_dream_generations WHERE stable_key=? ORDER BY generation",
+                (stable_key,),
+            ).fetchall()
+        return tuple(dict(row) for row in rows)
+
+    def harness_dream_changeset_for_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT c.* FROM harness_dream_generations g "
+                "JOIN harness_dream_changesets c USING(stable_key) WHERE g.run_id=?",
+                (run_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def latest_harness_dream_changeset(self, source_identity: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM harness_dream_changesets WHERE source_identity=? "
+                "ORDER BY dream_date DESC,created_at DESC LIMIT 1",
+                (source_identity,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def active_harness_dream_changesets(self) -> tuple[dict[str, Any], ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM harness_dream_changesets WHERE active_run_id IS NOT NULL "
+                "ORDER BY dream_date,created_at",
+            ).fetchall()
+        return tuple(dict(row) for row in rows)
+
+    def release_orphan_harness_dream_generation(
+        self, stable_key: str, *, expected_revision: int, run_id: str,
+    ) -> dict[str, Any]:
+        """Remove the only safe orphan: a claim committed before its Run existed."""
+        timestamp = now_iso()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM agent_states WHERE run_id=?", (run_id,),
+            ).fetchone() is not None:
+                raise StateConflictError("Harness Dream Run exists; orphan release is unsafe")
+            changed = connection.execute(
+                "UPDATE harness_dream_changesets SET status='discovered',active_run_id=NULL,"
+                "revision=revision+1,updated_at=? WHERE stable_key=? AND revision=? "
+                "AND active_run_id=? AND status='running'",
+                (timestamp, stable_key, expected_revision, run_id),
+            )
+            if changed.rowcount != 1:
+                raise StateConflictError("Harness Dream orphan release CAS failed")
+            connection.execute(
+                "UPDATE harness_dream_generations SET status='abandoned_before_run',"
+                "result_json=?,completed_at=? WHERE stable_key=? AND run_id=?",
+                (json.dumps({"reason": "run_not_created"}), timestamp, stable_key, run_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM harness_dream_changesets WHERE stable_key=?", (stable_key,),
+            ).fetchone()
+            connection.commit()
+        return dict(row)
+
+    def freeze_harness_dream(
+        self, source_identity: str, dream_date: str, *, actor: str, reason: str,
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO harness_dream_freezes VALUES(?,?,?,?,?) "
+                "ON CONFLICT(source_identity,dream_date) DO UPDATE SET "
+                "actor=excluded.actor,reason=excluded.reason,created_at=excluded.created_at",
+                (source_identity, dream_date, actor, reason, timestamp),
+            )
+            row = connection.execute(
+                "SELECT * FROM harness_dream_freezes WHERE source_identity=? AND dream_date=?",
+                (source_identity, dream_date),
+            ).fetchone()
+            connection.commit()
+        return dict(row)
+
+    def unfreeze_harness_dream(self, source_identity: str, dream_date: str) -> bool:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            removed = connection.execute(
+                "DELETE FROM harness_dream_freezes WHERE source_identity=? AND dream_date=?",
+                (source_identity, dream_date),
+            ).rowcount
+            connection.commit()
+        return bool(removed)
+
+    def harness_dream_freeze(self, source_identity: str, dream_date: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM harness_dream_freezes WHERE source_identity=? AND dream_date=?",
+                (source_identity, dream_date),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def create_harness_dream_revert(
+        self, proposal_id: str, stable_key: str, operation_run_id: str,
+        proposal: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        payload = json.dumps(
+            AuditSanitizer.sanitize(proposal), ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"),
+        )
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM harness_dream_reverts WHERE proposal_id=?", (proposal_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO harness_dream_reverts VALUES(?,?,?,?,?,0,?,?)",
+                    (proposal_id, stable_key, operation_run_id, "proposed", payload,
+                     timestamp, timestamp),
+                )
+                state = self._state_in(connection, operation_run_id)
+                self._write_event(
+                    connection, state, "harness_dream_revert_proposed",
+                    {"proposal_id": proposal_id, "stable_key": stable_key},
+                )
+            elif str(existing["proposal_json"]) != payload:
+                raise StateConflictError("Harness Dream revert proposal identity conflict")
+            selected = connection.execute(
+                "SELECT * FROM harness_dream_reverts WHERE proposal_id=?", (proposal_id,),
+            ).fetchone()
+            connection.commit()
+        return dict(selected)
+
+    def harness_dream_revert(self, proposal_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM harness_dream_reverts WHERE proposal_id=?", (proposal_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def decide_harness_dream_revert(
+        self, proposal_id: str, *, expected_revision: int, status: str,
+        proposal: dict[str, Any],
+    ) -> dict[str, Any]:
+        if status not in {"approved", "rejected", "blocked", "merged"}:
+            raise ValueError(f"Invalid Harness Dream revert status: {status}")
+        timestamp = now_iso()
+        payload = json.dumps(
+            AuditSanitizer.sanitize(proposal), ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"),
+        )
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                "UPDATE harness_dream_reverts SET status=?,proposal_json=?,revision=revision+1,"
+                "updated_at=? WHERE proposal_id=? AND revision=?",
+                (status, payload, timestamp, proposal_id, expected_revision),
+            )
+            if changed.rowcount != 1:
+                raise StateConflictError("Harness Dream revert decision revision conflict")
+            row = connection.execute(
+                "SELECT * FROM harness_dream_reverts WHERE proposal_id=?", (proposal_id,),
+            ).fetchone()
+            state = self._state_in(connection, str(row["operation_run_id"]))
+            self._write_event(
+                connection, state, f"harness_dream_revert_{status}",
+                {"proposal_id": proposal_id, "stable_key": str(row["stable_key"])},
+            )
+            connection.commit()
+        return dict(row)
+
+    def create_gateway_restart_request(
+        self, request_id: str, stable_key: str, *, expected_pid: int,
+        expected_gateway_epoch: str, expected_commit: str, request: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        payload = json.dumps(
+            AuditSanitizer.sanitize(request), ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"),
+        )
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO gateway_restart_requests VALUES(?,?,?,?,?,'pending',?,?,?) "
+                "ON CONFLICT(stable_key) DO NOTHING",
+                (request_id, stable_key, expected_pid, expected_gateway_epoch,
+                 expected_commit, payload, timestamp, timestamp),
+            )
+            row = connection.execute(
+                "SELECT * FROM gateway_restart_requests WHERE stable_key=?", (stable_key,),
+            ).fetchone()
+            connection.commit()
+        return dict(row)
+
+    def update_gateway_restart_request(self, request_id: str, status: str) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                "UPDATE gateway_restart_requests SET status=?,updated_at=? WHERE request_id=?",
+                (status, timestamp, request_id),
+            )
+            if changed.rowcount != 1:
+                raise KeyError(request_id)
+            row = connection.execute(
+                "SELECT * FROM gateway_restart_requests WHERE request_id=?", (request_id,),
+            ).fetchone()
+            connection.commit()
+        return dict(row)
+
+    def pending_gateway_restart_requests(self) -> tuple[dict[str, Any], ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM gateway_restart_requests WHERE status IN ('pending','waiting') "
+                "ORDER BY created_at",
+            ).fetchall()
+        return tuple(dict(row) for row in rows)
+
+    def mark_harness_dream_restart_timeout(
+        self, stable_key: str, request_id: str,
+    ) -> dict[str, Any]:
+        """Atomically stop automatic restart waiting and surface a durable alert."""
+        timestamp = now_iso()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM harness_dream_changesets WHERE stable_key=?", (stable_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(stable_key)
+            run_id = str(row["active_run_id"] or "")
+            if not run_id:
+                generation = connection.execute(
+                    "SELECT run_id FROM harness_dream_generations WHERE stable_key=? "
+                    "ORDER BY generation DESC LIMIT 1", (stable_key,),
+                ).fetchone()
+                run_id = str(generation["run_id"]) if generation is not None else ""
+            try:
+                result_payload = json.loads(str(row["result_json"] or "{}"))
+            except json.JSONDecodeError:
+                result_payload = {}
+            result_payload.update({
+                "status": "restart_wait_timeout",
+                "message": "Gateway restart safe-boundary wait timed out; restart manually",
+            })
+            result_json = json.dumps(
+                result_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            connection.execute(
+                "UPDATE gateway_restart_requests SET status='restart_wait_timeout',updated_at=? "
+                "WHERE request_id=?", (timestamp, request_id),
+            )
+            connection.execute(
+                "UPDATE harness_dream_changesets SET status='restart_wait_timeout',"
+                "result_json=?,revision=revision+1,updated_at=? WHERE stable_key=?",
+                (result_json, timestamp, stable_key),
+            )
+            if run_id:
+                connection.execute(
+                    "UPDATE inbox SET title=?,summary=?,is_read=0 WHERE run_id=?",
+                    ("Harness Dream restart timed out",
+                     "Source merge succeeded, but safe automatic Gateway restart timed out. "
+                     "Restart the Gateway manually.", run_id),
+                )
+                state = self._state_in(connection, run_id)
+                self._write_event(
+                    connection, state, "gateway_restart_wait_timeout",
+                    {"stable_key": stable_key, "request_id": request_id,
+                     "message": "Gateway restart safe-boundary wait timed out"},
+                )
+            selected = connection.execute(
+                "SELECT * FROM harness_dream_changesets WHERE stable_key=?", (stable_key,),
+            ).fetchone()
+            connection.commit()
+        return dict(selected)
+
     def operations(self, run_id: str) -> tuple[OperationRecord, ...]:
         with self._connection() as connection:
             rows = connection.execute(
@@ -1158,6 +1677,13 @@ class StateController:
                 "SELECT MIN(json_extract(attempt_json,'$.heartbeat_at')) FROM operation_attempts "
                 "WHERE status='running'",
             ).fetchone()[0]
+            dream_recovery = int(connection.execute(
+                "SELECT COUNT(*) FROM harness_dream_changesets WHERE status='unknown'",
+            ).fetchone()[0])
+            restart_pending = int(connection.execute(
+                "SELECT COUNT(*) FROM gateway_restart_requests WHERE status IN "
+                "('pending','waiting','requested')",
+            ).fetchone()[0])
         return {
             "sqlite_quick_check": quick_check,
             "outbox_backlog": outbox,
@@ -1166,6 +1692,8 @@ class StateController:
             "pending_approvals": pending,
             "expired_approvals": expired,
             "stalled_operations": stalled,
+            "harness_dream_recovery_required": dream_recovery,
+            "gateway_restart_pending": restart_pending,
             "max_state_age_seconds": _age_seconds(oldest_state, timestamp),
             "max_heartbeat_age_seconds": _age_seconds(oldest_heartbeat, timestamp),
             "migration_backup": str(self.migration_backup_path) if self.migration_backup_path else None,

@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import secrets
+import subprocess
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
@@ -13,11 +16,23 @@ from uuid import uuid4
 
 from Agent import ExtensionLoader, RuntimeConfig
 from Agent.state import (
+    CompleteOperationAttemptCommand,
+    CreateOperationWithAttemptCommand,
+    FailOperationAttemptCommand,
+    MarkOperationAttemptUnknownCommand,
+    OperationFailureKind,
+    OperationKind,
     PersistenceContract,
     RecordRuntimeEventCommand,
+    ReconcileOperationAttemptCommand,
+    ReconcileResult,
+    ReconcileStatus,
     RecoveryDecisionCommand,
+    RetryPolicySnapshot,
+    StartOperationAttemptCommand,
     TaskState,
     TerminalTarget,
+    ToolIdempotency,
     TransitionCommand,
     WorkloadKind,
     is_runnable,
@@ -34,6 +49,7 @@ from cron import (
     CronStore,
 )
 from gateway.code_sessions import CodeSessionManager
+from gateway.audit import AuditSanitizer
 from gateway.events import GatewayEventBus
 from gateway.outbox import OutboxDispatcher
 from gateway.recovery import RecoveryCoordinator
@@ -42,6 +58,11 @@ from gateway.models import (
     ApprovalDecision,
     CodeSessionCreateRequest,
     CodeTurnRequest,
+    HarnessEvolutionDecision,
+    HarnessDreamDecisionRequest,
+    HarnessDreamFreezeRequest,
+    HarnessDreamRunRequest,
+    HarnessDreamRevertRequest,
     ProjectRecord,
     RunCreateRequest,
     RecoveryDecisionRequest,
@@ -59,6 +80,13 @@ from reference import (
 )
 from skill import SkillInstallRequest, SkillService
 from dream import DreamRunResult, DreamScheduler, DreamService
+from gateway.harness_dream import (
+    HarnessDreamChangeSet,
+    HarnessDreamRunResult,
+    HarnessDreamStatus,
+    HarnessRevertProposal,
+)
+from gateway.restart import GatewayRestartCoordinator
 from backup import (
     AgentHomeMaintenanceCoordinator,
     AgentHomeWriteGate,
@@ -67,6 +95,7 @@ from backup import (
     SensitiveEnvSanitizer,
     assert_restore_inactive,
 )
+from sandbox import CheckpointDreamCoordinator
 
 
 class GatewayApplication:
@@ -125,7 +154,12 @@ class GatewayApplication:
             worker=self.reference_embedding_worker,
         )
         from gateway.harness_evolution import GatewayHarnessEvolutionService
-        self.harness_evolution = GatewayHarnessEvolutionService(config)
+        self.harness_evolution = GatewayHarnessEvolutionService(
+            config,
+            store=self.store,
+            state_controller=self.state_controller,
+        )
+        self._harness_dream_tick_lock = asyncio.Lock()
         self.pool = RuntimePool(
             agent_root=config.agent_root,
             store=self.store,
@@ -163,22 +197,44 @@ class GatewayApplication:
             config,
             excluded_sessions=self.store.automated_session_ids,
         )
+        self.checkpoint_dream = CheckpointDreamCoordinator(
+            config.workspace_root,
+            config.agent_root,
+            checkpoint_limit=config.sandbox_checkpoint_limit,
+            merged_ref_retention_days=config.sandbox_checkpoint_merged_branch_retention_days,
+            model_runner=self.dream_service.run_stateless_model,
+        )
         self.dream_scheduler = DreamScheduler(
             self.dream_service,
             self.pool.is_idle,
             self._record_dream_result,
             heartbeat_seconds=config.cron_heartbeat_seconds,
             run_day=lambda selected: self._execute_dream_day(selected, automatic=True),
+            run_checkpoint_day=self.checkpoint_dream.process_due,
+            run_harness_day=lambda selected: self.run_harness_dream(
+                selected.isoformat(), automatic=True, actor="dream:scheduler",
+            ),
             write_gate=self.write_gate,
         )
         self._browser_codes: dict[str, float] = {}
         self.code_sessions = CodeSessionManager(config)
+        from tools import HarnessDreamTool, HarnessErrorTool, HarnessManualTool
+        self.harness_manual_tool = HarnessManualTool(lambda: self.code_sessions)
+        self.harness_error_tool = HarnessErrorTool(self.harness_evolution)
+        self.harness_dream_tool = HarnessDreamTool(self)
         self.maintenance.register("runtime_pool", self.pool)
         self.maintenance.register("cron", self.cron_scheduler)
         self.maintenance.register("dream", self.dream_scheduler)
         self.maintenance.register("outbox", self.outbox)
         self.maintenance.register("reference_embedding", self.reference_embedding_worker)
         self.maintenance.register("harness", self.code_sessions)
+        self.restart_coordinator = GatewayRestartCoordinator(
+            agent_root=config.agent_root, source_root=source_root,
+            port=config.gateway_port, gateway_epoch=self.gateway_epoch,
+            state_controller=self.state_controller, maintenance=self.maintenance,
+            is_idle=self.pool.is_idle,
+            timeout_seconds=config.harness_dream_restart_wait_timeout_seconds,
+        )
         self.backup_service = BackupService(
             config.agent_root,
             coordinator=self.maintenance,
@@ -209,6 +265,8 @@ class GatewayApplication:
         try:
             await self.pool.start()
             await self.recovery.recover()
+            await self._recover_harness_dream_generations()
+            await self.restart_coordinator.recover_pending()
             await self.cron_scheduler.start()
             await self.dream_scheduler.start()
             await self.backup_scheduler.start()
@@ -224,6 +282,107 @@ class GatewayApplication:
             kind="manual",
             drain_timeout_seconds=self.config.backup_drain_timeout_seconds,
         )
+
+    async def _recover_harness_dream_generations(self) -> None:
+        """Reconcile active DREAM generations without ever replaying the Engine."""
+        for row in self.state_controller.active_harness_dream_changesets():
+            stable_key = str(row["stable_key"])
+            run_id = str(row["active_run_id"])
+            try:
+                state = self.state_controller.state(run_id)
+            except KeyError:
+                self.state_controller.release_orphan_harness_dream_generation(
+                    stable_key, expected_revision=int(row["revision"]), run_id=run_id,
+                )
+                continue
+            changeset = HarnessDreamChangeSet.model_validate_json(
+                str(row["changeset_json"]), strict=True,
+            )
+            operations = self.state_controller.operations(run_id)
+            operation = next(
+                (item for item in reversed(operations) if item.name == "harness_dream"), None,
+            )
+            if operation is None:
+                evidence = {"status": "UNKNOWN", "evidence": "missing Dream operation"}
+            elif operation.status.value == "completed" and operation.result:
+                try:
+                    evidence = json.loads(operation.result)
+                except json.JSONDecodeError:
+                    evidence = {"status": "UNKNOWN", "evidence": "invalid operation result"}
+            else:
+                evidence = await self.harness_evolution.reconcile_dream(
+                    changeset, generation=int(row["generation"]),
+                )
+                if operation is not None:
+                    attempt = self.state_controller.current_attempt(operation.operation_id)
+                    status = ReconcileStatus(str(evidence.get("status") or "UNKNOWN").lower())
+                    observed = json.dumps(
+                        evidence.get("evidence"), ensure_ascii=False,
+                        sort_keys=True, separators=(",", ":"),
+                    )
+                    state = self.state_controller.state(run_id)
+                    if attempt.status.value in {"running", "unknown"}:
+                        self.state_controller.apply(ReconcileOperationAttemptCommand(
+                            command_id=hashlib.sha256(
+                                f"dream-reconcile:{attempt.attempt_id}:{status.value}".encode(),
+                            ).hexdigest(),
+                            run_id=run_id, expected_revision=state.revision,
+                            gateway_epoch=self.gateway_epoch, attempt_id=attempt.attempt_id,
+                            result=ReconcileResult(
+                                status=status, evidence=observed,
+                                result_source="harness_dream_reconcile",
+                                observed_result=(
+                                    observed if status is ReconcileStatus.COMPLETED else None
+                                ),
+                                checked_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                            ),
+                        ))
+            reconciled = str(evidence.get("status") or "").upper()
+            if reconciled == "COMPLETED" or str(evidence.get("status")) == "merged":
+                raw_result = {
+                    "status": "merged", "message": "Recovered committed Harness Dream merge",
+                    "invocation_id": str((evidence.get("evidence") or {}).get("invocation_id", ""))
+                    if isinstance(evidence.get("evidence"), dict) else "",
+                    "merged_commit": str((evidence.get("evidence") or {}).get("merged_commit", ""))
+                    if isinstance(evidence.get("evidence"), dict) else "",
+                    "restart_required": True, "run_id": run_id,
+                }
+                outcome = "success"
+            elif reconciled == "NOT_APPLIED":
+                raw_result = {
+                    "status": "confirmed_failed", "message": "Dream Engine was not applied",
+                    "reconcile": evidence, "run_id": run_id,
+                }
+                outcome = "failed"
+            else:
+                raw_result = {
+                    "status": "unknown", "message": "Harness Dream requires recovery",
+                    "reconcile": evidence, "run_id": run_id,
+                }
+                outcome = "unknown"
+            current = self.state_controller.harness_dream_changeset(stable_key=stable_key)
+            assert current is not None
+            self.state_controller.finish_harness_dream_generation(
+                stable_key, run_id=run_id, expected_revision=int(current["revision"]),
+                status=outcome, result=raw_result,
+            )
+            self.outbox.wake()
+            if outcome == "unknown":
+                current_state = self.state_controller.state(run_id)
+                if current_state.task_state is not TaskState.RECOVERY_REQUIRED:
+                    self.state_controller.apply(TransitionCommand(
+                        command_id=uuid4().hex, run_id=run_id,
+                        expected_revision=current_state.revision,
+                        gateway_epoch=self.gateway_epoch,
+                        task_state=TaskState.RECOVERY_REQUIRED,
+                        reason="Recovered Harness Dream has unknown Git effect",
+                    ))
+            else:
+                await self._finish_workload(
+                    run_id,
+                    TerminalTarget.SUCCEEDED if outcome == "success" else TerminalTarget.FAILED,
+                    str(raw_result["message"]),
+                )
 
     async def _record_backup_result(self, status: str, payload: dict[str, object]) -> None:
         run_id = uuid4().hex
@@ -260,6 +419,7 @@ class GatewayApplication:
 
     async def close(self) -> None:
         try:
+            await self.restart_coordinator.close()
             await self.backup_scheduler.close()
             await self.dream_scheduler.close()
             await self.cron_scheduler.close()
@@ -270,13 +430,33 @@ class GatewayApplication:
             await self.outbox.close()
 
     async def start_code_session(self, request: CodeSessionCreateRequest):
-        self.store.project(request.project_id)
+        project = self.store.project(request.project_id)
+        origin_session_id = request.origin_session_id
+        if origin_session_id is None:
+            memory = MemoryStore(
+                self.config.memory_dir,
+                workspace_root=Path(project.path),
+                agent_root=self.config.agent_root,
+            )
+            origin_session_id = memory.create_session("")
         return await self._run_code_workload(
             WorkloadKind.CODE_SESSION_START,
             request.project_id,
             request.client_id,
             "启动 Coding Session",
-            lambda: self.code_sessions.start(request.project_id, request.client_id),
+            lambda run_id: self.harness_manual_tool.start(
+                request.project_id, request.client_id,
+                origin_session_id=origin_session_id,
+                origin_run_id=self._latest_origin_run_id(
+                    request.project_id, origin_session_id, fallback=run_id,
+                ),
+                origin_context=self._code_origin_context(
+                    request.project_id, origin_session_id,
+                    self._latest_origin_run_id(
+                        request.project_id, origin_session_id, fallback=run_id,
+                    ),
+                ),
+            ),
         )
 
     async def run_code_turn(self, session_id: str, request: CodeTurnRequest):
@@ -286,7 +466,7 @@ class GatewayApplication:
             project_id,
             request.client_id,
             request.task,
-            lambda: self.code_sessions.run_turn(session_id, request.client_id, request.task),
+            lambda _run_id: self.harness_manual_tool.turn(session_id, request.client_id, request.task),
         )
 
     async def finalize_code_session(self, session_id: str, client_id: str):
@@ -296,7 +476,7 @@ class GatewayApplication:
             project_id,
             client_id,
             "合并并结束 Coding Session",
-            lambda: self.code_sessions.finalize(session_id, client_id),
+            lambda _run_id: self.harness_manual_tool.finalize(session_id, client_id),
         )
 
     async def abort_code_session(self, session_id: str, client_id: str):
@@ -306,7 +486,7 @@ class GatewayApplication:
             project_id,
             client_id,
             "放弃 Coding Session",
-            lambda: self.code_sessions.abort(session_id, client_id),
+            lambda _run_id: self.harness_manual_tool.abort(session_id, client_id),
         )
 
     async def _run_code_workload(self, kind, project_id, client_id, task, operation):
@@ -320,12 +500,63 @@ class GatewayApplication:
         if not is_runnable(state, None, now=datetime.now().astimezone()):
             raise RuntimeError(f"Code workload 不可调度：{state.task_state.value}")
         try:
-            result = await operation()
+            result = await operation(state.run_id)
         except Exception as exc:
             await self._finish_workload(state.run_id, TerminalTarget.FAILED, str(exc) or type(exc).__name__)
             raise
         await self._finish_workload(state.run_id, TerminalTarget.SUCCEEDED, "Coding workload 完成")
         return result
+
+    def _latest_origin_run_id(
+        self, project_id: str, session_id: str, *, fallback: str,
+    ) -> str:
+        candidates = [
+            run for run in self.store.list_runs(project_id)
+            if run.session_id == session_id and run.workload_kind == WorkloadKind.CHAT.value
+        ]
+        # GatewayStore orders newest first.
+        return candidates[0].run_id if candidates else fallback
+
+    def _code_origin_context(
+        self, project_id: str, session_id: str, origin_run_id: str,
+    ) -> dict[str, object]:
+        project = self.store.project(project_id)
+        memory = MemoryStore(
+            self.config.memory_dir, workspace_root=Path(project.path),
+            agent_root=self.config.agent_root,
+        )
+        records = list(memory.session_records(session_id)) if memory.has_session(session_id) else []
+        canonical = json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return {
+            "origin_project_id": project_id,
+            "origin_session_id": session_id,
+            "origin_run_id": origin_run_id,
+            "session_record_ids": tuple(
+                str(record["record_id"]) for record in records if record.get("record_id")
+            ),
+            "session_records_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "context_summary": str(AuditSanitizer.sanitize("\n".join(
+                f"{record.get('role')}: {str(record.get('content') or '')[:1000]}"
+                for record in records[-8:] if record.get("role") in {"user", "assistant"}
+            )[-6000:])),
+            "trigger_evidence": {"entry": "/code"},
+        }
+
+    async def decide_harness_evolution(
+        self, proposal_id: str, decision: HarnessEvolutionDecision,
+    ) -> dict[str, object]:
+        proposal = self.harness_evolution.decide_proposal(
+            proposal_id, confirmed=decision.confirmed, client_id=decision.client_id,
+        )
+        if not decision.confirmed:
+            return proposal
+        result = await self._run_code_workload(
+            WorkloadKind.HARNESS_EVOLUTION,
+            str(proposal["origin_project_id"]), decision.client_id,
+            f"ERROR Harness Evolution: {proposal['task']}",
+            lambda _run_id: self.harness_error_tool.run_proposal(proposal_id),
+        )
+        return {**proposal, "result": result}
 
     async def _finish_workload(self, run_id: str, target: TerminalTarget, summary: str) -> None:
         state = self.state_controller.state(run_id)
@@ -418,12 +649,587 @@ class GatewayApplication:
     def dream_status(self):
         return self.dream_scheduler.status()
 
+    def harness_dream_status(self) -> HarnessDreamStatus:
+        scanner = self.harness_evolution.dream_scanner
+        today = datetime.now(scanner.zone).date().isoformat()
+        freeze = self.state_controller.harness_dream_freeze(scanner.source_identity, today)
+        latest = self.state_controller.latest_harness_dream_changeset(scanner.source_identity)
+        return HarnessDreamStatus(
+            enabled=self.config.harness_dream_enabled,
+            frozen=freeze is not None,
+            freeze=freeze,
+            latest=latest,
+        )
+
+    def freeze_harness_dream(self, *, actor: str, reason: str) -> dict[str, object]:
+        scanner = self.harness_evolution.dream_scanner
+        selected = datetime.now(scanner.zone).date().isoformat()
+        return self.state_controller.freeze_harness_dream(
+            scanner.source_identity, selected, actor=actor, reason=reason,
+        )
+
+    def unfreeze_harness_dream(self) -> dict[str, object]:
+        scanner = self.harness_evolution.dream_scanner
+        selected = datetime.now(scanner.zone).date().isoformat()
+        return {
+            "removed": self.state_controller.unfreeze_harness_dream(
+                scanner.source_identity, selected,
+            ),
+            "date": selected,
+        }
+
+    async def run_harness_dream(
+        self,
+        selected: str | None,
+        *,
+        automatic: bool,
+        actor: str,
+        allow_blocked: bool = False,
+        expected_revision: int | None = None,
+    ) -> HarnessDreamRunResult:
+        async with self._harness_dream_tick_lock:
+            scanner = self.harness_evolution.dream_scanner
+            now = datetime.now(scanner.zone)
+            if automatic and not self.config.harness_dream_enabled:
+                return HarnessDreamRunResult(
+                    status="no_changes", date=(now.date() - timedelta(days=1)).isoformat(),
+                    message="Harness Dream is disabled",
+                )
+            row: dict[str, object] | None = None
+            selected_date: date
+            if selected:
+                try:
+                    selected_date = date.fromisoformat(selected)
+                except ValueError:
+                    row = self.state_controller.harness_dream_changeset_for_run(selected)
+                    if row is None:
+                        row = self.state_controller.harness_dream_changeset(stable_key=selected)
+                    if row is None:
+                        raise KeyError(f"Unknown Harness Dream date or operation: {selected}")
+                    selected_date = date.fromisoformat(str(row["dream_date"]))
+            else:
+                selected_date = now.date() - timedelta(days=1)
+            if automatic:
+                freeze = self.state_controller.harness_dream_freeze(
+                    scanner.source_identity, now.date().isoformat(),
+                )
+                if freeze is not None:
+                    return HarnessDreamRunResult(
+                        status="frozen", date=selected_date.isoformat(),
+                        message=f"Harness Dream auto-run is frozen: {freeze['reason']}",
+                    )
+            if row is None:
+                row = self.state_controller.harness_dream_changeset(
+                    dream_date=selected_date.isoformat(), source_identity=scanner.source_identity,
+                )
+            if row is None:
+                changeset = self.harness_evolution.discover_dream_changes(
+                    selected_date, cutoff_at=now,
+                )
+                row, duplicate = self.state_controller.claim_harness_dream(
+                    changeset.model_dump(mode="json"),
+                    automatic_cycle=automatic,
+                    no_changes=not changeset.evidence,
+                )
+                if not changeset.evidence:
+                    return HarnessDreamRunResult(
+                        status="no_changes", date=changeset.date,
+                        stable_key=changeset.stable_key,
+                        message="No eligible Harness merge was committed before the Dream cutoff",
+                    )
+                if duplicate:
+                    changeset = HarnessDreamChangeSet.model_validate_json(
+                        str(row["changeset_json"]), strict=True,
+                    )
+            else:
+                changeset = HarnessDreamChangeSet.model_validate_json(
+                    str(row["changeset_json"]), strict=True,
+                )
+            current_status = str(row["status"])
+            if current_status in {
+                "success", "no_changes", "running", "unknown", "restart_wait_timeout",
+            }:
+                return self._harness_dream_existing_result(row)
+            if automatic and current_status != "discovered":
+                return self._harness_dream_existing_result(row)
+            if current_status == "blocked" and not allow_blocked:
+                return self._harness_dream_existing_result(row)
+            selected_revision = int(row["revision"])
+            if expected_revision is not None and selected_revision != expected_revision:
+                from gateway.state_controller import StateConflictError
+                raise StateConflictError("Harness Dream decision revision conflict")
+            run_id = uuid4().hex
+            locked = self.state_controller.start_harness_dream_generation(
+                changeset.stable_key,
+                run_id=run_id,
+                expected_revision=selected_revision,
+                allow_blocked=allow_blocked,
+            )
+            generation = int(locked["generation"])
+            state = self._begin_workload_run(
+                run_id=run_id,
+                workload=WorkloadKind.HARNESS_DREAM,
+                project_id="harness-dream",
+                client_id=actor,
+                task=f"Harness Dream {changeset.date} generation {generation}",
+            )
+            operation_id = hashlib.sha256(
+                f"{changeset.stable_key}:g{generation}:operation".encode("utf-8"),
+            ).hexdigest()
+            attempt_id = hashlib.sha256(f"{operation_id}:attempt:1".encode("utf-8")).hexdigest()
+            state = self.state_controller.apply(CreateOperationWithAttemptCommand(
+                command_id=hashlib.sha256(f"{operation_id}:create".encode()).hexdigest(),
+                run_id=run_id, expected_revision=state.revision,
+                gateway_epoch=self.gateway_epoch,
+                operation_id=operation_id, attempt_id=attempt_id,
+                turn_id=state.turn_id, kind=OperationKind.TOOL,
+                name="harness_dream",
+                stable_key=f"{changeset.stable_key}:g{generation}",
+                request_hash=changeset.changeset_hash,
+                idempotency=ToolIdempotency.NON_IDEMPOTENT,
+                side_effecting=True,
+                external_idempotency_key=changeset.stable_key,
+                retry_policy_snapshot=RetryPolicySnapshot(
+                    max_attempts=1, base_seconds=0.0, max_seconds=0.0,
+                    automatic=False, requires_reconcile=True,
+                    requires_human_confirmation=not automatic,
+                ),
+            )).state
+            state = self.state_controller.apply(StartOperationAttemptCommand(
+                command_id=hashlib.sha256(f"{attempt_id}:start".encode()).hexdigest(),
+                run_id=run_id, expected_revision=state.revision,
+                gateway_epoch=self.gateway_epoch, attempt_id=attempt_id,
+            )).state
+            try:
+                raw_result = await self.harness_evolution.execute_dream(
+                    changeset, generation=generation, automatic=automatic, run_id=run_id,
+                )
+                outcome = self._map_harness_dream_outcome(raw_result)
+                canonical = json.dumps(
+                    raw_result, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                )
+                state = self.state_controller.state(run_id)
+                if outcome == "unknown":
+                    state = self.state_controller.apply(MarkOperationAttemptUnknownCommand(
+                        command_id=hashlib.sha256(f"{attempt_id}:unknown".encode()).hexdigest(),
+                        run_id=run_id, expected_revision=state.revision,
+                        gateway_epoch=self.gateway_epoch, attempt_id=attempt_id,
+                        failure_reason="Harness Dream Git effect could not be proven",
+                    )).state
+                elif outcome == "failed":
+                    state = self.state_controller.apply(FailOperationAttemptCommand(
+                        command_id=hashlib.sha256(f"{attempt_id}:failed".encode()).hexdigest(),
+                        run_id=run_id, expected_revision=state.revision,
+                        gateway_epoch=self.gateway_epoch, attempt_id=attempt_id,
+                        failure_kind=OperationFailureKind.TERMINAL,
+                        failure_reason=str(raw_result.get("message") or "Harness Dream failed"),
+                    )).state
+                else:
+                    state = self.state_controller.apply(CompleteOperationAttemptCommand(
+                        command_id=hashlib.sha256(f"{attempt_id}:complete".encode()).hexdigest(),
+                        run_id=run_id, expected_revision=state.revision,
+                        gateway_epoch=self.gateway_epoch, attempt_id=attempt_id,
+                        result=canonical,
+                        result_hash=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+                        result_source="harness_dream_engine",
+                    )).state
+            except Exception as exc:
+                raw_result = {
+                    "status": "unknown", "message": str(exc) or type(exc).__name__,
+                    "invocation_id": hashlib.sha256(
+                        f"dream:{changeset.stable_key}:g{generation}".encode("utf-8"),
+                    ).hexdigest()[:32],
+                }
+                outcome = "unknown"
+                state = self.state_controller.state(run_id)
+                self.state_controller.apply(MarkOperationAttemptUnknownCommand(
+                    command_id=hashlib.sha256(f"{attempt_id}:exception-unknown".encode()).hexdigest(),
+                    run_id=run_id, expected_revision=state.revision,
+                    gateway_epoch=self.gateway_epoch, attempt_id=attempt_id,
+                    failure_reason=str(exc) or type(exc).__name__,
+                ))
+            raw_result["run_id"] = run_id
+            current_changeset = self.state_controller.harness_dream_changeset(
+                stable_key=changeset.stable_key,
+            )
+            assert current_changeset is not None
+            committed = self.state_controller.finish_harness_dream_generation(
+                changeset.stable_key,
+                run_id=run_id,
+                expected_revision=int(current_changeset["revision"]),
+                status=outcome,
+                result=raw_result,
+            )
+            self.outbox.wake()
+            if outcome == "unknown":
+                state = self.state_controller.state(run_id)
+                self.state_controller.apply(TransitionCommand(
+                    command_id=uuid4().hex, run_id=run_id,
+                    expected_revision=state.revision, gateway_epoch=self.gateway_epoch,
+                    task_state=TaskState.RECOVERY_REQUIRED,
+                    reason="Harness Dream merge effect requires reconciliation",
+                ))
+            else:
+                target = TerminalTarget.FAILED if outcome == "failed" else TerminalTarget.SUCCEEDED
+                await self._finish_workload(
+                    run_id, target, str(raw_result.get("message") or f"Harness Dream {outcome}"),
+                )
+            result = HarnessDreamRunResult(
+                status=outcome,
+                date=changeset.date,
+                stable_key=changeset.stable_key,
+                generation=int(committed["generation"]),
+                run_id=run_id,
+                message=str(raw_result.get("message") or f"Harness Dream {outcome}"),
+                invocation_id=str(raw_result.get("invocation_id") or ""),
+                merged_commit=str(raw_result.get("merged_commit") or ""),
+                changed_files=tuple(raw_result.get("changed_files") or ()),
+                restart_required=bool(raw_result.get("restart_required")),
+            )
+            if (
+                outcome == "success" and result.restart_required
+                and self.config.harness_dream_auto_restart
+            ):
+                await self._request_harness_dream_restart(result)
+            return result
+
+    @staticmethod
+    def _map_harness_dream_outcome(result: dict[str, object]) -> str:
+        status = str(result.get("status") or "")
+        if status in {"merged", "no_code_changes"}:
+            return "success"
+        if status == "deferred":
+            return "deferred"
+        if status in {"blocked_main_changed", "requires_broader_source_change"}:
+            return "blocked"
+        if status == "unknown":
+            return "unknown"
+        return "failed"
+
+    @staticmethod
+    def _harness_dream_existing_result(row: dict[str, object]) -> HarnessDreamRunResult:
+        raw = json.loads(str(row.get("result_json") or "{}"))
+        status = str(row["status"])
+        if status == "running":
+            status = "blocked"
+        return HarnessDreamRunResult(
+            status=status,
+            date=str(row["dream_date"]),
+            stable_key=str(row["stable_key"]),
+            generation=int(row["generation"]),
+            run_id=str(row.get("active_run_id") or raw.get("run_id") or ""),
+            message=str(raw.get("message") or f"Harness Dream is {row['status']}"),
+            invocation_id=str(raw.get("invocation_id") or ""),
+            merged_commit=str(raw.get("merged_commit") or ""),
+            changed_files=tuple(raw.get("changed_files") or ()),
+            restart_required=bool(raw.get("restart_required")),
+        )
+
+    async def decide_harness_dream(
+        self, operation_id: str, request: HarnessDreamDecisionRequest,
+    ) -> HarnessDreamRunResult | dict[str, object]:
+        row = self.state_controller.harness_dream_changeset_for_run(operation_id)
+        if row is None:
+            raise KeyError(operation_id)
+        if int(row["revision"]) != request.expected_revision:
+            from gateway.state_controller import StateConflictError
+            raise StateConflictError("Harness Dream decision revision conflict")
+        if str(row["status"]) == "unknown":
+            if not request.approved:
+                return {"status": "unknown", "approved": False, "reason": request.reason}
+            changeset = HarnessDreamChangeSet.model_validate_json(
+                str(row["changeset_json"]), strict=True,
+            )
+            reconciled = await self.harness_evolution.reconcile_dream(
+                changeset, generation=int(row["generation"]),
+            )
+            reconcile_status = str(reconciled.get("status") or "UNKNOWN").upper()
+            if reconcile_status == "UNKNOWN":
+                return {"status": "unknown", "approved": True, "reconcile": reconciled}
+            run_id = str(row["active_run_id"])
+            operation = next(
+                item for item in reversed(self.state_controller.operations(run_id))
+                if item.name == "harness_dream"
+            )
+            attempt = self.state_controller.current_attempt(operation.operation_id)
+            state = self.state_controller.state(run_id)
+            observed = json.dumps(
+                reconciled.get("evidence"), ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"),
+            )
+            if attempt.status.value in {"running", "unknown"}:
+                self.state_controller.apply(ReconcileOperationAttemptCommand(
+                    command_id=hashlib.sha256(
+                        f"dream-decision:{attempt.attempt_id}:{reconcile_status}".encode(),
+                    ).hexdigest(),
+                    run_id=run_id, expected_revision=state.revision,
+                    gateway_epoch=self.gateway_epoch, attempt_id=attempt.attempt_id,
+                    result=ReconcileResult(
+                        status=ReconcileStatus(reconcile_status.lower()),
+                        evidence=observed, result_source="harness_dream_reconcile",
+                        observed_result=(
+                            observed if reconcile_status == "COMPLETED" else None
+                        ),
+                        checked_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                    ),
+                ))
+            outcome = "success" if reconcile_status == "COMPLETED" else "failed"
+            raw_result = {
+                "status": "merged" if outcome == "success" else "confirmed_failed",
+                "message": f"Harness Dream reconcile: {reconcile_status}",
+                "reconcile": reconciled, "run_id": run_id,
+                "merged_commit": (
+                    str(reconciled.get("evidence", {}).get("merged_commit", ""))
+                    if isinstance(reconciled.get("evidence"), dict) else ""
+                ),
+                "restart_required": outcome == "success",
+            }
+            current = self.state_controller.harness_dream_changeset(
+                stable_key=str(row["stable_key"]),
+            )
+            assert current is not None
+            committed = self.state_controller.finish_harness_dream_generation(
+                str(row["stable_key"]), run_id=run_id,
+                expected_revision=int(current["revision"]), status=outcome,
+                result=raw_result,
+            )
+            await self._finish_workload(
+                run_id,
+                TerminalTarget.SUCCEEDED if outcome == "success" else TerminalTarget.FAILED,
+                str(raw_result["message"]),
+            )
+            result = self._harness_dream_existing_result(committed)
+            if outcome == "success" and result.restart_required:
+                await self._request_harness_dream_restart(result)
+            return result
+        if str(row["status"]) != "blocked":
+            raise RuntimeError("Only a BLOCKED or UNKNOWN Harness Dream can be decided")
+        if not request.approved:
+            return {"status": "blocked", "approved": False, "reason": request.reason}
+        return await self.run_harness_dream(
+            operation_id, automatic=False, actor=request.client_id,
+            allow_blocked=True, expected_revision=request.expected_revision,
+        )
+
+    async def _request_harness_dream_restart(self, result: HarnessDreamRunResult) -> None:
+        if not result.stable_key or not result.merged_commit:
+            raise RuntimeError("Harness Dream restart requires stable_key and merged_commit")
+        await self.restart_coordinator.request(
+            stable_key=result.stable_key, expected_commit=result.merged_commit,
+            run_id=result.run_id,
+        )
+
+    async def create_harness_dream_revert(
+        self, operation_id: str, *, actor: str,
+    ) -> dict[str, object]:
+        del actor  # actor is carried by the authenticated Gateway request/audit boundary.
+        row = self.state_controller.harness_dream_changeset_for_run(operation_id)
+        if row is None:
+            row = self.state_controller.harness_dream_changeset(stable_key=operation_id)
+        if row is None or str(row["status"]) != "success":
+            raise RuntimeError("Only a successfully merged Harness Dream can be reverted")
+        result = json.loads(str(row.get("result_json") or "{}"))
+        merged_commit = str(result.get("merged_commit") or "")
+        if not merged_commit:
+            raise RuntimeError("Harness Dream merge receipt has no merged commit")
+        proposal_id = hashlib.sha256(
+            f"dream-revert:{row['stable_key']}:{merged_commit}".encode("utf-8"),
+        ).hexdigest()[:32]
+        existing = self.state_controller.harness_dream_revert(proposal_id)
+        if existing is not None:
+            return {**existing, "proposal": json.loads(str(existing["proposal_json"]))}
+        source_identity = self.harness_evolution.dream_scanner.source_identity
+        worktree = (
+            self.config.agent_root / ".yy" / "harness-evolution" / "reverts"
+            / source_identity / proposal_id
+        )
+        placeholder = HarnessRevertProposal(
+            proposal_id=proposal_id, stable_key=str(row["stable_key"]),
+            operation_run_id=operation_id, source_identity=source_identity,
+            merged_commit=merged_commit, base_head="", candidate_commit="",
+            candidate_branch=f"harness-dream-revert/{proposal_id[:12]}",
+            worktree_path=str(worktree), status="proposed",
+            validation_summary=("candidate preparation pending",),
+            created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+        )
+        claimed = self.state_controller.create_harness_dream_revert(
+            proposal_id, str(row["stable_key"]), operation_id,
+            placeholder.model_dump(mode="json"),
+        )
+        try:
+            proposal = await asyncio.to_thread(
+                self._build_harness_dream_revert,
+                proposal_id, str(row["stable_key"]), operation_id, merged_commit,
+            )
+        except Exception as exc:
+            proposal = placeholder.model_copy(update={
+                "status": "blocked",
+                "validation_summary": (
+                    f"candidate preparation failed: {str(exc) or type(exc).__name__}",
+                ),
+            })
+        stored = self.state_controller.decide_harness_dream_revert(
+            proposal_id, expected_revision=int(claimed["revision"]),
+            status=proposal.status, proposal=proposal.model_dump(mode="json"),
+        )
+        self.outbox.wake()
+        return {**stored, "proposal": proposal.model_dump(mode="json")}
+
+    def _build_harness_dream_revert(
+        self, proposal_id: str, stable_key: str, operation_id: str, merged_commit: str,
+    ) -> HarnessRevertProposal:
+        source_root = (self.config.coding_source_root or Path(__file__).resolve().parents[1]).resolve()
+        env = SensitiveEnvSanitizer.subprocess_env({"GIT_TERMINAL_PROMPT": "0"})
+
+        def git(*arguments: str, cwd: Path = source_root, check: bool = True) -> str:
+            completed = subprocess.run(
+                ["git", *arguments], cwd=cwd, check=False,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=300,
+            )
+            if check and completed.returncode != 0:
+                detail = completed.stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(detail or f"git {' '.join(arguments)} failed")
+            return completed.stdout.decode("utf-8", errors="replace").strip()
+
+        if git("status", "--porcelain"):
+            raise RuntimeError("Source repository is dirty; revert candidate was deferred")
+        base_head = git("rev-parse", "HEAD")
+        if subprocess.run(
+            ["git", "merge-base", "--is-ancestor", merged_commit, base_head],
+            cwd=source_root, env=env, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+        ).returncode != 0:
+            raise RuntimeError("Merged Dream commit is not an ancestor of current HEAD")
+        source_identity = self.harness_evolution.dream_scanner.source_identity
+        worktree = (
+            self.config.agent_root / ".yy" / "harness-evolution" / "reverts"
+            / source_identity / proposal_id
+        )
+        branch = f"harness-dream-revert/{proposal_id[:12]}"
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        git("worktree", "add", "-b", branch, str(worktree), base_head)
+        status = "proposed"
+        validations: list[str] = []
+        candidate_commit = ""
+        try:
+            revert = subprocess.run(
+                ["git", "revert", "--no-commit", merged_commit], cwd=worktree,
+                env=env, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=300,
+            )
+            if revert.returncode != 0:
+                status = "blocked"
+                validations.append("git revert conflict")
+            else:
+                commands = (
+                    ([sys.executable, "-m", "compileall", "-q", "Agent", "gateway", "tool", "tools"], "compileall"),
+                    ([sys.executable, "-m", "pytest", "-q"], "pytest"),
+                    ([sys.executable, "-m", "unittest", "-q"], "unittest"),
+                    (["uv", "lock", "--check"], "uv lock --check"),
+                    (["git", "diff", "--check"], "git diff --check"),
+                )
+                for command, label in commands:
+                    completed = subprocess.run(
+                        command, cwd=worktree, env=env, check=False,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1800,
+                    )
+                    validations.append(f"{label}: {completed.returncode}")
+                    if completed.returncode != 0:
+                        status = "blocked"
+                        break
+                if status == "proposed":
+                    git("add", "-A", cwd=worktree)
+                    git("commit", "-m", f"revert: Harness Dream {merged_commit[:12]}", cwd=worktree)
+                    candidate_commit = git("rev-parse", "HEAD", cwd=worktree)
+        except Exception:
+            # Preserve the worktree and Git evidence for operator inspection.
+            raise
+        return HarnessRevertProposal(
+            proposal_id=proposal_id, stable_key=stable_key,
+            operation_run_id=operation_id, source_identity=source_identity,
+            merged_commit=merged_commit, base_head=base_head,
+            candidate_commit=candidate_commit, candidate_branch=branch,
+            worktree_path=str(worktree), status=status,
+            validation_summary=tuple(validations),
+            created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+        )
+
+    async def decide_harness_dream_revert(
+        self, proposal_id: str, request: HarnessDreamDecisionRequest,
+    ) -> dict[str, object]:
+        row = self.state_controller.harness_dream_revert(proposal_id)
+        if row is None:
+            raise KeyError(proposal_id)
+        if int(row["revision"]) != request.expected_revision:
+            from gateway.state_controller import StateConflictError
+            raise StateConflictError("Harness Dream revert decision revision conflict")
+        if str(row["status"]) not in {"proposed", "blocked", "approved"}:
+            raise RuntimeError("Harness Dream revert proposal is already decided")
+        proposal = HarnessRevertProposal.model_validate_json(
+            str(row["proposal_json"]), strict=True,
+        )
+        if not request.approved:
+            if str(row["status"]) == "approved":
+                raise RuntimeError("Approved revert intent cannot be reversed without recovery")
+            updated = proposal.model_copy(update={"status": "rejected"})
+            stored = self.state_controller.decide_harness_dream_revert(
+                proposal_id, expected_revision=request.expected_revision,
+                status="rejected", proposal=updated.model_dump(mode="json"),
+            )
+            self.outbox.wake()
+            return stored
+        if proposal.status not in {"proposed", "approved"} or not proposal.candidate_commit:
+            raise RuntimeError("Blocked revert candidate must be repaired before approval")
+        revision = request.expected_revision
+        if proposal.status != "approved":
+            intent = proposal.model_copy(update={"status": "approved"})
+            intent_row = self.state_controller.decide_harness_dream_revert(
+                proposal_id, expected_revision=revision, status="approved",
+                proposal=intent.model_dump(mode="json"),
+            )
+            revision = int(intent_row["revision"])
+            proposal = intent
+        updated = await asyncio.to_thread(self._merge_harness_dream_revert, proposal)
+        stored = self.state_controller.decide_harness_dream_revert(
+            proposal_id, expected_revision=revision,
+            status=updated.status, proposal=updated.model_dump(mode="json"),
+        )
+        self.outbox.wake()
+        return {**stored, "proposal": updated.model_dump(mode="json")}
+
+    def _merge_harness_dream_revert(
+        self, proposal: HarnessRevertProposal,
+    ) -> HarnessRevertProposal:
+        source_root = (self.config.coding_source_root or Path(__file__).resolve().parents[1]).resolve()
+        env = SensitiveEnvSanitizer.subprocess_env({"GIT_TERMINAL_PROMPT": "0"})
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=source_root, env=env,
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+        ).stdout.decode("utf-8", errors="replace").strip()
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=source_root, env=env,
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+        ).stdout.decode().strip()
+        if not status and head == proposal.candidate_commit:
+            return proposal.model_copy(update={"status": "merged"})
+        if status or head != proposal.base_head:
+            return proposal.model_copy(update={"status": "blocked"})
+        merged = subprocess.run(
+            ["git", "merge", "--ff-only", proposal.candidate_commit],
+            cwd=source_root, env=env, check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300,
+        )
+        if merged.returncode != 0:
+            return proposal.model_copy(update={"status": "blocked"})
+        return proposal.model_copy(update={"status": "merged"})
+
     async def run_dream(self, selected: str | None = None):
         if not self.pool.is_idle():
             raise RuntimeError("普通 Agent 任务仍在运行，Dream 将在任务结束后执行")
         target = date.fromisoformat(selected) if selected else datetime.now().astimezone().date() - timedelta(days=1)
         result = await self._execute_dream_day(target, automatic=False)
         await self._record_dream_result(result, False)
+        await self.checkpoint_dream.process_due(target)
         return result
 
     async def backfill_dream(self, start: str, end: str):
@@ -758,3 +1564,6 @@ class GatewayApplication:
 def _now() -> str:
     from gateway.models import now_iso
     return now_iso()
+    RetryPolicySnapshot,
+    StartOperationAttemptCommand,
+    ToolIdempotency,

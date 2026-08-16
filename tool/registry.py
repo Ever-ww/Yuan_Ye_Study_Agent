@@ -55,6 +55,21 @@ class AsyncToolRegistry:
         """按注册顺序返回工具名称。"""
         return tuple(name for name in self._tools if self.is_available(name, context))
 
+    def contract_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Stable Tool contract projection used by Harness candidate validation."""
+        return {
+            name: {
+                "schema": tool.schema,
+                "risk": tool.risk,
+                "idempotency": str(getattr(tool, "idempotency", "PURE")),
+                "delegatable": bool(getattr(tool, "delegatable", True)),
+                "runtime_profiles": list(getattr(
+                    tool, "runtime_profiles", ("interactive", "cron", "harness", "maintenance"),
+                )),
+            }
+            for name, tool in sorted(self._tools.items())
+        }
+
     def is_available(self, name: str, context: ToolContext | None) -> bool:
         """判断工具在当前执行上下文中是否真实可用。"""
         tool = self._tools.get(name)
@@ -73,14 +88,28 @@ class AsyncToolRegistry:
         """创建严格子集；未知名称和 subagent 递归调用会被拒绝。"""
         selected: list[AsyncTool] = []
         for name in names:
-            if name in {"subagent", "skill_install", "cronjob", "harness_evolve"}:
+            if name in {
+                "subagent", "skill_install", "cronjob", "harness_evolve",
+                "harness_capability", "harness_manual", "harness_error", "harness_dream",
+                "sandbox_checkpoint_history", "sandbox_checkpoint_branch",
+            }:
                 raise ValueError(f"子 Agent 不允许选择工具：{name}")
             tool = self._tools.get(name)
             if tool is None:
                 raise ValueError(f"未知工具：{name}")
+            if not bool(getattr(tool, "delegatable", True)):
+                raise ValueError(f"子 Agent 不允许选择工具：{name}")
             if tool not in selected:
                 selected.append(tool)
         return AsyncToolRegistry(selected)
+
+    def ends_turn(self, name: str, result: str) -> bool:
+        """Return whether a successful Tool result must end the current model turn."""
+        tool = self._tools.get(name)
+        if tool is None:
+            raise ValueError(f"未知工具：{name}")
+        predicate = getattr(tool, "ends_turn", None)
+        return bool(predicate(result)) if callable(predicate) else False
 
     def risk_of(self, name: str, arguments: dict[str, Any] | None = None) -> ToolRisk:
         """返回静态或基于已校验参数计算出的动态风险等级。"""

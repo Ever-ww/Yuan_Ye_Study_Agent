@@ -1,56 +1,58 @@
-"""High-risk, non-delegable entry point for capability-driven Harness evolution."""
+"""One-release compatibility alias for :mod:`tools.harness_capability`."""
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any
 
-from tool.contracts import ToolContext
-
-
-class HarnessEvolutionService(Protocol):
-    async def evolve_capability(
-        self, *, operation_id: str, task: str, target: str, capability_gap: str,
-    ) -> dict[str, Any]: ...
-
-    async def reconcile_capability(self, operation_id: str) -> dict[str, Any]: ...
+from .harness_capability import HarnessCapabilityService, HarnessCapabilityTool
 
 
-class HarnessEvolveTool:
+class HarnessEvolveTool(HarnessCapabilityTool):
+    """Deprecated direct-call alias; new Runtime schemas advertise harness_capability."""
+
     name = "harness_evolve"
     description = "在用户高风险审批后，使用隔离 Harness worktree 修复 Yuan Ye 自身缺失或损坏的 Tool/Hook 能力。仅用于 Agent 自身能力缺口，不用于普通项目代码。"
     schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "task": {"type": "string", "minLength": 1},
-            "target": {"type": "string", "enum": ["extension", "tool"]},
-            "capability_gap": {"type": "string", "minLength": 1},
+            "capability_gap": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "minLength": 1},
+                    "desired_behavior": {"type": "string", "minLength": 1},
+                    "current_limitation": {"type": "string", "minLength": 1},
+                    "acceptance_criteria": {
+                        "type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1,
+                    },
+                    "safety_constraints": {
+                        "type": "array", "items": {"type": "string", "minLength": 1},
+                    },
+                },
+                "required": ["summary", "desired_behavior", "current_limitation", "acceptance_criteria"],
+                "additionalProperties": False,
+            },
         },
-        "required": ["task", "target", "capability_gap"],
+        "required": ["task", "capability_gap"],
         "additionalProperties": False,
     }
-    risk = "high"
-    idempotency = "NON_IDEMPOTENT"
+    async def run(self, arguments: dict[str, Any], context) -> str:
+        raw_gap = arguments.get("capability_gap")
+        if not isinstance(raw_gap, dict):
+            text = str(raw_gap or arguments.get("task") or "")
+            arguments = {
+                **arguments,
+                "capability_gap": {
+                    "summary": text,
+                    "desired_behavior": str(arguments.get("task") or text),
+                    "current_limitation": text,
+                    "acceptance_criteria": [str(arguments.get("task") or text)],
+                    "safety_constraints": [],
+                },
+            }
+        return await super().run(arguments, context)
 
-    def __init__(self, service: HarnessEvolutionService) -> None:
-        self.service = service
 
-    async def run(self, arguments: dict[str, Any], context: ToolContext) -> str:
-        del context
-        # Import lazily so the generic tools package does not depend on Gateway at import time.
-        from gateway.durable_execution import current_operation_id
+HarnessEvolutionService = HarnessCapabilityService
 
-        operation_id = current_operation_id()
-        if not operation_id:
-            raise RuntimeError("harness_evolve must run inside a durable Tool operation")
-        result = await self.service.evolve_capability(
-            operation_id=operation_id,
-            task=str(arguments["task"]),
-            target=str(arguments["target"]),
-            capability_gap=str(arguments["capability_gap"]),
-        )
-        import json
-        return json.dumps(result, ensure_ascii=False, sort_keys=True)
-
-    async def reconcile(self, operation: Any, context: ToolContext) -> dict[str, Any]:
-        del context
-        return await self.service.reconcile_capability(str(operation.operation_id))
+__all__ = ["HarnessEvolutionService", "HarnessEvolveTool"]

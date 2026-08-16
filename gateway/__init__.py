@@ -11,6 +11,11 @@ from .models import (
     CodeSessionRecord,
     CodeTurnRequest,
     CodeTurnResult,
+    HarnessEvolutionDecision,
+    HarnessDreamDecisionRequest,
+    HarnessDreamFreezeRequest,
+    HarnessDreamRunRequest,
+    HarnessDreamRevertRequest,
     GatewayEventEnvelope,
     InboxItem,
     ProjectRecord,
@@ -18,6 +23,15 @@ from .models import (
     RecoveryDecisionRequest,
 )
 from .process import GatewayProcessManager
+from .restart import GatewayRestartCoordinator
+from .harness_dream import (
+    DreamEvolutionContext,
+    HarnessDreamChangeScanner,
+    HarnessDreamChangeSet,
+    HarnessDreamRunResult,
+    HarnessDreamStatus,
+    HarnessRevertProposal,
+)
 from .runtime_pool import RuntimePool
 from .finalize import FinalizeCoordinator, OperationRetryDriver
 from .finalize_evidence import (
@@ -42,10 +56,22 @@ __all__ = [
     "CodeSessionRecord",
     "CodeTurnRequest",
     "CodeTurnResult",
+    "HarnessEvolutionDecision",
+    "HarnessDreamDecisionRequest",
+    "HarnessDreamFreezeRequest",
+    "HarnessDreamRunRequest",
+    "HarnessDreamRevertRequest",
+    "DreamEvolutionContext",
+    "HarnessDreamChangeScanner",
+    "HarnessDreamChangeSet",
+    "HarnessDreamRunResult",
+    "HarnessDreamStatus",
+    "HarnessRevertProposal",
     "GatewayApplication",
     "GatewayClient",
     "GatewayEventEnvelope",
     "GatewayProcessManager",
+    "GatewayRestartCoordinator",
     "GatewayStore",
     "InboxItem",
     "ProjectRecord",

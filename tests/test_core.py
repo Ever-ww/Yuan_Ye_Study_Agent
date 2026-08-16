@@ -31,6 +31,35 @@ class ToolProvider:
         return ModelReply(text="计算完成：4")
 
 
+class _RestartTool:
+    name = "restart_tool"
+    description = "test terminal Tool"
+    risk = "read"
+    schema = {"type": "object", "properties": {}, "additionalProperties": False}
+
+    async def run(self, arguments, context):
+        del arguments, context
+        return json.dumps({"status": "merged", "restart_required": True})
+
+    @staticmethod
+    def ends_turn(result: str) -> bool:
+        return bool(json.loads(result).get("restart_required"))
+
+
+class _RestartProvider:
+    streaming = False
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, messages, tools):
+        del messages, tools
+        self.calls += 1
+        if self.calls > 1:
+            raise AssertionError("restart-required Tool must terminate before another model call")
+        return ModelReply(tool_calls=(ToolCall(name="restart_tool", arguments={}),))
+
+
 class MultiToolProvider:
     """一个模型 Turn 同时请求两个工具。"""
 
@@ -420,6 +449,7 @@ class CoreTests(unittest.TestCase):
             defaults = load_runtime_config(root)
             self.assertEqual(defaults.compression_threshold_tokens, 200000)
             self.assertEqual(defaults.sandbox_checkpoint_limit, 17)
+            self.assertEqual(defaults.sandbox_checkpoint_merged_branch_retention_days, 30)
             self.assertEqual(defaults.approval_timeout_seconds, 30)
             (root / ".yy" / "settings.local.json").write_text(
                 '{"compression_threshold_tokens":-1}', encoding="utf-8",
@@ -430,6 +460,13 @@ class CoreTests(unittest.TestCase):
                 '{"sandbox_checkpoint_limit":0}', encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "sandbox_checkpoint_limit"):
+                load_runtime_config(root)
+            (root / ".yy" / "settings.local.json").write_text(
+                '{"sandbox_checkpoint_merged_branch_retention_days":0}', encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ValueError, "sandbox_checkpoint_merged_branch_retention_days",
+            ):
                 load_runtime_config(root)
 
     def test_memory_uses_timestamped_jsonl_and_index(self) -> None:
@@ -953,6 +990,23 @@ class CoreTests(unittest.TestCase):
                 return [str(event.payload["content"]) async for event in runtime.run_task("问候") if event.type is EventType.TEXT]
         self.assertEqual(asyncio.run(collect()), ["你", "好"])
 
+    def test_restart_required_tool_finishes_without_second_model_call(self) -> None:
+        async def collect():
+            with tempfile.TemporaryDirectory() as value:
+                provider = _RestartProvider()
+                runtime = AgentRuntime(
+                    load_runtime_config(Path(value)), provider=provider,
+                    tools=AsyncToolRegistry([_RestartTool()]), enable_sandbox=False,
+                )
+                events = [event async for event in runtime.run_task("补能力")]
+                return provider.calls, events
+
+        calls, events = asyncio.run(collect())
+        self.assertEqual(calls, 1)
+        self.assertIn(EventType.GATEWAY_RESTART_REQUIRED, [event.type for event in events])
+        self.assertEqual(events[-1].type, EventType.FINAL)
+        self.assertIn("重启 Gateway", events[-1].payload["answer"])
+
     def test_write_tool_requires_approval_and_stays_in_workspace(self) -> None:
         async def check() -> None:
             with tempfile.TemporaryDirectory() as value:
@@ -987,6 +1041,8 @@ class CoreTests(unittest.TestCase):
                         "write",
                         "bash",
                         "sandbox_rollback",
+                        "sandbox_checkpoint_history",
+                        "sandbox_checkpoint_branch",
                         "calculator",
                         "search_workspace",
                         "current_time",

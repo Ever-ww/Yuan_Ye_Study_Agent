@@ -1,4 +1,6 @@
 interface:
   display_name: "Harness Evolve"
-  short_description: "Evolve Yuan Ye Tool or Hook capabilities safely"
-  default_prompt: "Use the Harness to safely extend a missing Yuan Ye Tool or Hook capability."
+  short_description: "Resume legacy Harness capability work"
+  default_prompt: "Use $harness-evolve only to resume a legacy Harness capability operation."
+policy:
+  allow_implicit_invocation: false

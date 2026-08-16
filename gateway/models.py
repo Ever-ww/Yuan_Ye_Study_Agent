@@ -164,6 +164,47 @@ class CodeSessionCreateRequest(BaseModel):
 
     project_id: str = Field(min_length=1)
     client_id: str = Field(min_length=1)
+    origin_session_id: str | None = None
+
+
+class HarnessEvolutionDecision(BaseModel):
+    """One durable user decision for a Gateway ERROR Evolution proposal."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    client_id: str = Field(min_length=1)
+    confirmed: bool
+
+
+class HarnessDreamRunRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    client_id: str = Field(min_length=1)
+    selected: str | None = Field(default=None, min_length=1)
+    confirmed: bool = False
+
+
+class HarnessDreamFreezeRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    client_id: str = Field(min_length=1)
+    reason: str = Field(default="operator freeze", min_length=1, max_length=1000)
+
+
+class HarnessDreamDecisionRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    client_id: str = Field(min_length=1)
+    expected_revision: int = Field(ge=0)
+    approved: bool
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class HarnessDreamRevertRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    client_id: str = Field(min_length=1)
+    confirmed: bool = False
 
 
 class CodeTurnRequest(BaseModel):
@@ -189,6 +230,8 @@ class CodeSessionRecord(BaseModel):
     base_commit: str = Field(min_length=1)
     status: str = Field(min_length=1)
     verified_turns: int = Field(ge=0)
+    origin_session_id: str | None = None
+    origin_run_id: str | None = None
 
 
 class CodeTurnResult(BaseModel):

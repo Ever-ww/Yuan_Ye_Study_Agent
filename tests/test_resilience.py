@@ -495,7 +495,7 @@ class ResilienceTests(unittest.TestCase):
                 1,
             )
 
-    def test_declined_repair_records_decision_without_worktree(self) -> None:
+    def test_local_cli_does_not_execute_or_persist_error_evolution(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             config = load_runtime_config(root)
@@ -509,8 +509,7 @@ class ResilienceTests(unittest.TestCase):
             with patch("run_ui.cli.typer.confirm", return_value=False):
                 asyncio.run(_handle_chat_failure(config, runtime, "问题", session_id, failure))
             snapshots = list((root / "tests" / "error").glob("*.jsonl"))
-            self.assertEqual(len(snapshots), 1)
-            self.assertIn('"confirmed": false', snapshots[0].read_text(encoding="utf-8"))
+            self.assertEqual(snapshots, [])
             self.assertFalse((root / ".yy" / "harness-evolution" / "worktrees").exists())
 
     def test_network_failure_does_not_create_snapshot(self) -> None:

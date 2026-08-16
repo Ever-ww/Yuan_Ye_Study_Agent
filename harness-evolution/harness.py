@@ -29,6 +29,7 @@ from tool import (
     register_subagent,
 )
 from tools import SkillReadTool, WebFetchTool, WebSearchTool
+from gateway.harness_dream import DreamEvolutionContext
 
 
 _SECRET_KEYS = {
@@ -169,6 +170,39 @@ class ErrorSnapshotWriter:
             handle.write(json.dumps(_sanitize(record, self.secrets), ensure_ascii=False) + "\n")
 
 
+class HarnessOriginContext(BaseModel):
+    """Immutable snapshot that relates a Harness invocation to its parent Gateway work."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    origin_project_id: str
+    origin_session_id: str | None = None
+    origin_run_id: str
+    session_record_ids: tuple[str, ...] = ()
+    session_records_hash: str = ""
+    context_summary: str = ""
+    trigger_evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class CapabilityGap(BaseModel):
+    """A behaviour-level description of a missing Yuan Ye Tool capability."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    summary: str = Field(min_length=1)
+    desired_behavior: str = Field(min_length=1)
+    current_limitation: str = Field(min_length=1)
+    acceptance_criteria: tuple[str, ...] = Field(min_length=1)
+    safety_constraints: tuple[str, ...] = ()
+
+
+class HarnessRepairPolicy(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    max_attempts: int = Field(default=4, ge=1, le=4)
+    allow_automatic_repair: bool = True
+
+
 class HarnessEvolutionRequest(BaseModel):
     """一次经用户确认的隔离诊断请求。"""
 
@@ -180,15 +214,24 @@ class HarnessEvolutionRequest(BaseModel):
     project_root: Path | None = None
     incident_id: str | None = None
     snapshot_path: Path | None = None
-    trigger: Literal["manual", "error", "capability"] = "error"
-    target: Literal["extension", "tool", "source_repair"] = "source_repair"
+    trigger: Literal["manual", "error", "capability", "dream"] = "error"
+    target: Literal["extension", "tool", "source_repair", "dream_optimize"] = "source_repair"
     source_root: Path | None = None
     agent_root: Path | None = None
     invocation_id: str | None = None
     operation_id: str | None = None
-    capability_gap: str = ""
+    capability_gap: CapabilityGap | None = None
+    dream_context: DreamEvolutionContext | None = None
+    origin: HarnessOriginContext | None = None
     max_attempts: int = Field(default=1, ge=1, le=4)
     merge_policy: Literal["immediate", "deferred"] = "immediate"
+
+    @property
+    def repair_policy(self) -> HarnessRepairPolicy:
+        return HarnessRepairPolicy(
+            max_attempts=self.max_attempts,
+            allow_automatic_repair=self.max_attempts > 1,
+        )
 
     def resolved_source_root(self) -> Path:
         return (self.source_root or self.project_root or self.config.coding_source_root or self.config.workspace_root).resolve()
@@ -216,6 +259,28 @@ class HarnessEvolutionResult(BaseModel):
     worktree_path: str = ""
     branch: str = ""
     merged: bool = False
+    invocation_id: str = ""
+    verified_commit: str = ""
+    merged_commit: str = ""
+    changed_files: tuple[str, ...] = ()
+    tests_summary: str = ""
+    restart_required: bool = False
+
+
+class HarnessEvolutionInvocation(BaseModel):
+    """Immutable identity and final evidence summary for one Engine execution."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    invocation_id: str
+    trigger: Literal["manual", "error", "capability", "dream"]
+    target: Literal["extension", "tool", "source_repair", "dream_optimize"]
+    source_identity: str
+    origin: HarnessOriginContext | None = None
+    base_commit: str
+    verified_commit: str = ""
+    merged_commit: str = ""
+    status: str
 
 
 class CodeSessionRecord(BaseModel):
@@ -233,6 +298,7 @@ class CodeSessionRecord(BaseModel):
     last_verified_commit: str
     verified_turns: int = 0
     audit_path: Path
+    origin: HarnessOriginContext | None = None
 
 
 class CodeTurnResult(BaseModel):
@@ -330,7 +396,9 @@ class CodeSessionController:
         self.runtime: AgentRuntime | None = None
         self._requirements: list[str] = []
 
-    async def start(self, source_root: Path | None = None) -> CodeSessionRecord:
+    async def start(
+        self, source_root: Path | None = None, *, origin: HarnessOriginContext | None = None,
+    ) -> CodeSessionRecord:
         if self.record is not None:
             raise RuntimeError("Coding Session 已经启动")
         root = (source_root or self.config.coding_source_root or Path(__file__).resolve().parents[1]).resolve()
@@ -374,6 +442,7 @@ class CodeSessionController:
                 base_commit=base,
                 source_branch=branch_name,
                 coding_memory_session_id=str(getattr(runtime, "coding_session_id", "")),
+                origin=origin.model_dump(mode="json") if origin else None,
             )
             self.runtime = runtime
             self.record = CodeSessionRecord(
@@ -385,6 +454,7 @@ class CodeSessionController:
                 base_commit=base,
                 last_verified_commit=base,
                 audit_path=audit_path,
+                origin=origin,
             )
             return self.record
         except Exception:
@@ -393,91 +463,8 @@ class CodeSessionController:
             raise
 
     async def _run_turn_legacy(self, task: str) -> CodeTurnResult:
-        record, runtime = self._active()
-        requirement = task.strip()
-        if not requirement:
-            raise ValueError("Coding 需求不能为空")
-        test_id = hashlib.sha256(
-            f"{record.code_session_id}:{record.verified_turns}:{requirement}:{uuid4().hex}".encode("utf-8")
-        ).hexdigest()[:8]
-        slug = _code_slug(requirement)
-        test_file = f"tests/extensions/test_{slug}_{test_id}.py"
-        self._requirements.append(requirement)
-        self.audit.append_event(
-            record.audit_path,
-            "code_turn_started",
-            task=requirement,
-            required_test_file=test_file,
-        )
-        diagnostic = ""
-        feedback = ""
-        for attempt in range(1, 5):
-            prompt = self._turn_prompt(requirement, test_file, attempt, feedback)
-            self.audit.append_event(
-                record.audit_path,
-                "code_generation" if attempt == 1 else "code_auto_repair",
-                attempt=attempt,
-                prompt=prompt,
-            )
-            try:
-                chunks: list[str] = []
-                async for event in runtime.run_task(prompt, session_id=record.coding_memory_session_id):
-                    if event.type is EventType.FINAL:
-                        chunks.append(str(event.payload.get("answer", "")))
-                diagnostic = chunks[-1] if chunks else ""
-            except Exception as exc:
-                feedback = f"Coding Runtime 执行失败：{str(exc) or type(exc).__name__}"
-                self.audit.append_event(
-                    record.audit_path,
-                    "code_runtime_failed",
-                    attempt=attempt,
-                    message=feedback,
-                )
-                if attempt < 4:
-                    continue
-                return self._failed_turn(record, test_file, attempt, feedback, diagnostic)
-
-            validation = await self._validate_and_test(record, test_file)
-            if validation["passed"]:
-                await self._git(record.worktree_path, "add", "--all")
-                await self._git(
-                    record.worktree_path,
-                    "-c", "user.name=Yuan Ye Harness",
-                    "-c", "user.email=harness@local.invalid",
-                    "commit", "-m", f"Extension: {slug} ({record.verified_turns + 1})",
-                )
-                commit = (await self._git(record.worktree_path, "rev-parse", "HEAD")).stdout.strip()
-                self.record = record.model_copy(update={
-                    "last_verified_commit": commit,
-                    "verified_turns": record.verified_turns + 1,
-                    "status": "active",
-                })
-                self.audit.append_event(
-                    record.audit_path,
-                    "code_turn_verified",
-                    attempt=attempt,
-                    commit=commit,
-                    test_file=test_file,
-                    diagnostic=diagnostic,
-                )
-                return CodeTurnResult(
-                    code_session_id=record.code_session_id,
-                    status="verified",
-                    message="扩展代码和测试已通过验证，并提交到隔离临时分支。",
-                    test_file=test_file,
-                    attempts=attempt,
-                    commit=commit,
-                    diagnostic=diagnostic,
-                )
-            feedback = str(validation["feedback"])
-            self.audit.append_event(
-                record.audit_path,
-                "code_tests_failed",
-                attempt=attempt,
-                feedback=feedback,
-            )
-        self.record = record.model_copy(update={"status": "unverified"})
-        return self._failed_turn(record, test_file, 4, feedback, diagnostic)
+        """Compatibility alias; the single Evolution Engine owns the execution pipeline."""
+        return await self.run_turn(task)
 
     async def run_turn(self, task: str) -> CodeTurnResult:
         """Thin MANUAL adapter: the shared engine owns generation, repair and validation."""
@@ -488,74 +475,11 @@ class CodeSessionController:
         ).run_manual_turn(self, task)
 
     async def finalize(self) -> CodeFinalizeResult:
-        record, runtime = self._active()
-        status = (await self._git(
-            record.worktree_path, "status", "--porcelain", "--untracked-files=all"
-        )).stdout.strip()
-        head = (await self._git(record.worktree_path, "rev-parse", "HEAD")).stdout.strip()
-        if status or head != record.last_verified_commit or record.status == "unverified":
-            return CodeFinalizeResult(
-                code_session_id=record.code_session_id,
-                status="unverified_changes",
-                message="worktree 存在未验证修改，不能合并；请继续修复后再输入 /exit。",
-                stay_in_code_mode=True,
-                worktree_path=str(record.worktree_path),
-                branch=record.branch,
-            )
-        await runtime.close()
-        self.runtime = None
-        if record.last_verified_commit == record.base_commit:
-            await self._cleanup(record, keep_branch=False)
-            self.record = None
-            return CodeFinalizeResult(
-                code_session_id=record.code_session_id,
-                status="no_changes",
-                message="本次 Coding Session 没有已验证改动，已清理并返回普通聊天。",
-            )
-        await self._require_clean_source(record.source_root)
-        current_head = (await self._git(record.source_root, "rev-parse", "HEAD")).stdout.strip()
-        if current_head != record.base_commit:
-            self.audit.append_event(
-                record.audit_path, "code_merge_refused",
-                status="main_changed", current_head=current_head,
-            )
-            self.record = record.model_copy(update={"status": "main_changed"})
-            return CodeFinalizeResult(
-                code_session_id=record.code_session_id,
-                status="main_changed",
-                message="源码仓库 HEAD 已变化，已保留临时分支与 worktree，未执行合并。",
-                stay_in_code_mode=False,
-                worktree_path=str(record.worktree_path),
-                branch=record.branch,
-            )
-        await self._git(record.source_root, "merge", "--ff-only", record.branch)
-        changed_files = [
-            line for line in (
-                await self._git(
-                    record.source_root, "diff", "--name-only",
-                    f"{record.base_commit}..{record.last_verified_commit}",
-                )
-            ).stdout.splitlines() if line.strip()
-        ]
-        self.audit.append_event(
-            record.audit_path, "code_merged",
-            commit=record.last_verified_commit, changed_files=changed_files,
-        )
-        try:
-            await self._update_long_term(record, changed_files)
-        except Exception as exc:
-            self.audit.append_event(
-                record.audit_path, "long_term_memory_failed",
-                message=str(exc) or type(exc).__name__,
-            )
-        await self._cleanup(record, keep_branch=False)
-        self.record = None
-        return CodeFinalizeResult(
-            code_session_id=record.code_session_id,
-            status="merged",
-            message="已 fast-forward 合并验证通过的扩展；重启 Gateway 后生效。",
-            merged=True,
-        )
+        return await HarnessEvolutionEngine.for_config(
+            self.config,
+            runtime_factory=self.runtime_factory or create_coding_runtime,
+            memory_provider_factory=self.memory_provider_factory,
+        ).finalize_manual(self)
 
     async def abort(self) -> CodeFinalizeResult:
         record, runtime = self._active()
@@ -800,6 +724,7 @@ def create_coding_runtime(
         isolated.workspace_root,
         web_search_tool=web_search,
         web_fetch_tool=web_fetch,
+        runtime_profile="harness",
     ).select(selected_names)
     tools.register(SkillReadTool(skills))
     register_subagent(tools, RuntimeSubagentRunner(isolated, tools))
@@ -843,203 +768,12 @@ class HarnessEvolutionRunner:
         self.memory_provider_factory = memory_provider_factory
 
     async def _run_legacy(self, request: HarnessEvolutionRequest) -> HarnessEvolutionResult:
-        root = request.project_root.resolve()
-        clean = await self._git(root, "status", "--porcelain", "--untracked-files=all")
-        if clean.stdout.strip():
-            message = "主 worktree 存在未提交修改，Harness 已停止且不会 stash 用户内容"
-            self.writer.append_event(request.snapshot_path, "evolution", status="dirty_worktree", message=message)
-            return HarnessEvolutionResult(status="dirty_worktree", message=message)
-        branch_result = await self._git(root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
-        if branch_result.returncode != 0 or not branch_result.stdout.strip():
-            message = "当前不在可识别分支上，Harness 无法安全合并"
-            self.writer.append_event(request.snapshot_path, "evolution", status="detached_head", message=message)
-            return HarnessEvolutionResult(status="detached_head", message=message)
-        base = (await self._git(root, "rev-parse", "HEAD")).stdout.strip()
-        branch = f"harness-evolution/{request.incident_id[:16]}"
-        worktree = (root / ".yy" / "harness-evolution" / "worktrees" / request.incident_id).resolve()
-        parent = (root / ".yy" / "harness-evolution" / "worktrees").resolve()
-        if parent not in worktree.parents:
-            raise ValueError("Harness worktree 路径越界")
-        parent.mkdir(parents=True, exist_ok=True)
-        await self._git(root, "worktree", "add", "-b", branch, str(worktree), base)
-        keep_branch = False
-        try:
-            self.writer.append_event(
-                request.snapshot_path,
-                "evolution",
-                status="worktree_created",
-                worktree_path=str(worktree),
-                branch=branch,
-                base_commit=base,
-            )
-            try:
-                runtime = self.runtime_factory(request.config, worktree)
-            except Exception as exc:
-                message = f"Coding Runtime 初始化失败：{str(exc) or type(exc).__name__}"
-                self.writer.append_event(
-                    request.snapshot_path,
-                    "evolution",
-                    status="coding_runtime_failed",
-                    message=message,
-                )
-                return HarnessEvolutionResult(
-                    status="coding_runtime_failed",
-                    message=message,
-                    worktree_path=str(worktree),
-                    branch=branch,
-                )
-            if not _runtime_targets_worktree(runtime, worktree):
-                await runtime.close()
-                message = "Coding Runtime 的 workspace 未指向隔离 Git worktree，已拒绝运行"
-                self.writer.append_event(
-                    request.snapshot_path,
-                    "evolution",
-                    status="invalid_runtime_workspace",
-                    message=message,
-                    expected_workspace=str(worktree),
-                )
-                return HarnessEvolutionResult(
-                    status="invalid_runtime_workspace",
-                    message=message,
-                    worktree_path=str(worktree),
-                    branch=branch,
-                )
-            diagnostic_task = (
-                "你是负责维护当前项目的 Coding Agent。当前 workspace 是隔离的 Git worktree。"
-                "请结合专属项目记忆、已审核 Skill、文件搜索/读写工具、Subagent 和 Docker Bash，"
-                "复现并修复下面的代码缺陷。只做解决问题所需的最小修改，不得修改 `.git`、`.yy`、"
-                "凭据或本机配置；完成后说明修改和验证结果。Harness 会在你结束后统一执行完整测试，"
-                "只有验证通过的变更才会合并。\n\n完整错误快照：\n"
-                + request.snapshot_path.read_text(encoding="utf-8")
-            )
-            runtime_error: Exception | None = None
-            try:
-                coding_session_id = getattr(runtime, "coding_session_id", None)
-                if coding_session_id:
-                    result = await runtime.run(diagnostic_task, session_id=str(coding_session_id))
-                else:
-                    result = await runtime.run(diagnostic_task)
-                diagnostic = result.answer
-            except Exception as exc:
-                diagnostic = f"诊断 Agent 失败：{str(exc) or type(exc).__name__}"
-                runtime_error = exc
-            finally:
-                await runtime.close()
-            self.writer.append_event(request.snapshot_path, "evolution", status="diagnosed", diagnostic=diagnostic)
-            if runtime_error is not None:
-                message = f"Coding Runtime 执行失败：{str(runtime_error) or type(runtime_error).__name__}"
-                self.writer.append_event(
-                    request.snapshot_path,
-                    "evolution",
-                    status="coding_runtime_failed",
-                    message=message,
-                )
-                return HarnessEvolutionResult(
-                    status="coding_runtime_failed",
-                    message=message,
-                    worktree_path=str(worktree),
-                    branch=branch,
-                )
-            changes = (await self._git(worktree, "status", "--porcelain", "--untracked-files=all")).stdout
-            if not changes.strip():
-                message = "Coding Agent 完成诊断，但未产生代码变更"
-                self.writer.append_event(
-                    request.snapshot_path,
-                    "evolution",
-                    status="no_code_changes",
-                    message=message,
-                    worktree_path=str(worktree),
-                )
-                return HarnessEvolutionResult(
-                    status="no_code_changes", message=message, worktree_path=str(worktree), branch=branch,
-                )
-
-            forbidden = _forbidden_changed_paths(changes)
-            if forbidden:
-                message = f"Coding Agent 修改了禁止路径：{forbidden[0]}"
-                self.writer.append_event(
-                    request.snapshot_path,
-                    "evolution",
-                    status="forbidden_changes",
-                    message=message,
-                    forbidden_paths=forbidden,
-                )
-                return HarnessEvolutionResult(
-                    status="forbidden_changes", message=message, worktree_path=str(worktree), branch=branch,
-                )
-
-            self.writer.append_event(request.snapshot_path, "evolution", status="changes_detected", git_status=changes)
-            await self._git(worktree, "add", "--intent-to-add", "--all")
-            tests = await self._run_tests(worktree, request.snapshot_path)
-            if not tests:
-                return HarnessEvolutionResult(
-                    status="tests_failed", message="新版本测试失败，已丢弃隔离 worktree",
-                    worktree_path=str(worktree), branch=branch,
-                )
-            await self._git(worktree, "add", "--all")
-            await self._git(
-                worktree,
-                "-c", "user.name=Yuan Ye Harness",
-                "-c", "user.email=harness@local.invalid",
-                "commit", "-m", f"Harness evolution {request.incident_id[:12]}",
-            )
-            repair_commit = (await self._git(worktree, "rev-parse", "HEAD")).stdout.strip()
-            changed_files = [
-                line.strip()
-                for line in (
-                    await self._git(worktree, "diff", "--name-only", f"{base}..{repair_commit}")
-                ).stdout.splitlines()
-                if line.strip()
-            ]
-            if (await self._git(root, "status", "--porcelain", "--untracked-files=all")).stdout.strip():
-                keep_branch = True
-                message = "验证后主 worktree 发生变化，已拒绝自动合并并保留临时分支"
-                self.writer.append_event(request.snapshot_path, "evolution", status="main_changed", message=message, branch=branch)
-                return HarnessEvolutionResult(
-                    status="main_changed", message=message, worktree_path=str(worktree), branch=branch,
-                )
-            if (await self._git(root, "rev-parse", "HEAD")).stdout.strip() != base:
-                keep_branch = True
-                message = "验证期间主分支 HEAD 已变化，已拒绝自动合并并保留临时分支"
-                self.writer.append_event(request.snapshot_path, "evolution", status="main_changed", message=message, branch=branch)
-                return HarnessEvolutionResult(
-                    status="main_changed", message=message, worktree_path=str(worktree), branch=branch,
-                )
-            await self._git(root, "merge", "--ff-only", branch)
-            self.writer.append_event(request.snapshot_path, "evolution", status="merged", branch=branch)
-            try:
-                await self._update_long_term_memory(
-                    request,
-                    root,
-                    diagnostic=diagnostic,
-                    commit_sha=repair_commit,
-                    changed_files=changed_files,
-                )
-            except Exception as exc:
-                try:
-                    self.writer.append_event(
-                        request.snapshot_path,
-                        "evolution",
-                        status="long_term_memory_failed",
-                        message=str(exc) or type(exc).__name__,
-                    )
-                except Exception:
-                    pass
-            return HarnessEvolutionResult(
-                status="merged", message="修复已合并，下次启动生效",
-                worktree_path=str(worktree), branch=branch, merged=True,
-            )
-        finally:
-            cleanup = await self._cleanup(root, worktree, branch, keep_branch=keep_branch)
-            self.writer.append_event(
-                request.snapshot_path,
-                "evolution",
-                status="cleanup",
-                former_worktree_path=str(worktree),
-                branch=branch,
-                branch_preserved=keep_branch,
-                **cleanup,
-            )
+        """Compatibility alias; ERROR execution is owned by HarnessEvolutionEngine."""
+        return await HarnessEvolutionEngine.for_config(
+            request.config,
+            runtime_factory=self.runtime_factory,
+            memory_provider_factory=self.memory_provider_factory,
+        ).run_error(self, request)
 
     async def run(self, request: HarnessEvolutionRequest) -> HarnessEvolutionResult:
         """ERROR facade retained for compatibility; execution is dispatched by the engine."""
@@ -1259,14 +993,35 @@ class HarnessInvocationAudit:
         directory = self.root / identity
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{invocation_id}.jsonl"
-        if not path.exists():
+        created = not path.exists()
+        if created:
             path.touch()
-        self.append(path, "invocation_started", source_identity=identity, **record)
+            self.append(
+                path, "invocation_started", invocation_id=invocation_id,
+                source_identity=identity, **record,
+            )
         return path
 
     def append(self, path: Path, event: str, **record: Any) -> None:
+        try:
+            sequence = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip()) + 1
+        except OSError:
+            sequence = 1
+        occurred_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        event_identity = hashlib.sha256(
+            json.dumps(
+                {"path": path.name, "sequence": sequence, "event": event, "record": _sanitize(record)},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8"),
+        ).hexdigest()
+        metadata: dict[str, Any] = {
+            "event": event, "timestamp": _timestamp(), "occurred_at": occurred_at,
+            "sequence": sequence, "audit_event_id": event_identity,
+        }
+        if event == "merge_committed":
+            metadata["merge_event_id"] = event_identity
         payload = json.dumps(
-            _sanitize({"event": event, "timestamp": _timestamp(), **record}),
+            _sanitize({**metadata, **record}),
             ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ) + "\n"
         with path.open("a", encoding="utf-8", newline="\n") as handle:
@@ -1280,7 +1035,7 @@ class HarnessInvocationAudit:
 
 
 class HarnessEvolutionEngine:
-    """The common Harness evolution dispatch point for MANUAL, ERROR and CAPABILITY.
+    """The common Harness evolution dispatch point for all four Harness triggers.
 
     The legacy facades intentionally remain thin: their trigger evidence and outer lifecycle
     differ, but all new capability evolution and all facade calls enter here first.
@@ -1297,6 +1052,7 @@ class HarnessEvolutionEngine:
         self.runtime_factory = runtime_factory
         self.memory_provider_factory = memory_provider_factory
         self.audit = HarnessInvocationAudit(config.agent_root)
+        self._tool_registry_baselines: dict[str, dict[str, Any]] = {}
 
     @classmethod
     def for_config(cls, config: RuntimeConfig, **kwargs: Any) -> "HarnessEvolutionEngine":
@@ -1305,102 +1061,592 @@ class HarnessEvolutionEngine:
     async def run_error(
         self, facade: HarnessEvolutionRunner, request: HarnessEvolutionRequest,
     ) -> HarnessEvolutionResult:
-        # ERROR keeps its verified ErrorSnapshot and one-attempt compatibility behaviour.
-        return await facade._run_legacy(request)
+        if request.snapshot_path is None or not request.snapshot_path.is_file():
+            raise ValueError("ERROR evolution requires a durable ErrorSnapshot")
+        selected = request.model_copy(update={
+            "trigger": "error",
+            "target": "source_repair",
+            "max_attempts": 4,
+            "merge_policy": "immediate",
+        })
+        injected_validator = (
+            facade._run_tests
+            if type(facade)._run_tests is not HarnessEvolutionRunner._run_tests
+            else None
+        )
+        return await self._run_isolated(
+            selected, error_writer=facade.writer, error_validator=injected_validator,
+            error_facade=facade,
+        )
 
     async def run_manual_turn(self, controller: CodeSessionController, task: str) -> CodeTurnResult:
-        # CodeSessionController remains responsible for session ownership; this engine is the
-        # common execution dispatch point. Its legacy implementation is retained temporarily
-        # for backwards-compatible /code audit records and test subclass hooks.
-        return await controller._run_turn_legacy(task)
+        record, runtime = controller._active()
+        requirement = task.strip()
+        if not requirement:
+            raise ValueError("Coding 需求不能为空")
+        test_id = hashlib.sha256(
+            f"{record.code_session_id}:{record.verified_turns}:{requirement}".encode("utf-8")
+        ).hexdigest()[:8]
+        test_file = f"tests/extensions/test_{_code_slug(requirement)}_{test_id}.py"
+        controller._requirements.append(requirement)
+        controller.audit.append_event(
+            record.audit_path, "code_turn_started", task=requirement,
+            required_test_file=test_file, trigger="manual", target="extension",
+        )
+        diagnostic, feedback, attempts = await self._repair_loop(
+            runtime=runtime,
+            request=HarnessEvolutionRequest(
+                task=requirement, config=self.config, trigger="manual", target="extension",
+                source_root=record.source_root, agent_root=self.config.agent_root,
+                invocation_id=hashlib.sha256(
+                    f"manual:{record.code_session_id}:{record.verified_turns + 1}".encode("utf-8")
+                ).hexdigest()[:32],
+                max_attempts=4, merge_policy="deferred",
+            ),
+            worktree=record.worktree_path,
+            test_file=test_file,
+            audit_path=record.audit_path,
+            audit=lambda event, **data: controller.audit.append_event(record.audit_path, event, **data),
+            compatibility_validator=(
+                controller._validate_and_test
+                if type(controller)._validate_and_test is not CodeSessionController._validate_and_test
+                else None
+            ),
+            manual_record=record,
+        )
+        if feedback:
+            controller.record = record.model_copy(update={"status": "unverified"})
+            return controller._failed_turn(record, test_file, attempts, feedback, diagnostic)
+        await self._commit_candidate(
+            record.worktree_path,
+            f"Extension: {_code_slug(requirement)} ({record.verified_turns + 1})",
+        )
+        commit = (await self._command(record.worktree_path, ["git", "rev-parse", "HEAD"])).stdout.strip()
+        controller.record = record.model_copy(update={
+            "last_verified_commit": commit,
+            "verified_turns": record.verified_turns + 1,
+            "status": "active",
+        })
+        controller.audit.append_event(
+            record.audit_path, "code_turn_verified", attempt=attempts,
+            commit=commit, test_file=test_file, diagnostic=diagnostic,
+        )
+        return CodeTurnResult(
+            code_session_id=record.code_session_id, status="verified",
+            message="扩展代码和测试已通过统一 Harness Engine 验证，并提交到隔离临时分支。",
+            test_file=test_file, attempts=attempts, commit=commit, diagnostic=diagnostic,
+        )
+
+    async def finalize_manual(self, controller: CodeSessionController) -> CodeFinalizeResult:
+        record, runtime = controller._active()
+        status = (await self._command(
+            record.worktree_path, ["git", "status", "--porcelain", "--untracked-files=all"],
+        )).stdout.strip()
+        head = (await self._command(record.worktree_path, ["git", "rev-parse", "HEAD"])).stdout.strip()
+        if status or head != record.last_verified_commit or record.status == "unverified":
+            return CodeFinalizeResult(
+                code_session_id=record.code_session_id, status="unverified_changes",
+                message="worktree 存在未验证修改，不能合并；请继续修复后再输入 /exit。",
+                stay_in_code_mode=True, worktree_path=str(record.worktree_path), branch=record.branch,
+            )
+        await runtime.close()
+        controller.runtime = None
+        if record.last_verified_commit == record.base_commit:
+            await controller._cleanup(record, keep_branch=False)
+            controller.record = None
+            return CodeFinalizeResult(
+                code_session_id=record.code_session_id, status="no_changes",
+                message="本次 Coding Session 没有已验证改动，已清理并返回普通聊天。",
+            )
+        merge = await self._merge_verified(
+            root=record.source_root, base=record.base_commit,
+            verified=record.last_verified_commit, branch=record.branch,
+            audit=lambda event, **data: controller.audit.append_event(record.audit_path, event, **data),
+            invocation_id=record.code_session_id, trigger="manual",
+        )
+        if merge != "merged":
+            controller.record = record.model_copy(update={"status": "main_changed"})
+            return CodeFinalizeResult(
+                code_session_id=record.code_session_id, status="main_changed",
+                message="源码仓库 HEAD 已变化，已保留临时分支与 worktree，未执行合并。",
+                worktree_path=str(record.worktree_path), branch=record.branch,
+            )
+        changed = await self._changed_files(record.source_root, record.base_commit, record.last_verified_commit)
+        await controller._update_long_term(record, changed)
+        await controller._cleanup(record, keep_branch=False)
+        controller.record = None
+        return CodeFinalizeResult(
+            code_session_id=record.code_session_id, status="merged",
+            message="已由统一 Harness Engine fast-forward 合并验证通过的 Hook。",
+            merged=True,
+        )
 
     async def run(self, request: HarnessEvolutionRequest) -> HarnessEvolutionResult:
         if request.trigger == "error":
-            raise ValueError("ERROR evolution must use its ErrorSnapshot facade")
+            if request.snapshot_path is None:
+                raise ValueError("ERROR evolution must reference a real ErrorSnapshot")
+            writer = ErrorSnapshotWriter(request.resolved_agent_root())
+            return await self._run_isolated(request, error_writer=writer)
         if request.trigger == "manual":
             raise ValueError("MANUAL evolution must use CodeSessionController")
-        return await self._run_capability(request)
+        return await self._run_isolated(request)
 
-    async def _run_capability(self, request: HarnessEvolutionRequest) -> HarnessEvolutionResult:
-        if request.target not in {"extension", "tool"}:
-            return HarnessEvolutionResult(status="requires_broader_source_change", message="CAPABILITY only permits extension or tool targets")
+    async def _run_isolated(
+        self,
+        request: HarnessEvolutionRequest,
+        *,
+        error_writer: ErrorSnapshotWriter | None = None,
+        error_validator: Callable[[Path, Path], Any] | None = None,
+        error_facade: HarnessEvolutionRunner | None = None,
+    ) -> HarnessEvolutionResult:
+        if request.trigger == "capability" and request.target != "tool":
+            return HarnessEvolutionResult(
+                status="requires_broader_source_change",
+                message="CAPABILITY is restricted to Tool evolution",
+            )
+        if request.trigger == "dream" and (
+            request.target != "dream_optimize" or request.dream_context is None
+        ):
+            return HarnessEvolutionResult(
+                status="confirmed_failed",
+                message="DREAM evolution requires an immutable DREAM_OPTIMIZE changeset",
+            )
         root = request.resolved_source_root()
         invocation_id = request.resolved_invocation_id()
-        test_file = f"tests/test_tool_{_code_slug(request.task)}_{hashlib.sha256(invocation_id.encode('utf-8')).hexdigest()[:8]}.py"
+        test_file = (
+            f"tests/tools/test_{_code_slug(request.task)}_"
+            f"{hashlib.sha256(invocation_id.encode('utf-8')).hexdigest()[:8]}.py"
+            if request.target == "tool" else ""
+        )
+        if request.target == "dream_optimize":
+            test_file = (
+                f"tests/harness_dream/test_{request.dream_context.changeset.date.replace('-', '_')}_"
+                f"{hashlib.sha256(invocation_id.encode('utf-8')).hexdigest()[:8]}.py"
+            )
         source_identity = hashlib.sha256(str(root).casefold().encode("utf-8")).hexdigest()[:16]
+        if request.target == "tool":
+            self._tool_registry_baselines[invocation_id] = await self._registry_snapshot(root)
         audit_path = self.audit.create(
             root, invocation_id, trigger=request.trigger, target=request.target,
-            operation_id=request.operation_id, task=request.task, capability_gap=request.capability_gap,
+            operation_id=request.operation_id, task=request.task,
+            capability_gap=request.capability_gap.model_dump(mode="json") if request.capability_gap else None,
+            origin=request.origin.model_dump(mode="json") if request.origin else None,
         )
+        def record_event(event: str, **data: Any) -> None:
+            self.audit.append(audit_path, event, **data)
+            if error_writer is not None and request.snapshot_path is not None:
+                status = str(data.get("status") or event)
+                error_writer.append_event(
+                    request.snapshot_path, "evolution", status=status,
+                    event=event, **{key: value for key, value in data.items() if key != "status"},
+                )
         clean = await HarnessEvolutionRunner._command(root, ["git", "status", "--porcelain", "--untracked-files=all"], check=False)
         if clean.returncode != 0 or clean.stdout.strip():
-            self.audit.append(audit_path, "finished", status="confirmed_failed", reason="source_not_clean")
-            return HarnessEvolutionResult(status="confirmed_failed", message="Source repository must be clean before capability evolution")
+            record_event("finished", status="confirmed_failed", reason="source_not_clean")
+            status = (
+                "dirty_worktree" if request.trigger == "error"
+                else "deferred" if request.trigger == "dream"
+                else "confirmed_failed"
+            )
+            return HarnessEvolutionResult(status=status, message="Source repository must be clean before Harness evolution", invocation_id=invocation_id)
         branch_result = await HarnessEvolutionRunner._command(root, ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], check=False)
         if branch_result.returncode != 0 or not branch_result.stdout.strip():
             return HarnessEvolutionResult(status="confirmed_failed", message="Detached HEAD cannot safely evolve Harness")
         base = (await HarnessEvolutionRunner._command(root, ["git", "rev-parse", "HEAD"])).stdout.strip()
-        branch = f"harness-capability/{invocation_id[:16]}"
+        branch = f"harness-{request.trigger}/{invocation_id[:16]}"
         worktree = request.resolved_agent_root() / ".yy" / "harness-evolution" / "worktrees" / source_identity / invocation_id
         worktree.parent.mkdir(parents=True, exist_ok=True)
         added = await HarnessEvolutionRunner._command(root, ["git", "worktree", "add", "-b", branch, str(worktree), base], check=False)
         if added.returncode != 0:
-            self.audit.append(audit_path, "finished", status="unknown", reason=added.stderr[-2048:])
+            record_event("finished", status="unknown", reason=added.stderr[-2048:])
             return HarnessEvolutionResult(status="unknown", message="Could not create isolated Harness worktree")
         keep = True
         try:
-            self.audit.append(audit_path, "worktree_created", base_commit=base, branch=branch, worktree=str(worktree))
+            record_event("worktree_created", base_commit=base, branch=branch, worktree=str(worktree))
             runtime = self.runtime_factory(request.config, worktree)
             if not _runtime_targets_worktree(runtime, worktree):
                 await runtime.close()
-                return HarnessEvolutionResult(status="confirmed_failed", message="Coding runtime escaped its isolated worktree")
-            feedback = ""
-            diagnostic = ""
-            for attempt in range(1, request.max_attempts + 1):
-                prompt = self._capability_prompt(request, attempt, feedback, test_file)
-                self.audit.append(audit_path, "coding_attempt", attempt=attempt)
-                try:
-                    result = await runtime.run(prompt, session_id=str(getattr(runtime, "coding_session_id", "")) or None)
-                    diagnostic = result.answer
-                except Exception as exc:
-                    feedback = str(exc) or type(exc).__name__
-                    continue
-                valid, feedback = await self._validate_capability(worktree, request, invocation_id, audit_path, test_file)
-                if valid:
-                    break
-            else:
-                await runtime.close()
-                self.audit.append(audit_path, "finished", status="confirmed_failed", diagnostic=diagnostic, feedback=feedback)
-                return HarnessEvolutionResult(status="confirmed_failed", message=f"Capability evolution did not validate: {feedback}", worktree_path=str(worktree), branch=branch)
+                record_event("finished", status="invalid_runtime_workspace")
+                keep = False
+                return HarnessEvolutionResult(
+                    status="invalid_runtime_workspace",
+                    message="Coding runtime escaped its isolated worktree",
+                    worktree_path=str(worktree), branch=branch,
+                    invocation_id=invocation_id,
+                )
+            diagnostic, feedback, attempts = await self._repair_loop(
+                runtime=runtime, request=request, worktree=worktree,
+                test_file=test_file, audit_path=audit_path,
+                audit=record_event,
+                error_writer=error_writer,
+                error_validator=error_validator,
+            )
             await runtime.close()
-            await HarnessEvolutionRunner._command(worktree, ["git", "add", "--all"])
-            await HarnessEvolutionRunner._command(worktree, ["git", "-c", "user.name=Yuan Ye Harness", "-c", "user.email=harness@local.invalid", "commit", "-m", f"Harness capability {invocation_id[:12]}"])
+            if feedback == "Coding Agent produced no source changes":
+                keep = False
+                record_event("finished", status="no_code_changes")
+                return HarnessEvolutionResult(
+                    status="no_code_changes",
+                    message="Coding Agent completed without source changes",
+                    worktree_path=str(worktree), branch=branch,
+                    invocation_id=invocation_id,
+                )
+            if feedback:
+                if feedback.startswith("requires broader source change:"):
+                    status = "requires_broader_source_change"
+                elif request.trigger == "error" and feedback.startswith("Coding Runtime failed:"):
+                    status = "coding_runtime_failed"
+                    keep = False
+                else:
+                    status = "tests_failed" if request.trigger == "error" else "confirmed_failed"
+                if request.trigger == "error":
+                    # A deterministic validation failure has no unknown Git side effect;
+                    # export is already in the audit/ErrorSnapshot and the candidate is safe to clean.
+                    keep = False
+                record_event("finished", status=status, diagnostic=diagnostic, feedback=feedback)
+                return HarnessEvolutionResult(
+                    status=status, message=f"Harness evolution did not validate: {feedback}",
+                    worktree_path=str(worktree), branch=branch, invocation_id=invocation_id,
+                    tests_summary=feedback,
+                )
+            changes = (await self._command(worktree, ["git", "status", "--porcelain", "--untracked-files=all"])).stdout
+            if not changes.strip():
+                keep = False
+                return HarnessEvolutionResult(
+                    status="no_code_changes", message="Coding Agent completed without source changes",
+                    worktree_path=str(worktree), branch=branch, invocation_id=invocation_id,
+                )
+            await self._commit_candidate(worktree, f"Harness {request.trigger} {invocation_id[:12]}")
             verified = (await HarnessEvolutionRunner._command(worktree, ["git", "rev-parse", "HEAD"])).stdout.strip()
-            current = (await HarnessEvolutionRunner._command(root, ["git", "rev-parse", "HEAD"])).stdout.strip()
-            if current != base:
-                self.audit.append(audit_path, "finished", status="blocked_main_changed", verified_commit=verified, current_head=current)
-                return HarnessEvolutionResult(status="blocked_main_changed", message="Main branch changed; candidate preserved", worktree_path=str(worktree), branch=branch)
-            self.audit.append(audit_path, "merge_intent", base_commit=base, verified_commit=verified, branch=branch, target_branch=branch_result.stdout.strip(), expected_head=base)
-            merged = await HarnessEvolutionRunner._command(root, ["git", "merge", "--ff-only", branch], check=False)
-            if merged.returncode != 0:
-                self.audit.append(audit_path, "finished", status="unknown", merge_error=merged.stderr[-4096:])
-                return HarnessEvolutionResult(status="unknown", message="Merge result is not safely known; evidence preserved", worktree_path=str(worktree), branch=branch)
-            self.audit.append(audit_path, "merge_committed", merged_commit=verified)
+            merge_status = await self._merge_verified(
+                root=root, base=base, verified=verified, branch=branch,
+                audit=record_event,
+                invocation_id=invocation_id, trigger=request.trigger,
+                target_branch=branch_result.stdout.strip(),
+            )
+            if merge_status != "merged":
+                return HarnessEvolutionResult(
+                    status=merge_status, message="Main branch changed or merge result is unknown; candidate preserved",
+                    worktree_path=str(worktree), branch=branch, invocation_id=invocation_id,
+                    verified_commit=verified,
+                )
             keep = False
-            return HarnessEvolutionResult(status="merged", message="Capability evolution merged; restart Gateway to load Python changes", worktree_path=str(worktree), branch=branch, merged=True)
+            changed_files = await self._changed_files(root, base, verified)
+            if error_facade is not None:
+                await error_facade._update_long_term_memory(
+                    request, root, diagnostic=diagnostic,
+                    commit_sha=verified, changed_files=changed_files,
+                )
+            elif request.trigger in {"capability", "dream"}:
+                await self._update_shared_memory(
+                    root, request.task, verified, changed_files, record_event,
+                )
+            return HarnessEvolutionResult(
+                status="merged", message="Harness evolution merged safely",
+                worktree_path=str(worktree), branch=branch, merged=True,
+                invocation_id=invocation_id, verified_commit=verified,
+                merged_commit=verified, changed_files=tuple(changed_files),
+                tests_summary=f"validated in {attempts} attempt(s)",
+                restart_required=request.trigger in {"capability", "dream"},
+            )
         finally:
             if not keep:
                 await HarnessEvolutionRunner._command(root, ["git", "worktree", "remove", "--force", str(worktree)], check=False)
                 await HarnessEvolutionRunner._command(root, ["git", "branch", "-D", branch], check=False)
+                record_event(
+                    "cleanup", status="cleanup", former_worktree_path=str(worktree),
+                    branch=branch, branch_preserved=False,
+                )
+
+    async def _repair_loop(
+        self, *, runtime: Any, request: HarnessEvolutionRequest, worktree: Path,
+        test_file: str, audit_path: Path, audit: Callable[..., None],
+        error_writer: ErrorSnapshotWriter | None = None,
+        error_validator: Callable[[Path, Path], Any] | None = None,
+        compatibility_validator: Callable[..., Any] | None = None,
+        manual_record: CodeSessionRecord | None = None,
+    ) -> tuple[str, str, int]:
+        feedback = ""
+        diagnostic = ""
+        for attempt in range(1, request.repair_policy.max_attempts + 1):
+            prompt = self._prompt(request, attempt, feedback, test_file)
+            audit("coding_attempt", attempt=attempt, trigger=request.trigger)
+            try:
+                diagnostic = await self._invoke_runtime(runtime, prompt)
+            except Exception as exc:
+                feedback = f"Coding Runtime failed: {str(exc) or type(exc).__name__}"
+                audit("coding_runtime_failed", attempt=attempt, message=feedback)
+                if not request.repair_policy.allow_automatic_repair:
+                    return diagnostic, feedback, attempt
+                continue
+            if compatibility_validator is not None and manual_record is not None:
+                validation = await compatibility_validator(manual_record, test_file)
+                valid, feedback = bool(validation["passed"]), str(validation["feedback"])
+            else:
+                valid, feedback = await self._validate_target(
+                    worktree, request, audit_path, test_file,
+                    error_writer=error_writer, error_validator=error_validator,
+                )
+            if valid:
+                return diagnostic, "", attempt
+            audit("validation_failed", attempt=attempt, feedback=feedback)
+            if not request.repair_policy.allow_automatic_repair:
+                return diagnostic, feedback, attempt
+        return diagnostic, feedback or "validation did not pass", request.repair_policy.max_attempts
+
+    async def _invoke_runtime(self, runtime: Any, prompt: str) -> str:
+        session_id = str(getattr(runtime, "coding_session_id", "")) or None
+        run_task = getattr(runtime, "run_task", None)
+        if callable(run_task):
+            answers: list[str] = []
+            async for event in run_task(prompt, session_id=session_id):
+                if event.type is EventType.FINAL:
+                    answers.append(str(event.payload.get("answer", "")))
+            return answers[-1] if answers else ""
+        result = await runtime.run(prompt, session_id=session_id) if session_id else await runtime.run(prompt)
+        return str(result.answer)
+
+    def _prompt(
+        self, request: HarnessEvolutionRequest, attempt: int, feedback: str, test_file: str,
+    ) -> str:
+        if request.trigger == "error":
+            snapshot = request.snapshot_path.read_text(encoding="utf-8") if request.snapshot_path else ""
+            prompt = (
+                "You are the Yuan Ye Harness Coding Agent in an isolated Git worktree. "
+                "Repair the system defect evidenced by the real RuntimeFailure snapshot below. "
+                "You may change Git-tracked source and tests, plus necessary new source/tests. "
+                "Never modify .git, .yy, .yy-backups, credentials, local settings, or user changes. "
+                "Make the smallest reliable correction and preserve existing architecture.\n\n"
+                f"Task: {request.task}\nRuntimeFailure snapshot:\n{snapshot}"
+            )
+        elif request.trigger == "manual":
+            prompt = (
+                "You are maintaining Yuan Ye Hook behaviour in an isolated Git worktree. "
+                "Read the repository as needed, but write only extension/hook/** and tests/extensions/**. "
+                f"Create the controller-assigned test `{test_file}`. Do not modify extension/README.md.\n\n"
+                f"User request: {request.task}"
+            )
+        elif request.trigger == "dream":
+            context = request.dream_context
+            assert context is not None
+            changeset = context.changeset
+            prompt = (
+                "You are performing a conservative nightly review of code changed by verified Yuan Ye Harness invocations. "
+                "Preserve behaviour and public contracts. Improve only concrete defects, duplication, error handling, "
+                "maintainability and tests. Do not add unrelated features or change API, Tool schema, risk, idempotency, "
+                "permissions, dependencies, lock files, database schema, configuration format, credentials, Harness approval, "
+                "merge/reconcile, or Backup/Restore controls. Read the full repository, but write only the supplied allowlist "
+                f"and the assigned test `{test_file}`.\n\n"
+                f"Dream date: {changeset.date}\nChanged files: {json.dumps(changeset.changed_files, ensure_ascii=False)}\n"
+                f"Merged commits: {json.dumps(changeset.merged_commits, ensure_ascii=False)}\n"
+                "If no safe, meaningful improvement is needed, make no changes."
+            )
+        else:
+            prompt = self._capability_prompt(request, attempt, "", test_file)
+        if attempt > 1:
+            prompt += (
+                f"\n\nRepair attempt {attempt}. The previous candidate failed these real validations:\n"
+                f"{feedback}\nContinue in the same worktree and Memory Session; do not start over."
+            )
+        return prompt
+
+    async def _update_shared_memory(
+        self, root: Path, task: str, commit: str, changed_files: list[str],
+        audit: Callable[..., None],
+    ) -> None:
+        long_term = HarnessLongTermMemory(
+            self.config.agent_root / ".yy" / "harness-evolution" / "memory" / "profile",
+            agent_root=self.config.agent_root,
+        )
+        long_term.ensure_project_initialized(root)
+        update = long_term.deterministic_update(
+            root, task=task, commit_sha=commit, changed_files=changed_files,
+        )
+        try:
+            await long_term.apply_update(update)
+            audit("long_term_memory_updated", mode="deterministic", changed_files=changed_files)
+        except Exception as exc:
+            audit("long_term_memory_failed", message=str(exc) or type(exc).__name__)
+
+    async def _validate_target(
+        self, worktree: Path, request: HarnessEvolutionRequest, audit_path: Path,
+        test_file: str, *, error_writer: ErrorSnapshotWriter | None,
+        error_validator: Callable[[Path, Path], Any] | None,
+    ) -> tuple[bool, str]:
+        status = (await self._command(
+            worktree, ["git", "status", "--porcelain", "--untracked-files=all"],
+        )).stdout
+        paths = _status_paths(status)
+        if not paths:
+            return False, "Coding Agent produced no source changes"
+        forbidden = _forbidden_changed_paths(status)
+        if forbidden:
+            return False, f"Forbidden Agent Home, Git, credential, or local path changed: {forbidden[0]}"
+        if request.target == "source_repair":
+            validator = error_validator
+            if validator is None:
+                commands = [
+                    ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"],
+                    ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "unittest", "discover", "-s", "tests", "-v"],
+                    ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "compileall", "-q", "Agent", "bootstrap", "context_process", "dream", "extension", "gateway", "memory", "prompt", "reference", "sandbox", "skill", "tool", "tools", "run_ui", "tests", "harness-evolution", "run.py"],
+                    ["uv", "lock", "--check"],
+                    ["git", "diff", "--check"],
+                ]
+                for command in commands:
+                    result = await self._command(worktree, command, check=False, timeout=1200)
+                    self.audit.append(
+                        audit_path, "validation", command=command,
+                        returncode=result.returncode, stdout=result.stdout[-65536:],
+                        stderr=result.stderr[-65536:],
+                    )
+                    if error_writer is not None and request.snapshot_path is not None:
+                        error_writer.append_event(
+                            request.snapshot_path, "test", command=command,
+                            returncode=result.returncode,
+                            stdout=result.stdout[-65536:], stderr=result.stderr[-65536:],
+                        )
+                    if result.returncode:
+                        return False, f"{' '.join(command)} failed: {(result.stderr or result.stdout)[-4000:]}"
+                return True, ""
+            passed = bool(await validator(worktree, request.snapshot_path))
+            return (True, "") if passed else (False, "Full ERROR validation pipeline failed")
+        if request.target == "dream_optimize":
+            return await self._validate_dream(worktree, request, audit_path, test_file)
+        return await self._validate_capability(
+            worktree, request, request.resolved_invocation_id(), audit_path, test_file,
+        )
+
+    async def _commit_candidate(self, worktree: Path, message: str) -> None:
+        await self._command(worktree, ["git", "add", "--all"])
+        await self._command(worktree, [
+            "git", "-c", "user.name=Yuan Ye Harness",
+            "-c", "user.email=harness@local.invalid", "commit", "-m", message,
+        ])
+
+    async def _merge_verified(
+        self, *, root: Path, base: str, verified: str, branch: str,
+        audit: Callable[..., None], invocation_id: str, trigger: str,
+        target_branch: str | None = None,
+    ) -> str:
+        clean = await self._command(
+            root, ["git", "status", "--porcelain", "--untracked-files=all"], check=False,
+        )
+        current = (await self._command(root, ["git", "rev-parse", "HEAD"])).stdout.strip()
+        selected_branch = target_branch or (
+            await self._command(root, ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], check=False)
+        ).stdout.strip()
+        if clean.returncode or clean.stdout.strip() or current != base:
+            audit(
+                "merge_blocked", invocation_id=invocation_id, trigger=trigger,
+                expected_head=base, current_head=current, target_branch=selected_branch,
+            )
+            return "blocked_main_changed"
+        changed_files = await self._changed_files(root, base, verified)
+        audit(
+            "merge_intent", invocation_id=invocation_id, trigger=trigger,
+            source_identity=hashlib.sha256(str(root.resolve()).casefold().encode()).hexdigest()[:16],
+            base_commit=base, verified_commit=verified, candidate_branch=branch,
+            target_branch=selected_branch, expected_head=base, changed_files=changed_files,
+        )
+        merged = await self._command(root, ["git", "merge", "--ff-only", branch], check=False)
+        if merged.returncode:
+            audit("merge_unknown", invocation_id=invocation_id, error=merged.stderr[-4096:])
+            return "unknown"
+        actual = (await self._command(root, ["git", "rev-parse", "HEAD"])).stdout.strip()
+        if actual != verified:
+            audit("merge_unknown", invocation_id=invocation_id, expected=verified, actual=actual)
+            return "unknown"
+        audit(
+            "merge_committed", invocation_id=invocation_id,
+            trigger=trigger,
+            source_identity=hashlib.sha256(str(root.resolve()).casefold().encode()).hexdigest()[:16],
+            base_commit=base, verified_commit=verified, merged_commit=actual,
+            target_branch=selected_branch, changed_files=changed_files,
+        )
+        return "merged"
+
+    async def _validate_dream(
+        self, worktree: Path, request: HarnessEvolutionRequest,
+        audit_path: Path, test_file: str,
+    ) -> tuple[bool, str]:
+        context = request.dream_context
+        if context is None:
+            return False, "DREAM changeset is missing"
+        status = (
+            await HarnessEvolutionRunner._command(
+                worktree, ["git", "status", "--porcelain", "--untracked-files=all"],
+            )
+        ).stdout
+        paths = _status_paths(status)
+        protected_exact = {
+            "pyproject.toml", "uv.lock", "tool/contracts.py", "tool/registry.py",
+            "gateway/state_controller.py", "gateway/harness_evolution.py",
+            "gateway/harness_dream.py", "tools/harness_dream.py",
+            "tools/harness_capability.py", "tools/harness_error.py", "tools/harness_manual.py",
+        }
+        protected_prefixes = (
+            ".git/", ".yy/", ".yy-backups/", "backup/", "gateway/recovery.py",
+            "gateway/maintenance", "harness-evolution/",
+        )
+        allowed = set(context.changeset.changed_files)
+        allowed_tests = {path for path in allowed if path.startswith("tests/")}
+        allowed.add(test_file)
+        if any(path in protected_exact or path.startswith(protected_prefixes) for path in paths):
+            return False, "requires broader source change: DREAM protected path modified"
+        if any(path not in allowed and path not in allowed_tests for path in paths):
+            return False, "DREAM target changed a path outside its immutable changeset allowlist"
+        source_candidates = {
+            path for path in context.changeset.changed_files if not path.startswith("tests/")
+        }
+        if not any(path in source_candidates for path in paths):
+            return False, "DREAM produced no source optimization"
+        if test_file not in paths or not (worktree / test_file).is_file():
+            return False, f"DREAM must create its assigned regression test: {test_file}"
+        commands = [
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q", test_file],
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "compileall", "-q", "Agent", "dream", "gateway", "harness-evolution", "tool", "tools"],
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"],
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "unittest", "discover", "-s", "tests", "-v"],
+            ["uv", "lock", "--check"],
+            ["git", "diff", "--check"],
+        ]
+        for command in commands:
+            result = await HarnessEvolutionRunner._command(
+                worktree, command, check=False, timeout=1200,
+            )
+            self.audit.append(
+                audit_path, "validation", command=command, returncode=result.returncode,
+                stdout=result.stdout[-16000:], stderr=result.stderr[-16000:],
+            )
+            if result.returncode:
+                return False, f"{' '.join(command)} failed: {(result.stderr or result.stdout)[-4000:]}"
+        return True, ""
+
+    async def _changed_files(self, root: Path, base: str, verified: str) -> list[str]:
+        result = await self._command(root, ["git", "diff", "--name-only", f"{base}..{verified}"])
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    @staticmethod
+    async def _command(
+        directory: Path, command: list[str], *, check: bool = True, timeout: float = 1200,
+    ) -> "_CommandResult":
+        return await HarnessEvolutionRunner._command(
+            directory, command, check=check, timeout=timeout,
+        )
 
     @staticmethod
     def _capability_prompt(request: HarnessEvolutionRequest, attempt: int, feedback: str, test_file: str) -> str:
-        scope = "extension/hook/** and tests/extensions/**" if request.target == "extension" else "tools/**/*.py, tool/defaults.py when registration is necessary, and only the controller-assigned tests/test_tool_*.py"
+        gap = request.capability_gap
+        scope = (
+            "tools/**/*.py, tests/tools/**, tool/defaults.py and tools/__init__.py only when registration/export is necessary"
+        )
         prompt = (
             "You are the Yuan Ye Harness Coding Agent in an isolated Git worktree. "
-            f"This is a {request.target} capability evolution. Only modify {scope}. "
+            f"This is a Tool capability evolution. Only modify {scope}. "
             "Do not modify Harness controls, Tool registry/contracts, Gateway core, pyproject.toml, uv.lock, credentials, .git or .yy. "
-            f"User task: {request.task}\nCapability gap: {request.capability_gap}\n"
+            "Any new Tool must declare `delegatable = False` and `runtime_profiles = ('interactive',)`. "
+            f"User task: {request.task}\nCapability gap: "
+            f"{json.dumps(gap.model_dump(mode='json') if gap else {}, ensure_ascii=False)}\n"
             f"Implement the smallest safe change and tests. The only permitted dedicated test path is `{test_file}`. "
             "If this needs a dependency, credential plumbing, database migration, or core framework change, stop and report that broader source change is required."
         )
@@ -1419,10 +1665,14 @@ class HarnessEvolutionEngine:
                 return False, "TOOL target must modify a tools/*.py implementation"
             if test_file not in paths or not (worktree / test_file).is_file():
                 return False, f"TOOL target must create its assigned test file: {test_file}"
-            if any(not (path.startswith("tools/") or path == "tool/defaults.py" or re.fullmatch(r"tests/test_tool_[a-z0-9_]+_[0-9a-f]{8}\.py", path)) for path in paths):
+            if any(not (
+                path.startswith("tools/")
+                or path in {"tool/defaults.py", "tools/__init__.py"}
+                or re.fullmatch(r"tests/tools/test_[a-z0-9_]+_[0-9a-f]{8}\.py", path)
+            ) for path in paths):
                 return False, "TOOL target changed a path outside its allowlist"
         else:
-            if any(not (path.startswith("extension/hook/") or path.startswith("tests/extensions/") or path == "extension/README.md") for path in paths):
+            if any(not (path.startswith("extension/hook/") or path.startswith("tests/extensions/")) for path in paths):
                 return False, "EXTENSION target changed a path outside its allowlist"
             if not any(path.startswith("extension/hook/") for path in paths):
                 return False, "EXTENSION target must modify a hook implementation"
@@ -1443,7 +1693,43 @@ class HarnessEvolutionEngine:
             self.audit.append(audit_path, "validation", command=command, returncode=result.returncode, stdout=result.stdout[-16000:], stderr=result.stderr[-16000:])
             if result.returncode:
                 return False, f"{' '.join(command)} failed: {(result.stderr or result.stdout)[-4000:]}"
+        if request.target == "tool":
+            candidate = await self._registry_snapshot(worktree)
+            baseline = self._tool_registry_baselines.get(invocation_id, {})
+            for name, contract in baseline.items():
+                if candidate.get(name) != contract:
+                    return False, f"Unrelated default Tool contract changed or disappeared: {name}"
+            added = sorted(set(candidate).difference(baseline))
+            if not added and not any(path.startswith("tools/") for path in paths):
+                return False, "TOOL target neither registered nor modified a Tool implementation"
+            for name in added:
+                contract = candidate[name]
+                if contract.get("delegatable", True):
+                    return False, f"New capability Tool must declare delegatable=False: {name}"
+                if contract.get("runtime_profiles") != ["interactive"]:
+                    return False, f"New capability Tool must declare runtime_profiles=('interactive',): {name}"
         return True, ""
+
+    async def _registry_snapshot(self, root: Path) -> dict[str, Any]:
+        script = (
+            "import json; from pathlib import Path; from tool.defaults import default_tools; "
+            f"r=default_tools(Path({str(root)!r}), runtime_profile='interactive'); "
+            "print(json.dumps(r.contract_snapshot(), ensure_ascii=False, sort_keys=True))"
+        )
+        result = await self._command(
+            root,
+            ["uv", "run", "--frozen", "--extra", "dev", "python", "-c", script],
+            check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(f"Default Tool Registry cannot be built: {(result.stderr or result.stdout)[-4000:]}")
+        try:
+            value = json.loads(result.stdout.strip().splitlines()[-1])
+        except (IndexError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Default Tool Registry did not produce a valid contract snapshot") from exc
+        if not isinstance(value, dict):
+            raise RuntimeError("Default Tool Registry contract snapshot must be an object")
+        return value
 
 
 class _CommandResult(BaseModel):
@@ -1510,9 +1796,11 @@ def _forbidden_changed_paths(status: str) -> list[str]:
             or lowered.startswith(".git/")
             or lowered == ".yy"
             or lowered.startswith(".yy/")
+            or lowered == ".yy-backups"
+            or lowered.startswith(".yy-backups/")
             or lowered.startswith("tests/error/")
             or name.startswith(".env")
-            or name in {"settings.local.json", "config.ini"}
+            or name in {"settings.local.json", "config.ini", "credentials.json", "secrets.json"}
         ):
             forbidden.append(normalized)
     return forbidden

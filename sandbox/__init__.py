@@ -1,6 +1,13 @@
 """Docker 沙箱与本地 checkpoint 的正式公共接口。"""
 
 from .checkpoint import CheckpointStore
+from .checkpoint_dream import (
+    CheckpointBranchGarbageCollector,
+    CheckpointCandidateValidator,
+    CheckpointDreamCoordinator,
+    CheckpointDreamResult,
+    CheckpointDreamSessionResult,
+)
 from .docker import (
     BashUnavailableError,
     CommandResult,
@@ -14,8 +21,12 @@ from .locks import WorkspaceLockManager
 from .models import (
     BashResult,
     CheckpointAuditEvent,
+    CheckpointBranchRecord,
+    CheckpointMergeAttempt,
     CheckpointRecord,
+    CheckpointRestorePoint,
     CheckpointState,
+    CheckpointValueAssessment,
     RollbackResult,
     SandboxStatus,
 )
@@ -31,9 +42,18 @@ __all__ = [
     "BashResult",
     "BashUnavailableError",
     "CheckpointAuditEvent",
+    "CheckpointBranchGarbageCollector",
+    "CheckpointCandidateValidator",
+    "CheckpointBranchRecord",
+    "CheckpointMergeAttempt",
     "CheckpointRecord",
+    "CheckpointDreamCoordinator",
+    "CheckpointDreamResult",
+    "CheckpointDreamSessionResult",
+    "CheckpointRestorePoint",
     "CheckpointState",
     "CheckpointStore",
+    "CheckpointValueAssessment",
     "CommandResult",
     "DockerSandboxSession",
     "DockerUnavailableError",

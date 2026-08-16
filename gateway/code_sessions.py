@@ -50,13 +50,33 @@ class CodeSessionManager:
         self._lock = asyncio.Lock()
         self._maintenance_epoch: int | None = None
 
-    async def start(self, project_id: str, client_id: str) -> CodeSessionRecord:
+    async def start(
+        self, project_id: str, client_id: str, *,
+        origin_session_id: str | None = None, origin_run_id: str,
+        origin_context: dict | None = None,
+    ) -> CodeSessionRecord:
         async with self._lock:
             self._require_available()
             if self.source_root in self._sources:
                 raise RuntimeError("这个 Yuan Ye 源码仓库已经有活动的 Coding Session")
             controller = self.module.CodeSessionController(self.config)
-            raw = await controller.start(self.source_root)
+            origin = self.module.HarnessOriginContext.model_validate(
+                origin_context or {
+                    "origin_project_id": project_id,
+                    "origin_session_id": origin_session_id,
+                    "origin_run_id": origin_run_id,
+                    "context_summary": "Gateway /code control session",
+                    "trigger_evidence": {"code_session_start_run_id": origin_run_id},
+                },
+                strict=True,
+            )
+            try:
+                raw = await controller.start(self.source_root, origin=origin)
+            except TypeError as exc:
+                # Compatibility for injected test/session facades that predate origin context.
+                if "origin" not in str(exc):
+                    raise
+                raw = await controller.start(self.source_root)
             session_id = raw.code_session_id
             self._sessions[session_id] = controller
             self._sources[self.source_root] = session_id
@@ -286,4 +306,6 @@ class CodeSessionManager:
             base_commit=raw.base_commit,
             status=raw.status,
             verified_turns=raw.verified_turns,
+            origin_session_id=raw.origin.origin_session_id if raw.origin else None,
+            origin_run_id=raw.origin.origin_run_id if raw.origin else None,
         )

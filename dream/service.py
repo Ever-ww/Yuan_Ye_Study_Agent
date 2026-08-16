@@ -319,6 +319,10 @@ class DreamService:
             raise RuntimeError("Dream 维护 Runtime 未返回完整结果")
         return result.answer
 
+    async def run_stateless_model(self, messages: list[dict[str, str]]) -> str:
+        """供其他Dream阶段复用同一无工具、无Memory、无Sandbox的模型边界。"""
+        return await self._run_model(messages)
+
     def _provider(self):
         return build_provider(
             self.config.provider,

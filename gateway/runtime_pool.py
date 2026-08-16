@@ -12,7 +12,7 @@ from pathlib import Path
 from time import monotonic
 from uuid import uuid4
 
-from Agent import AgentRuntime, EventType, ExtensionCatalog, ModelRetryPolicy, load_runtime_config
+from Agent import AgentRuntime, EventType, ExtensionCatalog, ModelRetryPolicy, RuntimeFailure, load_runtime_config
 from Agent.hook import HookRegistry
 from Agent.runtime.ephemeral import EphemeralMemory
 from Agent.state import (
@@ -367,6 +367,25 @@ class RuntimePool:
             await self._emit(current, "run_cancelled", {"message": "当前运行已取消"})
         except Exception as exc:
             message = str(exc) or type(exc).__name__
+            failure = (
+                runtime.last_failure
+                if runtime is not None and getattr(runtime, "last_failure", None) is not None
+                else RuntimeFailure.capture(exc)
+            )
+            proposal = None
+            if self.harness_evolution_service is not None:
+                try:
+                    proposal = self.harness_evolution_service.propose_error(
+                        run_id=original.run_id, failure=failure,
+                    )
+                except Exception as proposal_error:
+                    await self._emit(original, "harness_evolution_proposal_failed", {
+                        "message": str(proposal_error) or type(proposal_error).__name__,
+                    })
+            if proposal is not None:
+                # The client subscription terminates at run_failed. Proposal must be emitted
+                # first so the originating user can make the one durable decision.
+                await self._emit(original, "harness_evolution_proposed", proposal)
             state = self.state_controller.state(original.run_id)
             if state.task_state is not TaskState.RECOVERY_REQUIRED:
                 await self._finish_run(original.run_id, ExecutionOutcome.ERROR, message)
@@ -488,10 +507,10 @@ class RuntimePool:
             self.harness_evolution_service is not None
             and not run.client_id.startswith("cron:")
             and hasattr(runtime, "tools")
-            and "harness_evolve" not in runtime.tools.names()
+            and "harness_capability" not in runtime.tools.names()
         ):
-            from tools import HarnessEvolveTool
-            runtime.tools.register(HarnessEvolveTool(self.harness_evolution_service))
+            from tools import HarnessCapabilityTool
+            runtime.tools.register(HarnessCapabilityTool(self.harness_evolution_service))
         if (
             self.tool_operations is not None
             and hasattr(runtime, "tool_context")
@@ -551,6 +570,7 @@ class RuntimePool:
                 session_origin="cron",
                 references=self.reference_service,
                 enable_references=self.reference_service is not None,
+                runtime_profile="cron",
             )
         runtime = AgentRuntime(
             config,
@@ -567,6 +587,7 @@ class RuntimePool:
             session_origin="cron" if scheduled else "interactive",
             references=self.reference_service,
             enable_references=self.reference_service is not None,
+            runtime_profile="interactive",
         )
         return runtime
 

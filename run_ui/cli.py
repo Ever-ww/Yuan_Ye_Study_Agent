@@ -39,7 +39,6 @@ from cron import (
 )
 from skill import SkillInstallRequest
 from .approval import InteractiveApproval, active_live as _active_live
-from .harness_loader import load_harness_module
 from .web import serve
 from backup import BackupService, RestoreService
 
@@ -208,6 +207,8 @@ async def _render_gateway(
                             lines.append(f"[red]工具失败[/] {event.payload.get('name', '')}")
                         else:
                             lines.append(f"[green]工具完成[/] {event.payload.get('name', '')}")
+                    elif event.type == EventType.GATEWAY_RESTART_REQUIRED.value:
+                        lines.append(f"[bold yellow]{event.payload.get('message', '需要重启 Gateway')}[/]")
                     elif event.type == "approval_requested":
                         approved = await approval_selector(
                             str(event.payload.get("tool_name", "")),
@@ -229,6 +230,23 @@ async def _render_gateway(
                     elif event.type in {"run_failed", "run_cancelled", "run_interrupted"}:
                         terminal_error = str(event.payload.get("message", "运行结束"))
                         lines.append(f"[red]{terminal_error}[/]")
+                    elif event.type == "harness_evolution_proposed":
+                        live.stop()
+                        confirmed = typer.confirm(
+                            "检测到可修复的 Yuan Ye 源码缺陷。是否启动隔离 Harness 自动修复（最多 4 次）？",
+                            default=False,
+                        )
+                        try:
+                            result = await client.decide_harness_evolution(
+                                str(event.payload["proposal_id"]), confirmed,
+                            )
+                            status = str((result.get("result") or {}).get("status") or result.get("status"))
+                            lines.append(
+                                f"[{'green' if status == 'merged' else 'yellow'}]"
+                                f"Harness Proposal：{status}[/]"
+                            )
+                        finally:
+                            live.start(refresh=True)
                     elif event.type == "run_completed":
                         answer = str(event.payload.get("answer", ""))
                         if answer and not streaming_text:
@@ -400,7 +418,7 @@ async def _chat_gateway(
             )
             continue
         if task == "/code":
-            await _code_mode(client, project_id)
+            await _code_mode(client, project_id, session_id)
             continue
         if task == "/skill" or task.startswith("/skill "):
             await _handle_gateway_skill_command(client, project_id, session_id, task)
@@ -413,6 +431,9 @@ async def _chat_gateway(
             continue
         if task == "/dream" or task.startswith("/dream "):
             await _handle_dream_command(client, task)
+            continue
+        if task == "/harness" or task.startswith("/harness "):
+            await _handle_harness_command(client, task)
             continue
         if not task:
             continue
@@ -700,11 +721,13 @@ def _render_inbox_item(item: dict[str, object]) -> None:
     console.print(Panel(content, title=f"Inbox {item.get('item_id', '')}"))
 
 
-async def _code_mode(client: GatewayClient, project_id: str) -> None:
+async def _code_mode(
+    client: GatewayClient, project_id: str, origin_session_id: str | None = None,
+) -> None:
     """在 Gateway 托管的隔离 worktree 中运行持续 Extension Coding 会话。"""
     try:
         with console.status("[cyan]正在创建隔离 Git worktree 和 Coding Runtime…[/]"):
-            session = await client.start_code_session(project_id)
+            session = await client.start_code_session(project_id, origin_session_id)
     except Exception as exc:
         console.print(Panel(
             str(exc) or type(exc).__name__,
@@ -935,6 +958,45 @@ async def _handle_dream_command(client: GatewayClient, task: str) -> None:
         console.print(f"[red]{str(exc) or type(exc).__name__}[/]")
 
 
+async def _handle_harness_command(client: GatewayClient, task: str) -> None:
+    """Handle durable Harness Dream commands outside the chat transcript."""
+    try:
+        parts = shlex.split(task)
+        if len(parts) < 2 or parts[1].lower() != "dream":
+            raise ValueError("用法：/harness dream status|run|freeze|unfreeze|revert")
+        action = parts[2].lower() if len(parts) > 2 else "status"
+        if action == "status" and len(parts) == 3:
+            console.print_json(data=await client.harness_dream_status())
+            return
+        if action == "run" and len(parts) in {3, 4}:
+            selected = parts[3] if len(parts) == 4 else None
+            if not typer.confirm("Harness Dream 会修改 Yuan Ye 源码，确认运行？", default=False):
+                console.print("[yellow]已取消[/]")
+                return
+            console.print_json(data=await client.run_harness_dream(selected))
+            return
+        if action == "freeze":
+            reason = " ".join(parts[3:]).strip() or "operator freeze"
+            console.print_json(data=await client.freeze_harness_dream(reason))
+            return
+        if action == "unfreeze" and len(parts) == 3:
+            console.print_json(data=await client.unfreeze_harness_dream())
+            return
+        if action == "revert" and len(parts) == 4:
+            if not typer.confirm("仅生成回滚候选，不会立即合并。继续？", default=False):
+                console.print("[yellow]已取消[/]")
+                return
+            console.print_json(data=await client.create_harness_dream_revert(parts[3]))
+            return
+        raise ValueError(
+            "用法：/harness dream status；/harness dream run [YYYY-MM-DD|operation_id]；"
+            "/harness dream freeze [reason]；/harness dream unfreeze；"
+            "/harness dream revert <operation_id>"
+        )
+    except Exception as exc:
+        console.print(f"[red]{str(exc) or type(exc).__name__}[/]")
+
+
 def _render_dream_result(result) -> None:
     style = "green" if result.status == "completed" else "yellow" if result.status == "noop" else "red"
     console.print(Panel(
@@ -1130,66 +1192,13 @@ def _skill_usage() -> str:
 
 
 async def _handle_chat_failure(config, runtime, task: str, session_id: str, failure: RuntimeFailure) -> None:
-    """仅保存代码类缺陷现场，并由用户决定是否启动 Harness。"""
-    if not failure.snapshot_worthy:
-        # 网络、服务、配置、权限和普通运行错误已经由 CLI 展示。它们不能
-        # 通过修改项目代码可靠解决，因此既不保存隐私敏感快照，也不加载
-        # Harness 模块。网络重试最终成功时不会进入本函数。
-        return
-
-    harness = load_harness_module()
-    writer = harness.ErrorSnapshotWriter(
-        config.agent_root,
-        secrets=(
-            config.api_key or "",
-            config.web_search_api_key or "",
-            config.reference_embedding_api_key or "",
-        ),
-    )
-    try:
-        records = runtime.memory.session_records(session_id) if session_id and runtime.memory.has_session(session_id) else []
-        snapshot = writer.capture(
-            task=task,
-            session_id=session_id,
-            failure=failure,
-            session_records=records,
-            session_file=runtime.memory.active_filename(session_id) if session_id and records else "",
+    """Legacy local runtime hook; Gateway is the sole ERROR Evolution owner."""
+    del config, runtime, task, session_id
+    if failure.snapshot_worthy:
+        console.print(
+            "[yellow]本地 Runtime 不再直接执行 Harness；请通过 Gateway 对话重试，"
+            "Gateway 会保存完整 RuntimeFailure 并发出一次确认 Proposal。[/]"
         )
-    except Exception as snapshot_error:
-        console.print(f"[yellow]错误现场保存失败：{str(snapshot_error) or type(snapshot_error).__name__}[/]")
-        return
-    console.print(f"[dim]错误复现快照：{snapshot}[/]")
-    confirmed = typer.confirm("检测到可诊断的代码/模型格式缺陷，是否启动 Harness 隔离流水线？", default=False)
-    writer.append_event(snapshot, "decision", repairable=True, confirmed=confirmed)
-    if not confirmed:
-        return
-    request = harness.HarnessEvolutionRequest(
-        project_root=(config.coding_source_root or Path(__file__).resolve().parents[1]),
-        incident_id=snapshot.stem,
-        snapshot_path=snapshot,
-        task=task,
-        config=config,
-        trigger="error",
-        target="source_repair",
-        source_root=(config.coding_source_root or Path(__file__).resolve().parents[1]),
-        agent_root=config.agent_root,
-        max_attempts=1,
-        merge_policy="immediate",
-    )
-    console.print("[cyan]Harness 正在检查主 worktree并准备隔离诊断…[/]")
-    try:
-        result = await harness.HarnessEvolutionRunner(writer).run(request)
-    except Exception as evolution_error:
-        writer.append_event(
-            snapshot,
-            "evolution",
-            status="pipeline_error",
-            message=str(evolution_error) or type(evolution_error).__name__,
-        )
-        console.print(f"[red]Harness 流水线失败：{str(evolution_error) or type(evolution_error).__name__}[/]")
-        return
-    style = "green" if result.merged else "yellow"
-    console.print(f"[{style}]{result.message}[/]")
 
 
 @session_app.command("list")

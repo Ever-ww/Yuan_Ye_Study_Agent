@@ -20,6 +20,8 @@ from backup import AgentHomeWriteGate, QuiesceResult
 IdleCheck = Callable[[], bool]
 ResultCallback = Callable[[DreamRunResult, bool], Awaitable[None]]
 DayRunner = Callable[[date], Awaitable[DreamRunResult]]
+HarnessDayRunner = Callable[[date], Awaitable[Any]]
+CheckpointDayRunner = Callable[[date], Awaitable[Any]]
 
 
 class DreamScheduler:
@@ -34,6 +36,8 @@ class DreamScheduler:
         heartbeat_seconds: int = 60,
         clock: Callable[[], datetime] | None = None,
         run_day: DayRunner | None = None,
+        run_harness_day: HarnessDayRunner | None = None,
+        run_checkpoint_day: CheckpointDayRunner | None = None,
         write_gate: AgentHomeWriteGate | None = None,
     ) -> None:
         self.service = service
@@ -42,6 +46,8 @@ class DreamScheduler:
         self.heartbeat_seconds = heartbeat_seconds
         self.clock = clock or (lambda: datetime.now().astimezone())
         self.run_day = run_day or self.service.process_day
+        self.run_harness_day = run_harness_day
+        self.run_checkpoint_day = run_checkpoint_day
         self._task: asyncio.Task[None] | None = None
         self._wake = asyncio.Event()
         self._closing = False
@@ -79,22 +85,51 @@ class DreamScheduler:
         async with self._tick_lock:
             if self._maintenance_epoch is not None:
                 return None
-            if not self.service.config.dream_enabled or not self.is_idle():
+            profile_enabled = self.service.config.dream_enabled
+            harness_enabled = bool(
+                self.run_harness_day is not None
+                and self.service.config.harness_dream_enabled
+            )
+            checkpoint_enabled = bool(profile_enabled and self.run_checkpoint_day is not None)
+            if (not profile_enabled and not harness_enabled and not checkpoint_enabled) or not self.is_idle():
                 return None
             now = self._local_now()
-            if self._retry_after is not None and now < self._retry_after:
+            profile_retry_blocked = self._retry_after is not None and now < self._retry_after
+            due = self._due_date(now) if profile_enabled and not profile_retry_blocked else None
+            scheduled_day = self._latest_scheduled_day(now)
+            if due is None and not harness_enabled:
                 return None
-            due = self._due_date(now)
-            if due is None:
-                return None
-            result = await self.run_day(due)
-            await self.on_result(result, True)
-            if result.status == "failed":
-                self.last_error = result.message
-                self._retry_after = now + timedelta(seconds=max(300, self.heartbeat_seconds))
-            else:
-                self.last_error = None
-                self._retry_after = None
+            result: DreamRunResult | None = None
+            if due is not None:
+                try:
+                    result = await self.run_day(due)
+                    await self.on_result(result, True)
+                except Exception as exc:
+                    self.last_error = str(exc) or type(exc).__name__
+                    self._retry_after = now + timedelta(seconds=max(300, self.heartbeat_seconds))
+                else:
+                    if result.status == "failed":
+                        self.last_error = result.message
+                        self._retry_after = now + timedelta(
+                            seconds=max(300, self.heartbeat_seconds),
+                        )
+                    else:
+                        self.last_error = None
+                        self._retry_after = None
+            # 代码类Dream阶段拥有独立持久状态；Profile失败不能阻止同一tick中的独立阶段。
+            if (
+                checkpoint_enabled and self.run_checkpoint_day is not None
+                and scheduled_day is not None and due is not None
+            ):
+                try:
+                    await self.run_checkpoint_day(scheduled_day)
+                except Exception as exc:
+                    self.last_error = str(exc) or type(exc).__name__
+            if harness_enabled and self.run_harness_day is not None and scheduled_day is not None:
+                try:
+                    await self.run_harness_day(scheduled_day)
+                except Exception as exc:
+                    self.last_error = str(exc) or type(exc).__name__
             return result
 
     async def quiesce(self, maintenance_epoch: int) -> QuiesceResult:
@@ -135,6 +170,10 @@ class DreamScheduler:
         return croniter(self.service.config.dream_schedule, now).get_next(datetime).isoformat(
             timespec="seconds",
         )
+
+    def _latest_scheduled_day(self, now: datetime) -> date | None:
+        previous = croniter(self.service.config.dream_schedule, now).get_prev(datetime)
+        return previous.date() - timedelta(days=1)
 
     def _local_now(self) -> datetime:
         selected = self.clock()

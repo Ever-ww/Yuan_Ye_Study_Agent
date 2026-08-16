@@ -242,12 +242,17 @@ class ReactLoop:
             if reply.tool_calls:
                 prepared_calls = [(call, str(call.id)) for call in reply.tool_calls]
                 messages.append(_assistant_tool_message(reply))
+                terminal_tool_answer = ""
                 try:
                     async for event in self._execute_tools(prepared_calls, messages, context, task, session_id):
                         yield event
+                        if event.type is EventType.FINAL:
+                            terminal_tool_answer = str(event.payload.get("answer", ""))
                 except Exception as exc:
                     _attach_failure_context(exc, messages, schemas, model, [])
                     raise
+                if terminal_tool_answer:
+                    return
                 successful_steps += 1
                 continue
 
@@ -273,7 +278,7 @@ class ReactLoop:
         session_id: str,
     ) -> AsyncIterator[RunEvent]:
         """在当前无编号 Turn 内执行模型请求的全部工具。"""
-        for call, call_id in calls:
+        for position, (call, call_id) in enumerate(calls):
             before = HookEvent(point=HookPoint.TOOL_BEFORE, session_id=session_id, data={
                 "task": task, "name": call.name, "arguments": dict(call.arguments), "tool_call_id": call_id,
             })
@@ -364,6 +369,28 @@ class ReactLoop:
                 "name": name, "content": result, "status": "success",
             })
             messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result})
+            if self.tools.ends_turn(name, result):
+                for pending, pending_id in calls[position + 1:]:
+                    skipped = (
+                        f"工具未执行：同一模型响应中的 {name} 已合并源码并要求重启 Gateway。"
+                    )
+                    messages.append({
+                        "role": "tool", "tool_call_id": pending_id,
+                        "name": pending.name, "content": skipped,
+                    })
+                    yield RunEvent(type=EventType.TOOL_COMPLETED, payload={
+                        "name": pending.name, "content": skipped, "status": "skipped",
+                    })
+                answer = (
+                    "Harness 已安全合并新的 Tool 源码。当前 Gateway 的 Tool Catalog 仍是旧快照，"
+                    "本次运行已正常结束；请重启 Gateway 后在原 Session 继续，下一次运行将加载新 Tool。"
+                )
+                yield RunEvent(type=EventType.GATEWAY_RESTART_REQUIRED, payload={
+                    "tool": name,
+                    "message": answer,
+                })
+                yield RunEvent(type=EventType.FINAL, payload={"answer": answer})
+                return
 
 def _assistant_tool_message(reply: ModelReply) -> dict[str, Any]:
     """构造可再次发送给 OpenAI-compatible 接口的 assistant 工具消息。"""

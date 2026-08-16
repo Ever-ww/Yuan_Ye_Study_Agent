@@ -30,6 +30,7 @@ class GatewayProcessManager:
         self.startup_lock_path = self.directory / "startup.lock"
         self.log_path = self.directory / "gateway.log"
         self.stop_request_path = self.directory / "stop.request"
+        self.restart_request_path = self.directory / "restart.request"
         # This is the external control plane, never the replaceable `.yy` tree.
         self.directory.mkdir(parents=True, exist_ok=True)
 
@@ -366,7 +367,7 @@ def run_gateway(agent_root: Path, port: int) -> None:
                 serving = asyncio.create_task(server.serve())
                 try:
                     while not serving.done():
-                        if manager.stop_request_path.exists():
+                        if manager.stop_request_path.exists() or manager.restart_request_path.exists():
                             server.should_exit = True
                             break
                         await asyncio.sleep(0.2)

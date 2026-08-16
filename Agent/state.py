@@ -56,6 +56,8 @@ class WorkloadKind(str, Enum):
     CODE_TURN = "code_turn"
     CODE_FINALIZE = "code_finalize"
     CODE_ABORT = "code_abort"
+    HARNESS_EVOLUTION = "harness_evolution"
+    HARNESS_DREAM = "harness_dream"
     MAINTENANCE = "maintenance"
 
 

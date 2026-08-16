@@ -225,6 +225,7 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
   "tool_output_head_ratio": 0.2,
   "tool_output_tail_ratio": 0.2,
   "sandbox_checkpoint_limit": 17,
+  "sandbox_checkpoint_merged_branch_retention_days": 30,
   "gateway_port": 8765,
   "gateway_max_concurrent_runs": 4,
   "gateway_runtime_idle_seconds": 900,
@@ -330,7 +331,7 @@ Google Scholar 仍只是候选链接来源；工具不会绕过验证码、登�
 
 `tool_output_max_chars` 默认是 `10000`。在下一次用户任务开始时，超过该阈值的历史工具输出仅在模型上下文中裁剪：保留前 `tool_output_head_ratio`（默认 20%）和后 `tool_output_tail_ratio`（默认 20%），中段替换为审计标记。当前任务内的工具结果始终完整；Session JSONL 与错误快照也始终保存完整原文。设为 `0` 可关闭此裁剪。
 
-`sandbox_checkpoint_limit` 默认是 `17`，必须是大于等于 1 的整数。它限制每个 Session 在 `.yy/sandbox/checkpoints/` 中保留的本地快照数量，基线也计入上限；超过后会删除最旧引用，并只清理独立 checkpoint 对象库，不改写项目主仓库。
+`sandbox_checkpoint_limit` 默认是 `17`，必须是大于等于 1 的整数。它只限制每个 Session 中可供用户精确回退的恢复点数量，基线也计入上限；超过后淘汰最老恢复点引用，但归档分支仍需要的提交继续由 branch ref 保护，不改写项目主仓库。
 
 Gateway 默认监听 `127.0.0.1:8765`，不同 Session 最多同时运行 4 个任务，同一 Session 同时只允许一个任务。`gateway_runtime_idle_seconds=900` 表示 Session Runtime 空闲 15 分钟后关闭 Trace 与 Docker；Session JSONL 不会删除，下一次请求仍可恢复。
 
@@ -897,3 +898,23 @@ arXiv ID、规范 URL，最后才使用题名与年份。下载前查索引，�
 总结。扫描件没有可提取文字时只记录 `ocr_required`，不会伪造全文总结。准确原文 passage、
 页码和模型生成的引用示例继续分别写入 `~/.yy/reference/reference.sqlite3`；全局 PDF 只能通过
 受控 `paper_id` 关联，`reference_write` 不接受任意 Agent Home 绝对路径。
+
+## Branch-based Sandbox Checkpoint
+
+Sandbox checkpoint 使用 Agent Home 中的独立裸 Git 仓库，不修改项目自身的 HEAD、index 或
+branch。执行 rollback 时，原活动分支会变成 `ARCHIVED` 并完整保留后续内容，系统从指定恢复点
+创建新的活动分支；后续 `write`、`edit` 和 `bash` 只在新分支继续提交。`sandbox_rollback` 支持
+按 `steps`、checkpoint `sequence` 或完整 SHA 精确选择恢复点，并可通过 `merge_eligible=false`
+明确声明旧分支不应进入自动 Dream。
+
+`sandbox_checkpoint_limit` 只限制每个 Session 对用户可见的恢复点数量。超限时淘汰最老恢复点
+ref，但仍被活动或归档 branch ref 引用的 Git commit 不会被物理删除。每日 Dream 会对
+`ARCHIVED + READY + merge_eligible` 分支执行无 Memory、无工具的价值判断；只有判断为有价值、
+三方合并无冲突、workspace 精确位于活动 HEAD 且验证通过时才自动创建双父 merge checkpoint。
+`BLOCKED/DEFERRED/UNKNOWN` 属于 merge attempt 结果，不会污染分支的
+`ACTIVE/ARCHIVED/MERGED` 生命周期。已合并分支 ref 默认保留30天，可通过
+`sandbox_checkpoint_merged_branch_retention_days` 调整，之后仅在合并历史稳定且没有恢复引用时GC。
+
+交互式 Runtime 可用 `sandbox_checkpoint_history` 查看恢复点、分支生命周期和 Dream 合并记录；
+`sandbox_checkpoint_branch` 是需要统一高风险审批的管理入口，可明确重新启用或禁用某个归档分支的
+Dream 准入。两个入口都只操作隔离 Checkpoint 仓库，不修改项目 Git。

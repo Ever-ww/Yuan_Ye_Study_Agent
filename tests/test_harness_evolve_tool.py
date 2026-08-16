@@ -31,17 +31,29 @@ class HarnessEvolveToolTests(unittest.TestCase):
 
         async def scenario() -> None:
             with self.assertRaisesRegex(RuntimeError, "durable Tool operation"):
-                await tool.run({"task": "x", "target": "tool", "capability_gap": "missing"}, context)
+                await tool.run({"task": "x", "capability_gap": {
+                    "summary": "missing", "desired_behavior": "do x",
+                    "current_limitation": "no tool", "acceptance_criteria": ["x works"],
+                    "safety_constraints": [],
+                }}, context)
             token = _CURRENT_OPERATION.set("op-1")
             try:
-                result = json.loads(await tool.run({"task": "x", "target": "tool", "capability_gap": "missing"}, context))
+                result = json.loads(await tool.run({"task": "x", "capability_gap": {
+                    "summary": "missing", "desired_behavior": "do x",
+                    "current_limitation": "no tool", "acceptance_criteria": ["x works"],
+                    "safety_constraints": [],
+                }}, context))
             finally:
                 _CURRENT_OPERATION.reset(token)
             self.assertEqual(result["operation_id"], "op-1")
 
         asyncio.run(scenario())
         self.assertEqual(service.calls[0]["operation_id"], "op-1")
+        self.assertNotIn("target", service.calls[0])
+        self.assertEqual(tool.runtime_profiles, ("interactive",))
+        self.assertFalse(tool.delegatable)
+        self.assertTrue(tool.ends_turn(json.dumps({"status": "merged", "restart_required": True})))
+        self.assertFalse(tool.ends_turn(json.dumps({"status": "merged", "restart_required": False})))
         registry = AsyncToolRegistry([tool])
         with self.assertRaises(ValueError):
             registry.select(["harness_evolve"])
-
