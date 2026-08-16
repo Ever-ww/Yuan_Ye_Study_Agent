@@ -40,10 +40,12 @@ class _CapturingProvider(_AnswerProvider):
     def __init__(self) -> None:
         self.tool_names: list[set[str]] = []
         self.system_prompts: list[str] = []
+        self.user_queries: list[str] = []
 
     async def complete(self, messages, tools):
         self.tool_names.append({str(item["name"]) for item in tools})
         self.system_prompts.append(str(messages[0]["content"]))
+        self.user_queries.append(str(messages[-1]["content"]))
         return await super().complete(messages, tools)
 
 
@@ -160,7 +162,8 @@ class SandboxTests(unittest.TestCase):
             )
             self.assertTrue(provider.tool_names)
             self.assertTrue(all("bash" not in names for names in provider.tool_names))
-            self.assertTrue(all("Checkpoint-only（Bash 禁用" in prompt for prompt in provider.system_prompts))
+            self.assertTrue(all("checkpoint_only" in query for query in provider.user_queries))
+            self.assertTrue(all("Checkpoint-only（Bash 禁用" not in prompt for prompt in provider.system_prompts))
             await runtime.close()
             self.assertFalse(sandbox.active)
 

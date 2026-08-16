@@ -1,6 +1,0 @@
-interface:
-  display_name: "Harness Evolve"
-  short_description: "Resume legacy Harness capability work"
-  default_prompt: "Use $harness-evolve only to resume a legacy Harness capability operation."
-policy:
-  allow_implicit_invocation: false

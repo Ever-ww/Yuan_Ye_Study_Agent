@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import platform
-from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict
 from skill import SkillCatalogSnapshot
+from .runtime_context import AgentDynamicContextBuilder
 
 if TYPE_CHECKING:
     from Agent.config import RuntimeConfig
@@ -44,11 +43,10 @@ class SystemPromptComposer:
         self.skills = skills
         self.sandbox_mode = "docker" if sandbox_enabled else "closed"
         self._snapshots: dict[str, SystemPromptSnapshot] = {}
+        self.rebuild_count = 0
 
     def set_sandbox_status(self, status: "SandboxStatus") -> None:
         """在 Trace 探测完成后固定当前 Session 的实际安全能力。"""
-        if self.sandbox_mode != status.mode:
-            self._snapshots.clear()
         self.sandbox_mode = status.mode
 
     def open_session(
@@ -83,9 +81,6 @@ class SystemPromptComposer:
         )
         soul = _read(self.config.agent_root / ".yy" / "agents" / "SOUL.md")
         agent = _read(self.config.agent_root / ".yy" / "agents" / "AGENT.md")
-        profile = self.memory.prompt_context(session_id)
-        summary = self.memory.latest_summary(session_id)
-        environment = _environment(self.config, sandbox_mode=self.sandbox_mode)
         sections = [
             skill_xml,
             "# Agent 身份（SOUL）\n" + soul,
@@ -105,17 +100,13 @@ class SystemPromptComposer:
                 "download_paper，成功后使用其返回路径调用 read_file；不要把 HTML 页面当作 PDF 下载。"
             ),
             "# 项目说明（AGENT）\n" + agent,
-            "# 长时记忆\n" + (profile or "（暂无可用长期记忆）"),
-            "# 系统与会话信息\n" + environment + (
-                f"\nSession ID：{session_id}\n当前分段：{segment_path.name}\n分段绝对路径：{segment_path}"
-                f"\nSession 初始化时间：{initialized_at}"
+            (
+                "# 运行时上下文规则\n"
+                "当前时间、工作区、Session、Sandbox、长期记忆和压缩摘要只会出现在当前 "
+                "user query 末尾的 ephemeral agent_runtime_context 中。该区块不属于用户原文，"
+                "不得整块复制到回答、Memory、文件、日志或 Tool 参数中。"
             ),
         ]
-        runtime_notice = str(getattr(self.memory, "runtime_notice", "")).strip()
-        if runtime_notice:
-            sections.insert(1, "# 当前运行模式\n" + runtime_notice)
-        if summary:
-            sections.append("# 当前会话压缩摘要\n" + summary)
         snapshot = SystemPromptSnapshot(
             session_id=session_id,
             segment_path=segment_path,
@@ -124,6 +115,7 @@ class SystemPromptComposer:
             skill_catalog=selected_catalog,
         )
         self._snapshots[session_id] = snapshot
+        self.rebuild_count += 1
         if self.skills is not None and selected_catalog is not None:
             self.skills.bind_session(session_id, selected_catalog)
         return snapshot
@@ -144,14 +136,10 @@ class SystemPromptComposer:
 
 
 class TaskPromptComposer:
-    """当前用户消息只在发送模型时附加本地时间。"""
+    """当前用户消息在 Provider 投影之前保持原文。"""
 
     def compose(self, task: str) -> dict[str, str]:
-        now = datetime.now().astimezone()
-        return {
-            "role": "user",
-            "content": f"{task}\n\n[本次提问时间：{now:%Y-%m-%d %H:%M:%S}，时区：{now.tzname() or str(now.tzinfo)}]",
-        }
+        return {"role": "user", "content": task}
 
 
 class PromptComposer:
@@ -172,6 +160,7 @@ class PromptComposer:
             raise ValueError("PromptComposer 需要 MemoryStore")
         self.system = SystemPromptComposer(config, memory, skills, sandbox_enabled=sandbox_enabled)
         self.task = TaskPromptComposer()
+        self.dynamic_context = AgentDynamicContextBuilder(config, memory)
 
     def compose(self, task: str, session_id: str | None = None) -> list[dict[str, str]]:
         if session_id is None:
@@ -209,23 +198,21 @@ class PromptComposer:
 
     def set_sandbox_status(self, status: "SandboxStatus") -> None:
         self.system.set_sandbox_status(status)
+        self.dynamic_context.set_sandbox_mode(status.mode)
+
+    def render_provider_query(
+        self,
+        original_query: str,
+        session_id: str,
+        *,
+        origin_refs: dict[str, str] | None = None,
+    ) -> str:
+        return self.dynamic_context.render(
+            original_query,
+            session_id,
+            origin_refs=origin_refs,
+        )
 
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8").strip() if path.exists() else "（未配置）"
-
-
-def _environment(config: "RuntimeConfig", *, sandbox_mode: str) -> str:
-    now = datetime.now().astimezone()
-    sandbox_text = {
-        "docker": "Docker 沙箱（Bash 可用，文件修改受 checkpoint 保护）",
-        "checkpoint_only": "Checkpoint-only（Bash 禁用，本地写入与回溯可用）",
-        "pending": "正在探测 Docker",
-        "closed": "未启用或已关闭",
-    }.get(sandbox_mode, sandbox_mode)
-    return (
-        f"操作系统：{platform.system()} {platform.release()}\n"
-        f"架构：{platform.machine()}\nPython：{platform.python_version()}\n"
-        f"工作区：{config.workspace_root}\nSandbox：{sandbox_text}\n"
-        f"时区：{now.tzname() or str(now.tzinfo)}\n系统时间：{now:%Y-%m-%d %H:%M:%S}"
-    )

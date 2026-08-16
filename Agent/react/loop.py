@@ -17,6 +17,7 @@ from Agent.errors import AgentExecutionLimitError, AgentInvariantError
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models.errors import is_retryable_model_error
 from Agent.retry import ModelRetryPolicy
+from memory.persistence import SessionPersistenceProjection
 from tool import (
     AsyncToolRegistry,
     ToolContext,
@@ -51,6 +52,7 @@ class ReactLoop:
         """重复模型调用，直到模型返回最终文本或达到调用上限。"""
         model_calls: list[dict[str, Any]] = []
         question_tokens = _estimate_tokens(task)
+        ephemeral_context_tokens: int | None = None
         task_started_at = time.perf_counter()
 
         successful_steps = 0
@@ -71,6 +73,7 @@ class ReactLoop:
                 try:
                     await self.hooks.emit(before)
                     compression_operation = before.data.pop("compression_operation", None)
+                    render_ephemeral_context = before.data.pop("render_ephemeral_context", None)
                     if callable(compression_operation):
                         yield RunEvent(
                             type=EventType.COMPRESSION_STARTED,
@@ -99,6 +102,16 @@ class ReactLoop:
                                 else EventType.COMPRESSION_FALLBACK
                             )
                             yield RunEvent(type=kind, payload=compression)
+                    if callable(render_ephemeral_context):
+                        render_ephemeral_context(before.data.get("messages"))
+                        rendered_messages = before.data.get("messages")
+                        if isinstance(rendered_messages, list) and rendered_messages:
+                            rendered_content = rendered_messages[-1].get("content")
+                            if isinstance(rendered_content, str):
+                                ephemeral_context_tokens = max(
+                                    0,
+                                    _estimate_tokens(rendered_content) - question_tokens,
+                                )
                     persist_user = before.data.pop("persist_current_user_operation", None)
                     if callable(persist_user):
                         persisted = persist_user()
@@ -108,6 +121,7 @@ class ReactLoop:
                     schemas = before.data.get("tools")
                     if not isinstance(messages, list) or not isinstance(schemas, list):
                         raise AgentInvariantError("model_before 必须保留列表形式的 messages 和 tools")
+                    schemas.sort(key=lambda schema: str(schema.get("name", "")))
                     context_loaded = True
                     estimated_context = _estimate_tokens(json.dumps({"messages": messages, "tools": schemas}, ensure_ascii=False))
                     during = HookEvent(point=HookPoint.MODEL_DURING, session_id=session_id, data={
@@ -215,6 +229,7 @@ class ReactLoop:
                 estimated_context,
                 question_tokens,
                 reply,
+                ephemeral_context_tokens=ephemeral_context_tokens,
             )
             model_calls.append(call_metric)
             after = HookEvent(point=HookPoint.MODEL_AFTER, session_id=session_id, data={
@@ -410,15 +425,31 @@ def _ensure_tool_call_ids(reply: ModelReply) -> ModelReply:
     return ModelReply(text=reply.text, tool_calls=calls, finished=reply.finished, usage=reply.usage, reasoning=reply.reasoning)
 
 
-def _model_call_metric(latency_ms: float, context_tokens: int, question_tokens: int, reply: ModelReply) -> dict[str, Any]:
+def _model_call_metric(
+    latency_ms: float,
+    context_tokens: int,
+    question_tokens: int,
+    reply: ModelReply,
+    *,
+    ephemeral_context_tokens: int | None = None,
+) -> dict[str, Any]:
     """生成一次无编号模型 API 调用的审计指标。"""
     serialized_calls = json.dumps([{"name": call.name, "arguments": call.arguments} for call in reply.tool_calls], ensure_ascii=False)
     usage = reply.usage
+    total_input = usage.input_tokens if usage and usage.input_tokens is not None else context_tokens
+    cached_input = usage.cached_input_tokens if usage and usage.cached_input_tokens is not None else None
     return {
         "latency_ms": latency_ms,
         "input_tokens": {
-            "context_total": usage.input_tokens if usage and usage.input_tokens is not None else context_tokens,
+            "context_total": total_input,
+            "cached": cached_input,
+            "cache_hit_ratio": (
+                cached_input / total_input
+                if cached_input is not None and total_input > 0
+                else None
+            ),
             "current_question": question_tokens,
+            "ephemeral_context": ephemeral_context_tokens,
             "context_source": "provider" if usage and usage.input_tokens is not None else "estimated",
             "current_question_source": "estimated",
         },
@@ -445,7 +476,7 @@ def _attach_failure_context(
     """把可复现请求现场附到异常；失败时仍保留原始异常。"""
     try:
         setattr(error, "yy_failure_context", {
-            "messages": copy.deepcopy(messages),
+            "messages": SessionPersistenceProjection.from_runtime_messages(messages),
             "tools": copy.deepcopy(schemas),
             "model": copy.deepcopy(model),
             "retry_history": copy.deepcopy(retry_history),

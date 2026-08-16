@@ -1,0 +1,4 @@
+interface:
+  display_name: "Runtime Failure Repair"
+  short_description: "Repair a confirmed Yuan Ye runtime defect"
+  default_prompt: "Use $runtime-failure-repair to repair the defect represented by the current Error evidence."

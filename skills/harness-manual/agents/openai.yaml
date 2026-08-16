@@ -1,6 +1,0 @@
-interface:
-  display_name: "Harness Manual"
-  short_description: "Open persistent Hook coding mode"
-  default_prompt: "Use $harness-manual to guide this Hook behavior change through /code."
-policy:
-  allow_implicit_invocation: false

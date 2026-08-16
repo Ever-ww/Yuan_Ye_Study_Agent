@@ -71,7 +71,25 @@ def register_memory_callbacks(
                     audit=_audit(event),
                 )
             )
-        event.data["reload_messages_after_compression"] = lambda: rebuild_messages(refresh_system=True)
+            render_provider_query = getattr(prompts, "render_provider_query", None)
+            if callable(render_provider_query):
+                origin_refs = _audit(event)
+
+                def render_ephemeral_context(target_messages: list[dict[str, object]]) -> None:
+                    if not target_messages or target_messages[-1].get("role") != "user":
+                        raise ValueError("Agent runtime context requires the current user query at the tail")
+                    original = target_messages[-1].get("content")
+                    if not isinstance(original, str):
+                        raise ValueError("Agent user query must be text")
+                    target_messages[-1]["content"] = render_provider_query(
+                        original,
+                        event.session_id,
+                        origin_refs=origin_refs,
+                    )
+
+                event.data["render_ephemeral_context"] = render_ephemeral_context
+        # Summary/Profile are provider-tail facts; compression must not rebuild the stable prefix.
+        event.data["reload_messages_after_compression"] = lambda: rebuild_messages(refresh_system=False)
 
     async def clear_context_state(event: HookEvent) -> None:
         base_systems.pop(event.session_id, None)

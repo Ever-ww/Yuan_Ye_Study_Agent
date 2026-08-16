@@ -1,0 +1,4 @@
+interface:
+  display_name: "Conservative Dream Review"
+  short_description: "Review recent Harness changes conservatively"
+  default_prompt: "Use $conservative-dream-review to make a behavior-preserving improvement to the authorized changeset."

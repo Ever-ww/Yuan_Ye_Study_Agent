@@ -1,0 +1,4 @@
+interface:
+  display_name: "Repository Safety"
+  short_description: "Protect repository state during Harness evolution"
+  default_prompt: "Use $repository-safety to inspect and modify an isolated Harness worktree safely."

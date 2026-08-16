@@ -69,6 +69,7 @@ class AgentRuntime:
         approval: ApprovalCallback | None = None,
         tool_context: ToolContext | None = None,
         context_processor: ContextProcessor | None = None,
+        prompt_composer: PromptComposer | None = None,
         skills: SkillService | None = None,
         compression_provider_factory=None,
         subagent_runner=None,
@@ -251,7 +252,12 @@ class AgentRuntime:
                 self.memory,
                 provider_factory=compression_provider_factory,
             )
-        self.prompts = PromptComposer(self.config, self.memory, self.skills, sandbox_enabled=self.sandbox is not None)
+        self.prompts = prompt_composer or PromptComposer(
+            self.config,
+            self.memory,
+            self.skills,
+            sandbox_enabled=self.sandbox is not None,
+        )
         self.hooks = hooks or build_default_hooks(
             self.config.memory_dir, self.memory, self.context_processor, self.prompts,
             session_origin=session_origin,

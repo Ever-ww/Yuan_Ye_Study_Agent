@@ -105,8 +105,15 @@ def _openai_usage(value: object) -> TokenUsage | None:
         return None
     input_tokens = value.get("prompt_tokens", value.get("input_tokens"))
     output_tokens = value.get("completion_tokens", value.get("output_tokens"))
+    details = value.get("prompt_tokens_details", value.get("input_tokens_details", {}))
+    cached_input_tokens = details.get("cached_tokens") if isinstance(details, dict) else None
     return TokenUsage(
         input_tokens=int(input_tokens) if isinstance(input_tokens, (int, float)) else None,
+        cached_input_tokens=(
+            int(cached_input_tokens)
+            if isinstance(cached_input_tokens, (int, float))
+            else None
+        ),
         output_tokens=int(output_tokens) if isinstance(output_tokens, (int, float)) else None,
     )
 
@@ -327,6 +334,11 @@ class AnthropicProvider:
             raw_usage = {}
         usage = TokenUsage(
             input_tokens=int(raw_usage["input_tokens"]) if isinstance(raw_usage.get("input_tokens"), (int, float)) else None,
+            cached_input_tokens=(
+                int(raw_usage["cache_read_input_tokens"])
+                if isinstance(raw_usage.get("cache_read_input_tokens"), (int, float))
+                else None
+            ),
             output_tokens=int(raw_usage["output_tokens"]) if isinstance(raw_usage.get("output_tokens"), (int, float)) else None,
         )
         text_parts: list[str] = []

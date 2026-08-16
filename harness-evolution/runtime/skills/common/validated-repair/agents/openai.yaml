@@ -1,0 +1,4 @@
+interface:
+  display_name: "Validated Repair"
+  short_description: "Repair code from concrete validation evidence"
+  default_prompt: "Use $validated-repair to fix a candidate from the latest validation evidence."

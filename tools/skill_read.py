@@ -27,14 +27,29 @@ class SkillReadTool:
 
     def __init__(self, service: SkillService) -> None:
         self.service = service
+        self._loaded: set[tuple[str, str, str, str]] = set()
+        self.cache_hits = 0
+        self.cache_misses = 0
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> str:
         if not context.session_id:
             raise RuntimeError("skill_read 需要绑定到活动 Session")
         snapshot = self.service.session_snapshot(context.session_id)
-        return await asyncio.to_thread(
+        name = str(arguments["name"])
+        path = str(arguments.get("path") or "SKILL.md")
+        key = (context.session_id, name, path, snapshot.digest)
+        if key in self._loaded:
+            self.cache_hits += 1
+            entry = snapshot.by_name().get(name)
+            if entry is None:
+                raise KeyError(f"当前 Session 未启用 Skill：{name}")
+            return f"skill-ref:{name}:{path}:{entry.content_digest}"
+        content = await asyncio.to_thread(
             self.service.read,
             snapshot,
-            arguments["name"],
-            arguments.get("path") or "SKILL.md",
+            name,
+            path,
         )
+        self._loaded.add(key)
+        self.cache_misses += 1
+        return content

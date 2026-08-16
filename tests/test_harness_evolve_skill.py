@@ -1,14 +1,26 @@
-from __future__ import annotations
-
 from pathlib import Path
 import unittest
 
 
-class HarnessEvolveSkillTests(unittest.TestCase):
-    def test_skill_is_repository_backed_and_declares_safe_trigger(self) -> None:
-        path = Path(__file__).parents[1] / "skills" / "harness-evolve" / "SKILL.md"
-        text = path.read_text(encoding="utf-8")
-        self.assertIn("name: harness-evolve", text)
-        self.assertIn("harness_evolve", text)
-        self.assertIn("ordinary workspace", text)
+ROOT = Path(__file__).parents[1]
 
+
+class HarnessEvolveSkillTests(unittest.TestCase):
+    def test_harness_skills_are_isolated_from_main_catalog(self) -> None:
+        self.assertFalse((ROOT / "skills" / "harness-evolve").exists())
+        self.assertFalse((ROOT / "skills" / "harness-capability").exists())
+        resource = ROOT / "harness-evolution" / "runtime" / "skills"
+        expected = {
+            "repository-safety",
+            "validated-repair",
+            "hook-evolution",
+            "runtime-failure-repair",
+            "tool-capability-evolution",
+            "conservative-dream-review",
+        }
+        found = {path.parent.name for path in resource.rglob("SKILL.md")}
+        self.assertEqual(found, expected)
+
+
+if __name__ == "__main__":
+    unittest.main()

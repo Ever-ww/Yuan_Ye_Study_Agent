@@ -521,8 +521,9 @@ class CoreTests(unittest.TestCase):
                 [(item["role"], item["content"]) for item in provider.messages[1:-1]],
                 [("user", "第一句"), ("assistant", "第一答")],
             )
-            self.assertTrue(provider.messages[-1]["content"].startswith("第二句\n\n[本次提问时间："))
-            self.assertTrue(PromptComposer(root).compose("纯基础")[1]["content"].startswith("纯基础\n\n[本次提问时间："))
+            self.assertTrue(provider.messages[-1]["content"].startswith("<user_query>\n第二句\n</user_query>"))
+            self.assertIn('<agent_runtime_context ephemeral="true">', provider.messages[-1]["content"])
+            self.assertEqual(PromptComposer(root).compose("纯基础")[1]["content"], "纯基础")
 
     def test_memory_initialization_creates_extensible_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -711,7 +712,7 @@ class CoreTests(unittest.TestCase):
                 1,
             )
             self.assertEqual(memory.restore_messages(result.session_id)[0]["role"], "user")
-            self.assertTrue(provider.messages[-1]["content"].startswith("整理长上下文\n\n[本次提问时间："))
+            self.assertTrue(provider.messages[-1]["content"].startswith("<user_query>\n整理长上下文\n</user_query>"))
             compression_payload = json.loads(compressor.messages[-1]["content"])
             self.assertNotIn(
                 "整理长上下文",
@@ -1406,9 +1407,10 @@ class CoreTests(unittest.TestCase):
             self.assertIn("必须先检查最上方 <available_skills> 目录", system)
             self.assertIn("优先调用 skill_read", system)
             self.assertNotIn("根目录不得进入模型", system)
-            self.assertIn(f"Session ID：{result.session_id}", system)
-            self.assertIn("分段绝对路径：", system)
-            self.assertTrue(provider.messages[-1]["content"].startswith("测试问题\n\n[本次提问时间："))
+            self.assertNotIn(f"Session ID：{result.session_id}", system)
+            self.assertNotIn("分段绝对路径：", system)
+            self.assertTrue(provider.messages[-1]["content"].startswith("<user_query>\n测试问题\n</user_query>"))
+            self.assertIn(f'"session_id":"{result.session_id}"', provider.messages[-1]["content"])
 
     def test_historical_tool_output_is_trimmed_only_in_memory(self) -> None:
         with tempfile.TemporaryDirectory() as value:

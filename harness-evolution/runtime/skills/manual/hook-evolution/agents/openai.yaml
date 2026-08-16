@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hook Evolution"
+  short_description: "Evolve Yuan Ye Hook behavior safely"
+  default_prompt: "Use $hook-evolution to implement the requested Hook behavior in the assigned worktree."

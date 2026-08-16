@@ -424,7 +424,7 @@ class ResilienceTests(unittest.TestCase):
             self.assertIsNotNone(failure)
             self.assertEqual(failure.category, "network")
             self.assertEqual(len(failure.retry_history), 3)
-            self.assertTrue(failure.messages[-1]["content"].startswith("失败问题\n\n[本次提问时间："))
+            self.assertEqual(failure.messages[-1]["content"], "失败问题")
             self.assertEqual([record["role"] for record in failed_records], ["user", "assistant"])
             self.assertEqual(failed_records[-1]["status"], "network_error")
             self.assertEqual(followup[-1].type, EventType.FINAL)
@@ -606,6 +606,7 @@ class ResilienceTests(unittest.TestCase):
                 "web_fetch",
                 "skill_read",
                 "subagent",
+                "harness_manual_preflight",
             })
             self.assertTrue({
                 "calculator",
@@ -622,24 +623,33 @@ class ResilienceTests(unittest.TestCase):
             )
             self.assertEqual(
                 set(subagent_schema["properties"]["tools"]["items"]["enum"]),
-                names - {"subagent"},
+                names - {"subagent", "harness_manual_preflight"},
             )
             self.assertIsNotNone(runtime.skills)
-            self.assertEqual(runtime.skills.source_root, root.resolve())
-            self.assertEqual(runtime.skills.skills_root, (root / "skills").resolve())
+            self.assertEqual(runtime.skills.source_root, worktree.resolve())
             self.assertIsNone(runtime.references)
             self.assertIsNotNone(runtime.context_processor)
-            self.assertIn("coding-helper", runtime.prompts.compose("诊断")[0]["content"])
+            system_prompt = runtime.prompts.compose("诊断")[0]["content"]
+            self.assertNotIn("coding-helper", system_prompt)
+            self.assertIn("repository-safety", system_prompt)
+            self.assertIn("hook-evolution", system_prompt)
+            self.assertNotIn("runtime-failure-repair", system_prompt)
             runtime.skills.bind_session(
                 runtime.coding_session_id,
                 runtime.skills.catalog_snapshot(),
             )
             skill_text = asyncio.run(runtime.tools.execute(
                 "skill_read",
-                {"name": "coding-helper"},
+                {"name": "repository-safety"},
                 runtime.tool_context.model_copy(update={"session_id": runtime.coding_session_id}),
             ))
-            self.assertIn("最小修复", skill_text)
+            self.assertIn("Repository Safety", skill_text)
+            with self.assertRaises(KeyError):
+                asyncio.run(runtime.tools.execute(
+                    "skill_read",
+                    {"name": "coding-helper"},
+                    runtime.tool_context.model_copy(update={"session_id": runtime.coding_session_id}),
+                ))
             self.assertEqual(runtime.config.workspace_root, worktree.resolve())
             self.assertEqual(runtime.tool_context.project_root, worktree.resolve())
             expected_memory = root / ".yy" / "harness-evolution" / "memory"
@@ -653,6 +663,7 @@ class ResilienceTests(unittest.TestCase):
             self.assertEqual(sandbox.writes, ["fixed.py"])
             self.assertGreaterEqual(sandbox.closed, 1)
             records = runtime.memory.session_records(runtime.coding_session_id)
+            self.assertNotIn("harness_runtime_context", str(records))
             self.assertEqual([record["role"] for record in records[-4:]], [
                 "user",
                 "assistant",

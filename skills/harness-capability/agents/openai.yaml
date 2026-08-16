@@ -1,4 +1,0 @@
-interface:
-  display_name: "Harness Capability"
-  short_description: "Add a missing Yuan Ye Tool"
-  default_prompt: "Use $harness-capability to define and safely implement this missing Tool capability."

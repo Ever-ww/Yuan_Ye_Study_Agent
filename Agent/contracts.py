@@ -53,6 +53,7 @@ class TokenUsage(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True)
 
     input_tokens: int | None = Field(default=None, ge=0)
+    cached_input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
 
 

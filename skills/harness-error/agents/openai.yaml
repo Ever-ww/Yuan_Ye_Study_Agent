@@ -1,6 +1,0 @@
-interface:
-  display_name: "Harness Error"
-  short_description: "Repair captured runtime defects"
-  default_prompt: "Use $harness-error to handle this persisted RuntimeFailure proposal safely."
-policy:
-  allow_implicit_invocation: false

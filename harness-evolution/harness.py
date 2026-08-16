@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import re
 import sys
@@ -18,18 +19,24 @@ from backup.security import SensitiveEnvSanitizer
 from Agent import AgentRuntime, EventType, ExtensionLoader, ModelRetryPolicy, RuntimeConfig, RuntimeFailure
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models import build_provider
-from Agent.runtime.subagent import RuntimeSubagentRunner
 from memory import HarnessLongTermMemory, HarnessMemoryUpdate, MemoryStore
 from prompt import compose_harness_memory_messages
 from sandbox import SandboxSessionProtocol
-from skill import SkillService
 from tool import (
     AsyncToolRegistry,
-    default_tools,
     register_subagent,
 )
-from tools import SkillReadTool, WebFetchTool, WebSearchTool
 from gateway.harness_dream import DreamEvolutionContext
+from harness_runtime import (
+    HarnessDynamicContextController,
+    HarnessPromptComposer,
+    HarnessPromptPrefixCache,
+    HarnessRuntimeProfile,
+    HarnessRuntimeResourceLoader,
+    HarnessRuntimeTrigger,
+    HarnessTraceContext,
+    register_harness_context_callbacks,
+)
 
 
 _SECRET_KEYS = {
@@ -43,17 +50,6 @@ _SECRET_KEYS = {
     "password",
 }
 _SOURCE_PATH = re.compile(r'File "([^"]+)"')
-_CODING_BASE_TOOL_NAMES = (
-    "read_file",
-    "search_workspace",
-    "edit",
-    "write",
-    "bash",
-    "sandbox_rollback",
-    "web_fetch",
-)
-
-
 def _timestamp() -> str:
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -430,7 +426,14 @@ class CodeSessionController:
         await self._git(root, "worktree", "add", "-b", branch, str(worktree), base)
         try:
             factory = self.runtime_factory or create_coding_runtime
-            runtime = factory(self.config, worktree)
+            runtime = _create_profiled_runtime(
+                factory,
+                self.config,
+                worktree,
+                trigger="manual",
+                target="extension",
+                invocation_id=code_id,
+            )
             if not _runtime_targets_worktree(runtime, worktree):
                 await runtime.close()
                 raise RuntimeError("Coding Runtime 没有指向隔离 worktree")
@@ -670,6 +673,9 @@ def create_coding_runtime(
     worktree_root: Path,
     *,
     sandbox: SandboxSessionProtocol | None = None,
+    profile: HarnessRuntimeProfile | None = None,
+    trace_context: HarnessTraceContext | None = None,
+    prefix_cache: HarnessPromptPrefixCache | None = None,
 ) -> AgentRuntime:
     """复用正式 AgentRuntime 装配具备完整工作区能力的 Coding Agent。"""
     isolated = config.model_copy(update={
@@ -677,10 +683,12 @@ def create_coding_runtime(
         "stream": False,
         "compression_threshold_tokens": config.compression_threshold_tokens or 200000,
     })
-    skills = SkillService(
-        isolated.agent_root,
-        isolated.workspace_root,
-        isolated.coding_source_root,
+    resource_loader = HarnessRuntimeResourceLoader(Path(__file__).resolve().parent / "runtime")
+    selected_profile = profile or resource_loader.profile(HarnessRuntimeTrigger.MANUAL)
+    skills = resource_loader.build_skills(
+        selected_profile,
+        agent_root=isolated.agent_root,
+        workspace_root=isolated.workspace_root,
     )
     memory_root = isolated.agent_root / ".yy" / "harness-evolution" / "memory"
     long_term = HarnessLongTermMemory(
@@ -697,45 +705,40 @@ def create_coding_runtime(
     )
     session_id = uuid4().hex[:16]
     memory.create_session("Harness Coding Agent 本次更新", session_id=session_id)
-    web_search = (
-        WebSearchTool(
-            isolated.web_search_api_key,
-            timeout_seconds=isolated.web_search_timeout_seconds,
-            use_system_proxy=isolated.use_system_proxy,
-            proxy_url=isolated.proxy_url,
-        )
-        if isolated.web_search_api_key
-        else None
+    tools = resource_loader.build_tools(selected_profile, isolated, skills)
+    tool_catalog_hash = resource_loader.tool_catalog_hash(tools)
+    prompts = HarnessPromptComposer(
+        selected_profile,
+        skills,
+        tool_catalog_hash=tool_catalog_hash,
+        prefix_cache=prefix_cache,
     )
-    web_fetch = WebFetchTool(
-        timeout_seconds=isolated.web_fetch_timeout_seconds,
-        max_bytes=isolated.web_fetch_max_bytes,
-        max_chars=isolated.web_fetch_max_chars,
-        use_system_proxy=isolated.use_system_proxy,
-        proxy_url=isolated.proxy_url,
+    selected_trace = trace_context or HarnessTraceContext(
+        trace_id=uuid4().hex,
+        trigger=selected_profile.trigger,
+        target="extension" if selected_profile.trigger is HarnessRuntimeTrigger.MANUAL else "source_repair",
+        invocation_id=uuid4().hex,
+        prompt_profile_hash=prompts.prompt_profile.cache_key,
+        tool_catalog_hash=tool_catalog_hash,
+        skill_catalog_hash=skills.catalog_snapshot().digest,
+        context_epoch=1,
+        created_at=datetime.now().astimezone(),
     )
-    # Harness 只暴露修复代码所需的最小能力。网页抓取始终可用；配置了
-    # Brave Key 时额外加入搜索。论文、资料库、时间、计算、Cron 和 Skill
-    # 安装仍不进入 Schema。
-    selected_names = list(_CODING_BASE_TOOL_NAMES)
-    if web_search is not None:
-        selected_names.append("web_search")
-    tools = default_tools(
-        isolated.workspace_root,
-        web_search_tool=web_search,
-        web_fetch_tool=web_fetch,
-        runtime_profile="harness",
-    ).select(selected_names)
-    tools.register(SkillReadTool(skills))
-    register_subagent(tools, RuntimeSubagentRunner(isolated, tools))
-    expected_tools = {*selected_names, "skill_read", "subagent"}
-    if set(tools.names()) != expected_tools:
-        raise RuntimeError("Harness Coding 工具目录偏离固定白名单")
+    if selected_trace.trigger is not selected_profile.trigger:
+        raise ValueError("Harness Trace trigger does not match its isolated Runtime profile")
+    if selected_trace.tool_catalog_hash != tool_catalog_hash:
+        raise ValueError("Harness Trace Tool catalog hash does not match the loaded profile")
+    if selected_trace.skill_catalog_hash != skills.catalog_snapshot().digest:
+        raise ValueError("Harness Trace Skill catalog hash does not match the loaded profile")
+    if selected_trace.prompt_profile_hash != prompts.prompt_profile.cache_key:
+        raise ValueError("Harness Trace prompt profile hash does not match the loaded profile")
+    dynamic_context = HarnessDynamicContextController(selected_trace)
     runtime = AgentRuntime(
         isolated,
         tools=tools,
         memory=memory,
         skills=skills,
+        prompt_composer=prompts,
         approval=_approve_coding_tool,
         enable_context_processing=True,
         enable_skills=True,
@@ -747,10 +750,83 @@ def create_coding_runtime(
         enable_extensions=False,
         enable_cron=False,
         enable_references=False,
+        runtime_profile="harness",
     )
+    register_harness_context_callbacks(runtime.hooks, dynamic_context)
     runtime.coding_session_id = session_id
     runtime.harness_long_term_memory = long_term
+    runtime.harness_runtime_profile = selected_profile
+    runtime.harness_trace_context = selected_trace
+    runtime.harness_dynamic_context = dynamic_context
+    runtime.harness_prompt_profile = prompts.prompt_profile
     return runtime
+
+
+def _runtime_profile_and_trace(
+    config: RuntimeConfig,
+    worktree: Path,
+    *,
+    trigger: str,
+    target: str,
+    invocation_id: str,
+) -> tuple[HarnessRuntimeProfile, HarnessTraceContext]:
+    resource_loader = HarnessRuntimeResourceLoader(Path(__file__).resolve().parent / "runtime")
+    profile = resource_loader.profile(HarnessRuntimeTrigger(trigger))
+    isolated = config.model_copy(update={"workspace_root": worktree.resolve(), "stream": False})
+    skills = resource_loader.build_skills(
+        profile,
+        agent_root=isolated.agent_root,
+        workspace_root=isolated.workspace_root,
+    )
+    tools = resource_loader.build_tools(profile, isolated, skills)
+    tool_hash = resource_loader.tool_catalog_hash(tools)
+    prompts = HarnessPromptComposer(profile, skills, tool_catalog_hash=tool_hash)
+    trace = HarnessTraceContext(
+        trace_id=uuid4().hex,
+        trigger=profile.trigger,
+        target=target,
+        invocation_id=invocation_id,
+        prompt_profile_hash=prompts.prompt_profile.cache_key,
+        tool_catalog_hash=tool_hash,
+        skill_catalog_hash=skills.catalog_snapshot().digest,
+        context_epoch=1,
+        created_at=datetime.now().astimezone(),
+    )
+    return profile, trace
+
+
+def _create_profiled_runtime(
+    factory: Callable[..., AgentRuntime],
+    config: RuntimeConfig,
+    worktree: Path,
+    *,
+    trigger: str,
+    target: str,
+    invocation_id: str,
+) -> AgentRuntime:
+    signature = inspect.signature(factory)
+    supports_profile = (
+        "profile" in signature.parameters
+        and "trace_context" in signature.parameters
+    ) or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    if not supports_profile:
+        return factory(config, worktree)
+    profile, trace = _runtime_profile_and_trace(
+        config,
+        worktree,
+        trigger=trigger,
+        target=target,
+        invocation_id=invocation_id,
+    )
+    return factory(
+        config,
+        worktree,
+        profile=profile,
+        trace_context=trace,
+    )
 
 
 class HarnessEvolutionRunner:
@@ -1101,6 +1177,7 @@ class HarnessEvolutionEngine:
                 invocation_id=hashlib.sha256(
                     f"manual:{record.code_session_id}:{record.verified_turns + 1}".encode("utf-8")
                 ).hexdigest()[:32],
+                origin=record.origin,
                 max_attempts=4, merge_policy="deferred",
             ),
             worktree=record.worktree_path,
@@ -1263,7 +1340,14 @@ class HarnessEvolutionEngine:
         keep = True
         try:
             record_event("worktree_created", base_commit=base, branch=branch, worktree=str(worktree))
-            runtime = self.runtime_factory(request.config, worktree)
+            runtime = _create_profiled_runtime(
+                self.runtime_factory,
+                request.config,
+                worktree,
+                trigger=request.trigger,
+                target=request.target,
+                invocation_id=invocation_id,
+            )
             if not _runtime_targets_worktree(runtime, worktree):
                 await runtime.close()
                 record_event("finished", status="invalid_runtime_workspace")
@@ -1369,7 +1453,19 @@ class HarnessEvolutionEngine:
         feedback = ""
         diagnostic = ""
         for attempt in range(1, request.repair_policy.max_attempts + 1):
-            prompt = self._prompt(request, attempt, feedback, test_file)
+            await self._update_ephemeral_context(
+                runtime,
+                request=request,
+                worktree=worktree,
+                attempt=attempt,
+                test_file=test_file,
+                feedback=feedback,
+            )
+            prompt = (
+                self._prompt(request, attempt, feedback, test_file)
+                if getattr(runtime, "harness_dynamic_context", None) is not None
+                else self._legacy_compatibility_prompt(request, attempt, feedback, test_file)
+            )
             audit("coding_attempt", attempt=attempt, trigger=request.trigger)
             try:
                 diagnostic = await self._invoke_runtime(runtime, prompt)
@@ -1394,6 +1490,68 @@ class HarnessEvolutionEngine:
                 return diagnostic, feedback, attempt
         return diagnostic, feedback or "validation did not pass", request.repair_policy.max_attempts
 
+    async def _update_ephemeral_context(
+        self,
+        runtime: Any,
+        *,
+        request: HarnessEvolutionRequest,
+        worktree: Path,
+        attempt: int,
+        test_file: str,
+        feedback: str,
+    ) -> None:
+        controller = getattr(runtime, "harness_dynamic_context", None)
+        if controller is None:
+            return
+        status = await self._command(
+            worktree,
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            check=False,
+        )
+        head = await self._command(worktree, ["git", "rev-parse", "HEAD"], check=False)
+        origin_refs: dict[str, Any] = {
+            "task_hash": hashlib.sha256(request.task.encode("utf-8")).hexdigest(),
+        }
+        if request.origin is not None:
+            origin_refs["origin"] = request.origin.model_dump(mode="json")
+        if request.snapshot_path is not None:
+            snapshot = request.snapshot_path.resolve()
+            origin_refs["error_snapshot"] = {
+                "path": str(snapshot),
+                "content_hash": hashlib.sha256(snapshot.read_bytes()).hexdigest()
+                if snapshot.is_file() else "",
+            }
+        if request.capability_gap is not None:
+            origin_refs["capability_gap"] = request.capability_gap.model_dump(mode="json")
+        if request.dream_context is not None:
+            origin_refs["dream"] = request.dream_context.model_dump(mode="json")
+        git_state = {
+            "head": head.stdout.strip() if head.returncode == 0 else "",
+            "status": status.stdout[-12000:] if status.returncode == 0 else "unavailable",
+        }
+        source_payload = json.dumps(
+            {"origin_refs": origin_refs, "git_state": git_state, "attempt": attempt},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        controller.update(
+            origin_refs=_sanitize(origin_refs),
+            worktree_state={
+                "isolated": True,
+                "workspace_name": worktree.name,
+            },
+            git_state=_sanitize(git_state),
+            current_attempt=attempt,
+            assigned_validation={"test_file": test_file} if test_file else {},
+            previous_validation_summary=str(_sanitize(feedback[-12000:])),
+            recovery_constraints=(
+                "Do not repeat an UNKNOWN external or Git side effect.",
+                "Do not modify durable history to make recovery appear successful.",
+            ),
+            source_hash=hashlib.sha256(source_payload.encode("utf-8")).hexdigest(),
+        )
+
     async def _invoke_runtime(self, runtime: Any, prompt: str) -> str:
         session_id = str(getattr(runtime, "coding_session_id", "")) or None
         run_task = getattr(runtime, "run_task", None)
@@ -1409,45 +1567,33 @@ class HarnessEvolutionEngine:
     def _prompt(
         self, request: HarnessEvolutionRequest, attempt: int, feedback: str, test_file: str,
     ) -> str:
-        if request.trigger == "error":
-            snapshot = request.snapshot_path.read_text(encoding="utf-8") if request.snapshot_path else ""
-            prompt = (
-                "You are the Yuan Ye Harness Coding Agent in an isolated Git worktree. "
-                "Repair the system defect evidenced by the real RuntimeFailure snapshot below. "
-                "You may change Git-tracked source and tests, plus necessary new source/tests. "
-                "Never modify .git, .yy, .yy-backups, credentials, local settings, or user changes. "
-                "Make the smallest reliable correction and preserve existing architecture.\n\n"
-                f"Task: {request.task}\nRuntimeFailure snapshot:\n{snapshot}"
-            )
-        elif request.trigger == "manual":
-            prompt = (
-                "You are maintaining Yuan Ye Hook behaviour in an isolated Git worktree. "
-                "Read the repository as needed, but write only extension/hook/** and tests/extensions/**. "
-                f"Create the controller-assigned test `{test_file}`. Do not modify extension/README.md.\n\n"
-                f"User request: {request.task}"
-            )
-        elif request.trigger == "dream":
-            context = request.dream_context
-            assert context is not None
-            changeset = context.changeset
-            prompt = (
-                "You are performing a conservative nightly review of code changed by verified Yuan Ye Harness invocations. "
-                "Preserve behaviour and public contracts. Improve only concrete defects, duplication, error handling, "
-                "maintainability and tests. Do not add unrelated features or change API, Tool schema, risk, idempotency, "
-                "permissions, dependencies, lock files, database schema, configuration format, credentials, Harness approval, "
-                "merge/reconcile, or Backup/Restore controls. Read the full repository, but write only the supplied allowlist "
-                f"and the assigned test `{test_file}`.\n\n"
-                f"Dream date: {changeset.date}\nChanged files: {json.dumps(changeset.changed_files, ensure_ascii=False)}\n"
-                f"Merged commits: {json.dumps(changeset.merged_commits, ensure_ascii=False)}\n"
-                "If no safe, meaningful improvement is needed, make no changes."
-            )
-        else:
-            prompt = self._capability_prompt(request, attempt, "", test_file)
-        if attempt > 1:
-            prompt += (
-                f"\n\nRepair attempt {attempt}. The previous candidate failed these real validations:\n"
-                f"{feedback}\nContinue in the same worktree and Memory Session; do not start over."
-            )
+        del feedback, test_file
+        # Trigger rules live in the byte-stable system prefix. Attempt, validation, Git,
+        # origin, and recovery facts are injected ephemerally into this current query.
+        if attempt == 1:
+            return request.task.strip()
+        return (
+            f"Continue the same Harness task without starting over (repair attempt {attempt}):\n"
+            f"{request.task.strip()}"
+        )
+
+    def _legacy_compatibility_prompt(
+        self,
+        request: HarnessEvolutionRequest,
+        attempt: int,
+        feedback: str,
+        test_file: str,
+    ) -> str:
+        """Keep injected two-argument test runtimes working for one compatibility release."""
+        if request.trigger == "manual":
+            return CodeSessionController._turn_prompt(request.task, test_file, attempt, feedback)
+        if request.trigger == "capability":
+            return self._capability_prompt(request, attempt, feedback, test_file)
+        prompt = request.task
+        if test_file:
+            prompt += f"\n\nCreate and run the assigned test `{test_file}`."
+        if feedback:
+            prompt += f"\n\nPrevious validation failed:\n{feedback}"
         return prompt
 
     async def _update_shared_memory(

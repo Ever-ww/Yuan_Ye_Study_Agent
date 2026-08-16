@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .profile import ProfileStore
+from .persistence import SessionPersistenceProjection
 from .session import SessionStore
 
 
@@ -45,6 +46,7 @@ class MemoryStore:
 
     def create_session(self, first_message: str, session_id: str | None = None) -> str:
         """创建会话并返回稳定哈希。"""
+        SessionPersistenceProjection.assert_persistable(first_message)
         return self.sessions.create(first_message, session_id)
 
     def record_user(
@@ -56,6 +58,7 @@ class MemoryStore:
         audit: dict[str, object] | None = None,
     ) -> None:
         """记录一条用户输入。"""
+        SessionPersistenceProjection.assert_persistable(content)
         cache = self._ensure_cache(session_id)
         record_id = self.sessions.append(session_id, "user", content, {"origin": origin, **(audit or {})})
         cache.append({"role": "user", "content": content})
@@ -73,6 +76,7 @@ class MemoryStore:
         audit: dict[str, object] | None = None,
     ) -> str:
         """记录最终助手回复，以及本次用户任务的模型、时延和 Token 指标。"""
+        content = SessionPersistenceProjection.strip_ephemeral(content)
         metadata: dict[str, object] = {}
         if model is not None:
             metadata["model"] = model
@@ -100,6 +104,9 @@ class MemoryStore:
         audit: dict[str, object] | None = None,
     ) -> str:
         """记录模型原始返回的标准 assistant.tool_calls 消息。"""
+        SessionPersistenceProjection.assert_no_ephemeral(tool_calls)
+        if content is not None:
+            content = SessionPersistenceProjection.strip_ephemeral(content)
         metadata: dict[str, object] = {
             "tool_calls": tool_calls,
             "model": model,
@@ -125,6 +132,8 @@ class MemoryStore:
         audit: dict[str, object] | None = None,
     ) -> str:
         """记录工具成功结果或错误反馈。"""
+        SessionPersistenceProjection.assert_no_ephemeral(arguments)
+        content = SessionPersistenceProjection.strip_ephemeral(content)
         cache = self._ensure_cache(session_id)
         record_id = self.sessions.append(session_id, "tool", content, {
             "tool_call_id": tool_call_id,

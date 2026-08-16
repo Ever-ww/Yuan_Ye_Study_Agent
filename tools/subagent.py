@@ -59,6 +59,7 @@ class SubagentTool:
                 "subagent", "skill_install", "cronjob", "harness_evolve",
                 "harness_capability", "harness_manual", "harness_error", "harness_dream",
             }
+            and self.registry.is_delegatable(name)
         )
         return {
             "type": "object",

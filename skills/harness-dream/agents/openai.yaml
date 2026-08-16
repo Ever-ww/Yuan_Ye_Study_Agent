@@ -1,6 +1,0 @@
-interface:
-  display_name: "Harness Dream"
-  short_description: "Review nightly Harness changes"
-  default_prompt: "Use $harness-dream to inspect or operate the nightly Harness review safely."
-policy:
-  allow_implicit_invocation: false

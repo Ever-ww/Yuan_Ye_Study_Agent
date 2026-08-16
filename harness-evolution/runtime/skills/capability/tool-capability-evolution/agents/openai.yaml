@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tool Capability Evolution"
+  short_description: "Add or repair an approved Tool capability"
+  default_prompt: "Use $tool-capability-evolution to implement the approved Tool capability and its contract tests."

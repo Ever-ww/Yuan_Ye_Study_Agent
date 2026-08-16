@@ -342,7 +342,12 @@ class CronGatewayApiTests(unittest.TestCase):
             self.assertIsInstance(cron_runtime.memory, EphemeralMemory)
             self.assertEqual(cron_runtime.memory.prompt_context("any"), "")
             cron_prompt = cron_runtime.prompts.system.open_session("ephemeral-check").content
-            self.assertIn("无记忆后台子 Agent", cron_prompt)
+            self.assertNotIn("无记忆后台子 Agent", cron_prompt)
+            cron_query = cron_runtime.prompts.render_provider_query(
+                "check",
+                "ephemeral-check",
+            )
+            self.assertIn("无记忆后台子 Agent", cron_query)
             self.assertNotIn("search-summary-paper", cron_runtime.memory.prompt_context("any"))
             asyncio.run(normal_runtime.close())
             asyncio.run(cron_runtime.close())

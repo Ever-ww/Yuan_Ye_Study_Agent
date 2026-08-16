@@ -55,6 +55,12 @@ class AsyncToolRegistry:
         """按注册顺序返回工具名称。"""
         return tuple(name for name in self._tools if self.is_available(name, context))
 
+    def is_delegatable(self, name: str) -> bool:
+        tool = self._tools.get(name)
+        if tool is None:
+            raise ValueError(f"Unknown tool: {name}")
+        return bool(getattr(tool, "delegatable", True))
+
     def contract_snapshot(self) -> dict[str, dict[str, Any]]:
         """Stable Tool contract projection used by Harness candidate validation."""
         return {
