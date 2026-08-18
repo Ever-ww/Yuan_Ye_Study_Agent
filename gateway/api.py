@@ -243,6 +243,18 @@ def create_gateway_api(
     async def run_cron(job_id: str):
         return await gateway.run_cron(job_id)
 
+    @app.post("/api/v1/cron/jobs/{job_id}/run-now", dependencies=[Depends(authorize_write)])
+    async def run_cron_now(job_id: str):
+        return await gateway.run_cron(job_id)
+
+    @app.get("/api/v1/cron/jobs/{job_id}/history", dependencies=[Depends(authorize)])
+    async def cron_history(job_id: str, limit: int = 100):
+        return await gateway.cron_history(job_id, limit=limit)
+
+    @app.post("/api/v1/cron/dispatches/{dispatch_id}/retry", dependencies=[Depends(authorize_write)])
+    async def retry_cron_dispatch(dispatch_id: str):
+        return await gateway.retry_cron_dispatch(dispatch_id)
+
     @app.delete("/api/v1/cron/jobs/{job_id}", dependencies=[Depends(authorize_write)])
     async def remove_cron(job_id: str):
         return await gateway.remove_cron(job_id)

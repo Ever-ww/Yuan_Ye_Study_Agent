@@ -29,7 +29,7 @@ class CronJobTool:
                 "type": "string",
                 "enum": [
                     "list", "status", "validate", "preview", "create", "edit",
-                    "pause", "resume", "run", "remove",
+                    "pause", "resume", "run", "retry", "history", "remove",
                 ],
             },
             "job_id": {"type": "string"},
@@ -65,7 +65,7 @@ class CronJobTool:
         self.project_id = project_id
 
     def risk_for(self, arguments: dict[str, Any]) -> ToolRisk:
-        return "read" if arguments["action"] in {"list", "status", "validate", "preview"} else "high"
+        return "read" if arguments["action"] in {"list", "status", "validate", "preview", "history"} else "high"
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> str:
         del context
@@ -75,6 +75,9 @@ class CronJobTool:
             return _json([item.model_dump(mode="json") for item in jobs])
         if action == "status":
             return (await self.service.status()).model_dump_json(indent=2)
+        if action == "history":
+            job_id = _required(arguments, "job_id")
+            return _json([item.model_dump(mode="json") for item in await self.service.history(job_id)])
         if action in {"validate", "preview"}:
             schedule = _schedule(arguments)
             preview = self.service.preview(schedule, count=arguments.get("count", 5))
@@ -105,6 +108,8 @@ class CronJobTool:
             job = await self.service.resume(job_id)
         elif action == "run":
             job = await self.service.trigger(job_id)
+        elif action == "retry":
+            return (await self.service.retry(job_id)).model_dump_json(indent=2)
         elif action == "remove":
             job = await self.service.remove(job_id)
         else:  # Schema 已经阻止未知 action。

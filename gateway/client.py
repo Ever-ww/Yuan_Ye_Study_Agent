@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import httpx
 from cron import (
+    CronDispatch,
     CronJob,
     CronJobCreateRequest,
     CronJobEditRequest,
@@ -142,6 +143,17 @@ class GatewayClient:
 
     async def run_cron(self, job_id: str) -> CronJob:
         return await self._cron_action(job_id, "run")
+
+    async def run_cron_now(self, job_id: str) -> CronJob:
+        return CronJob.model_validate(await self._request("POST", f"/api/v1/cron/jobs/{job_id}/run-now"))
+
+    async def cron_history(self, job_id: str, *, limit: int = 100) -> tuple[CronDispatch, ...]:
+        values = await self._request("GET", f"/api/v1/cron/jobs/{job_id}/history", params={"limit": limit})
+        return tuple(CronDispatch.model_validate(value) for value in values)
+
+    async def retry_cron_dispatch(self, dispatch_id: str) -> CronDispatch:
+        value = await self._request("POST", f"/api/v1/cron/dispatches/{dispatch_id}/retry")
+        return CronDispatch.model_validate(value)
 
     async def remove_cron(self, job_id: str) -> CronJob:
         value = await self._request("DELETE", f"/api/v1/cron/jobs/{job_id}")

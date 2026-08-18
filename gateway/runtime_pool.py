@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +14,6 @@ from uuid import uuid4
 
 from Agent import AgentRuntime, EventType, ExtensionCatalog, ModelRetryPolicy, RuntimeFailure, load_runtime_config
 from Agent.hook import HookRegistry
-from Agent.runtime.ephemeral import EphemeralMemory
 from Agent.state import (
     BindSessionCommand,
     ExecutionOutcome,
@@ -41,6 +40,7 @@ from backup import AgentHomeWriteGate, QuiesceResult
 
 
 RuntimeFactory = Callable[[Path, GatewayApprovalBroker], AgentRuntime]
+CronTerminalCallback = Callable[[RunRecord], Awaitable[None]]
 
 
 @dataclass
@@ -75,6 +75,7 @@ class RuntimePool:
         finalizer: FinalizeCoordinator | None = None,
         harness_evolution_service=None,
         cron_tool_authorizer=None,
+        cron_terminal_callback: CronTerminalCallback | None = None,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.store = store
@@ -112,6 +113,7 @@ class RuntimePool:
             reservations=self.session_reservations,
         )
         self.harness_evolution_service = harness_evolution_service
+        self.cron_terminal_callback = cron_terminal_callback
         self._pending_profile_refresh: set[tuple[str, str]] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._closing = False
@@ -126,7 +128,15 @@ class RuntimePool:
     async def submit(self, run: RunRecord) -> None:
         if self._closing or self._maintenance_epoch is not None:
             raise RuntimeError("Gateway 正在关闭，不能接收新任务")
+        async with self._lock:
+            existing = self._tasks.get(run.run_id)
+            if existing is not None and not existing.done():
+                return
         state = self.state_controller.state(run.run_id)
+        if state.task_state in {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.INTERRUPTED}:
+            return
+        if state.task_state is TaskState.RECOVERY_REQUIRED:
+            raise RuntimeError("RECOVERY_REQUIRED Run must be handled by RecoveryCoordinator")
         operation = self.state_controller.active_operation(run.run_id)
         attempt = (
             self.state_controller.current_attempt(operation.operation_id)
@@ -136,6 +146,14 @@ class RuntimePool:
             raise RuntimeError("Run fencing token 不属于当前 Gateway epoch")
         if not is_runnable(state, operation, attempt, now=datetime.now().astimezone()):
             raise RuntimeError(f"Run 当前不可调度：{state.task_state.value}")
+        state = self.state_controller.apply(TransitionCommand(
+            command_id=f"runtime-submit:{run.run_id}:{state.revision}",
+            run_id=run.run_id,
+            expected_revision=state.revision,
+            gateway_epoch=self.state_controller.gateway_epoch,
+            task_state=TaskState.STARTING,
+            reason="RuntimePool durable submit claim",
+        )).state
         if run.session_id:
             await self.session_reservations.acquire(
                 run.project_id, run.session_id, owner_id=run.run_id, wait=False,
@@ -145,7 +163,8 @@ class RuntimePool:
             self._execute_with_write_scope(run, started),
             name=f"gateway-run-{run.run_id}",
         )
-        self._tasks[run.run_id] = task
+        async with self._lock:
+            self._tasks[run.run_id] = task
         await started.wait()
         if task.done() and task.exception() is not None:
             raise task.exception()
@@ -302,8 +321,15 @@ class RuntimePool:
         try:
             await self._emit(original, "run_queued", {"message": "任务已进入 Gateway 队列"})
             async with self._semaphore:
-                await self._transition(original.run_id, task_state=TaskState.STARTING, reason="Scheduler 认领 Run")
                 selected = self.state_controller.state(original.run_id)
+                if selected.task_state is TaskState.QUEUED:
+                    selected = await self._transition(
+                        original.run_id,
+                        task_state=TaskState.STARTING,
+                        reason="Scheduler durable claim",
+                    )
+                elif selected.task_state is not TaskState.STARTING:
+                    raise RuntimeError(f"Run lost durable submit claim: {selected.task_state.value}")
                 await self._transition(
                     original.run_id,
                     task_state=TaskState.RUNNING,
@@ -327,7 +353,7 @@ class RuntimePool:
                             if stateless_cron:
                                 await self._emit(
                                     current, "cron_ephemeral_context_started",
-                                    {"ephemeral_session_id": session_id, "persisted": False},
+                                    {"session_id": session_id, "persisted": True, "origin": "cron"},
                                 )
                                 continue
                             state = self.state_controller.state(current.run_id)
@@ -490,6 +516,10 @@ class RuntimePool:
             result_summary=reason if outcome is ExecutionOutcome.SUCCESS else None,
         )
         await self.finalizer.finalize(run_id)
+        if self.cron_terminal_callback is not None:
+            final_run = self.store.run(run_id)
+            if final_run.client_id.startswith("cron:"):
+                await self.cron_terminal_callback(final_run)
         if self.outbox:
             self.outbox.wake()
 
@@ -503,6 +533,15 @@ class RuntimePool:
             runtime = self.runtime_factory(workspace, self.approvals)
         else:
             runtime = self._default_runtime(workspace, self.approvals, run)
+        if run.client_id.startswith("cron:") and self.cron_service is not None:
+            # The dispatch snapshot, not today's editable CronJob, is the
+            # authority for an already materialized unattended run.
+            dispatch = await self.cron_service.store.dispatch_by_run_id(run.run_id)
+            snapshot = dispatch.job_snapshot
+            profile = snapshot.get("runtime_profile", {}) if isinstance(snapshot, dict) else {}
+            allowed_tools = tuple(profile.get("allowed_tools", ())) if isinstance(profile, dict) else ()
+            # Cron starts from a deny-all surface. A durable snapshot selects tools.
+            runtime.tools = runtime.tools.select(allowed_tools)
         if (
             self.harness_evolution_service is not None
             and not run.client_id.startswith("cron:")
@@ -549,7 +588,12 @@ class RuntimePool:
             from skill import SkillService
             config = config.model_copy(update={"stream": False, "compression_threshold_tokens": 0})
             skills = SkillService(config.agent_root, workspace, config.coding_source_root)
-            memory = EphemeralMemory(config.agent_root)
+            # A Cron dispatch has a fresh durable Session but never restores another Session.
+            memory = MemoryStore(
+                config.memory_dir,
+                workspace_root=config.workspace_root,
+                agent_root=config.agent_root,
+            )
             hooks = HookRegistry()
             return AgentRuntime(
                 config,
@@ -558,7 +602,7 @@ class RuntimePool:
                 skills=skills,
                 approval=approvals,
                 enable_context_processing=False,
-                enable_subagent=True,
+                enable_subagent=False,
                 enable_extensions=False,
                 retry_policy=ModelRetryPolicy(
                     max_attempts=config.model_retry_max_attempts,

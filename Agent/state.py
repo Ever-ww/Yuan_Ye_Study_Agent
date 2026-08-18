@@ -103,6 +103,7 @@ class OperationKind(str, Enum):
     AUDIT = "audit"
     FINALIZE = "finalize"
     SUBAGENT = "subagent"
+    CRON_DISPATCH = "cron_dispatch"
 
 
 class ToolIdempotency(str, Enum):

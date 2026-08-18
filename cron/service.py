@@ -1,4 +1,4 @@
-"""Cron 管理服务：只负责定义、校验与持久化，不负责执行模型。"""
+"""Cron job management over the SQLite durable repository."""
 
 from __future__ import annotations
 
@@ -8,27 +8,16 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from .models import (
-    CronJob,
-    CronJobCreateRequest,
-    CronJobEditRequest,
-    CronPreview,
-    CronSchedule,
-    CronStatus,
-    parse_time,
-    utc_iso,
-    utc_now,
+    CronDispatch, CronJob, CronJobCreateRequest, CronJobEditRequest, CronPreview,
+    CronRuntimeProfile, CronSchedule, CronStatus, parse_time, utc_iso, utc_now,
 )
 from .schedule import CronScheduleCalculator
 from .store import CronStore
 
 
 _NEVER_PREAPPROVE = frozenset({
-    "bash",
-    "cronjob",
-    "harness_evolve",
-    "sandbox_rollback",
-    "skill_install",
-    "subagent",
+    "bash", "cronjob", "harness_evolve", "harness_capability", "sandbox_rollback",
+    "skill_install", "subagent",
 })
 
 
@@ -42,7 +31,7 @@ class CronService:
         self._waker = callback
 
     def wake(self) -> None:
-        if self._waker is not None:
+        if self._waker:
             self._waker()
 
     async def ensure(self) -> None:
@@ -55,249 +44,190 @@ class CronService:
             parse_time(str(schedule.run_at))
         return schedule
 
-    def preview(
-        self,
-        schedule: CronSchedule,
-        *,
-        count: int = 5,
-        base_time: datetime | None = None,
-    ) -> CronPreview:
-        selected = self.validate_schedule(schedule)
-        return self.calculator.preview(selected, count=count, base_time=base_time)
+    def preview(self, schedule: CronSchedule, *, count: int = 5, base_time: datetime | None = None) -> CronPreview:
+        return self.calculator.preview(self.validate_schedule(schedule), count=count, base_time=base_time)
+
+    def _profile(self, request: CronJobCreateRequest | CronJobEditRequest, previous: CronJob | None = None) -> CronRuntimeProfile:
+        profile = getattr(request, "runtime_profile", None)
+        grants = getattr(request, "preapproved_tools", None)
+        if profile is not None:
+            _validate_preapproved_tools(profile.allowed_tools)
+            _validate_preapproved_tools(profile.preapproved_tools)
+            return profile
+        if grants is not None:
+            selected = _validate_preapproved_tools(tuple(grants))
+            allowed = tuple(sorted(set(selected) | set(previous.runtime_profile.allowed_tools if previous else ())))
+            return CronRuntimeProfile(
+                allowed_tools=allowed,
+                allowed_skills=previous.runtime_profile.allowed_skills if previous else (),
+                sandbox_policy=previous.runtime_profile.sandbox_policy if previous else "read_only",
+                preapproved_tools=selected,
+                limits=previous.runtime_profile.limits if previous else CronRuntimeProfile().limits,
+            )
+        return previous.runtime_profile if previous else CronRuntimeProfile()
 
     async def create(self, request: CronJobCreateRequest) -> CronJob:
+        await self.store.ensure()
         schedule = self.validate_schedule(request.schedule)
-        preapproved_tools = _validate_preapproved_tools(request.preapproved_tools)
         now = utc_now()
-        next_run = self._initial_next(schedule, now)
-        job_id = f"cron_{uuid4().hex}"
         job = CronJob(
-            job_id=job_id,
-            project_id=request.project_id,
-            name=request.name.strip(),
-            prompt=request.prompt.strip(),
-            preapproved_tools=preapproved_tools,
-            schedule=schedule,
-            created_at=utc_iso(now),
-            updated_at=utc_iso(now),
-            next_run_at=utc_iso(next_run),
+            job_id=f"cron_{uuid4().hex}", project_id=request.project_id, name=request.name.strip(),
+            prompt=request.prompt.strip(), schedule=schedule, misfire_policy=request.misfire_policy,
+            runtime_profile=self._profile(request), created_at=utc_iso(now), updated_at=utc_iso(now),
+            next_run_at=utc_iso(self._initial_next(schedule, now)),
         )
-
-        def add(state) -> None:
-            state.jobs[job_id] = job
-
-        await self.store.mutate(add)
+        await self.store.save_job(job)
         self.wake()
         return job
 
-    async def ensure_paper_research_preset(
-        self,
-        *,
-        project_id: str,
-        expression: str,
-        timezone_name: str,
-    ) -> CronJob:
-        """Idempotently create the first-run paper research Job in jobs.json."""
-        schedule = self.validate_schedule(CronSchedule(
-            kind="cron", expression=expression, timezone=timezone_name,
-        ))
-        digest = hashlib.sha256(f"{project_id}:paper-research".encode("utf-8")).hexdigest()[:16]
+    async def ensure_paper_research_preset(self, *, project_id: str, expression: str, timezone_name: str) -> CronJob:
+        await self.store.ensure()
+        digest = hashlib.sha256(f"{project_id}:paper-research".encode()).hexdigest()[:16]
         job_id = f"cron_paper_research_{digest}"
-        selected: CronJob | None = None
+        try:
+            return await self.get(job_id)
+        except KeyError:
+            pass
+        schedule = self.validate_schedule(CronSchedule(kind="cron", expression=expression, timezone=timezone_name))
         now = utc_now()
-
-        def ensure(state) -> None:
-            nonlocal selected
-            existing = state.jobs.get(job_id)
-            if existing is not None:
-                selected = existing
-                return
-            selected = CronJob(
-                job_id=job_id,
-                project_id=project_id,
-                name="定时论文调研",
-                prompt=(
-                    "执行一次无人值守论文调研。先调用 profile_read(name=\"RESEARCH\") 读取研究方向；"
-                    "若为空，明确说明并结束。读取并严格执行 search-summary-paper Skill，默认检索、"
-                    "下载并完整阅读 5 篇公开论文，生成详细中文总结、论文库索引和可核验 Reference。"
-                    "若 web_search 未配置，改用 web_fetch 查询 arXiv、OpenAlex 或 Semantic Scholar 的"
-                    "公开 JSON API，不得因单一检索工具不可用而直接结束。"
-                    "单个来源失败时继续其他候选，不绕过登录、验证码或付费墙。最终汇报成功、重复、"
-                    "不可访问和解析失败项。当前 Cron Agent 没有会话记忆，所有依据必须来自本次工具结果。"
-                ),
-                schedule=schedule,
-                preapproved_tools=("paper_library_download", "paper_library_save", "reference_write"),
-                created_at=utc_iso(now),
-                updated_at=utc_iso(now),
-                next_run_at=utc_iso(self._initial_next(schedule, now)),
-            )
-            state.jobs[job_id] = selected
-
-        await self.store.mutate(ensure)
+        tools = ("paper_library_download", "paper_library_save", "reference_write")
+        profile = CronRuntimeProfile(allowed_tools=tools, allowed_skills=("search-summary-paper",), preapproved_tools=tools)
+        job = CronJob(
+            job_id=job_id, project_id=project_id, name="定时论文调研",
+            prompt="执行一次无记忆论文调研。读取研究方向，使用已授权工具和 search-summary-paper Skill；对单一来源失败使用候选来源继续。",
+            schedule=schedule, runtime_profile=profile, created_at=utc_iso(now), updated_at=utc_iso(now),
+            next_run_at=utc_iso(self._initial_next(schedule, now)),
+        )
+        await self.store.save_job(job)
         self.wake()
-        assert selected is not None
-        return selected
+        return job
 
     async def tool_preapproved(self, job_id: str, tool_name: str) -> bool:
         try:
             job = await self.get(job_id)
         except KeyError:
             return False
-        return tool_name in job.preapproved_tools
+        return tool_name in job.runtime_profile.preapproved_tools
 
     async def edit(self, job_id: str, request: CronJobEditRequest) -> CronJob:
-        selected: CronJob | None = None
-        now = utc_now()
-
-        def update(state) -> None:
-            nonlocal selected
-            job = _job(state.jobs, job_id)
-            if job.active_run_id or job.manual_run_requested:
-                raise RuntimeError("活动 Cron Job 不能编辑，请等待当前运行结束")
-            values = request.model_dump(exclude_none=True)
-            if "schedule" in values:
-                schedule = self.validate_schedule(request.schedule)  # type: ignore[arg-type]
-                values["schedule"] = schedule
-                values["next_run_at"] = utc_iso(self._initial_next(schedule, now))
-                values["state"] = "scheduled"
-            if "name" in values:
-                values["name"] = str(values["name"]).strip()
-            if "prompt" in values:
-                values["prompt"] = str(values["prompt"]).strip()
-            if "preapproved_tools" in values:
-                values["preapproved_tools"] = _validate_preapproved_tools(
-                    tuple(values["preapproved_tools"]),
-                )
-            values["updated_at"] = utc_iso(now)
-            selected = CronJob.model_validate(job.model_copy(update=values).model_dump(), strict=True)
-            state.jobs[job_id] = selected
-
-        await self.store.mutate(update)
+        job = await self.get(job_id)
+        if job.state == "deleted":
+            raise RuntimeError("deleted Cron job cannot be edited")
+        now = utc_now(); timestamp = utc_iso(now)
+        values = request.model_dump(exclude_none=True)
+        schedule_changed = "schedule" in values
+        schedule = self.validate_schedule(request.schedule) if request.schedule else job.schedule
+        state = job.state
+        if schedule_changed and job.schedule.kind == "once" and job.state == "completed":
+            state = "scheduled"
+        updated = job.model_copy(update={
+            "name": str(values.get("name", job.name)).strip(),
+            "prompt": str(values.get("prompt", job.prompt)).strip(),
+            "schedule": schedule,
+            "misfire_policy": values.get("misfire_policy", job.misfire_policy),
+            "runtime_profile": self._profile(request, job),
+            "state": state,
+            "next_run_at": utc_iso(self._initial_next(schedule, now)) if schedule_changed else job.next_run_at,
+            "revision": job.revision + 1, "updated_at": timestamp,
+        })
+        await self.store.save_job(updated, expected_revision=job.revision)
         self.wake()
-        assert selected is not None
-        return selected
+        return updated
 
     async def pause(self, job_id: str) -> CronJob:
-        return await self._set_state(job_id, "paused")
+        job = await self.get(job_id)
+        if job.state in {"completed", "deleted"}:
+            raise RuntimeError("completed or deleted Cron job cannot be paused")
+        updated = job.model_copy(update={"state": "paused", "revision": job.revision + 1, "updated_at": utc_iso()})
+        await self.store.save_job(updated, expected_revision=job.revision)
+        return updated
 
     async def resume(self, job_id: str) -> CronJob:
-        selected: CronJob | None = None
+        job = await self.get(job_id)
+        if job.state == "deleted":
+            raise RuntimeError("deleted Cron job cannot be resumed")
+        if job.schedule.kind == "once" and job.state == "completed":
+            raise RuntimeError("completed one-time Cron job cannot be resumed")
         now = utc_now()
-
-        def update(state) -> None:
-            nonlocal selected
-            job = _job(state.jobs, job_id)
-            if job.schedule.kind == "once" and job.state == "completed":
-                raise RuntimeError("已经完成的单次 Cron Job 不能恢复")
-            next_value = parse_time(job.next_run_at) if job.next_run_at else None
-            if next_value is None:
-                next_value = self._initial_next(job.schedule, now)
-            selected = job.model_copy(update={
-                "state": "scheduled",
-                "next_run_at": utc_iso(next_value),
-                "updated_at": utc_iso(now),
-            })
-            state.jobs[job_id] = selected
-
-        await self.store.mutate(update)
+        updated = job.model_copy(update={"state": "scheduled", "next_run_at": utc_iso(self._initial_next(job.schedule, now)),
+                                          "revision": job.revision + 1, "updated_at": utc_iso(now)})
+        await self.store.save_job(updated, expected_revision=job.revision)
         self.wake()
-        assert selected is not None
-        return selected
+        return updated
 
     async def trigger(self, job_id: str) -> CronJob:
-        selected: CronJob | None = None
-        now = utc_now()
-
-        def update(state) -> None:
-            nonlocal selected
-            job = _job(state.jobs, job_id)
-            if job.active_run_id or job.manual_run_requested:
-                raise RuntimeError("Cron Job 已有活动运行，不能重复触发")
-            selected = job.model_copy(update={
-                "manual_run_requested": True,
-                "updated_at": utc_iso(now),
-            })
-            state.jobs[job_id] = selected
-
-        await self.store.mutate(update)
+        job = await self.get(job_id)
+        if job.state == "deleted" or job.current_dispatch_id:
+            raise RuntimeError("Cron job already has an active dispatch or has been deleted")
+        now = utc_iso()
+        snapshot = job.model_dump(mode="json")
+        request_hash = hashlib.sha256(f"run-now:{job.job_id}:{job.revision}:{now}".encode()).hexdigest()
+        dispatch = CronDispatch(dispatch_id=f"cron_dispatch_{uuid4().hex}", job_id=job.job_id, job_revision=job.revision,
+                                trigger="run_now", job_snapshot=snapshot, request_hash=request_hash, created_at=now)
+        await self.store.due_materialize(job, [dispatch], job.next_run_at, now=now)
         self.wake()
-        assert selected is not None
-        return selected
+        return await self.get(job_id)
+
+    async def retry(self, dispatch_id: str) -> CronDispatch:
+        original = await self.store.dispatch(dispatch_id)
+        if original.status not in {"failed", "cancelled"}:
+            raise RuntimeError("only a determined failed/cancelled dispatch can be retried")
+        now = utc_iso()
+        retry = CronDispatch(dispatch_id=f"cron_dispatch_{uuid4().hex}", job_id=original.job_id,
+                             job_revision=original.job_revision, trigger="retry", retry_of_dispatch_id=original.dispatch_id,
+                             job_snapshot=original.job_snapshot, request_hash=hashlib.sha256(f"retry:{original.dispatch_id}:{now}".encode()).hexdigest(), created_at=now)
+        job = await self.get(original.job_id)
+        await self.store.due_materialize(job, [retry], job.next_run_at, now=now)
+        self.wake()
+        return retry
 
     async def remove(self, job_id: str) -> CronJob:
-        selected: CronJob | None = None
-
-        def remove_job(state) -> None:
-            nonlocal selected
-            selected = _job(state.jobs, job_id)
-            if selected.active_run_id or selected.manual_run_requested:
-                raise RuntimeError("活动 Cron Job 不能删除")
-            state.jobs.pop(job_id)
-
-        await self.store.mutate(remove_job)
+        job = await self.get(job_id)
+        if job.state == "deleted":
+            return job
+        now = utc_iso()
+        updated = job.model_copy(update={"state": "deleted", "next_run_at": None, "deleted_at": now,
+                                          "revision": job.revision + 1, "updated_at": now})
+        await self.store.save_job(updated, expected_revision=job.revision)
+        # Pending dispatches cannot have side effects, hence are safe to cancel.
+        for dispatch in await self.store.dispatches(job_id, limit=10_000):
+            if dispatch.status in {"pending", "claimed"}:
+                await self.store.cancel_unbound(dispatch.dispatch_id, reason="job_deleted_before_claim")
         self.wake()
-        assert selected is not None
-        return selected
+        return updated
 
     async def list(self, project_id: str | None = None) -> tuple[CronJob, ...]:
-        state = await self.store.load()
-        values = [
-            job for job in state.jobs.values()
-            if project_id is None or job.project_id == project_id
-        ]
-        return tuple(sorted(values, key=lambda item: (item.name.casefold(), item.job_id)))
+        await self.store.ensure()
+        return await self.store.jobs(project_id)
 
     async def get(self, job_id: str) -> CronJob:
-        return _job((await self.store.load()).jobs, job_id)
+        await self.store.ensure()
+        return await self.store.job(job_id)
+
+    async def history(self, job_id: str, *, limit: int = 100) -> tuple[CronDispatch, ...]:
+        await self.store.ensure()
+        return await self.store.dispatches(job_id, limit=limit)
 
     async def status(self, *, error: str | None = None) -> CronStatus:
-        try:
-            state = await self.store.load()
-        except (OSError, ValueError) as exc:
-            return CronStatus(healthy=False, last_error=error or str(exc))
-        jobs = tuple(state.jobs.values())
-        last_error = error or state.heartbeat.last_error
-        return CronStatus(
-            healthy=state.heartbeat.status != "unhealthy" and not last_error,
-            heartbeat=state.heartbeat,
-            jobs_total=len(jobs),
-            jobs_scheduled=sum(job.state == "scheduled" for job in jobs),
-            jobs_running=sum(job.active_run_id is not None for job in jobs),
-            last_error=last_error,
-        )
+        await self.store.ensure()
+        heartbeat = await self.store.heartbeat()
+        jobs = await self.store.jobs(include_deleted=True)
+        return CronStatus(healthy=heartbeat.status != "unhealthy" and not error and not heartbeat.last_error,
+                          heartbeat=heartbeat, jobs_total=len(jobs), jobs_scheduled=sum(j.state == "scheduled" for j in jobs),
+                          jobs_running=sum(j.current_run_id is not None for j in jobs), last_error=error or heartbeat.last_error)
 
     async def project_has_jobs(self, project_id: str) -> bool:
-        return any(
-            job.project_id == project_id
-            and (job.state != "completed" or job.active_run_id is not None or job.manual_run_requested)
-            for job in (await self.store.load()).jobs.values()
-        )
-
-    async def _set_state(self, job_id: str, value: str) -> CronJob:
-        selected: CronJob | None = None
-
-        def update(state) -> None:
-            nonlocal selected
-            job = _job(state.jobs, job_id)
-            if job.state == "completed":
-                raise RuntimeError("已经完成的单次 Cron Job 不能暂停")
-            selected = job.model_copy(update={"state": value, "updated_at": utc_iso()})
-            state.jobs[job_id] = selected
-
-        await self.store.mutate(update)
-        self.wake()
-        assert selected is not None
-        return selected
+        return bool(await self.store.jobs(project_id))
 
     def _initial_next(self, schedule: CronSchedule, now: datetime) -> datetime:
         if schedule.kind == "once":
             selected = parse_time(str(schedule.run_at))
             if selected <= now.astimezone(timezone.utc):
-                raise ValueError("单次计划时间必须晚于当前时间")
+                raise ValueError("one-time schedule must be in the future")
             return selected
         selected = self.calculator.next_after(schedule, now)
         if selected is None:
-            raise ValueError("计划没有下一次执行时间")
+            raise ValueError("schedule has no next run")
         return selected
 
 
@@ -305,15 +235,5 @@ def _validate_preapproved_tools(values: tuple[str, ...]) -> tuple[str, ...]:
     selected = tuple(sorted({value.strip() for value in values if value.strip()}))
     blocked = _NEVER_PREAPPROVE.intersection(selected)
     if blocked:
-        raise ValueError(
-            "Cron 无人值守任务不能预授权递归、自修改或任意命令能力："
-            + ", ".join(sorted(blocked))
-        )
+        raise ValueError("Cron cannot preapprove: " + ", ".join(sorted(blocked)))
     return selected
-
-
-def _job(jobs: dict[str, CronJob], job_id: str) -> CronJob:
-    try:
-        return jobs[job_id]
-    except KeyError as exc:
-        raise KeyError(f"Cron Job 不存在：{job_id}") from exc

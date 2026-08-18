@@ -38,6 +38,7 @@ from Agent.state import (
     is_runnable,
 )
 from cron import (
+    CronDispatch,
     CronJob,
     CronJobCreateRequest,
     CronJobEditRequest,
@@ -137,6 +138,7 @@ class GatewayApplication:
         self.extensions = ExtensionLoader(source_root).scan()
         self.cron_store = CronStore(
             config.agent_root,
+            database_path=self.store.database_path,
             heartbeat_seconds=config.cron_heartbeat_seconds,
         )
         self.cron_service = CronService(self.cron_store, CronScheduleCalculator())
@@ -179,6 +181,7 @@ class GatewayApplication:
             write_gate=self.write_gate,
             harness_evolution_service=self.harness_evolution,
             cron_tool_authorizer=self.cron_service.tool_preapproved,
+            cron_terminal_callback=self._settle_cron_terminal,
         )
         self.recovery = RecoveryCoordinator(
             self.state_controller,
@@ -188,8 +191,8 @@ class GatewayApplication:
         )
         self.cron_scheduler = CronScheduler(
             self.cron_store,
-            self._submit_cron_run,
-            self.store.run,
+            self._submit_cron_dispatch,
+            gateway_epoch=lambda: self.gateway_epoch,
             write_gate=self.write_gate,
         )
         self.cron_service.set_waker(self.cron_scheduler.wake)
@@ -264,6 +267,8 @@ class GatewayApplication:
         await self.reference_embedding_worker.start()
         try:
             await self.pool.start()
+            await self.cron_store.ensure()
+            await self._reconcile_cron_dispatches()
             await self.recovery.recover()
             await self._recover_harness_dream_generations()
             await self.restart_coordinator.recover_pending()
@@ -274,6 +279,23 @@ class GatewayApplication:
             await self.outbox.close()
             await self.reference_embedding_worker.close()
             raise
+
+    async def _reconcile_cron_dispatches(self) -> None:
+        """Complete durable Cron bindings/projections; never create a second Run."""
+        for dispatch in await self.cron_store.active_dispatches():
+            if dispatch.status == "claimed":
+                # Deterministic run identity makes a crashed bind safely resumable.
+                await self._submit_cron_dispatch(dispatch)
+                continue
+            if not dispatch.run_id:
+                continue
+            try:
+                run = self.store.run(dispatch.run_id)
+            except KeyError:
+                await self.cron_store.mark_recovery_required(dispatch.dispatch_id, "bound cron run missing")
+                continue
+            if run.status in {"completed", "failed", "cancelled", "interrupted"}:
+                await self._settle_cron_terminal(run)
 
     async def create_backup(self, passphrase: str, output: Path | None = None):
         return await self.backup_service.create(
@@ -637,6 +659,14 @@ class GatewayApplication:
         result = await self.cron_service.trigger(job_id)
         self.cron_scheduler.wake()
         return result
+
+    async def retry_cron_dispatch(self, dispatch_id: str) -> CronDispatch:
+        result = await self.cron_service.retry(dispatch_id)
+        self.cron_scheduler.wake()
+        return result
+
+    async def cron_history(self, job_id: str, *, limit: int = 100) -> tuple[CronDispatch, ...]:
+        return await self.cron_service.history(job_id, limit=limit)
 
     async def remove_cron(self, job_id: str) -> CronJob:
         result = await self.cron_service.remove(job_id)
@@ -1444,38 +1474,91 @@ class GatewayApplication:
             return self.state_controller.state(run_id)
         return result
 
-    async def _submit_cron_run(self, job: CronJob, run_id: str) -> None:
+    async def _submit_cron_dispatch(self, dispatch: CronDispatch) -> None:
+        job = await self.cron_service.get(dispatch.job_id)
+        run_id = hashlib.sha256(f"cron-run:{dispatch.dispatch_id}".encode()).hexdigest()[:32]
+        session_id = hashlib.sha256(f"cron-session:{dispatch.dispatch_id}".encode()).hexdigest()[:16]
         self.store.project(job.project_id)
-        request_hash = hashlib.sha256(
-            json.dumps(
-                {"job_id": job.job_id, "project_id": job.project_id, "prompt": job.prompt},
-                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-            ).encode("utf-8"),
-        ).hexdigest()
         state, duplicate = self.state_controller.create_run(
             run_id=run_id,
             workload_kind=WorkloadKind.CRON,
             project_id=job.project_id,
             client_id=f"cron:{job.job_id}",
             task=job.prompt,
-            idempotency_key=f"cron:{run_id}",
-            request_hash=request_hash,
-            persistence_contract=PersistenceContract.CONTROL_ONLY,
+            idempotency_key=f"cron:{dispatch.dispatch_id}",
+            request_hash=dispatch.request_hash,
+            persistence_contract=PersistenceContract.SESSION_BACKED_WORKLOAD,
+            session_id=session_id,
         )
-        run = self.store.run(state.run_id)
+        operation_id = hashlib.sha256(f"cron-operation:{dispatch.dispatch_id}".encode()).hexdigest()[:32]
+        attempt_id = hashlib.sha256(f"cron-attempt:{dispatch.dispatch_id}".encode()).hexdigest()[:32]
+        need_binding_receipt = not duplicate
         if duplicate:
-            return
-        state = self.state_controller.apply(TransitionCommand(
+            try:
+                self.state_controller.operation(operation_id)
+            except KeyError:
+                # Crash after create_run but before the binding receipt: finish
+                # the same deterministic binding, never create another Run.
+                need_binding_receipt = True
+        if need_binding_receipt:
+            state = self.state_controller.apply(CreateOperationWithAttemptCommand(
+                command_id=f"cron-bind:{dispatch.dispatch_id}:create", run_id=run_id,
+                expected_revision=state.revision, gateway_epoch=self.gateway_epoch,
+                operation_id=operation_id, attempt_id=attempt_id, turn_id=state.turn_id,
+                kind=OperationKind.CRON_DISPATCH, name="cron_dispatch",
+                stable_key=f"cron-dispatch:{dispatch.dispatch_id}", request_hash=dispatch.request_hash,
+                idempotency=ToolIdempotency.PURE, side_effecting=False,
+                external_idempotency_key=f"cron:{dispatch.dispatch_id}",
+                retry_policy_snapshot=RetryPolicySnapshot(max_attempts=1, base_seconds=0.0, max_seconds=0.0,
+                    automatic=False, requires_reconcile=False, requires_human_confirmation=False),
+            )).state
+            state = self.state_controller.apply(StartOperationAttemptCommand(
+                command_id=f"cron-bind:{dispatch.dispatch_id}:start", run_id=run_id,
+                expected_revision=state.revision, gateway_epoch=self.gateway_epoch, attempt_id=attempt_id,
+            )).state
+            receipt = json.dumps({"dispatch_id": dispatch.dispatch_id, "job_id": job.job_id,
+                "job_revision": dispatch.job_revision, "session_id": session_id, "run_id": run_id,
+                "request_hash": dispatch.request_hash}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            state = self.state_controller.apply(CompleteOperationAttemptCommand(
+                command_id=f"cron-bind:{dispatch.dispatch_id}:complete", run_id=run_id,
+                expected_revision=state.revision, gateway_epoch=self.gateway_epoch, attempt_id=attempt_id,
+                result=receipt, result_hash=hashlib.sha256(receipt.encode()).hexdigest(), result_source="cron_binding",
+            )).state
+        if state.task_state is TaskState.CREATED:
+            state = self.state_controller.apply(TransitionCommand(
             command_id=uuid4().hex,
             run_id=state.run_id,
             expected_revision=state.revision,
             gateway_epoch=self.gateway_epoch,
             task_state=TaskState.QUEUED,
             reason="Cron Scheduler 提交任务",
-        )).state
+            )).state
+        await self.cron_store.bind_running(dispatch.dispatch_id, claim_token=str(dispatch.claim_token),
+                                           session_id=session_id, run_id=run_id,
+                                           operation_id=operation_id, attempt_id=attempt_id)
         self.outbox.wake()
         run = self.store.run(state.run_id)
-        await self.pool.submit(run)
+        current_state = self.state_controller.state(run.run_id)
+        if current_state.task_state is TaskState.QUEUED:
+            await self.pool.submit(run)
+        elif current_state.task_state in {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.INTERRUPTED}:
+            await self._settle_cron_terminal(run)
+
+    async def _settle_cron_terminal(self, run) -> None:
+        """Project a terminal Run into its scheduling-domain Dispatch exactly once."""
+        try:
+            row = await self.cron_store.dispatch_by_run_id(run.run_id)
+        except KeyError:
+            return
+        if row.status not in {"running", "recovery_required"}:
+            return
+        status = "succeeded" if run.status == "completed" else "failed"
+        await self.cron_store.mark_terminal(
+            row.dispatch_id,
+            status=status,
+            result=run.answer if status == "succeeded" else None,
+            error=run.error if status == "failed" else None,
+        )
 
     async def cancel_run(self, run_id: str) -> bool:
         self.store.run(run_id)
