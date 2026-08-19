@@ -48,6 +48,8 @@ from gateway.models import (
     RunCreateRequest,
     RecoveryDecisionRequest,
     RunRecord,
+    ExtensionGrantRequest,
+    ExtensionReenableRequest,
 )
 from gateway.process import GatewayProcessManager
 
@@ -327,10 +329,15 @@ class GatewayClient:
         )
         return CodeTurnResult.model_validate(value)
 
-    async def finalize_code_session(self, session_id: str) -> CodeFinalizeResult:
+    async def finalize_code_session(
+        self, session_id: str, approved_plan_hash: str | None = None,
+    ) -> CodeFinalizeResult:
+        params = {"client_id": self.client_id}
+        if approved_plan_hash is not None:
+            params["approved_plan_hash"] = approved_plan_hash
         value = await self._request(
             "POST", f"/api/v1/code/sessions/{session_id}/finalize",
-            params={"client_id": self.client_id},
+            params=params,
         )
         return CodeFinalizeResult.model_validate(value)
 
@@ -349,6 +356,27 @@ class GatewayClient:
             params={"client_id": self.client_id},
         )
         return CodeFinalizeResult.model_validate(value)
+
+    async def extension_status(self, hook_id: str | None = None) -> dict[str, Any]:
+        params = {"hook_id": hook_id} if hook_id else None
+        return dict(await self._request("GET", "/api/v1/extensions/status", params=params))
+
+    async def extension_grant(
+        self, request: ExtensionGrantRequest, *, revoke: bool = False,
+    ) -> dict[str, Any]:
+        action = "revoke" if revoke else "grant"
+        return dict(await self._request(
+            "POST", f"/api/v1/extensions/{action}",
+            json=request.model_dump(mode="json"),
+        ))
+
+    async def extension_reenable(
+        self, request: ExtensionReenableRequest,
+    ) -> dict[str, Any]:
+        return dict(await self._request(
+            "POST", "/api/v1/extensions/reenable",
+            json=request.model_dump(mode="json"),
+        ))
 
     async def code_session_events(
         self,

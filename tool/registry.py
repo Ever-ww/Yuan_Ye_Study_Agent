@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import inspect
 from typing import Annotated, Any, Awaitable, Callable, Iterable, Literal
@@ -69,12 +71,27 @@ class AsyncToolRegistry:
                 "risk": tool.risk,
                 "idempotency": str(getattr(tool, "idempotency", "PURE")),
                 "delegatable": bool(getattr(tool, "delegatable", True)),
+                "extension_preapproval": bool(getattr(tool, "extension_preapproval", False)),
                 "runtime_profiles": list(getattr(
                     tool, "runtime_profiles", ("interactive", "cron", "harness", "maintenance"),
                 )),
             }
             for name, tool in sorted(self._tools.items())
         }
+
+    def extension_preapproval_allowed(self, name: str) -> bool:
+        tool = self._tools.get(name)
+        if tool is None:
+            raise ValueError(f"Unknown Tool: {name}")
+        return bool(getattr(tool, "extension_preapproval", False))
+
+    def tool_contract_hash(self, name: str) -> str:
+        snapshot = self.contract_snapshot().get(name)
+        if snapshot is None:
+            raise ValueError(f"Unknown Tool: {name}")
+        return hashlib.sha256(json.dumps(
+            snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
 
     def is_available(self, name: str, context: ToolContext | None) -> bool:
         """判断工具在当前执行上下文中是否真实可用。"""
@@ -189,15 +206,38 @@ class AsyncToolRegistry:
                 tool_call_id=tool_call_id or f"direct_{name}",
             )
         try:
+            extension_authorization = context.extension_authorization
+            extension_denial: str | None = None
+            if extension_authorization is not None:
+                expected_hash = extension_authorization.tool_contract_hashes.get(name)
+                if name not in extension_authorization.allowed_tools:
+                    extension_denial = "extension_tool_not_preapproved"
+                elif not self.extension_preapproval_allowed(name):
+                    extension_denial = "tool_disallows_extension_preapproval"
+                elif expected_hash != self.tool_contract_hash(name):
+                    extension_denial = "extension_tool_contract_changed"
+                if extension_denial is not None:
+                    if coordinator is not None and operation is not None:
+                        await coordinator.skip_denied(operation, reason=extension_denial)
+                    denied = PermissionError(
+                        f"Extension Tool invocation denied: {extension_denial}"
+                    )
+                    setattr(denied, "extension_policy_denial", True)
+                    raise denied
             if needs_approval:
-                if coordinator is not None:
-                    await coordinator.waiting_human(operation)
-                approved = bool(
-                    context.approval is not None
-                    and await context.approval(name, arguments)
-                )
+                # A valid Extension authorization is the offline Candidate
+                # decision. It must never be converted into WAITING_HUMAN.
+                if extension_authorization is not None:
+                    approved = True
+                else:
+                    if coordinator is not None:
+                        await coordinator.waiting_human(operation)
+                    approved = bool(
+                        context.approval is not None
+                        and await context.approval(name, arguments)
+                    )
                 denied_result = None
-                if coordinator is not None:
+                if coordinator is not None and extension_authorization is None:
                     denied_result = await coordinator.approval_decided(operation, approved=approved)
                 if not approved and denied_result is not None:
                     return denied_result

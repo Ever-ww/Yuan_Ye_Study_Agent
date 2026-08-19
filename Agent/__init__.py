@@ -1,8 +1,25 @@
 """Yuan Ye Study Agent 的正式异步公共接口。"""
 
 from .config import RuntimeConfig, default_agent_root, load_runtime_config, prepare_default_agent_root
-from .extensions import ExtensionCatalog, ExtensionContext, ExtensionLoader, ExtensionModule
-from .hook import HookEvent, HookPoint, HookRegistry
+from .extensions import (
+    CapabilityTier,
+    ExtensionCapability,
+    ExtensionCapabilityDenied,
+    ExtensionCatalog,
+    ExtensionContext,
+    ExtensionContractViolation,
+    ExtensionEventView,
+    ExtensionLoader,
+    ExtensionManifest,
+    ExtensionModule,
+    ExtensionMutationBuffer,
+    ExtensionRuntimePolicy,
+    ExtensionRuntimeBinding,
+    ExtensionServices,
+    ExtensionTraceSnapshot,
+    build_extension_grant_plan,
+)
+from .hook import HookEvent, HookExecutor, HookFailureMode, HookOrigin, HookPoint, HookRegistry
 from .models import ModelNetworkError, ModelResponseFormatError, ModelServiceError
 from .retry import ModelRetryPolicy
 from .runtime import AgentRuntime, RuntimeFailure, RuntimeResult, RunEvent, EventType
@@ -28,10 +45,25 @@ __all__ = [
     "AgentRuntime",
     "EventType",
     "ExtensionCatalog",
+    "ExtensionCapability",
+    "ExtensionCapabilityDenied",
     "ExtensionContext",
+    "ExtensionContractViolation",
+    "ExtensionEventView",
     "ExtensionLoader",
+    "ExtensionManifest",
     "ExtensionModule",
+    "ExtensionMutationBuffer",
+    "ExtensionRuntimePolicy",
+    "ExtensionRuntimeBinding",
+    "ExtensionServices",
+    "ExtensionTraceSnapshot",
+    "CapabilityTier",
+    "build_extension_grant_plan",
     "HookEvent",
+    "HookExecutor",
+    "HookFailureMode",
+    "HookOrigin",
     "HookPoint",
     "HookRegistry",
     "AgentState",

@@ -13,14 +13,14 @@ class SessionRecord(BaseModel):
 
     model_config = ConfigDict(extra="allow", strict=True)
 
-    role: Literal["user", "assistant", "tool", "summary"]
+    role: Literal["user", "assistant", "tool", "summary", "extension"]
     content: str | None
     timestamp: str = Field(min_length=1)
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
     name: str | None = None
     reasoning: str | None = None
-    origin: Literal["interactive", "cron", "maintenance"] | None = None
+    origin: Literal["interactive", "cron", "maintenance", "extension"] | None = None
     record_id: str | None = Field(default=None, min_length=1)
     run_id: str | None = Field(default=None, min_length=1)
     turn_id: str | None = Field(default=None, min_length=1)
@@ -38,6 +38,8 @@ class SessionRecord(BaseModel):
                 raise ValueError("tool 记录必须包含字符串 content")
             if not self.tool_call_id or not self.name:
                 raise ValueError("tool 记录必须包含 tool_call_id 和 name")
+        if self.role == "extension" and not isinstance(self.content, str):
+            raise ValueError("extension records require string content")
         return self
 
 

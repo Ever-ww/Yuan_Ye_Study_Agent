@@ -14,7 +14,7 @@ from pathlib import Path
 from time import monotonic
 from uuid import uuid4
 
-from Agent import ExtensionLoader, RuntimeConfig
+from Agent import ExtensionCapability, ExtensionLoader, RuntimeConfig
 from Agent.state import (
     CompleteOperationAttemptCommand,
     CreateOperationWithAttemptCommand,
@@ -69,6 +69,8 @@ from gateway.models import (
     RecoveryDecisionRequest,
     RunRecord,
     SkillManageRequest,
+    ExtensionGrantRequest,
+    ExtensionReenableRequest,
 )
 from gateway.runtime_pool import RuntimeFactory, RuntimePool
 from gateway.store import GatewayStore
@@ -135,6 +137,7 @@ class GatewayApplication:
             dead_letter_enabled=config.outbox_dead_letter_enabled,
         )
         source_root = config.coding_source_root or Path(__file__).resolve().parents[1]
+        self._reconcile_extension_grant_intents(source_root)
         self.extensions = ExtensionLoader(source_root).scan()
         self.cron_store = CronStore(
             config.agent_root,
@@ -220,7 +223,9 @@ class GatewayApplication:
             write_gate=self.write_gate,
         )
         self._browser_codes: dict[str, float] = {}
-        self.code_sessions = CodeSessionManager(config)
+        self.code_sessions = CodeSessionManager(
+            config, grant_backend=self.state_controller,
+        )
         from tools import HarnessDreamTool, HarnessErrorTool, HarnessManualTool
         self.harness_manual_tool = HarnessManualTool(lambda: self.code_sessions)
         self.harness_error_tool = HarnessErrorTool(self.harness_evolution)
@@ -260,6 +265,44 @@ class GatewayApplication:
             on_result=self._record_backup_result,
             heartbeat_seconds=config.cron_heartbeat_seconds,
         )
+
+    def _reconcile_extension_grant_intents(self, source_root: Path) -> None:
+        for row in self.state_controller.pending_extension_grant_intents():
+            plan_hash = str(row["plan_hash"])
+            try:
+                plan = json.loads(str(row["plan_json"]))
+                if plan.get("plan_hash") != plan_hash:
+                    raise RuntimeError("Extension Grant Plan hash identity mismatch")
+                expected_repository = hashlib.sha256(
+                    str(source_root.resolve()).casefold().encode("utf-8")
+                ).hexdigest()
+                if str(row["repository_identity"]) != expected_repository:
+                    raise RuntimeError("Extension Grant repository identity mismatch")
+                candidate = str(row["candidate_commit"])
+                ancestry = subprocess.run(
+                    ["git", "merge-base", "--is-ancestor", candidate, "HEAD"],
+                    cwd=source_root, capture_output=True, text=True, check=False,
+                )
+                if ancestry.returncode == 1:
+                    # Intent was durable but merge has not happened.
+                    continue
+                if ancestry.returncode != 0:
+                    raise RuntimeError(ancestry.stderr.strip() or "Cannot verify Candidate ancestry")
+                catalog = ExtensionLoader(source_root).scan(strict=True)
+                by_id = {
+                    module.hook_id: module
+                    for selected in catalog.modules.values() for module in selected
+                }
+                for item in plan.get("hooks", []):
+                    module = by_id.get(str(item["hook_id"]))
+                    if module is None or (
+                        module.source_hash != item["source_hash"]
+                        or module.manifest_hash != item["manifest_hash"]
+                    ):
+                        raise RuntimeError("Merged Extension source does not match Grant intent")
+                self.state_controller.commit_extension_grant_intent(plan_hash)
+            except Exception:
+                self.state_controller.mark_extension_grant_recovery_required(plan_hash)
 
     async def start(self) -> None:
         self.state_controller.prune_retention()
@@ -481,6 +524,110 @@ class GatewayApplication:
             ),
         )
 
+    def extension_status(self, hook_id: str | None = None) -> dict[str, object]:
+        modules = [
+            module for selected in self.extensions.modules.values() for module in selected
+            if hook_id is None or module.hook_id == hook_id
+        ]
+        states = self.state_controller.extension_status(hook_id=hook_id)
+        return {
+            "extensions": [
+                {
+                    "hook_id": module.hook_id,
+                    "stage": module.stage.value,
+                    "name": module.name,
+                    "source_hash": module.source_hash,
+                    "manifest_hash": module.manifest_hash,
+                    "requested_capabilities": [item.value for item in module.manifest.capabilities],
+                    "requested_tools": list(module.manifest.allowed_tools),
+                    "timeout_seconds": module.manifest.timeout_seconds,
+                    "grant": self.state_controller.resolve_extension_grant(
+                        module.hook_id, module.stage.value,
+                        module.source_hash, module.manifest_hash,
+                    ),
+                }
+                for module in modules
+            ],
+            "runtime_states": states,
+            "loader_rejections": list(self.extensions.rejections),
+        }
+
+    def grant_extension(self, request: ExtensionGrantRequest, *, revoke: bool = False):
+        module = self._extension_module(
+            request.hook_id, request.stage, request.source_hash, request.manifest_hash,
+        )
+        requested = {item.value for item in module.manifest.capabilities}
+        selected = set(request.capabilities)
+        if not selected.issubset(requested):
+            raise ValueError("Grant contains a Capability not requested by the Manifest")
+        try:
+            tuple(ExtensionCapability(item) for item in selected)
+        except ValueError as exc:
+            raise ValueError("Grant contains an unknown Extension Capability") from exc
+        tools = set(request.tools)
+        if not tools.issubset(set(module.manifest.allowed_tools)):
+            raise ValueError("Grant contains a Tool not requested by the Manifest")
+        for name in tools:
+            if not self.pool.tool_operations:
+                raise RuntimeError("Durable Tool execution is unavailable")
+            if not self._interactive_tool_registry().extension_preapproval_allowed(name):
+                raise ValueError(f"Tool does not permit Extension preauthorization: {name}")
+            current_hash = self._interactive_tool_registry().tool_contract_hash(name)
+            if request.tool_contract_hashes.get(name) != current_hash:
+                raise ValueError(f"Tool contract hash mismatch: {name}")
+        result = self.state_controller.create_extension_grant(
+            hook_id=module.hook_id, stage=module.stage.value,
+            source_hash=module.source_hash, manifest_hash=module.manifest_hash,
+            granted_capabilities=() if revoke else tuple(sorted(selected)),
+            granted_tools=() if revoke else tuple(sorted(tools)),
+            tool_contract_hashes={} if revoke else request.tool_contract_hashes,
+            actor=request.actor, reason=request.reason,
+            decision="revoke" if revoke else "grant",
+        )
+        self.outbox.wake()
+        return result
+
+    def reenable_extension(self, request: ExtensionReenableRequest):
+        self._extension_module(request.hook_id, request.stage, request.source_hash, None)
+        result = self.state_controller.reenable_extension_hook(
+            request.hook_id, request.stage, request.source_hash,
+            expected_revision=request.expected_revision,
+            actor=request.actor,
+            reason=request.reason,
+        )
+        self.outbox.wake()
+        return result
+
+    def _extension_module(
+        self, hook_id: str, stage: str, source_hash: str,
+        manifest_hash: str | None,
+    ):
+        for module in self.extensions.modules.get(stage, ()):
+            if (
+                module.hook_id == hook_id and module.source_hash == source_hash
+                and (manifest_hash is None or module.manifest_hash == manifest_hash)
+            ):
+                return module
+        # HookPoint keys are enums; support them without leaking that detail to API callers.
+        for selected in self.extensions.modules.values():
+            for module in selected:
+                if (
+                    module.hook_id == hook_id and module.stage.value == stage
+                    and module.source_hash == source_hash
+                    and (manifest_hash is None or module.manifest_hash == manifest_hash)
+                ):
+                    return module
+        raise KeyError(hook_id)
+
+    def _interactive_tool_registry(self):
+        # Build the same default interactive registry contract used by Runtime.
+        from tool import default_tools
+        return default_tools(
+            self.config.workspace_root,
+            agent_root=self.config.agent_root,
+            runtime_profile="interactive",
+        )
+
     async def run_code_turn(self, session_id: str, request: CodeTurnRequest):
         project_id = self._code_project(session_id)
         return await self._run_code_workload(
@@ -491,14 +638,20 @@ class GatewayApplication:
             lambda _run_id: self.harness_manual_tool.turn(session_id, request.client_id, request.task),
         )
 
-    async def finalize_code_session(self, session_id: str, client_id: str):
+    async def finalize_code_session(
+        self, session_id: str, client_id: str,
+        approved_plan_hash: str | None = None,
+    ):
         project_id = self._code_project(session_id)
         return await self._run_code_workload(
             WorkloadKind.CODE_FINALIZE,
             project_id,
             client_id,
             "合并并结束 Coding Session",
-            lambda _run_id: self.harness_manual_tool.finalize(session_id, client_id),
+            lambda run_id: self.harness_manual_tool.finalize(
+                session_id, client_id, approved_plan_hash=approved_plan_hash,
+                run_id=run_id,
+            ),
         )
 
     async def abort_code_session(self, session_id: str, client_id: str):

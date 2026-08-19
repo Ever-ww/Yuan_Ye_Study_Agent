@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections import defaultdict
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -43,16 +46,140 @@ class HookEvent(BaseModel):
 HookCallback = Callable[[HookEvent], Awaitable[None] | None]
 
 
+class HookOrigin(str, Enum):
+    CORE = "core"
+    EXTENSION = "extension"
+
+
+class HookFailureMode(str, Enum):
+    FAIL_CLOSED = "fail_closed"
+    ISOLATE = "isolate"
+
+
+HookOutcomeReporter = Callable[[str, BaseException | None, float], Awaitable[None] | None]
+
+
+@dataclass(frozen=True)
+class HookRegistration:
+    priority: int
+    order: int
+    callback: HookCallback
+    identity: str
+    origin: HookOrigin
+    failure_mode: HookFailureMode
+    timeout_seconds: float
+    outcome_reporter: HookOutcomeReporter | None = None
+
+
+class HookExecutor:
+    """Apply timeout and isolation consistently to every Hook callback."""
+
+    @staticmethod
+    async def _await_in_current_task(
+        awaitable: Awaitable[Any], timeout_seconds: float,
+    ) -> Any:
+        """Timeout a Core Hook without moving ContextVars to a child Task."""
+        task = asyncio.current_task()
+        if task is None:
+            return await awaitable
+        timed_out = False
+
+        def cancel_for_timeout() -> None:
+            nonlocal timed_out
+            timed_out = True
+            task.cancel()
+
+        handle = asyncio.get_running_loop().call_later(timeout_seconds, cancel_for_timeout)
+        try:
+            return await awaitable
+        except asyncio.CancelledError as exc:
+            if timed_out:
+                raise asyncio.TimeoutError() from exc
+            raise
+        finally:
+            handle.cancel()
+
+    async def execute(self, registration: HookRegistration, event: HookEvent) -> None:
+        started = monotonic()
+        outcome = "success"
+        error: BaseException | None = None
+        try:
+            result = registration.callback(event)
+            if inspect.isawaitable(result):
+                # wait_for runs the coroutine in a child Task on Python 3.10.
+                # Core lifecycle Hooks intentionally share ContextVar scope
+                # (TRACE_START installs tokens consumed by TRACE_END), so they
+                # must stay in the caller Task. Untrusted Extension callbacks
+                # never own that core scope and retain the strict timeout.
+                if registration.origin is HookOrigin.EXTENSION:
+                    await asyncio.wait_for(result, timeout=registration.timeout_seconds)
+                else:
+                    await self._await_in_current_task(result, registration.timeout_seconds)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError as exc:
+            outcome, error = "timeout", exc
+        except BaseException as exc:
+            outcome, error = "exception", exc
+        duration = monotonic() - started
+        if registration.outcome_reporter is not None:
+            try:
+                reported = registration.outcome_reporter(outcome, error, duration)
+                if inspect.isawaitable(reported):
+                    await reported
+            except asyncio.CancelledError:
+                raise
+            except BaseException as report_error:
+                if registration.failure_mode is HookFailureMode.FAIL_CLOSED:
+                    raise RuntimeError(
+                        f"Hook {event.point.value}/{registration.identity} audit failed: "
+                        f"{report_error}"
+                    ) from report_error
+                return
+        if error is None or registration.failure_mode is HookFailureMode.ISOLATE:
+            return
+        raise RuntimeError(
+            f"Hook {event.point.value}/{registration.identity} failed: {error}"
+        ) from error
+
+
 class HookRegistry:
     """参考 PI Agent 的事件订阅方式，按优先级和注册顺序执行回调。"""
 
-    def __init__(self) -> None:
-        self._callbacks: dict[HookPoint, list[tuple[int, int, HookCallback]]] = defaultdict(list)
+    def __init__(self, executor: HookExecutor | None = None) -> None:
+        self._callbacks: dict[HookPoint, list[HookRegistration]] = defaultdict(list)
         self._order = 0
+        self._executor = executor or HookExecutor()
 
-    def register(self, point: HookPoint, callback: HookCallback, *, priority: int = 0) -> HookCallback:
+    def register(
+        self,
+        point: HookPoint,
+        callback: HookCallback,
+        *,
+        priority: int = 0,
+        identity: str | None = None,
+        origin: HookOrigin = HookOrigin.CORE,
+        failure_mode: HookFailureMode | None = None,
+        timeout_seconds: float = 30.0,
+        outcome_reporter: HookOutcomeReporter | None = None,
+    ) -> HookCallback:
         """注册同步或异步回调；优先级数值越小越先执行。"""
-        self._callbacks[point].append((priority, self._order, callback))
+        if timeout_seconds <= 0:
+            raise ValueError("Hook timeout_seconds must be positive")
+        mode = failure_mode or (
+            HookFailureMode.ISOLATE if origin is HookOrigin.EXTENSION
+            else HookFailureMode.FAIL_CLOSED
+        )
+        self._callbacks[point].append(HookRegistration(
+            priority=priority,
+            order=self._order,
+            callback=callback,
+            identity=identity or getattr(callback, "__name__", type(callback).__name__),
+            origin=origin,
+            failure_mode=mode,
+            timeout_seconds=float(timeout_seconds),
+            outcome_reporter=outcome_reporter,
+        ))
         self._order += 1
         return callback
 
@@ -64,16 +191,12 @@ class HookRegistry:
         return decorator
 
     async def emit(self, event: HookEvent) -> HookEvent:
-        """依次执行回调，并为失败补充 Hook 阶段与函数名。"""
-        callbacks = sorted(self._callbacks.get(event.point, ()), key=lambda item: (item[0], item[1]))
-        for _, _, callback in callbacks:
-            try:
-                result = callback(event)
-                if inspect.isawaitable(result):
-                    await result
-            except Exception as exc:
-                name = getattr(callback, "__name__", type(callback).__name__)
-                raise RuntimeError(f"Hook {event.point.value}/{name} 执行失败：{exc}") from exc
+        registrations = sorted(
+            self._callbacks.get(event.point, ()),
+            key=lambda item: (item.priority, item.order),
+        )
+        for registration in registrations:
+            await self._executor.execute(registration, event)
         return event
 
 

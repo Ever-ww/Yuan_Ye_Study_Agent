@@ -5,6 +5,7 @@ from Agent.hook import HookEvent
 
 EXTENSION_NAME = "default-tool-during"
 PRIORITY = 0
+EXTENSION_MANIFEST = {"schema_version": 1, "capabilities": [], "allowed_tools": [], "timeout_seconds": 5.0}
 
 
 async def handle(event: HookEvent, context: ExtensionContext) -> None:

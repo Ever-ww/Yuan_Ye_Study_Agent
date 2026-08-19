@@ -6,6 +6,7 @@ from tool.contracts import ToolContext
 
 
 class SearchWorkspaceTool:
+    extension_preapproval = True
     """在非运行产物目录中执行数量受限的文本搜索。"""
 
     name = "search_workspace"

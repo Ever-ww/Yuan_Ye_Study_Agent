@@ -36,7 +36,15 @@ class HarnessManualTool:
         return await self.service.run_turn(*args, **kwargs)
 
     async def finalize(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.service.finalize(*args, **kwargs)
+        try:
+            return await self.service.finalize(*args, **kwargs)
+        except TypeError as exc:
+            if not any(name in str(exc) for name in ("approved_plan_hash", "run_id")):
+                raise
+            fallback = dict(kwargs)
+            fallback.pop("approved_plan_hash", None)
+            fallback.pop("run_id", None)
+            return await self.service.finalize(*args, **fallback)
 
     async def abort(self, *args: Any, **kwargs: Any) -> Any:
         return await self.service.abort(*args, **kwargs)

@@ -30,6 +30,8 @@ from gateway.models import (
     RunCreateRequest,
     RecoveryDecisionRequest,
     SkillManageRequest,
+    ExtensionGrantRequest,
+    ExtensionReenableRequest,
 )
 from gateway.security import GatewayCredentials, bearer_value
 from sandbox import probe_docker_status
@@ -189,6 +191,22 @@ def create_gateway_api(
             "cron": cron_status.model_dump(mode="json"),
             "dream": dream_status.model_dump(mode="json"),
         }
+
+    @app.get("/api/v1/extensions/status", dependencies=[Depends(authorize)])
+    async def extension_status(hook_id: str | None = None):
+        return gateway.extension_status(hook_id)
+
+    @app.post("/api/v1/extensions/grant", dependencies=[Depends(authorize_write)])
+    async def extension_grant(payload: ExtensionGrantRequest):
+        return gateway.grant_extension(payload)
+
+    @app.post("/api/v1/extensions/revoke", dependencies=[Depends(authorize_write)])
+    async def extension_revoke(payload: ExtensionGrantRequest):
+        return gateway.grant_extension(payload, revoke=True)
+
+    @app.post("/api/v1/extensions/reenable", dependencies=[Depends(authorize_write)])
+    async def extension_reenable(payload: ExtensionReenableRequest):
+        return gateway.reenable_extension(payload)
 
     @app.get("/api/v1/bootstrap", dependencies=[Depends(authorize)])
     async def bootstrap():
@@ -396,8 +414,12 @@ def create_gateway_api(
         return await gateway.run_code_turn(session_id, payload)
 
     @app.post("/api/v1/code/sessions/{session_id}/finalize", dependencies=[Depends(authorize_write)])
-    async def finalize_code_session(session_id: str, client_id: str):
-        return await gateway.finalize_code_session(session_id, client_id)
+    async def finalize_code_session(
+        session_id: str, client_id: str, approved_plan_hash: str | None = None,
+    ):
+        return await gateway.finalize_code_session(
+            session_id, client_id, approved_plan_hash,
+        )
 
     @app.post("/api/v1/code/sessions/{session_id}/abort", dependencies=[Depends(authorize_write)])
     async def abort_code_session(session_id: str, client_id: str):

@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
 
 from Agent.config import RuntimeConfig, load_runtime_config
 from Agent.contracts import ApprovalCallback, EventType, RunEvent
-from Agent.extensions import ExtensionCatalog, ExtensionContext, ExtensionLoader
+from Agent.extensions import (
+    ExtensionCatalog,
+    ExtensionLoader,
+    ExtensionRuntimeBinding,
+    ExtensionRuntimePolicy,
+    ExtensionServices,
+)
 from Agent.hook import (
     HookEvent,
     HookPoint,
@@ -92,6 +98,8 @@ class AgentRuntime:
         enable_paper_library: bool = True,
         session_origin: Literal["interactive", "cron", "maintenance"] = "interactive",
         runtime_profile: Literal["interactive", "cron", "harness", "maintenance"] | None = None,
+        extension_state: Any | None = None,
+        extension_runtime_policy: ExtensionRuntimePolicy | None = None,
     ) -> None:
         self.config = config or load_runtime_config()
         self.provider = provider or build_provider(
@@ -265,20 +273,26 @@ class AgentRuntime:
         if self._owns_sandbox and self.sandbox is not None:
             register_sandbox_callbacks(self.hooks, self.sandbox)
         self.extensions = extensions
+        self._extension_binding = ExtensionRuntimeBinding(trace_id=uuid4().hex)
+        self._extension_services: ExtensionServices | None = None
         if enable_extensions:
             source_root = self.config.coding_source_root or self.config.agent_root
             self.extensions = self.extensions or ExtensionLoader(source_root).scan()
+            self._extension_services = ExtensionServices(
+                workspace_root=self.config.workspace_root,
+                memory=self.memory,
+                state_backend=extension_state,
+                tool_registry=self.tools,
+                tool_context=self.tool_context,
+            )
             self.extensions.register(
                 self.hooks,
-                ExtensionContext(
-                    agent_root=self.config.agent_root,
-                    source_root=source_root,
-                    workspace_root=self.config.workspace_root,
-                    state_root=self.config.agent_root / ".yy" / "extension",
-                    provider=self.config.provider,
-                    model=self.config.model,
-                    sandbox_enabled=self.sandbox is not None,
-                ),
+                provider=self.config.provider,
+                model=self.config.model,
+                sandbox_enabled=self.sandbox is not None,
+                services=self._extension_services,
+                binding=self._extension_binding,
+                runtime_policy=extension_runtime_policy,
             )
         self._session_id: str | None = None
         self._session_open = False
@@ -292,6 +306,12 @@ class AgentRuntime:
     def invalidate_context_cache(self) -> None:
         """让下一次模型调用重新读取长期 Profile，不影响正在运行的消息列表。"""
         self.prompts.invalidate_all()
+
+    def bind_gateway_run(self, run_id: str) -> None:
+        """Update audit/Tool binding without changing the frozen Trace grants."""
+        self._extension_binding.run_id = run_id
+        if self._extension_services is not None:
+            self._extension_services.tool_context = self.tool_context
 
     async def run_task(self, task: str, session_id: str | None = None) -> AsyncIterator[RunEvent]:
         """处理一次用户输入；一个 Turn 覆盖完整的用户任务。"""

@@ -244,6 +244,7 @@ class CodeTurnResult(BaseModel):
     attempts: int = Field(ge=1)
     commit: str = ""
     diagnostic: str = ""
+    grant_plan: dict[str, Any] = Field(default_factory=dict)
 
 
 class CodeFinalizeResult(BaseModel):
@@ -256,6 +257,32 @@ class CodeFinalizeResult(BaseModel):
     stay_in_code_mode: bool = False
     worktree_path: str = ""
     branch: str = ""
+    grant_plan: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExtensionGrantRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    hook_id: str = Field(min_length=1)
+    stage: str = Field(min_length=1)
+    source_hash: str = Field(min_length=64, max_length=64)
+    manifest_hash: str = Field(min_length=64, max_length=64)
+    capabilities: tuple[str, ...] = ()
+    tools: tuple[str, ...] = ()
+    tool_contract_hashes: dict[str, str] = Field(default_factory=dict)
+    actor: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
+class ExtensionReenableRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    hook_id: str = Field(min_length=1)
+    stage: str = Field(min_length=1)
+    source_hash: str = Field(min_length=64, max_length=64)
+    expected_revision: int = Field(ge=0)
+    actor: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
 
 
 def now_iso() -> str:

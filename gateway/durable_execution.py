@@ -204,6 +204,39 @@ class DurableToolCoordinator:
             "reason": "approval_denied_or_timeout",
         }, ensure_ascii=False)
 
+    async def skip_denied(self, operation: OperationRecord, *, reason: str) -> str:
+        """Persist a policy denial without ever entering WAITING_HUMAN."""
+        attempt_id = _CURRENT_ATTEMPT.get()
+        if attempt_id is None:
+            raise RuntimeError("Policy denial is missing its OperationAttempt")
+        state = self.controller.state(operation.run_id)
+        attempt = self.controller.current_attempt(operation.operation_id)
+        if attempt.status is not OperationStatus.SKIPPED:
+            state = self.controller.apply(SkipOperationAttemptCommand(
+                command_id=uuid4().hex,
+                run_id=state.run_id,
+                expected_revision=state.revision,
+                gateway_epoch=self.controller.gateway_epoch,
+                attempt_id=attempt_id,
+                skip_reason=reason,
+            )).state
+        if state.execution is not None and state.execution.state is not ExecutionState.OBSERVING:
+            state = self.controller.apply(TransitionCommand(
+                command_id=uuid4().hex,
+                run_id=state.run_id,
+                expected_revision=state.revision,
+                gateway_epoch=self.controller.gateway_epoch,
+                execution_state=ExecutionState.OBSERVING,
+                reason=f"Tool {operation.name} denied by Extension preauthorization policy",
+            )).state
+        _CURRENT_OPERATION.set(None)
+        _CURRENT_ATTEMPT.set(None)
+        return json.dumps({
+            "status": "NOT_EXECUTED",
+            "tool": operation.name,
+            "reason": reason,
+        }, ensure_ascii=False, sort_keys=True)
+
     async def execute(
         self,
         operation: OperationRecord,

@@ -37,12 +37,13 @@ def _load_harness(source_root: Path) -> ModuleType:
 class CodeSessionManager:
     """确保每个 Yuan Ye 源码仓库同时只有一个可变 Coding Session。"""
 
-    def __init__(self, config: RuntimeConfig) -> None:
+    def __init__(self, config: RuntimeConfig, *, grant_backend=None) -> None:
         self.config = config
         self.source_root = (
             config.coding_source_root or Path(__file__).resolve().parents[1]
         ).resolve()
         self.module = _load_harness(self.source_root)
+        self.grant_backend = grant_backend
         self._sessions: dict[str, object] = {}
         self._sources: dict[Path, str] = {}
         self._owners: dict[str, tuple[str, str]] = {}
@@ -59,7 +60,14 @@ class CodeSessionManager:
             self._require_available()
             if self.source_root in self._sources:
                 raise RuntimeError("这个 Yuan Ye 源码仓库已经有活动的 Coding Session")
-            controller = self.module.CodeSessionController(self.config)
+            try:
+                controller = self.module.CodeSessionController(
+                    self.config, grant_backend=self.grant_backend,
+                )
+            except TypeError as exc:
+                if "grant_backend" not in str(exc):
+                    raise
+                controller = self.module.CodeSessionController(self.config)
             origin = self.module.HarnessOriginContext.model_validate(
                 origin_context or {
                     "origin_project_id": project_id,
@@ -95,7 +103,10 @@ class CodeSessionManager:
             raw = await controller.run_turn(task)
         return CodeTurnResult.model_validate(raw.model_dump(mode="json"))
 
-    async def finalize(self, session_id: str, client_id: str) -> CodeFinalizeResult:
+    async def finalize(
+        self, session_id: str, client_id: str, *, approved_plan_hash: str | None = None,
+        run_id: str | None = None,
+    ) -> CodeFinalizeResult:
         self._require_available()
         controller = self._owned(session_id, client_id)
         lock = self._turn_locks[session_id]
@@ -103,7 +114,16 @@ class CodeSessionManager:
             raise RuntimeError("Coding Turn 正在运行，暂时不能退出或合并")
         async with lock:
             self._require_available()
-            raw = await controller.finalize()
+            try:
+                raw = await controller.finalize(
+                    approved_plan_hash=approved_plan_hash,
+                    decision_actor=client_id,
+                    run_id=run_id,
+                )
+            except TypeError as exc:
+                if not any(name in str(exc) for name in ("approved_plan_hash", "run_id")):
+                    raise
+                raw = await controller.finalize()
         result = CodeFinalizeResult.model_validate(raw.model_dump(mode="json"))
         if not result.stay_in_code_mode:
             self._forget(session_id)

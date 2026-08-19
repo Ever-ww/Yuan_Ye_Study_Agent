@@ -412,6 +412,7 @@ async def _chat_gateway(
                 "/code 进入 Hook Extension Coding 模式；"
                 "/compress；/context refresh；/skill list|install|update|audit|refresh；/exit；"
                 "/inbox [all|show <ID>|read <ID>|read-all]；"
+                "/extension status|grant|revoke|reenable（管理员 override）；"
                 "/cron list|status|add|at|preview|edit|pause|resume|run|remove；"
                 "/dream status|run|backfill|rollback；"
                 "运行中 Ctrl+C 取消当前 Run，空闲时 Ctrl+C 退出客户端。"
@@ -435,6 +436,9 @@ async def _chat_gateway(
         if task == "/harness" or task.startswith("/harness "):
             await _handle_harness_command(client, task)
             continue
+        if task == "/extension" or task.startswith("/extension "):
+            await _handle_extension_command(client, task)
+            continue
         if not task:
             continue
         previous_id = session_id
@@ -452,6 +456,30 @@ async def _chat_gateway(
             interrupt_controller.clear_active()
         if session_id and not previous_id:
             console.print(f"[dim]会话哈希：{session_id}[/]")
+
+
+async def _handle_extension_command(client: GatewayClient, task: str) -> None:
+    """Administrative Extension overrides; normal grants happen during /code."""
+    from gateway.models import ExtensionGrantRequest, ExtensionReenableRequest
+
+    parts = task.split(maxsplit=2)
+    action = parts[1].lower() if len(parts) > 1 else "status"
+    if action == "status":
+        selected = await client.extension_status(parts[2] if len(parts) > 2 else None)
+        console.print_json(data=selected)
+        return
+    if action not in {"grant", "revoke", "reenable"} or len(parts) < 3:
+        raise ValueError(
+            "Usage: /extension status [hook_id] or /extension grant|revoke|reenable <JSON>"
+        )
+    payload = json.loads(parts[2])
+    if action == "reenable":
+        result = await client.extension_reenable(ExtensionReenableRequest.model_validate(payload))
+    else:
+        result = await client.extension_grant(
+            ExtensionGrantRequest.model_validate(payload), revoke=action == "revoke",
+        )
+    console.print_json(data=result)
 
 
 async def _handle_cron_command(client: GatewayClient, project_id: str, task: str) -> None:
@@ -759,6 +787,30 @@ async def _code_mode(
             try:
                 with console.status("[cyan]正在检查并 fast-forward 合并…[/]"):
                     result = await client.finalize_code_session(session.code_session_id)
+                if result.status == "capability_confirmation_required":
+                    plan = result.grant_plan
+                    lines = []
+                    for hook in plan.get("hooks", []):
+                        controlled = hook.get("confirmation_required_capabilities", [])
+                        tools = [item.get("name") for item in hook.get("tools", [])]
+                        if controlled or tools:
+                            lines.append(
+                                f"{hook.get('hook_id')}: capabilities={controlled or '-'}; "
+                                f"tools={tools or '-'}"
+                            )
+                    console.print(Panel(
+                        "\n".join(lines) or "No elevated capabilities",
+                        title=f"Extension Candidate Grant {str(plan.get('plan_hash', ''))[:12]}",
+                        border_style="yellow",
+                    ))
+                    if not typer.confirm(
+                        "Confirm this exact Candidate grant and continue merge?", default=False,
+                    ):
+                        console.print("[yellow]Candidate remains unmerged in the /code worktree.[/]")
+                        continue
+                    result = await client.finalize_code_session(
+                        session.code_session_id, str(plan["plan_hash"]),
+                    )
             except Exception as exc:
                 console.print(f"[red]{str(exc) or type(exc).__name__}[/]")
                 continue

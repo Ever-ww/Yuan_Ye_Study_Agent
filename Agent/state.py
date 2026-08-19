@@ -166,7 +166,10 @@ OUTER_TRANSITIONS = MappingProxyType({
 
 INNER_TRANSITIONS = MappingProxyType({
     ExecutionState.THINKING: frozenset({
-        ExecutionState.WAITING_HUMAN, ExecutionState.ACTING, ExecutionState.FINISHED,
+        # OBSERVING is used for a policy-determined NOT_EXECUTED Tool result;
+        # it must not detour through WAITING_HUMAN or pretend a side effect ran.
+        ExecutionState.WAITING_HUMAN, ExecutionState.ACTING,
+        ExecutionState.OBSERVING, ExecutionState.FINISHED,
     }),
     ExecutionState.WAITING_HUMAN: frozenset({
         ExecutionState.ACTING, ExecutionState.OBSERVING, ExecutionState.FINISHED,

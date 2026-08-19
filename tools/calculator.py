@@ -7,6 +7,7 @@ from tool.contracts import ToolContext
 
 
 class CalculatorTool:
+    extension_preapproval = True
     """仅计算由普通数字和四则运算符组成的表达式。"""
 
     name = "calculator"

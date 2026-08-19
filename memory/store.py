@@ -64,6 +64,24 @@ class MemoryStore:
         cache.append({"role": "user", "content": content})
         return record_id
 
+    def record_extension_annotation(
+        self, session_id: str, content: str, *, hook_id: str,
+        source_hash: str, run_id: str | None = None,
+    ) -> str:
+        """Persist an auditable annotation that is never restored into model context."""
+        SessionPersistenceProjection.assert_persistable(content)
+        return self.sessions.append(
+            session_id,
+            "extension",
+            content,
+            {
+                "origin": "extension",
+                "hook_id": hook_id,
+                "source_hash": source_hash,
+                "run_id": run_id,
+            },
+        )
+
     def record_assistant(
         self,
         session_id: str,

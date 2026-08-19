@@ -104,7 +104,7 @@ class StateInvariantError(RuntimeError):
 class StateController:
     """以 SQLite 事务实现 command 幂等、CAS、FSM guard 和 Outbox。"""
 
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
 
     def __init__(
         self,
@@ -363,6 +363,66 @@ class StateController:
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(stable_key) REFERENCES harness_dream_changesets(stable_key)
                 );
+                CREATE TABLE IF NOT EXISTS extension_capability_grants (
+                    grant_id TEXT PRIMARY KEY,
+                    hook_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    manifest_hash TEXT NOT NULL,
+                    grant_version INTEGER NOT NULL CHECK(grant_version >= 1),
+                    decision TEXT NOT NULL CHECK(decision IN ('grant','revoke')),
+                    granted_capabilities_json TEXT NOT NULL,
+                    granted_tools_json TEXT NOT NULL,
+                    tool_contract_hashes_json TEXT NOT NULL,
+                    candidate_commit TEXT,
+                    decision_actor TEXT NOT NULL,
+                    decision_reason TEXT NOT NULL,
+                    decision_at TEXT NOT NULL,
+                    UNIQUE(hook_id,stage,source_hash,manifest_hash,grant_version)
+                );
+                CREATE INDEX IF NOT EXISTS extension_grants_lookup_idx
+                    ON extension_capability_grants(hook_id,stage,source_hash,manifest_hash,grant_version);
+                CREATE TABLE IF NOT EXISTS extension_grant_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    plan_hash TEXT NOT NULL UNIQUE,
+                    candidate_commit TEXT NOT NULL,
+                    repository_identity TEXT NOT NULL,
+                    run_id TEXT,
+                    status TEXT NOT NULL CHECK(status IN ('pending','committed','recovery_required')),
+                    plan_json TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS extension_hook_runtime_state (
+                    hook_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    runtime_failure_count INTEGER NOT NULL DEFAULT 0,
+                    runtime_failure_streak INTEGER NOT NULL DEFAULT 0,
+                    policy_denial_count INTEGER NOT NULL DEFAULT 0,
+                    contract_violation_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','quarantined')),
+                    quarantined_at TEXT,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(hook_id,stage,source_hash)
+                );
+                CREATE TABLE IF NOT EXISTS extension_hook_audit (
+                    audit_id TEXT PRIMARY KEY,
+                    run_id TEXT,
+                    trace_id TEXT NOT NULL,
+                    hook_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    manifest_hash TEXT NOT NULL,
+                    grant_version INTEGER NOT NULL,
+                    decision TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    duration_seconds REAL NOT NULL DEFAULT 0,
+                    audit_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_column(connection, "operation_ledger", "stable_key", "TEXT")
@@ -373,6 +433,7 @@ class StateController:
             self._ensure_column(connection, "event_outbox", "jsonl_next_attempt_at", "TEXT")
             self._ensure_column(connection, "event_outbox", "eventbus_dead_letter_at", "TEXT")
             self._ensure_column(connection, "event_outbox", "jsonl_dead_letter_at", "TEXT")
+            self._ensure_column(connection, "extension_grant_intents", "run_id", "TEXT")
             self._migrate_idempotency_scope(connection)
             self._migrate_legacy_operations(connection)
             self._migrate_legacy_approvals(connection)
@@ -1112,6 +1173,393 @@ class StateController:
     def approval(self, approval_id: str) -> DurableApproval:
         with self._connection() as connection:
             return self._approval_in(connection, approval_id)
+
+    def resolve_extension_grant(
+        self, hook_id: str, stage: str, source_hash: str, manifest_hash: str,
+    ) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM extension_capability_grants WHERE hook_id=? AND stage=? "
+                "AND source_hash=? AND manifest_hash=? ORDER BY grant_version DESC LIMIT 1",
+                (hook_id, stage, source_hash, manifest_hash),
+            ).fetchone()
+        if row is None or row["decision"] != "grant":
+            return None
+        return {
+            "grant_id": row["grant_id"],
+            "grant_version": int(row["grant_version"]),
+            "granted_capabilities": json.loads(row["granted_capabilities_json"]),
+            "granted_tools": json.loads(row["granted_tools_json"]),
+            "tool_contract_hashes": json.loads(row["tool_contract_hashes_json"]),
+            "candidate_commit": row["candidate_commit"],
+        }
+
+    def create_extension_grant(
+        self, *, hook_id: str, stage: str, source_hash: str, manifest_hash: str,
+        granted_capabilities: list[str] | tuple[str, ...],
+        granted_tools: list[str] | tuple[str, ...] = (),
+        tool_contract_hashes: dict[str, str] | None = None,
+        candidate_commit: str | None = None,
+        actor: str, reason: str, decision: str = "grant",
+    ) -> dict[str, Any]:
+        if decision not in {"grant", "revoke"}:
+            raise ValueError("Extension grant decision must be grant or revoke")
+        if any("*" in name for name in granted_tools):
+            raise ValueError("Extension Tool grants cannot contain wildcards")
+        timestamp = now_iso()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT COALESCE(MAX(grant_version),0) AS value FROM extension_capability_grants "
+                "WHERE hook_id=? AND stage=? AND source_hash=? AND manifest_hash=?",
+                (hook_id, stage, source_hash, manifest_hash),
+            ).fetchone()
+            version = int(row["value"]) + 1
+            grant_id = hashlib.sha256(
+                f"{hook_id}:{stage}:{source_hash}:{manifest_hash}:{version}:{decision}".encode()
+            ).hexdigest()
+            connection.execute(
+                "INSERT INTO extension_capability_grants VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    grant_id, hook_id, stage, source_hash, manifest_hash, version, decision,
+                    json.dumps(sorted(set(granted_capabilities)), ensure_ascii=False),
+                    json.dumps(sorted(set(granted_tools)), ensure_ascii=False),
+                    json.dumps(tool_contract_hashes or {}, sort_keys=True),
+                    candidate_commit, actor, reason, timestamp,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO extension_hook_audit VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    uuid4().hex, None, f"admin:{grant_id}", hook_id, stage,
+                    source_hash, manifest_hash, version, decision, "committed", 0.0,
+                    json.dumps(AuditSanitizer.sanitize({
+                        "actor": actor,
+                        "reason": reason,
+                        "granted_capabilities": sorted(set(granted_capabilities)),
+                        "granted_tools": sorted(set(granted_tools)),
+                    }), ensure_ascii=False, sort_keys=True),
+                    timestamp,
+                ),
+            )
+            connection.commit()
+        return {
+            "grant_id": grant_id, "hook_id": hook_id, "stage": stage,
+            "source_hash": source_hash, "manifest_hash": manifest_hash,
+            "grant_version": version, "decision": decision,
+        }
+
+    def begin_extension_grant_intent(
+        self, *, plan_hash: str, candidate_commit: str,
+        repository_identity: str, plan: dict[str, Any], actor: str,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        intent_id = hashlib.sha256(f"extension-grant:{plan_hash}".encode()).hexdigest()
+        timestamp = now_iso()
+        canonical = json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM extension_grant_intents WHERE plan_hash=?", (plan_hash,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO extension_grant_intents("
+                    "intent_id,plan_hash,candidate_commit,repository_identity,run_id,status,"
+                    "plan_json,actor,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (intent_id, plan_hash, candidate_commit, repository_identity, run_id,
+                     "pending", canonical, actor, timestamp, timestamp),
+                )
+            elif existing["candidate_commit"] != candidate_commit or existing["plan_json"] != canonical:
+                raise StateConflictError("Extension Grant Plan identity conflict")
+            connection.commit()
+        return self.extension_grant_intent(plan_hash) or {}
+
+    def extension_grant_intent(self, plan_hash: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM extension_grant_intents WHERE plan_hash=?", (plan_hash,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def pending_extension_grant_intents(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM extension_grant_intents WHERE status='pending' ORDER BY created_at",
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_extension_grant_recovery_required(self, plan_hash: str) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE extension_grant_intents SET status='recovery_required',updated_at=? "
+                "WHERE plan_hash=? AND status='pending'",
+                (now_iso(), plan_hash),
+            )
+
+    def commit_extension_grant_intent(self, plan_hash: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM extension_grant_intents WHERE plan_hash=?", (plan_hash,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(plan_hash)
+            if row["status"] == "committed":
+                connection.commit()
+                return dict(row)
+            plan = json.loads(row["plan_json"])
+            for item in plan.get("hooks", []):
+                version_row = connection.execute(
+                    "SELECT COALESCE(MAX(grant_version),0) AS value FROM extension_capability_grants "
+                    "WHERE hook_id=? AND stage=? AND source_hash=? AND manifest_hash=?",
+                    (item["hook_id"], item["stage"], item["source_hash"], item["manifest_hash"]),
+                ).fetchone()
+                version = int(version_row["value"]) + 1
+                grant_id = hashlib.sha256(
+                    f"{item['hook_id']}:{item['source_hash']}:{version}:grant".encode()
+                ).hexdigest()
+                tools = [tool["name"] for tool in item.get("tools", []) if tool.get("preapprovable")]
+                hashes = {
+                    tool["name"]: tool["contract_hash"] for tool in item.get("tools", [])
+                    if tool.get("preapprovable")
+                }
+                connection.execute(
+                    "INSERT INTO extension_capability_grants VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        grant_id, item["hook_id"], item["stage"], item["source_hash"],
+                        item["manifest_hash"], version, "grant",
+                        json.dumps(sorted(set(
+                            item.get("auto_granted_capabilities", [])
+                            + item.get("confirmation_required_capabilities", [])
+                        )), ensure_ascii=False),
+                        json.dumps(tools, ensure_ascii=False), json.dumps(hashes, sort_keys=True),
+                        row["candidate_commit"], row["actor"], "candidate_grant_plan",
+                        now_iso(),
+                    ),
+                )
+            connection.execute(
+                "UPDATE extension_grant_intents SET status='committed',updated_at=? WHERE plan_hash=?",
+                (now_iso(), plan_hash),
+            )
+            if row["run_id"] is not None:
+                state_row = connection.execute(
+                    "SELECT state_json FROM agent_states WHERE run_id=?", (row["run_id"],),
+                ).fetchone()
+                if state_row is not None:
+                    self._write_event(
+                        connection,
+                        AgentState.model_validate_json(state_row["state_json"], strict=True),
+                        "extension_grant_committed",
+                        {
+                            "plan_hash": plan_hash,
+                            "candidate_commit": row["candidate_commit"],
+                            "hook_ids": [item["hook_id"] for item in plan.get("hooks", [])],
+                            "restart_required": True,
+                        },
+                    )
+            connection.commit()
+        return self.extension_grant_intent(plan_hash) or {}
+
+    def extension_hook_is_quarantined(self, hook_id: str, stage: str, source_hash: str) -> bool:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT status FROM extension_hook_runtime_state "
+                "WHERE hook_id=? AND stage=? AND source_hash=?",
+                (hook_id, stage, source_hash),
+            ).fetchone()
+        return row is not None and row["status"] == "quarantined"
+
+    def record_extension_hook_outcome(
+        self, snapshot: Any, *, classification: str, duration: float,
+        error: BaseException | None, run_id: str | None,
+    ) -> None:
+        timestamp = now_iso()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM extension_hook_runtime_state WHERE hook_id=? AND stage=? AND source_hash=?",
+                (snapshot.hook_id, snapshot.stage.value, snapshot.source_hash),
+            ).fetchone()
+            values = {
+                "runtime_failure_count": int(row["runtime_failure_count"]) if row else 0,
+                "runtime_failure_streak": int(row["runtime_failure_streak"]) if row else 0,
+                "policy_denial_count": int(row["policy_denial_count"]) if row else 0,
+                "contract_violation_count": int(row["contract_violation_count"]) if row else 0,
+                "status": str(row["status"]) if row else "active",
+                "quarantined_at": row["quarantined_at"] if row else None,
+                "revision": int(row["revision"]) if row else 0,
+            }
+            if classification == "success":
+                values["runtime_failure_streak"] = 0
+            elif classification in {"exception", "timeout"}:
+                values["runtime_failure_count"] += 1
+                values["runtime_failure_streak"] += 1
+                if values["runtime_failure_streak"] >= 3:
+                    values["status"] = "quarantined"
+                    values["quarantined_at"] = timestamp
+            elif classification == "policy_denial":
+                values["policy_denial_count"] += 1
+            elif classification == "contract_violation":
+                values["contract_violation_count"] += 1
+            values["revision"] += 1
+            connection.execute(
+                "INSERT INTO extension_hook_runtime_state VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(hook_id,stage,source_hash) DO UPDATE SET "
+                "runtime_failure_count=excluded.runtime_failure_count,"
+                "runtime_failure_streak=excluded.runtime_failure_streak,"
+                "policy_denial_count=excluded.policy_denial_count,"
+                "contract_violation_count=excluded.contract_violation_count,"
+                "status=excluded.status,quarantined_at=excluded.quarantined_at,"
+                "revision=excluded.revision,updated_at=excluded.updated_at",
+                (
+                    snapshot.hook_id, snapshot.stage.value, snapshot.source_hash,
+                    values["runtime_failure_count"], values["runtime_failure_streak"],
+                    values["policy_denial_count"], values["contract_violation_count"],
+                    values["status"], values["quarantined_at"], values["revision"], timestamp,
+                ),
+            )
+            details = AuditSanitizer.sanitize({
+                "classification": classification,
+                "error": str(error) if error is not None else None,
+                "requested_capabilities": [item.value for item in snapshot.requested_capabilities],
+                "requested_tools": list(snapshot.requested_allowed_tools),
+                "effective_capabilities": [item.value for item in snapshot.effective_capabilities],
+                "effective_allowed_tools": list(snapshot.effective_allowed_tools),
+                **values,
+            })
+            connection.execute(
+                "INSERT INTO extension_hook_audit VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    uuid4().hex, run_id, snapshot.trace_id, snapshot.hook_id,
+                    snapshot.stage.value, snapshot.source_hash, snapshot.manifest_hash,
+                    snapshot.grant_version, classification, classification, float(duration),
+                    json.dumps(details, ensure_ascii=False, sort_keys=True), timestamp,
+                ),
+            )
+            if run_id is not None:
+                state_row = connection.execute(
+                    "SELECT state_json FROM agent_states WHERE run_id=?", (run_id,),
+                ).fetchone()
+                if state_row is not None:
+                    self._write_event(
+                        connection,
+                        AgentState.model_validate_json(state_row["state_json"], strict=True),
+                        "extension_hook_audit",
+                        {
+                            "hook_id": snapshot.hook_id,
+                            "stage": snapshot.stage.value,
+                            "source_hash": snapshot.source_hash,
+                            "manifest_hash": snapshot.manifest_hash,
+                            "grant_version": snapshot.grant_version,
+                            "decision": classification,
+                            "runtime_failure_count": values["runtime_failure_count"],
+                            "runtime_failure_streak": values["runtime_failure_streak"],
+                            "policy_denial_count": values["policy_denial_count"],
+                            "contract_violation_count": values["contract_violation_count"],
+                            "result": classification,
+                            "duration_seconds": float(duration),
+                        },
+                    )
+            connection.commit()
+
+    def record_extension_audit(
+        self, snapshot: Any, *, decision: str, result: str,
+        run_id: str | None, details: dict[str, Any] | None = None,
+    ) -> None:
+        timestamp = now_iso()
+        payload = AuditSanitizer.sanitize(details or {})
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO extension_hook_audit VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    uuid4().hex, run_id, snapshot.trace_id, snapshot.hook_id,
+                    snapshot.stage.value, snapshot.source_hash, snapshot.manifest_hash,
+                    snapshot.grant_version, decision, result, 0.0,
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True), timestamp,
+                ),
+            )
+            if run_id is not None:
+                state_row = connection.execute(
+                    "SELECT state_json FROM agent_states WHERE run_id=?", (run_id,),
+                ).fetchone()
+                if state_row is not None:
+                    self._write_event(
+                        connection,
+                        AgentState.model_validate_json(state_row["state_json"], strict=True),
+                        "extension_hook_audit",
+                        {
+                            "hook_id": snapshot.hook_id,
+                            "stage": snapshot.stage.value,
+                            "source_hash": snapshot.source_hash,
+                            "manifest_hash": snapshot.manifest_hash,
+                            "grant_version": snapshot.grant_version,
+                            "decision": decision,
+                            "result": result,
+                        },
+                    )
+            connection.commit()
+
+    def reenable_extension_hook(
+        self, hook_id: str, stage: str, source_hash: str, *, expected_revision: int,
+        actor: str = "administrator", reason: str = "manual override",
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM extension_hook_runtime_state WHERE hook_id=? AND stage=? AND source_hash=?",
+                (hook_id, stage, source_hash),
+            ).fetchone()
+            if row is None:
+                raise KeyError(hook_id)
+            if int(row["revision"]) != expected_revision:
+                raise StateConflictError("Extension reenable revision conflict")
+            connection.execute(
+                "UPDATE extension_hook_runtime_state SET status='active',runtime_failure_streak=0,"
+                "quarantined_at=NULL,revision=revision+1,updated_at=? "
+                "WHERE hook_id=? AND stage=? AND source_hash=?",
+                (now_iso(), hook_id, stage, source_hash),
+            )
+            grant = connection.execute(
+                "SELECT manifest_hash,grant_version FROM extension_capability_grants "
+                "WHERE hook_id=? AND stage=? AND source_hash=? "
+                "ORDER BY grant_version DESC LIMIT 1",
+                (hook_id, stage, source_hash),
+            ).fetchone()
+            connection.execute(
+                "INSERT INTO extension_hook_audit VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    uuid4().hex, None, f"admin:reenable:{uuid4().hex}", hook_id, stage,
+                    source_hash, str(grant["manifest_hash"]) if grant else "unknown",
+                    int(grant["grant_version"]) if grant else 0,
+                    "reenable", "committed", 0.0,
+                    json.dumps(AuditSanitizer.sanitize({
+                        "actor": actor, "reason": reason,
+                        "previous_revision": expected_revision,
+                    }), ensure_ascii=False, sort_keys=True),
+                    now_iso(),
+                ),
+            )
+            connection.commit()
+        return self.extension_status(hook_id=hook_id, stage=stage, source_hash=source_hash)[0]
+
+    def extension_status(
+        self, *, hook_id: str | None = None, stage: str | None = None,
+        source_hash: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses, values = [], []
+        for field, value in (("hook_id", hook_id), ("stage", stage), ("source_hash", source_hash)):
+            if value is not None:
+                clauses.append(f"{field}=?")
+                values.append(value)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM extension_hook_runtime_state" + where + " ORDER BY hook_id,stage,source_hash",
+                values,
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def reserve_idempotency(
         self, key: str, request_hash: str, run_id: str,

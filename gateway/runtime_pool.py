@@ -116,6 +116,7 @@ class RuntimePool:
         self.cron_terminal_callback = cron_terminal_callback
         self._pending_profile_refresh: set[tuple[str, str]] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._submitting: set[str] = set()
         self._closing = False
         self._lock = asyncio.Lock()
         self._reaper: asyncio.Task[None] | None = None
@@ -132,42 +133,44 @@ class RuntimePool:
             existing = self._tasks.get(run.run_id)
             if existing is not None and not existing.done():
                 return
-        state = self.state_controller.state(run.run_id)
-        if state.task_state in {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.INTERRUPTED}:
-            return
-        if state.task_state is TaskState.RECOVERY_REQUIRED:
-            raise RuntimeError("RECOVERY_REQUIRED Run must be handled by RecoveryCoordinator")
-        operation = self.state_controller.active_operation(run.run_id)
-        attempt = (
-            self.state_controller.current_attempt(operation.operation_id)
-            if operation is not None else None
-        )
-        if state.gateway_epoch != self.state_controller.gateway_epoch:
-            raise RuntimeError("Run fencing token 不属于当前 Gateway epoch")
-        if not is_runnable(state, operation, attempt, now=datetime.now().astimezone()):
-            raise RuntimeError(f"Run 当前不可调度：{state.task_state.value}")
-        state = self.state_controller.apply(TransitionCommand(
-            command_id=f"runtime-submit:{run.run_id}:{state.revision}",
-            run_id=run.run_id,
-            expected_revision=state.revision,
-            gateway_epoch=self.state_controller.gateway_epoch,
-            task_state=TaskState.STARTING,
-            reason="RuntimePool durable submit claim",
-        )).state
-        if run.session_id:
-            await self.session_reservations.acquire(
-                run.project_id, run.session_id, owner_id=run.run_id, wait=False,
+            if run.run_id in self._submitting:
+                return
+            self._submitting.add(run.run_id)
+        try:
+            state = self.state_controller.state(run.run_id)
+            if state.task_state in {
+                TaskState.SUCCEEDED, TaskState.FAILED,
+                TaskState.CANCELLED, TaskState.INTERRUPTED,
+            }:
+                return
+            if state.task_state is TaskState.RECOVERY_REQUIRED:
+                raise RuntimeError("RECOVERY_REQUIRED Run must be handled by RecoveryCoordinator")
+            operation = self.state_controller.active_operation(run.run_id)
+            attempt = (
+                self.state_controller.current_attempt(operation.operation_id)
+                if operation is not None else None
             )
-        started = asyncio.Event()
-        task = asyncio.create_task(
-            self._execute_with_write_scope(run, started),
-            name=f"gateway-run-{run.run_id}",
-        )
-        async with self._lock:
-            self._tasks[run.run_id] = task
-        await started.wait()
-        if task.done() and task.exception() is not None:
-            raise task.exception()
+            if state.gateway_epoch != self.state_controller.gateway_epoch:
+                raise RuntimeError("Run fencing token 不属于当前 Gateway epoch")
+            if not is_runnable(state, operation, attempt, now=datetime.now().astimezone()):
+                raise RuntimeError(f"Run 当前不可调度：{state.task_state.value}")
+            if run.session_id:
+                await self.session_reservations.acquire(
+                    run.project_id, run.session_id, owner_id=run.run_id, wait=False,
+                )
+            started = asyncio.Event()
+            task = asyncio.create_task(
+                self._execute_with_write_scope(run, started),
+                name=f"gateway-run-{run.run_id}",
+            )
+            async with self._lock:
+                self._tasks[run.run_id] = task
+            await started.wait()
+            if task.done() and task.exception() is not None:
+                raise task.exception()
+        finally:
+            async with self._lock:
+                self._submitting.discard(run.run_id)
 
     async def _execute_with_write_scope(self, run: RunRecord, started: asyncio.Event) -> None:
         if self.write_gate is None:
@@ -574,6 +577,8 @@ class RuntimePool:
                 None if run.client_id.startswith("cron:") else getattr(runtime, "memory", None),
                 retry_policy=retry_policy,
             ).register(runtime.hooks)
+        if hasattr(runtime, "bind_gateway_run"):
+            runtime.bind_gateway_run(run.run_id)
         return runtime
 
     def _default_runtime(
@@ -632,6 +637,7 @@ class RuntimePool:
             references=self.reference_service,
             enable_references=self.reference_service is not None,
             runtime_profile="interactive",
+            extension_state=self.state_controller,
         )
         return runtime
 

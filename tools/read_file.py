@@ -165,6 +165,7 @@ class DocumentReader:
 
 
 class ReadFileTool:
+    extension_preapproval = True
     """唯一文件读取工具；普通文本保持原始输出，文档自动结构化解析。"""
 
     name = "read_file"

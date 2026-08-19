@@ -8,6 +8,7 @@ from tool.path_guard import safe_workspace_path
 
 
 class WriteTool:
+    extension_preapproval = True
     """经 Runtime 批准后，原子写入工作区内的 UTF-8 文本。"""
 
     name = "write"

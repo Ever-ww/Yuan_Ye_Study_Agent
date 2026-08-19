@@ -41,7 +41,13 @@ from Agent import load_runtime_config
 from gateway.application import GatewayApplication
 from gateway.api import create_gateway_api
 from fastapi.testclient import TestClient
-from tool import ToolContext, ToolExecutionObservationError
+from tool import (
+    AsyncToolRegistry,
+    ExtensionToolAuthorization,
+    ToolContext,
+    ToolExecutionObservationError,
+)
+from tools.calculator import CalculatorTool
 
 
 def _hash(value: str) -> str:
@@ -302,6 +308,93 @@ def test_retryable_tool_uses_new_attempts_and_executes_until_success(durable, tm
     finally:
         coordinator.reset(token)
     assert calls == 3
+
+
+def _running_tool_state(controller: StateController, state):
+    for target in (TaskState.QUEUED, TaskState.STARTING):
+        state = controller.apply(TransitionCommand(
+            command_id=uuid4().hex, run_id=state.run_id,
+            expected_revision=state.revision, gateway_epoch="epoch",
+            task_state=target, reason="extension tool test",
+        )).state
+    return controller.apply(TransitionCommand(
+        command_id=uuid4().hex, run_id=state.run_id,
+        expected_revision=state.revision, gateway_epoch="epoch",
+        task_state=TaskState.RUNNING, execution_state=ExecutionState.THINKING,
+        reason="extension tool test",
+    )).state
+
+
+def test_extension_tool_denial_is_skipped_without_waiting_human(durable, tmp_path: Path) -> None:
+    controller, state = durable
+    state = _running_tool_state(controller, state)
+    coordinator = DurableToolCoordinator(controller)
+    token = coordinator.bind(state.run_id, "turn")
+    registry = AsyncToolRegistry([CalculatorTool()])
+    authorization = ExtensionToolAuthorization(
+        hook_id="extension:model_before:test", source_hash="a" * 64,
+        manifest_hash="b" * 64, grant_version=1, allowed_tools=(),
+        tool_contract_hashes={}, trace_id="trace",
+    )
+
+    async def run() -> None:
+        context = ToolContext(
+            project_root=tmp_path, operation_coordinator=coordinator,
+            extension_authorization=authorization,
+        )
+        with pytest.raises(PermissionError, match="extension_tool_not_preapproved"):
+            await registry.execute(
+                "calculator", {"expression": "2 + 2"}, context,
+                tool_call_id="extension-call",
+            )
+
+    try:
+        asyncio.run(run())
+    finally:
+        coordinator.reset(token)
+    operation = controller.operations(state.run_id)[0]
+    attempt = controller.operation_attempts(operation.operation_id)[0]
+    assert attempt.status is OperationStatus.SKIPPED
+    assert attempt.skip_reason == "extension_tool_not_preapproved"
+    assert controller.state(state.run_id).execution.state is ExecutionState.OBSERVING
+
+
+def test_preapproved_extension_tool_uses_durable_ledger_without_approval(
+    durable, tmp_path: Path,
+) -> None:
+    controller, state = durable
+    state = _running_tool_state(controller, state)
+    coordinator = DurableToolCoordinator(controller)
+    token = coordinator.bind(state.run_id, "turn")
+    registry = AsyncToolRegistry([CalculatorTool()])
+    authorization = ExtensionToolAuthorization(
+        hook_id="extension:model_before:test", source_hash="a" * 64,
+        manifest_hash="b" * 64, grant_version=1,
+        allowed_tools=("calculator",),
+        tool_contract_hashes={"calculator": registry.tool_contract_hash("calculator")},
+        trace_id="trace",
+    )
+
+    async def run() -> str:
+        return await registry.execute(
+            "calculator", {"expression": "2 + 2"},
+            ToolContext(
+                project_root=tmp_path, operation_coordinator=coordinator,
+                extension_authorization=authorization,
+            ),
+            tool_call_id="extension-call",
+        )
+
+    try:
+        result = asyncio.run(run())
+    finally:
+        coordinator.reset(token)
+    assert "4" in result
+    operation = controller.operations(state.run_id)[0]
+    attempt = controller.operation_attempts(operation.operation_id)[0]
+    assert operation.status is OperationStatus.COMPLETED
+    assert attempt.status is OperationStatus.COMPLETED
+    assert controller.state(state.run_id).execution.state is ExecutionState.OBSERVING
 
 
 @pytest.mark.parametrize(

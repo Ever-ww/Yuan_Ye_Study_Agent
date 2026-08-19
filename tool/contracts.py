@@ -6,10 +6,24 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 ToolRisk = Literal["read", "write", "high", "dynamic"]
+
+
+class ExtensionToolAuthorization(BaseModel):
+    """Immutable per-Trace proof that an Extension may invoke exact Tools."""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    hook_id: str
+    source_hash: str
+    manifest_hash: str
+    grant_version: int = Field(ge=1)
+    allowed_tools: tuple[str, ...]
+    tool_contract_hashes: dict[str, str]
+    trace_id: str
 
 
 class AsyncTool(Protocol):
@@ -21,6 +35,8 @@ class AsyncTool(Protocol):
     risk: ToolRisk
     # 可选声明；未声明时 Registry 根据风险采用保守等级。
     idempotency: str
+    # Explicit opt-in. Missing is treated as False by AsyncToolRegistry.
+    extension_preapproval: bool
 
     async def run(self, arguments: dict[str, Any], context: "ToolContext") -> str: ...
 
@@ -42,3 +58,6 @@ class ToolContext(BaseModel):
     session_id: str | None = None
     # Durable Runtime 注入的两阶段副作用协调器；普通/维护 Runtime 可为空。
     operation_coordinator: Any | None = None
+    # Present only for an Extension invocation. The Registry validates this
+    # proof and must never fall back to online human approval.
+    extension_authorization: ExtensionToolAuthorization | None = None

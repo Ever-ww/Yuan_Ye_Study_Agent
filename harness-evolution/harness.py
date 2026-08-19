@@ -16,7 +16,10 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 from backup.security import SensitiveEnvSanitizer
 
-from Agent import AgentRuntime, EventType, ExtensionLoader, ModelRetryPolicy, RuntimeConfig, RuntimeFailure
+from Agent import (
+    AgentRuntime, EventType, ExtensionLoader, ModelRetryPolicy, RuntimeConfig,
+    RuntimeFailure, build_extension_grant_plan,
+)
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models import build_provider
 from memory import HarnessLongTermMemory, HarnessMemoryUpdate, MemoryStore
@@ -24,6 +27,7 @@ from prompt import compose_harness_memory_messages
 from sandbox import SandboxSessionProtocol
 from tool import (
     AsyncToolRegistry,
+    default_tools,
     register_subagent,
 )
 from gateway.harness_dream import DreamEvolutionContext
@@ -295,6 +299,7 @@ class CodeSessionRecord(BaseModel):
     verified_turns: int = 0
     audit_path: Path
     origin: HarnessOriginContext | None = None
+    grant_plan: dict[str, Any] = Field(default_factory=dict)
 
 
 class CodeTurnResult(BaseModel):
@@ -309,6 +314,7 @@ class CodeTurnResult(BaseModel):
     attempts: int = Field(ge=1)
     commit: str = ""
     diagnostic: str = ""
+    grant_plan: dict[str, Any] = Field(default_factory=dict)
 
 
 class CodeFinalizeResult(BaseModel):
@@ -323,6 +329,7 @@ class CodeFinalizeResult(BaseModel):
     stay_in_code_mode: bool = False
     worktree_path: str = ""
     branch: str = ""
+    grant_plan: dict[str, Any] = Field(default_factory=dict)
 
 
 class CodeAuditWriter:
@@ -383,6 +390,7 @@ class CodeSessionController:
         *,
         runtime_factory: Callable[[RuntimeConfig, Path], AgentRuntime] | None = None,
         memory_provider_factory: Callable[[RuntimeConfig], Any] | None = None,
+        grant_backend: Any | None = None,
     ) -> None:
         self.config = config
         self.runtime_factory = runtime_factory
@@ -391,6 +399,8 @@ class CodeSessionController:
         self.record: CodeSessionRecord | None = None
         self.runtime: AgentRuntime | None = None
         self._requirements: list[str] = []
+        self.grant_backend = grant_backend
+        self._latest_grant_plan: dict[str, Any] = {}
 
     async def start(
         self, source_root: Path | None = None, *, origin: HarnessOriginContext | None = None,
@@ -477,12 +487,18 @@ class CodeSessionController:
             memory_provider_factory=self.memory_provider_factory,
         ).run_manual_turn(self, task)
 
-    async def finalize(self) -> CodeFinalizeResult:
+    async def finalize(
+        self, *, approved_plan_hash: str | None = None,
+        decision_actor: str = "code-user", run_id: str | None = None,
+    ) -> CodeFinalizeResult:
         return await HarnessEvolutionEngine.for_config(
             self.config,
             runtime_factory=self.runtime_factory or create_coding_runtime,
             memory_provider_factory=self.memory_provider_factory,
-        ).finalize_manual(self)
+        ).finalize_manual(
+            self, approved_plan_hash=approved_plan_hash,
+            decision_actor=decision_actor, run_id=run_id,
+        )
 
     async def abort(self) -> CodeFinalizeResult:
         record, runtime = self._active()
@@ -527,6 +543,29 @@ class CodeSessionController:
         contract = _validate_changed_extensions(record.worktree_path, extension_changes)
         if contract:
             return {"passed": False, "feedback": contract}
+        try:
+            catalog = ExtensionLoader(record.worktree_path).scan(strict=True)
+            registry = default_tools(
+                record.worktree_path, agent_root=self.config.agent_root,
+                runtime_profile="interactive",
+            )
+            grant_plan = build_extension_grant_plan(
+                catalog, registry, selected_paths=set(extension_changes),
+            )
+        except Exception as exc:
+            return {
+                "passed": False,
+                "feedback": f"Extension Grant Plan validation failed: {str(exc) or type(exc).__name__}",
+            }
+        unavailable = [
+            tool["name"] for item in grant_plan["hooks"] for tool in item["tools"]
+            if not tool["preapprovable"]
+        ]
+        if unavailable:
+            return {
+                "passed": False,
+                "feedback": "Tools do not permit Extension preauthorization: " + ", ".join(unavailable),
+            }
         commands = [
             ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q", test_file],
             ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q", "tests/extensions"],
@@ -550,7 +589,8 @@ class CodeSessionController:
                     f"{result.stdout[-12000:]}\n{result.stderr[-12000:]}"
                 )
                 return {"passed": False, "feedback": "\n".join(outputs)}
-        return {"passed": True, "feedback": ""}
+        self._latest_grant_plan = grant_plan
+        return {"passed": True, "feedback": "", "grant_plan": grant_plan}
 
     async def _rollback_unverified(self, record: CodeSessionRecord) -> None:
         await self._git(record.worktree_path, "reset", "--hard", record.last_verified_commit)
@@ -1199,10 +1239,12 @@ class HarnessEvolutionEngine:
             f"Extension: {_code_slug(requirement)} ({record.verified_turns + 1})",
         )
         commit = (await self._command(record.worktree_path, ["git", "rev-parse", "HEAD"])).stdout.strip()
+        grant_plan = _bind_grant_plan(controller._latest_grant_plan, commit)
         controller.record = record.model_copy(update={
             "last_verified_commit": commit,
             "verified_turns": record.verified_turns + 1,
             "status": "active",
+            "grant_plan": grant_plan,
         })
         controller.audit.append_event(
             record.audit_path, "code_turn_verified", attempt=attempts,
@@ -1212,9 +1254,14 @@ class HarnessEvolutionEngine:
             code_session_id=record.code_session_id, status="verified",
             message="扩展代码和测试已通过统一 Harness Engine 验证，并提交到隔离临时分支。",
             test_file=test_file, attempts=attempts, commit=commit, diagnostic=diagnostic,
+            grant_plan=grant_plan,
         )
 
-    async def finalize_manual(self, controller: CodeSessionController) -> CodeFinalizeResult:
+    async def finalize_manual(
+        self, controller: CodeSessionController, *,
+        approved_plan_hash: str | None = None,
+        decision_actor: str = "code-user", run_id: str | None = None,
+    ) -> CodeFinalizeResult:
         record, runtime = controller._active()
         status = (await self._command(
             record.worktree_path, ["git", "status", "--porcelain", "--untracked-files=all"],
@@ -1226,6 +1273,40 @@ class HarnessEvolutionEngine:
                 message="worktree 存在未验证修改，不能合并；请继续修复后再输入 /exit。",
                 stay_in_code_mode=True, worktree_path=str(record.worktree_path), branch=record.branch,
             )
+        changed_for_plan = await self._changed_files(
+            record.worktree_path, record.base_commit, record.last_verified_commit,
+        )
+        extension_paths = {
+            path for path in changed_for_plan if path.startswith("extension/hook/")
+        }
+        try:
+            catalog = ExtensionLoader(record.worktree_path).scan(strict=True)
+            grant_plan = _bind_grant_plan(build_extension_grant_plan(
+                catalog, default_tools(
+                    record.worktree_path, agent_root=self.config.agent_root,
+                    runtime_profile="interactive",
+                ), selected_paths=extension_paths,
+            ), record.last_verified_commit)
+        except Exception as exc:
+            return CodeFinalizeResult(
+                code_session_id=record.code_session_id,
+                status="grant_plan_invalid",
+                message=f"Extension Grant Plan validation failed: {str(exc) or type(exc).__name__}",
+                stay_in_code_mode=True,
+                worktree_path=str(record.worktree_path), branch=record.branch,
+            )
+        confirmation_required = any(
+            item.get("confirmation_required_capabilities") for item in grant_plan["hooks"]
+        )
+        if confirmation_required and approved_plan_hash != grant_plan["plan_hash"]:
+            return CodeFinalizeResult(
+                code_session_id=record.code_session_id,
+                status="capability_confirmation_required",
+                message="Controlled or privileged Extension capabilities require one Candidate confirmation.",
+                stay_in_code_mode=True,
+                worktree_path=str(record.worktree_path), branch=record.branch,
+                grant_plan=grant_plan,
+            )
         await runtime.close()
         controller.runtime = None
         if record.last_verified_commit == record.base_commit:
@@ -1234,6 +1315,17 @@ class HarnessEvolutionEngine:
             return CodeFinalizeResult(
                 code_session_id=record.code_session_id, status="no_changes",
                 message="本次 Coding Session 没有已验证改动，已清理并返回普通聊天。",
+            )
+        if controller.grant_backend is not None:
+            controller.grant_backend.begin_extension_grant_intent(
+                plan_hash=grant_plan["plan_hash"],
+                candidate_commit=record.last_verified_commit,
+                repository_identity=hashlib.sha256(
+                    str(record.source_root).casefold().encode("utf-8")
+                ).hexdigest(),
+                plan=grant_plan,
+                actor=decision_actor,
+                run_id=run_id,
             )
         merge = await self._merge_verified(
             root=record.source_root, base=record.base_commit,
@@ -1247,7 +1339,10 @@ class HarnessEvolutionEngine:
                 code_session_id=record.code_session_id, status="main_changed",
                 message="源码仓库 HEAD 已变化，已保留临时分支与 worktree，未执行合并。",
                 worktree_path=str(record.worktree_path), branch=record.branch,
+                grant_plan=grant_plan,
             )
+        if controller.grant_backend is not None:
+            controller.grant_backend.commit_extension_grant_intent(grant_plan["plan_hash"])
         changed = await self._changed_files(record.source_root, record.base_commit, record.last_verified_commit)
         await controller._update_long_term(record, changed)
         await controller._cleanup(record, keep_branch=False)
@@ -1256,6 +1351,7 @@ class HarnessEvolutionEngine:
             code_session_id=record.code_session_id, status="merged",
             message="已由统一 Harness Engine fast-forward 合并验证通过的 Hook。",
             merged=True,
+            grant_plan=grant_plan,
         )
 
     async def run(self, request: HarnessEvolutionRequest) -> HarnessEvolutionResult:
@@ -1982,7 +2078,19 @@ def _validate_changed_extensions(worktree: Path, changed: list[str]) -> str:
             if len(parts) != 4 or parts[:2] != ("extension", "hook") or path.suffix != ".py":
                 return f"Extension Python 文件必须是阶段目录的直接子文件：{relative}"
     try:
-        ExtensionLoader(worktree).scan()
+        ExtensionLoader(worktree).scan(strict=True)
     except Exception as exc:
         return f"Extension 契约校验失败：{str(exc) or type(exc).__name__}"
     return ""
+
+
+def _bind_grant_plan(plan: dict[str, Any], candidate_commit: str) -> dict[str, Any]:
+    selected = json.loads(json.dumps(plan, ensure_ascii=False)) if plan else {
+        "schema_version": 1, "hooks": [], "restart_required": True,
+    }
+    selected.pop("plan_hash", None)
+    selected["candidate_commit"] = candidate_commit
+    selected["plan_hash"] = hashlib.sha256(json.dumps(
+        selected, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return selected

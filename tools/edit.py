@@ -24,6 +24,7 @@ class EditBlock(BaseModel):
 
 
 class EditTool:
+    extension_preapproval = True
     """对已有文件执行互不重叠的精确替换，并创建一次 checkpoint。"""
 
     name = "edit"
