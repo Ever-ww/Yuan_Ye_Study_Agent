@@ -43,6 +43,14 @@ from .finalize_evidence import (
 from .session_reservation import SessionReservationRegistry
 from .state_controller import StateController, StateConflictError, StateInvariantError
 from .outbox import OutboxDispatcher
+from .event_store import (
+    EventConsumerCursorStore,
+    EventStore,
+    GatewayEventArchiveService,
+    GatewayEventArchiveScheduler,
+    GatewayEventSchemaRegistry,
+    ProjectionRebuilder,
+)
 from .recovery import RecoveryCoordinator
 from .store import GatewayStore
 from cron import CronJob, CronSchedule, CronService, CronStatus
@@ -89,6 +97,12 @@ __all__ = [
     "StateConflictError",
     "StateInvariantError",
     "OutboxDispatcher",
+    "EventConsumerCursorStore",
+    "EventStore",
+    "GatewayEventArchiveService",
+    "GatewayEventArchiveScheduler",
+    "GatewayEventSchemaRegistry",
+    "ProjectionRebuilder",
     "RecoveryCoordinator",
     "CronJob",
     "CronSchedule",

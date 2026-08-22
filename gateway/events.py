@@ -65,7 +65,8 @@ class GatewayEventBus:
         async with self._lock:
             return self._client_counts.get(client_id, 0) > 0
 
-    async def publish(self, event: GatewayEventEnvelope) -> None:
+    async def deliver_from_outbox(self, event: GatewayEventEnvelope) -> None:
+        """Deliver one already-durable event; business code must not call this API."""
         async with self._lock:
             if event.event_id in self._published_ids:
                 return

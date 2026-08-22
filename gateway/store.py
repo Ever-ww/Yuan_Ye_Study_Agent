@@ -1,27 +1,22 @@
-"""Gateway SQLite 元数据与逐 Run JSONL 事件存储。"""
+"""Gateway metadata queries and non-domain projections.
+
+Run lifecycle, Approval and durable Gateway Event mutations deliberately do not
+live here.  ``StateController`` is their only write authority; this store retains
+project/client metadata and read-only Run/Inbox projections.
+"""
 
 from __future__ import annotations
 
-import json
 import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any
-from uuid import uuid4
 
-from gateway.models import (
-    ApprovalRequest,
-    GatewayEventEnvelope,
-    InboxItem,
-    ProjectRecord,
-    RunRecord,
-    now_iso,
-)
+from gateway.models import InboxItem, ProjectRecord, RunRecord, now_iso
 
 
 class GatewayStore:
-    """用 SQLite 管理并发元数据，用 JSONL 保留可审计事件。"""
+    """Query Gateway projections and mutate only independent metadata."""
 
     def __init__(self, directory: Path) -> None:
         self.directory = directory.resolve()
@@ -39,7 +34,7 @@ class GatewayStore:
         with self._connect() as connection:
             check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
             if check != "ok":
-                raise RuntimeError(f"Gateway SQLite quick_check 失败：{check}")
+                raise RuntimeError(f"Gateway SQLite quick_check failed: {check}")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS projects (
@@ -77,7 +72,7 @@ class GatewayStore:
     def register_project(self, path: Path, name: str | None = None) -> ProjectRecord:
         resolved = path.resolve()
         if not resolved.is_dir():
-            raise ValueError(f"工作区不存在或不是目录：{resolved}")
+            raise ValueError(f"Workspace is not a directory: {resolved}")
         project_id = _project_id(resolved)
         timestamp = now_iso()
         selected_name = (name or resolved.name or str(resolved)).strip()
@@ -93,11 +88,8 @@ class GatewayStore:
                 (project_id, selected_name, str(resolved), created_at, timestamp),
             )
         return ProjectRecord(
-            project_id=project_id,
-            name=selected_name,
-            path=str(resolved),
-            created_at=created_at,
-            last_opened_at=timestamp,
+            project_id=project_id, name=selected_name, path=str(resolved),
+            created_at=created_at, last_opened_at=timestamp,
         )
 
     def list_projects(self) -> list[ProjectRecord]:
@@ -113,7 +105,7 @@ class GatewayStore:
                 "SELECT * FROM projects WHERE project_id=?", (project_id,),
             ).fetchone()
         if row is None:
-            raise KeyError(f"未知项目：{project_id}")
+            raise KeyError(f"Unknown project: {project_id}")
         return ProjectRecord(**dict(row))
 
     def remove_project(self, project_id: str) -> None:
@@ -123,63 +115,16 @@ class GatewayStore:
                 (project_id,),
             ).fetchone()
             if active is not None:
-                raise RuntimeError("项目仍有排队或运行中的任务，不能移除")
+                raise RuntimeError("Project still has an active Run")
             cursor = connection.execute("DELETE FROM projects WHERE project_id=?", (project_id,))
         if cursor.rowcount == 0:
-            raise KeyError(f"未知项目：{project_id}")
-
-    def create_run(
-        self,
-        project_id: str,
-        client_id: str,
-        task: str,
-        session_id: str | None,
-        run_id: str | None = None,
-    ) -> RunRecord:
-        run = RunRecord(
-            run_id=run_id or uuid4().hex,
-            project_id=project_id,
-            session_id=session_id,
-            client_id=client_id,
-            task=task,
-            status="queued",
-            created_at=now_iso(),
-        )
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO runs(run_id,project_id,session_id,client_id,task,status,created_at,"
-                "started_at,finished_at,answer,error) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    run.run_id, run.project_id, run.session_id, run.client_id, run.task,
-                    run.status, run.created_at, None, None, None, None,
-                ),
-            )
-            connection.execute(
-                "INSERT INTO event_sequences(run_id,last_sequence) VALUES(?,0)",
-                (run.run_id,),
-            )
-        self.event_path(run.run_id).touch()
-        return run
-
-    def update_run(self, run_id: str, **changes: Any) -> RunRecord:
-        allowed = {"session_id", "status", "started_at", "finished_at", "answer", "error"}
-        invalid = set(changes).difference(allowed)
-        if invalid:
-            raise ValueError(f"不允许更新 Run 字段：{sorted(invalid)[0]}")
-        if changes:
-            assignments = ",".join(f"{key}=?" for key in changes)
-            with self._connect() as connection:
-                connection.execute(
-                    f"UPDATE runs SET {assignments} WHERE run_id=?",
-                    (*changes.values(), run_id),
-                )
-        return self.run(run_id)
+            raise KeyError(f"Unknown project: {project_id}")
 
     def run(self, run_id: str) -> RunRecord:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
         if row is None:
-            raise KeyError(f"未知运行：{run_id}")
+            raise KeyError(f"Unknown Run: {run_id}")
         return _run_record(row)
 
     def list_runs(self, project_id: str | None = None) -> list[RunRecord]:
@@ -194,79 +139,12 @@ class GatewayStore:
         return [_run_record(row) for row in rows]
 
     def automated_session_ids(self) -> set[str]:
-        """返回旧记录中已知由 Cron/Dream 维护任务产生的 Session。"""
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT DISTINCT session_id FROM runs "
-                "WHERE session_id IS NOT NULL AND (client_id LIKE 'cron:%' OR client_id LIKE 'dream:%')",
+                "SELECT DISTINCT session_id FROM runs WHERE session_id IS NOT NULL "
+                "AND (client_id LIKE 'cron:%' OR client_id LIKE 'dream:%')",
             ).fetchall()
         return {str(row["session_id"]) for row in rows}
-
-    def append_event(
-        self,
-        run_id: str,
-        project_id: str,
-        session_id: str | None,
-        event_type: str,
-        payload: dict[str, Any],
-    ) -> GatewayEventEnvelope:
-        with self._lock, self._connect() as connection:
-            row = connection.execute(
-                "SELECT last_sequence FROM event_sequences WHERE run_id=?", (run_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"未知运行：{run_id}")
-            sequence = int(row["last_sequence"]) + 1
-            connection.execute(
-                "UPDATE event_sequences SET last_sequence=? WHERE run_id=?",
-                (sequence, run_id),
-            )
-            envelope = GatewayEventEnvelope(
-                event_id=uuid4().hex,
-                sequence=sequence,
-                timestamp=now_iso(),
-                project_id=project_id,
-                session_id=session_id,
-                run_id=run_id,
-                type=event_type,
-                payload=payload,
-            )
-            with self.event_path(run_id).open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(envelope.model_dump_json() + "\n")
-        return envelope
-
-    def read_events(self, run_id: str, after_sequence: int = 0) -> list[GatewayEventEnvelope]:
-        path = self.event_path(run_id)
-        if not path.exists():
-            raise KeyError(f"未知运行：{run_id}")
-        events: list[GatewayEventEnvelope] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                event = GatewayEventEnvelope.model_validate_json(line, strict=True)
-                if event.sequence > after_sequence:
-                    events.append(event)
-        return events
-
-    def create_inbox(self, run: RunRecord) -> InboxItem:
-        item = InboxItem(
-            item_id=uuid4().hex,
-            run_id=run.run_id,
-            project_id=run.project_id,
-            session_id=run.session_id,
-            title=run.task[:120],
-            summary=run.answer or run.error or "",
-            status=run.status,
-            created_at=now_iso(),
-        )
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT OR REPLACE INTO inbox VALUES(?,?,?,?,?,?,?,?,?)",
-                (
-                    item.item_id, item.run_id, item.project_id, item.session_id,
-                    item.title, item.summary, item.status, item.created_at, 0,
-                ),
-            )
-        return item
 
     def list_inbox(self, *, unread_only: bool = False) -> list[InboxItem]:
         query = "SELECT * FROM inbox"
@@ -275,63 +153,21 @@ class GatewayStore:
         query += " ORDER BY created_at DESC"
         with self._connect() as connection:
             rows = connection.execute(query).fetchall()
-        return [
-            InboxItem(
-                item_id=row["item_id"],
-                run_id=row["run_id"],
-                project_id=row["project_id"],
-                session_id=row["session_id"],
-                title=row["title"],
-                summary=row["summary"],
-                status=row["status"],
-                created_at=row["created_at"],
-                read=bool(row["is_read"]),
-            )
-            for row in rows
-        ]
+        return [_inbox_item(row) for row in rows]
 
     def mark_inbox_read(self, item_id: str) -> InboxItem:
         with self._connect() as connection:
             cursor = connection.execute("UPDATE inbox SET is_read=1 WHERE item_id=?", (item_id,))
             row = connection.execute("SELECT * FROM inbox WHERE item_id=?", (item_id,)).fetchone()
         if cursor.rowcount == 0 or row is None:
-            raise KeyError(f"未知 Inbox 项：{item_id}")
-        return InboxItem(
-            item_id=row["item_id"], run_id=row["run_id"], project_id=row["project_id"],
-            session_id=row["session_id"], title=row["title"], summary=row["summary"],
-            status=row["status"], created_at=row["created_at"], read=True,
-        )
+            raise KeyError(f"Unknown Inbox item: {item_id}")
+        return _inbox_item(row)
 
     def mark_run_inbox_read(self, run_id: str) -> InboxItem | None:
-        """终态结果已送达发起客户端时，幂等确认对应 Inbox。"""
         with self._connect() as connection:
             connection.execute("UPDATE inbox SET is_read=1 WHERE run_id=?", (run_id,))
             row = connection.execute("SELECT * FROM inbox WHERE run_id=?", (run_id,)).fetchone()
-        if row is None:
-            return None
-        return InboxItem(
-            item_id=row["item_id"], run_id=row["run_id"], project_id=row["project_id"],
-            session_id=row["session_id"], title=row["title"], summary=row["summary"],
-            status=row["status"], created_at=row["created_at"], read=True,
-        )
-
-    def save_approval(self, request: ApprovalRequest) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO approvals VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    request.approval_id, request.run_id, request.client_id,
-                    request.tool_name, json.dumps(request.arguments, ensure_ascii=False),
-                    request.state, request.created_at, request.decided_at,
-                ),
-            )
-
-    def decide_approval(self, approval_id: str, approved: bool) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE approvals SET state=?,decided_at=? WHERE approval_id=? AND state='pending'",
-                ("approved" if approved else "denied", now_iso(), approval_id),
-            )
+        return _inbox_item(row) if row is not None else None
 
     def client_connected(self, client_id: str) -> None:
         timestamp = now_iso()
@@ -350,9 +186,6 @@ class GatewayStore:
                 "UPDATE clients SET last_seen_at=?,disconnected_at=? WHERE client_id=?",
                 (timestamp, timestamp, client_id),
             )
-
-    def event_path(self, run_id: str) -> Path:
-        return self.runs_directory / f"{run_id}.jsonl"
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30)
@@ -380,14 +213,10 @@ class GatewayStore:
     def _ensure_run_columns(connection: sqlite3.Connection) -> None:
         columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
         additions = {
-            "task_state": "TEXT",
-            "execution_state": "TEXT",
-            "execution_outcome": "TEXT",
-            "finish_reason": "TEXT",
-            "state_revision": "INTEGER NOT NULL DEFAULT 0",
+            "task_state": "TEXT", "execution_state": "TEXT", "execution_outcome": "TEXT",
+            "finish_reason": "TEXT", "state_revision": "INTEGER NOT NULL DEFAULT 0",
             "workload_kind": "TEXT NOT NULL DEFAULT 'chat'",
-            "recovery_required": "INTEGER NOT NULL DEFAULT 0",
-            "terminal_target": "TEXT",
+            "recovery_required": "INTEGER NOT NULL DEFAULT 0", "terminal_target": "TEXT",
         }
         for name, declaration in additions.items():
             if name not in columns:
@@ -396,8 +225,7 @@ class GatewayStore:
 
 def _project_id(path: Path) -> str:
     import hashlib
-    normalized = str(path.resolve()).casefold()
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(str(path.resolve()).casefold().encode("utf-8")).hexdigest()[:16]
 
 
 def _run_record(row: sqlite3.Row) -> RunRecord:
@@ -405,3 +233,11 @@ def _run_record(row: sqlite3.Row) -> RunRecord:
     if "recovery_required" in payload:
         payload["recovery_required"] = bool(payload["recovery_required"])
     return RunRecord(**payload)
+
+
+def _inbox_item(row: sqlite3.Row) -> InboxItem:
+    return InboxItem(
+        item_id=row["item_id"], run_id=row["run_id"], project_id=row["project_id"],
+        session_id=row["session_id"], title=row["title"], summary=row["summary"],
+        status=row["status"], created_at=row["created_at"], read=bool(row["is_read"]),
+    )

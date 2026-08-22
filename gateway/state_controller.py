@@ -93,6 +93,7 @@ from gateway.finalize_evidence import (
     VerifiedArtifactEvidence,
 )
 from gateway.models import GatewayEventEnvelope, now_iso
+from gateway.event_store import EventStore, canonical_json, parse_canonical_event, sha256_text
 
 
 class StateConflictError(RuntimeError):
@@ -106,7 +107,7 @@ class StateInvariantError(RuntimeError):
 class StateController:
     """以 SQLite 事务实现 command 幂等、CAS、FSM guard 和 Outbox。"""
 
-    SCHEMA_VERSION = 9
+    SCHEMA_VERSION = 10
 
     def __init__(
         self,
@@ -124,8 +125,8 @@ class StateController:
         try:
             self.initialize()
         except Exception:
-            if migration_backup_path is not None and migration_backup_path.exists():
-                self._restore_backup(migration_backup_path)
+            if self.migration_backup_path is not None and self.migration_backup_path.exists():
+                self._restore_backup(self.migration_backup_path)
             raise
 
     def initialize(self) -> None:
@@ -203,27 +204,6 @@ class StateController:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(client_id,operation_name,idempotency_key)
-                );
-                CREATE TABLE IF NOT EXISTS gateway_events (
-                    event_id TEXT PRIMARY KEY,
-                    run_id TEXT NOT NULL,
-                    sequence INTEGER NOT NULL,
-                    event_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    UNIQUE(run_id, sequence)
-                );
-                CREATE TABLE IF NOT EXISTS event_outbox (
-                    event_id TEXT PRIMARY KEY,
-                    run_id TEXT NOT NULL,
-                    sequence INTEGER NOT NULL,
-                    eventbus_status TEXT NOT NULL DEFAULT 'pending',
-                    jsonl_status TEXT NOT NULL DEFAULT 'pending',
-                    eventbus_attempts INTEGER NOT NULL DEFAULT 0,
-                    jsonl_attempts INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT,
-                    delivered_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS operation_attempts (
                     attempt_id TEXT PRIMARY KEY,
@@ -452,11 +432,21 @@ class StateController:
             self._ensure_column(connection, "operation_ledger", "request_hash", "TEXT")
             self._ensure_column(connection, "operation_ledger", "side_effecting", "INTEGER NOT NULL DEFAULT 1")
             self._ensure_column(connection, "durable_approvals", "attempt_id", "TEXT")
-            self._ensure_column(connection, "event_outbox", "eventbus_next_attempt_at", "TEXT")
-            self._ensure_column(connection, "event_outbox", "jsonl_next_attempt_at", "TEXT")
-            self._ensure_column(connection, "event_outbox", "eventbus_dead_letter_at", "TEXT")
-            self._ensure_column(connection, "event_outbox", "jsonl_dead_letter_at", "TEXT")
+            event_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(gateway_events)").fetchall()
+            }
+            if event_columns and "canonical_event_json" not in event_columns:
+                self._ensure_column(connection, "event_outbox", "eventbus_next_attempt_at", "TEXT")
+                self._ensure_column(connection, "event_outbox", "jsonl_next_attempt_at", "TEXT")
+                self._ensure_column(connection, "event_outbox", "eventbus_dead_letter_at", "TEXT")
+                self._ensure_column(connection, "event_outbox", "jsonl_dead_letter_at", "TEXT")
             self._ensure_column(connection, "extension_grant_intents", "run_id", "TEXT")
+            self._ensure_column(
+                connection, "agent_states", "snapshot_stream_sequence", "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._migrate_gateway_event_v10(connection)
+            self._migrate_legacy_gateway_jsonl(connection)
             self._migrate_idempotency_scope(connection)
             self._migrate_legacy_operations(connection)
             self._migrate_legacy_approvals(connection)
@@ -522,6 +512,40 @@ class StateController:
                 BEGIN
                     SELECT RAISE(ABORT, 'finished OperationAttempt is immutable');
                 END;
+                DROP TRIGGER IF EXISTS immutable_gateway_event_identity;
+                CREATE TRIGGER immutable_gateway_event_identity
+                BEFORE UPDATE ON gateway_events
+                WHEN NEW.event_id IS NOT OLD.event_id
+                  OR NEW.command_id IS NOT OLD.command_id
+                  OR NEW.event_key IS NOT OLD.event_key
+                  OR NEW.stream_id IS NOT OLD.stream_id
+                  OR NEW.stream_sequence IS NOT OLD.stream_sequence
+                  OR NEW.event_type IS NOT OLD.event_type
+                  OR NEW.envelope_version IS NOT OLD.envelope_version
+                  OR NEW.schema_version IS NOT OLD.schema_version
+                  OR NEW.occurred_at IS NOT OLD.occurred_at
+                  OR NEW.run_id IS NOT OLD.run_id
+                  OR NEW.session_id IS NOT OLD.session_id
+                  OR NEW.causation_id IS NOT OLD.causation_id
+                  OR NEW.correlation_id IS NOT OLD.correlation_id
+                  OR NEW.payload_hash IS NOT OLD.payload_hash
+                  OR NEW.canonical_hash IS NOT OLD.canonical_hash
+                BEGIN
+                    SELECT RAISE(ABORT, 'canonical Gateway Event identity is immutable');
+                END;
+                DROP TRIGGER IF EXISTS immutable_delivery_snapshot;
+                CREATE TRIGGER immutable_delivery_snapshot
+                BEFORE UPDATE ON event_deliveries
+                WHEN NEW.delivery_id IS NOT OLD.delivery_id
+                  OR NEW.outbox_id IS NOT OLD.outbox_id
+                  OR NEW.event_id IS NOT OLD.event_id
+                  OR NEW.sink_id IS NOT OLD.sink_id
+                  OR NEW.required IS NOT OLD.required
+                  OR NEW.sink_config_version IS NOT OLD.sink_config_version
+                  OR NEW.sink_config_hash IS NOT OLD.sink_config_hash
+                BEGIN
+                    SELECT RAISE(ABORT, 'Event Delivery policy snapshot is immutable');
+                END;
                 """
             )
             connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
@@ -531,6 +555,372 @@ class StateController:
             final_check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
             if final_check != "ok":
                 raise RuntimeError(f"Gateway SQLite migration 后 quick_check 失败：{final_check}")
+
+    def _migrate_gateway_event_v10(self, connection: sqlite3.Connection) -> None:
+        """Convert v9 sink columns into the final generic delivery ledger.
+
+        Existing v1 event JSON is copied byte-for-byte: migration may add searchable
+        columns, but it must never rewrite historical canonical content or invent
+        delivery attempts that did not previously exist.
+        """
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(gateway_events)").fetchall()
+        }
+        if not columns:
+            self._create_event_v10_schema(connection)
+            self._ensure_default_event_sinks(connection)
+            return
+        if "canonical_event_json" in columns:
+            self._create_event_v10_schema(connection)
+            self._ensure_default_event_sinks(connection)
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("ALTER TABLE gateway_events RENAME TO gateway_events_v9")
+            connection.execute("ALTER TABLE event_outbox RENAME TO event_outbox_v9")
+            self._create_event_v10_schema(connection)
+            timestamp = now_iso()
+            self._ensure_default_event_sinks(connection, timestamp=timestamp)
+            old_outbox = {
+                str(row["event_id"]): row
+                for row in connection.execute("SELECT * FROM event_outbox_v9").fetchall()
+            }
+            for row in connection.execute(
+                "SELECT * FROM gateway_events_v9 ORDER BY run_id,sequence",
+            ).fetchall():
+                raw = str(row["event_json"])
+                event = parse_canonical_event(raw)
+                stream_id = event.stream_id or event.run_id
+                sequence = event.stream_sequence or event.sequence
+                command_id = event.command_id
+                connection.execute(
+                    "INSERT INTO gateway_events(event_id,command_id,event_key,stream_id,"
+                    "stream_sequence,event_type,envelope_version,schema_version,occurred_at,"
+                    "run_id,session_id,causation_id,correlation_id,canonical_event_json,"
+                    "payload_hash,canonical_hash,storage_tier,archive_id,revision) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'hot',NULL,0)",
+                    (
+                        event.event_id, command_id, event.event_key if command_id else None,
+                        stream_id, sequence, event.event_type or event.type, event.version,
+                        event.schema_version, event.timestamp, event.run_id, event.session_id,
+                        event.causation_id, event.correlation_id, raw,
+                        event.payload_hash or sha256_text(canonical_json(event.payload)), sha256_text(raw),
+                    ),
+                )
+                outbox_id = hashlib.sha256(
+                    f"event-outbox:v1:{event.event_id}".encode("utf-8"),
+                ).hexdigest()
+                old = old_outbox.get(event.event_id)
+                completed = str(old["delivered_at"]) if old is not None and old["delivered_at"] else None
+                connection.execute(
+                    "INSERT INTO event_outbox VALUES(?,?,?,?,0)",
+                    (outbox_id, event.event_id, str(row["created_at"]), completed),
+                )
+                for sink_id in ("eventbus", "jsonl"):
+                    sink = connection.execute(
+                        "SELECT * FROM event_sinks WHERE sink_id=?", (sink_id,),
+                    ).fetchone()
+                    old_status = str(old[f"{sink_id}_status"]) if old is not None else "pending"
+                    status = "delivered" if old_status == "sent" else "pending"
+                    attempts = int(old[f"{sink_id}_attempts"] or 0) if old is not None else 0
+                    next_retry = old[f"{sink_id}_next_attempt_at"] if old is not None else None
+                    dead = old[f"{sink_id}_dead_letter_at"] if old is not None else None
+                    if dead is not None:
+                        status = "dead_lettered"
+                    delivery_id = hashlib.sha256(
+                        f"event-delivery:v1:{event.event_id}:{sink_id}".encode("utf-8"),
+                    ).hexdigest()
+                    connection.execute(
+                        "INSERT INTO event_deliveries(delivery_id,outbox_id,event_id,sink_id,"
+                        "required,sink_config_version,sink_config_hash,status,attempt_count,"
+                        "next_retry_at,last_error_type,last_error,delivered_at,dead_lettered_at,revision) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                        (
+                            delivery_id, outbox_id, event.event_id, sink_id,
+                            int(sink["required_by_default"]), int(sink["current_config_version"]),
+                            sink["current_config_hash"], status, attempts, next_retry, None,
+                            old["last_error"] if old is not None else None,
+                            completed if status == "delivered" else None, dead,
+                        ),
+                    )
+            connection.execute("DROP TABLE event_outbox_v9")
+            connection.execute("DROP TABLE gateway_events_v9")
+            connection.execute(
+                "UPDATE event_sequences SET last_sequence=COALESCE((SELECT MAX(stream_sequence) "
+                "FROM gateway_events WHERE stream_id=event_sequences.run_id),0)",
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _create_event_v10_schema(connection: sqlite3.Connection) -> None:
+        schema = """
+            CREATE TABLE IF NOT EXISTS gateway_events (
+                event_id TEXT PRIMARY KEY, command_id TEXT, event_key TEXT,
+                stream_id TEXT NOT NULL,
+                stream_sequence INTEGER NOT NULL CHECK(stream_sequence >= 1),
+                event_type TEXT NOT NULL,
+                envelope_version INTEGER NOT NULL CHECK(envelope_version >= 1),
+                schema_version INTEGER NOT NULL CHECK(schema_version >= 1),
+                occurred_at TEXT NOT NULL, run_id TEXT NOT NULL, session_id TEXT,
+                causation_id TEXT, correlation_id TEXT, canonical_event_json TEXT,
+                payload_hash TEXT NOT NULL, canonical_hash TEXT NOT NULL,
+                storage_tier TEXT NOT NULL DEFAULT 'hot' CHECK(storage_tier IN ('hot','archived')),
+                archive_id TEXT, revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                UNIQUE(stream_id,stream_sequence),
+                FOREIGN KEY(archive_id) REFERENCES gateway_event_archives(archive_id) ON DELETE RESTRICT,
+                CHECK((storage_tier='hot' AND canonical_event_json IS NOT NULL) OR
+                      (storage_tier='archived' AND canonical_event_json IS NULL AND archive_id IS NOT NULL))
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS gateway_event_command_key_uq
+                ON gateway_events(command_id,event_key) WHERE command_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS gateway_events_stream_idx
+                ON gateway_events(stream_id,stream_sequence);
+            CREATE TABLE IF NOT EXISTS event_sinks (
+                sink_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+                current_config_version INTEGER NOT NULL CHECK(current_config_version >= 1),
+                current_config_hash TEXT NOT NULL,
+                required_by_default INTEGER NOT NULL CHECK(required_by_default IN (0,1)),
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS event_outbox (
+                outbox_id TEXT PRIMARY KEY, event_id TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL, completed_at TEXT,
+                revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                FOREIGN KEY(event_id) REFERENCES gateway_events(event_id) ON DELETE RESTRICT
+            );
+            CREATE TABLE IF NOT EXISTS event_deliveries (
+                delivery_id TEXT PRIMARY KEY, outbox_id TEXT NOT NULL, event_id TEXT NOT NULL,
+                sink_id TEXT NOT NULL, required INTEGER NOT NULL CHECK(required IN (0,1)),
+                sink_config_version INTEGER NOT NULL CHECK(sink_config_version >= 1),
+                sink_config_hash TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN
+                    ('pending','delivering','retrying','delivered','dead_lettered')),
+                attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+                next_retry_at TEXT, last_error_type TEXT, last_error TEXT,
+                delivered_at TEXT, dead_lettered_at TEXT,
+                revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                UNIQUE(event_id,sink_id),
+                FOREIGN KEY(outbox_id) REFERENCES event_outbox(outbox_id) ON DELETE RESTRICT,
+                FOREIGN KEY(event_id) REFERENCES gateway_events(event_id) ON DELETE RESTRICT,
+                FOREIGN KEY(sink_id) REFERENCES event_sinks(sink_id) ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS event_deliveries_due_idx
+                ON event_deliveries(status,next_retry_at);
+            CREATE TABLE IF NOT EXISTS event_delivery_attempts (
+                attempt_id TEXT PRIMARY KEY, delivery_id TEXT NOT NULL,
+                attempt_no INTEGER NOT NULL CHECK(attempt_no >= 1), gateway_epoch TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('delivering','succeeded','failed','interrupted')),
+                started_at TEXT NOT NULL, completed_at TEXT, error_type TEXT, error_summary TEXT,
+                UNIQUE(delivery_id,attempt_no),
+                FOREIGN KEY(delivery_id) REFERENCES event_deliveries(delivery_id) ON DELETE RESTRICT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_delivery_attempt
+                ON event_delivery_attempts(delivery_id) WHERE status='delivering';
+            CREATE TABLE IF NOT EXISTS event_consumer_cursors (
+                consumer_id TEXT NOT NULL, stream_id TEXT NOT NULL,
+                last_sequence INTEGER NOT NULL CHECK(last_sequence >= 0),
+                revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0), updated_at TEXT NOT NULL,
+                PRIMARY KEY(consumer_id,stream_id)
+            );
+            CREATE TABLE IF NOT EXISTS gateway_event_archives (
+                archive_id TEXT PRIMARY KEY, stream_id TEXT NOT NULL,
+                first_sequence INTEGER NOT NULL, last_sequence INTEGER NOT NULL,
+                event_count INTEGER NOT NULL CHECK(event_count > 0),
+                events_content_hash TEXT, manifest_hash TEXT, members_hash TEXT,
+                archive_path TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK(status IN
+                    ('preparing','verified','failed','recovery_required')),
+                created_at TEXT NOT NULL, verified_at TEXT,
+                revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0)
+            );
+            CREATE TABLE IF NOT EXISTS gateway_event_archive_members (
+                archive_id TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE,
+                stream_sequence INTEGER NOT NULL, canonical_hash TEXT NOT NULL,
+                byte_offset INTEGER, byte_length INTEGER,
+                PRIMARY KEY(archive_id,event_id),
+                FOREIGN KEY(archive_id) REFERENCES gateway_event_archives(archive_id) ON DELETE RESTRICT,
+                FOREIGN KEY(event_id) REFERENCES gateway_events(event_id) ON DELETE RESTRICT
+            );
+            CREATE TABLE IF NOT EXISTS gateway_event_migrations (
+                migration_id TEXT PRIMARY KEY, migration_version INTEGER NOT NULL,
+                source_path TEXT NOT NULL, source_hash TEXT NOT NULL, run_id TEXT NOT NULL,
+                event_count INTEGER NOT NULL, imported_count INTEGER NOT NULL,
+                conflict_count INTEGER NOT NULL, status TEXT NOT NULL,
+                started_at TEXT NOT NULL, completed_at TEXT,
+                UNIQUE(migration_version,source_path,source_hash)
+            );
+            """
+        # ``executescript`` performs an implicit commit.  Execute the simple DDL
+        # statements one-by-one so a v9 rename, copy and constraint installation
+        # remains protected by the caller's migration transaction and backup.
+        for statement in schema.split(";"):
+            if statement.strip():
+                connection.execute(statement)
+
+    @staticmethod
+    def _ensure_default_event_sinks(
+        connection: sqlite3.Connection, *, timestamp: str | None = None,
+    ) -> None:
+        selected_timestamp = timestamp or now_iso()
+        sink_definitions = {
+            "eventbus": {"transport": "in_process_event_bus", "version": 1},
+            "jsonl": {"transport": "canonical_jsonl_projection", "version": 1},
+        }
+        for sink_id, config in sink_definitions.items():
+            connection.execute(
+                "INSERT OR IGNORE INTO event_sinks VALUES(?,1,1,?,1,?)",
+                (sink_id, sha256_text(canonical_json(config)), selected_timestamp),
+            )
+
+    def _migrate_legacy_gateway_jsonl(self, connection: sqlite3.Connection) -> None:
+        """Import only strict ``gateway/runs/<known-run>.jsonl`` legacy events.
+
+        No recursive scan is permitted: Memory, Harness, Dream and ErrorSnapshot
+        JSONL files are different domains and can never become Gateway facts.
+        """
+        runs_directory = self.database_path.parent / "runs"
+        complete = connection.execute(
+            "SELECT 1 FROM gateway_event_migrations WHERE migration_version=10 "
+            "AND source_path='__legacy_gateway_jsonl_complete__' AND status='completed'",
+        ).fetchone()
+        if complete is not None:
+            return
+        if not runs_directory.exists():
+            runs_directory.mkdir(parents=True, exist_ok=True)
+        for path in sorted(runs_directory.glob("*.jsonl")):
+            if not path.is_file():
+                continue
+            run_id = path.stem
+            known_run = connection.execute(
+                "SELECT 1 FROM runs WHERE run_id=?", (run_id,),
+            ).fetchone()
+            if known_run is None:
+                raise RuntimeError(f"Legacy Gateway JSONL filename does not map to a known Run: {path}")
+            raw_file = path.read_bytes()
+            source_hash = hashlib.sha256(raw_file).hexdigest()
+            existing_migration = connection.execute(
+                "SELECT status FROM gateway_event_migrations WHERE migration_version=10 "
+                "AND source_path=? AND source_hash=?",
+                (str(path.resolve()), source_hash),
+            ).fetchone()
+            if existing_migration is not None and existing_migration["status"] == "completed":
+                continue
+            parsed: list[tuple[str, GatewayEventEnvelope]] = []
+            try:
+                text = raw_file.decode("utf-8")
+                for line_no, line in enumerate(text.splitlines(), start=1):
+                    if not line.strip():
+                        continue
+                    event = parse_canonical_event(line)
+                    if event.run_id != run_id:
+                        raise ValueError(f"line {line_no} belongs to another Run")
+                    parsed.append((line, event))
+            except Exception as exc:
+                raise RuntimeError(f"Legacy Gateway JSONL is not a strict event stream: {path}") from exc
+            sequence_identities: dict[int, str] = {}
+            for _raw, event in parsed:
+                sequence = event.stream_sequence or event.sequence
+                previous = sequence_identities.setdefault(sequence, event.event_id)
+                if previous != event.event_id:
+                    raise RuntimeError(f"Legacy Gateway JSONL sequence conflict: {path}:{sequence}")
+
+            timestamp = now_iso()
+            migration_id = hashlib.sha256(
+                f"gateway-event-migration:v10:{path.resolve()}:{source_hash}".encode("utf-8"),
+            ).hexdigest()
+            connection.execute("BEGIN IMMEDIATE")
+            imported = 0
+            try:
+                for raw, event in parsed:
+                    existing = connection.execute(
+                        "SELECT canonical_hash FROM gateway_events WHERE event_id=?", (event.event_id,),
+                    ).fetchone()
+                    digest = sha256_text(raw)
+                    if existing is not None:
+                        if existing["canonical_hash"] != digest:
+                            raise RuntimeError(f"Legacy event identity conflict: {event.event_id}")
+                        continue
+                    sequence = event.stream_sequence or event.sequence
+                    collision = connection.execute(
+                        "SELECT event_id FROM gateway_events WHERE stream_id=? AND stream_sequence=?",
+                        (run_id, sequence),
+                    ).fetchone()
+                    if collision is not None:
+                        raise RuntimeError(
+                            f"Legacy stream sequence conflict: {run_id}:{sequence}",
+                        )
+                    connection.execute(
+                        "INSERT INTO gateway_events(event_id,command_id,event_key,stream_id,"
+                        "stream_sequence,event_type,envelope_version,schema_version,occurred_at,"
+                        "run_id,session_id,causation_id,correlation_id,canonical_event_json,"
+                        "payload_hash,canonical_hash,storage_tier,archive_id,revision) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'hot',NULL,0)",
+                        (
+                            event.event_id, event.command_id,
+                            event.event_key if event.command_id else None, run_id, sequence,
+                            event.event_type or event.type, event.version, event.schema_version,
+                            event.timestamp, run_id, event.session_id, event.causation_id,
+                            event.correlation_id, raw,
+                            event.payload_hash or sha256_text(canonical_json(event.payload)), digest,
+                        ),
+                    )
+                    outbox_id = hashlib.sha256(
+                        f"event-outbox:migrated:{event.event_id}".encode("utf-8"),
+                    ).hexdigest()
+                    connection.execute(
+                        "INSERT INTO event_outbox VALUES(?,?,?,?,0)",
+                        (outbox_id, event.event_id, event.timestamp, timestamp),
+                    )
+                    # The source file proves historical JSONL projection.  Mark both
+                    # legacy sinks delivered so upgrade never rebroadcasts history.
+                    for sink in connection.execute(
+                        "SELECT * FROM event_sinks WHERE sink_id IN ('eventbus','jsonl')",
+                    ).fetchall():
+                        delivery_id = hashlib.sha256(
+                            f"event-delivery:migrated:{event.event_id}:{sink['sink_id']}".encode("utf-8"),
+                        ).hexdigest()
+                        connection.execute(
+                            "INSERT INTO event_deliveries VALUES(?,?,?,?,?,?,?,'delivered',0,NULL,"
+                            "NULL,NULL,?,NULL,0)",
+                            (
+                                delivery_id, outbox_id, event.event_id, sink["sink_id"],
+                                int(sink["required_by_default"]), int(sink["current_config_version"]),
+                                sink["current_config_hash"], timestamp,
+                            ),
+                        )
+                    imported += 1
+                connection.execute(
+                    "INSERT INTO gateway_event_migrations VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(migration_version,source_path,source_hash) DO UPDATE SET "
+                    "event_count=excluded.event_count,imported_count=excluded.imported_count,"
+                    "conflict_count=0,status='completed',completed_at=excluded.completed_at",
+                    (
+                        migration_id, 10, str(path.resolve()), source_hash, run_id,
+                        len(parsed), imported, 0, "completed", timestamp, timestamp,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE event_sequences SET last_sequence=MAX(last_sequence,COALESCE((SELECT "
+                    "MAX(stream_sequence) FROM gateway_events WHERE stream_id=?),0)) WHERE run_id=?",
+                    (run_id, run_id),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        timestamp = now_iso()
+        connection.execute(
+            "INSERT OR IGNORE INTO gateway_event_migrations VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                hashlib.sha256(b"gateway-event-migration:v10:complete").hexdigest(),
+                10, "__legacy_gateway_jsonl_complete__", hashlib.sha256(b"").hexdigest(),
+                "__all__", 0, 0, 0, "completed", timestamp, timestamp,
+            ),
+        )
 
     def _backup_before_state_migration(self) -> None:
         if not self.database_path.exists() or self.database_path.stat().st_size == 0:
@@ -594,11 +984,16 @@ class StateController:
                 connection.commit()
                 return selected
             connection.execute(
-                "INSERT INTO agent_states VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO agent_states(run_id,revision,gateway_epoch,task_state,execution_state,"
+                "recovery_required,state_json,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                 self._state_row(state),
             )
             self._update_run_projection(connection, state)
-            self._write_event(connection, state, "state_created", {"task_state": state.task_state.value})
+            self._write_event(
+                connection, state, "state_created", {"task_state": state.task_state.value},
+                command_id=f"run:{run_id}:create", event_key="primary",
+                correlation_id=run_id,
+            )
             connection.commit()
         return state
 
@@ -657,14 +1052,22 @@ class StateController:
             connection.execute(
                 "INSERT INTO event_sequences(run_id,last_sequence) VALUES(?,0)", (run_id,),
             )
-            connection.execute("INSERT INTO agent_states VALUES(?,?,?,?,?,?,?,?)", self._state_row(state))
+            connection.execute(
+                "INSERT INTO agent_states(run_id,revision,gateway_epoch,task_state,execution_state,"
+                "recovery_required,state_json,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                self._state_row(state),
+            )
             connection.execute(
                 "INSERT INTO idempotency_records VALUES(?,?,?,?,?,?,?,?)",
                 (client_id, workload_kind.value, idempotency_key, request_hash,
                  run_id, None, timestamp, timestamp),
             )
             self._update_run_projection(connection, state)
-            self._write_event(connection, state, "state_created", {"task_state": state.task_state.value})
+            self._write_event(
+                connection, state, "state_created", {"task_state": state.task_state.value},
+                command_id=f"run:{run_id}:create", event_key="primary",
+                correlation_id=run_id,
+            )
             connection.commit()
             return state, False
 
@@ -1153,6 +1556,10 @@ class StateController:
                 state,
                 self._event_type(command),
                 self._event_payload(command, previous, state, operation, attempt, approval),
+                command_id=command.command_id,
+                event_key=command.event_key,
+                causation_id=command.causation_id,
+                correlation_id=command.correlation_id or state.run_id,
             )
             result = ApplyResult(
                 state=state, operation=operation, attempt=attempt,
@@ -1749,12 +2156,9 @@ class StateController:
         return run_id
 
     def events(self, run_id: str, after_sequence: int = 0) -> list[GatewayEventEnvelope]:
-        with self._connection() as connection:
-            rows = connection.execute(
-                "SELECT event_json FROM gateway_events WHERE run_id=? AND sequence>? ORDER BY sequence",
-                (run_id, after_sequence),
-            ).fetchall()
-        return [GatewayEventEnvelope.model_validate_json(row["event_json"], strict=True) for row in rows]
+        return EventStore(self.database_path).read_projection_stream(
+            run_id, after_sequence=after_sequence,
+        )
 
     def claim_harness_dream(
         self,
@@ -2255,11 +2659,42 @@ class StateController:
         with self._connection() as connection:
             quick_check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
             outbox = int(connection.execute(
-                "SELECT COUNT(*) FROM event_outbox WHERE delivered_at IS NULL",
+                "SELECT COUNT(*) FROM event_outbox WHERE completed_at IS NULL",
             ).fetchone()[0])
             dead_letters = int(connection.execute(
-                "SELECT COUNT(*) FROM event_outbox WHERE "
-                "eventbus_dead_letter_at IS NOT NULL OR jsonl_dead_letter_at IS NOT NULL",
+                "SELECT COUNT(*) FROM event_deliveries WHERE status='dead_lettered'",
+            ).fetchone()[0])
+            hot_count, hot_bytes, oldest_hot = connection.execute(
+                "SELECT COUNT(*),COALESCE(SUM(LENGTH(CAST(canonical_event_json AS BLOB))),0),"
+                "MIN(occurred_at) FROM gateway_events WHERE storage_tier='hot'",
+            ).fetchone()
+            archive_count, archived_events, oldest_archive = connection.execute(
+                "SELECT COUNT(*),COALESCE(SUM(event_count),0),MIN(created_at) "
+                "FROM gateway_event_archives WHERE status='verified'",
+            ).fetchone()
+            archive_paths = [Path(str(row[0])) for row in connection.execute(
+                "SELECT archive_path FROM gateway_event_archives WHERE status='verified'",
+            ).fetchall()]
+            archive_failures = int(connection.execute(
+                "SELECT COUNT(*) FROM gateway_event_archives "
+                "WHERE status IN ('failed','recovery_required')",
+            ).fetchone()[0])
+            retrying = int(connection.execute(
+                "SELECT COUNT(*) FROM event_deliveries WHERE status='retrying'",
+            ).fetchone()[0])
+            attempt_failures = int(connection.execute(
+                "SELECT COUNT(*) FROM event_delivery_attempts WHERE status='failed'",
+            ).fetchone()[0])
+            attempt_interrupted = int(connection.execute(
+                "SELECT COUNT(*) FROM event_delivery_attempts WHERE status='interrupted'",
+            ).fetchone()[0])
+            consumer_lag = int(connection.execute(
+                "SELECT COALESCE(MAX((SELECT COALESCE(MAX(e.stream_sequence),0) "
+                "FROM gateway_events e WHERE e.stream_id=c.stream_id)-c.last_sequence),0) "
+                "FROM event_consumer_cursors c",
+            ).fetchone()[0])
+            projection_lag = int(connection.execute(
+                "SELECT COUNT(*) FROM event_deliveries WHERE sink_id='jsonl' AND status!='delivered'",
             ).fetchone()[0])
             recovery = int(connection.execute(
                 "SELECT COUNT(*) FROM agent_states WHERE task_state='recovery_required'",
@@ -2299,6 +2734,20 @@ class StateController:
             "sqlite_quick_check": quick_check,
             "outbox_backlog": outbox,
             "outbox_dead_letters": dead_letters,
+            "gateway_event_hot_count": int(hot_count),
+            "gateway_event_hot_bytes": int(hot_bytes),
+            "oldest_hot_event_at": oldest_hot,
+            "archive_count": int(archive_count),
+            "archived_event_count": int(archived_events),
+            "archive_bytes": sum(path.stat().st_size for path in archive_paths if path.exists()),
+            "oldest_archive_at": oldest_archive,
+            "archive_verification_failures": archive_failures,
+            "delivery_retrying": retrying,
+            "delivery_dead_lettered": dead_letters,
+            "delivery_attempt_failures": attempt_failures,
+            "delivery_attempt_interrupted": attempt_interrupted,
+            "consumer_lag": consumer_lag,
+            "projection_lag": projection_lag,
             "recovery_required": recovery,
             "pending_approvals": pending,
             "expired_approvals": expired,
@@ -2323,21 +2772,13 @@ class StateController:
             transitions = connection.execute(
                 "DELETE FROM state_transitions WHERE created_at<?", (history_before,),
             ).rowcount
-            # Only fully delivered rows may be removed; dead letters remain until
-            # an operator resolves them.
-            removable = connection.execute(
-                "SELECT event_id FROM event_outbox WHERE delivered_at IS NOT NULL "
-                "AND delivered_at<?", (history_before,),
-            ).fetchall()
-            event_ids = [str(row["event_id"]) for row in removable]
-            for event_id in event_ids:
-                connection.execute("DELETE FROM event_outbox WHERE event_id=?", (event_id,))
-                connection.execute("DELETE FROM gateway_events WHERE event_id=?", (event_id,))
+            # Canonical events and delivery evidence are not ordinary cache data.
+            # Hot bodies may only be released by the verified Archive protocol.
             connection.commit()
         return {
             "idempotency_records": int(idempotency),
             "state_transitions": int(transitions),
-            "gateway_events": len(event_ids),
+            "gateway_events": 0,
         }
 
     def _apply_transition(self, state: AgentState, command: TransitionCommand, timestamp: str) -> AgentState:
@@ -3089,6 +3530,12 @@ class StateController:
         state: AgentState,
         event_type: str,
         payload: dict[str, Any],
+        *,
+        command_id: str | None = None,
+        event_key: str = "primary",
+        schema_version: int = 1,
+        causation_id: str | None = None,
+        correlation_id: str | None = None,
     ) -> GatewayEventEnvelope:
         row = connection.execute(
             "SELECT last_sequence FROM event_sequences WHERE run_id=?", (state.run_id,),
@@ -3103,23 +3550,98 @@ class StateController:
         connection.execute(
             "UPDATE event_sequences SET last_sequence=? WHERE run_id=?", (sequence, state.run_id),
         )
+        timestamp = now_iso()
+        sanitized_payload = AuditSanitizer.sanitize(payload)
+        payload_hash = sha256_text(canonical_json(sanitized_payload))
+        selected_command_id = command_id or hashlib.sha256(
+            (
+                f"domain-event:v2\n{state.run_id}\n{event_type}\n"
+                f"{canonical_json(sanitized_payload)}"
+            ).encode("utf-8"),
+        ).hexdigest()
+        event_id = hashlib.sha256(
+            f"gateway-event:v2\n{selected_command_id}\n{event_key}\n{state.run_id}".encode("utf-8"),
+        ).hexdigest()
+        selected_correlation_id = correlation_id
+        if selected_correlation_id is None and state.parent_run_id:
+            parent = connection.execute(
+                "SELECT correlation_id FROM gateway_events WHERE stream_id=? "
+                "ORDER BY stream_sequence LIMIT 1",
+                (state.parent_run_id,),
+            ).fetchone()
+            selected_correlation_id = (
+                str(parent["correlation_id"])
+                if parent is not None and parent["correlation_id"]
+                else state.parent_run_id
+            )
+        selected_correlation_id = selected_correlation_id or state.run_id
         event = GatewayEventEnvelope(
-            event_id=uuid4().hex,
+            version=2,
+            event_id=event_id,
             sequence=sequence,
-            timestamp=now_iso(),
+            timestamp=timestamp,
             project_id=state.project_id,
             session_id=state.session_id,
             run_id=state.run_id,
             type=event_type,
-            payload=AuditSanitizer.sanitize(payload),
+            payload=sanitized_payload,
+            command_id=selected_command_id,
+            event_key=event_key,
+            stream_id=state.run_id,
+            stream_sequence=sequence,
+            event_type=event_type,
+            schema_version=schema_version,
+            causation_id=causation_id,
+            correlation_id=selected_correlation_id,
+            payload_hash=payload_hash,
+        )
+        canonical_event_json = canonical_json(event.model_dump(mode="json"))
+        canonical_hash = sha256_text(canonical_event_json)
+        connection.execute(
+            "INSERT INTO gateway_events(event_id,command_id,event_key,stream_id,stream_sequence,"
+            "event_type,envelope_version,schema_version,occurred_at,run_id,session_id,causation_id,"
+            "correlation_id,canonical_event_json,payload_hash,canonical_hash,storage_tier,archive_id,revision) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'hot',NULL,0)",
+            (
+                event.event_id, selected_command_id, event.event_key, state.run_id, sequence,
+                event_type, 2, schema_version, timestamp, state.run_id, state.session_id,
+                causation_id, event.correlation_id, canonical_event_json, payload_hash, canonical_hash,
+            ),
+        )
+        outbox_id = hashlib.sha256(f"event-outbox:v2:{event.event_id}".encode("utf-8")).hexdigest()
+        connection.execute(
+            "INSERT INTO event_outbox(outbox_id,event_id,created_at,completed_at,revision) "
+            "VALUES(?,?,?,NULL,0)",
+            (outbox_id, event.event_id, timestamp),
+        )
+        # Delivery policy is snapshotted with the event.  Later event_sinks changes
+        # never reinterpret completion requirements for an existing outbox row.
+        sinks = connection.execute(
+            "SELECT * FROM event_sinks WHERE enabled=1 ORDER BY sink_id",
+        ).fetchall()
+        for sink in sinks:
+            delivery_id = hashlib.sha256(
+                f"event-delivery:v2:{event.event_id}:{sink['sink_id']}".encode("utf-8"),
+            ).hexdigest()
+            connection.execute(
+                "INSERT INTO event_deliveries(delivery_id,outbox_id,event_id,sink_id,required,"
+                "sink_config_version,sink_config_hash,status,attempt_count,next_retry_at,"
+                "last_error_type,last_error,delivered_at,dead_lettered_at,revision) "
+                "VALUES(?,?,?,?,?,?,?,'pending',0,NULL,NULL,NULL,NULL,NULL,0)",
+                (
+                    delivery_id, outbox_id, event.event_id, sink["sink_id"],
+                    int(sink["required_by_default"]), int(sink["current_config_version"]),
+                    sink["current_config_hash"],
+                ),
+            )
+        connection.execute(
+            "UPDATE event_outbox SET completed_at=?,revision=revision+1 WHERE outbox_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM event_deliveries WHERE outbox_id=? AND required=1)",
+            (timestamp, outbox_id, outbox_id),
         )
         connection.execute(
-            "INSERT INTO gateway_events VALUES(?,?,?,?,?)",
-            (event.event_id, event.run_id, event.sequence, event.model_dump_json(), event.timestamp),
-        )
-        connection.execute(
-            "INSERT INTO event_outbox(event_id,run_id,sequence,created_at,updated_at) VALUES(?,?,?,?,?)",
-            (event.event_id, event.run_id, event.sequence, event.timestamp, event.timestamp),
+            "UPDATE agent_states SET snapshot_stream_sequence=? WHERE run_id=?",
+            (sequence, state.run_id),
         )
         return event
 

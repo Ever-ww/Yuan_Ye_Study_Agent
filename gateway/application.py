@@ -53,6 +53,7 @@ from gateway.code_sessions import CodeSessionManager
 from gateway.audit import AuditSanitizer
 from gateway.events import GatewayEventBus
 from gateway.outbox import OutboxDispatcher
+from gateway.event_store import EventStore, GatewayEventArchiveScheduler, GatewayEventArchiveService
 from gateway.recovery import RecoveryCoordinator
 from gateway.state_controller import StateController
 from gateway.models import (
@@ -127,10 +128,22 @@ class GatewayApplication:
             migration_backup_path=self.store.migration_backup_path,
             write_gate=self.write_gate,
         )
+        self.event_store = EventStore(self.store.database_path)
+        self.event_archive = GatewayEventArchiveService(
+            self.store.database_path,
+            config.agent_root / ".yy" / "gateway" / "event-archives",
+        )
+        self.event_archive_scheduler = GatewayEventArchiveScheduler(
+            self.event_archive,
+            schedule=config.gateway_event_archive_schedule,
+            retention_days=config.gateway_event_hot_retention_days,
+            segment_max_events=config.gateway_event_archive_segment_max_events,
+        )
         self.outbox = OutboxDispatcher(
             self.store.database_path,
             self.store.runs_directory,
-            self.events.publish,
+            self.events.deliver_from_outbox,
+            gateway_epoch=self.gateway_epoch,
             retry_max_attempts=config.outbox_retry_max_attempts,
             retry_base_seconds=config.outbox_retry_base_seconds,
             retry_max_seconds=config.outbox_retry_max_seconds,
@@ -306,7 +319,10 @@ class GatewayApplication:
 
     async def start(self) -> None:
         self.state_controller.prune_retention()
-        await self.outbox.start()
+        # Delivery and archive evidence are reconciled before any runtime recovery
+        # may append new events.  The dispatcher itself starts only after recovery.
+        self.outbox.reconcile_startup()
+        self.event_archive.recover_preparing()
         await self.reference_embedding_worker.start()
         try:
             await self.pool.start()
@@ -315,6 +331,9 @@ class GatewayApplication:
             await self.recovery.recover()
             await self._recover_harness_dream_generations()
             await self.restart_coordinator.recover_pending()
+            await self.outbox.start()
+            if self.config.gateway_event_archive_enabled:
+                await self.event_archive_scheduler.start()
             await self.cron_scheduler.start()
             await self.dream_scheduler.start()
             await self.backup_scheduler.start()
@@ -484,6 +503,7 @@ class GatewayApplication:
 
     async def close(self) -> None:
         try:
+            await self.event_archive_scheduler.close()
             await self.restart_coordinator.close()
             await self.backup_scheduler.close()
             await self.dream_scheduler.close()
@@ -1731,8 +1751,9 @@ class GatewayApplication:
         return await self.pool.cancel(run_id)
 
     def run_events(self, run_id: str, after_sequence: int = 0):
-        events = self.state_controller.events(run_id, after_sequence)
-        return events if events else self.store.read_events(run_id, after_sequence)
+        return self.event_store.read_projection_stream(
+            run_id, after_sequence=after_sequence,
+        )
 
     async def decide_approval(self, approval_id: str, decision: ApprovalDecision) -> bool:
         approval = self.state_controller.approval(approval_id)

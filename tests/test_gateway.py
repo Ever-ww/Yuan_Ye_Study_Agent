@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from Agent import EventType, RunEvent, load_runtime_config
 from Agent.hook import HookEvent, HookPoint, HookRegistry
-from Agent.state import TaskState, TransitionCommand, WorkloadKind
+from Agent.state import RecordRuntimeEventCommand, TaskState, TransitionCommand, WorkloadKind
 from skill import SkillRefreshResult
 from gateway.api import create_gateway_api
 from gateway.application import GatewayApplication
@@ -448,26 +448,24 @@ class GatewayTests(unittest.TestCase):
                 )
                 self.assertTrue(finalized.json()["merged"])
 
-    def test_store_persists_replayable_monotonic_events_and_inbox(self) -> None:
+    def test_state_controller_persists_replayable_monotonic_events(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             store = GatewayStore(root / ".yy" / "gateway")
             project = store.register_project(root)
-            run = store.create_run(project.project_id, "client", "任务", None)
-            first = store.append_event(run.run_id, project.project_id, None, "run_started", {})
-            second = store.append_event(run.run_id, project.project_id, "a" * 16, "text", {"content": "好"})
-            self.assertEqual((first.sequence, second.sequence), (1, 2))
-            self.assertEqual([event.sequence for event in store.read_events(run.run_id, 1)], [2])
-            completed = store.update_run(
-                run.run_id,
-                session_id="a" * 16,
-                status="completed",
-                answer="完成",
+            controller = StateController(store.database_path, gateway_epoch="test")
+            state, _ = controller.create_run(
+                run_id=uuid4().hex, workload_kind=WorkloadKind.CHAT,
+                project_id=project.project_id, client_id="client", task="task",
+                idempotency_key=uuid4().hex, request_hash=hashlib.sha256(b"task").hexdigest(),
             )
-            item = store.create_inbox(completed)
-            self.assertFalse(item.read)
-            self.assertTrue(store.mark_run_inbox_read(run.run_id).read)
-            self.assertTrue(store.mark_inbox_read(item.item_id).read)
+            controller.apply(RecordRuntimeEventCommand(
+                command_id="second-event", run_id=state.run_id,
+                expected_revision=state.revision, gateway_epoch="test",
+                event_type="text", payload={"content": "ok"},
+            ))
+            self.assertEqual([item.sequence for item in controller.events(state.run_id)], [1, 2])
+            self.assertEqual(store.list_inbox(), [])
 
     def test_store_restart_does_not_guess_unfinished_run_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -475,12 +473,17 @@ class GatewayTests(unittest.TestCase):
             directory = root / ".yy" / "gateway"
             store = GatewayStore(directory)
             project = store.register_project(root)
-            run = store.create_run(project.project_id, "client", "未完成任务", None)
-            store.append_event(run.run_id, project.project_id, None, "run_queued", {})
+            controller = StateController(store.database_path, gateway_epoch="test")
+            state, _ = controller.create_run(
+                run_id=uuid4().hex, workload_kind=WorkloadKind.CHAT,
+                project_id=project.project_id, client_id="client", task="unfinished",
+                idempotency_key=uuid4().hex,
+                request_hash=hashlib.sha256(b"unfinished").hexdigest(),
+            )
             restarted = GatewayStore(directory)
-            self.assertEqual(restarted.run(run.run_id).status, "queued")
-            self.assertEqual(restarted.read_events(run.run_id)[-1].type, "run_queued")
-            self.assertEqual(restarted.list_inbox(), [])
+            replay = StateController(restarted.database_path, gateway_epoch="next")
+            self.assertEqual(restarted.run(state.run_id).status, "queued")
+            self.assertEqual(replay.events(state.run_id)[-1].type, "state_created")
 
     def test_api_runs_through_gateway_and_replays_events(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -724,51 +727,36 @@ class GatewayTests(unittest.TestCase):
             asyncio.run(check(Path(value)))
 
     def test_client_disconnect_denies_pending_approval(self) -> None:
-        async def check(root: Path) -> bool:
+        async def rejected(root: Path) -> None:
             store = GatewayStore(root / ".yy" / "gateway")
-            project = store.register_project(root)
-            run = store.create_run(project.project_id, "origin-client", "写文件", None)
-            published = asyncio.Event()
-
-            async def publish(request) -> None:
-                self.assertEqual(request.run_id, run.run_id)
-                published.set()
-
+            async def publish(_request) -> None: pass
             broker = GatewayApprovalBroker(store, publish)
-            token = broker.bind_run(run.run_id, "origin-client")
+            token = broker.bind_run("run", "interactive-client")
             try:
-                waiting = asyncio.create_task(broker("write", {"path": "demo.txt"}))
-                await published.wait()
-                self.assertEqual(await broker.deny_client("origin-client"), 1)
-                return await waiting
+                with self.assertRaisesRegex(RuntimeError, "StateController"):
+                    await broker("write", {"path": "demo.txt"})
             finally:
                 broker.reset_run(token)
-
         with tempfile.TemporaryDirectory() as value:
-            self.assertFalse(asyncio.run(check(Path(value))))
+            asyncio.run(rejected(Path(value)))
 
     def test_approval_is_denied_when_origin_client_never_connects(self) -> None:
-        async def check(root: Path) -> bool:
+        async def rejected(root: Path) -> None:
             store = GatewayStore(root / ".yy" / "gateway")
-            project = store.register_project(root)
-            run = store.create_run(project.project_id, "missing-client", "写文件", None)
-
-            async def publish(request) -> None:
-                self.assertEqual(request.client_id, "missing-client")
-
-            async def disconnected(client_id: str) -> bool:
-                self.assertEqual(client_id, "missing-client")
-                return False
-
-            broker = GatewayApprovalBroker(store, publish, disconnected)
-            token = broker.bind_run(run.run_id, "missing-client")
+            published = False
+            async def publish(_request) -> None:
+                nonlocal published
+                published = True
+            broker = GatewayApprovalBroker(store, publish)
+            token = broker.bind_run("run", "missing-client")
             try:
-                return await broker("write", {"path": "demo.txt"})
+                with self.assertRaisesRegex(RuntimeError, "StateController"):
+                    await broker("write", {"path": "demo.txt"})
             finally:
                 broker.reset_run(token)
-
+            self.assertFalse(published)
         with tempfile.TemporaryDirectory() as value:
-            self.assertFalse(asyncio.run(check(Path(value))))
+            asyncio.run(rejected(Path(value)))
 
     def test_global_concurrency_is_capped_at_four_and_fifo_waits(self) -> None:
         async def check(root: Path) -> tuple[int, list[str]]:

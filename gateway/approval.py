@@ -63,8 +63,9 @@ class GatewayApprovalBroker:
                 return bool(await self.cron_tool_authorizer(
                     client_id.removeprefix("cron:"), tool_name,
                 ))
-            # 定时任务无人值守，危险能力不得等待或继承创建者的历史授权。
             return False
+        if self.state_controller is None:
+            raise RuntimeError("Interactive approval requires StateController durable authority")
         request = ApprovalRequest(
             approval_id=uuid4().hex,
             run_id=run_id,
@@ -76,42 +77,39 @@ class GatewayApprovalBroker:
         future = asyncio.get_running_loop().create_future()
         async with self._lock:
             self._pending[request.approval_id] = (request, future)
-        if self.state_controller is not None:
-            operation_id = current_operation_id()
-            attempt_id = current_attempt_id()
-            if operation_id is None or attempt_id is None:
-                raise RuntimeError("Durable Approval 缺少对应的 Operation")
-            operation = self.state_controller.operation(operation_id)
-            attempt = self.state_controller.current_attempt(operation_id)
-            if attempt.attempt_id != attempt_id:
-                raise RuntimeError("Durable Approval Attempt 已变化")
-            expires = (
-                datetime.now().astimezone() + timedelta(seconds=self.approval_timeout_seconds)
-            ).isoformat(timespec="seconds")
-            state = self.state_controller.state(run_id)
-            self.state_controller.apply(CreateApprovalCommand(
-                command_id=uuid4().hex,
+        operation_id = current_operation_id()
+        attempt_id = current_attempt_id()
+        if operation_id is None or attempt_id is None:
+            raise RuntimeError("Durable Approval 缺少对应的 Operation")
+        operation = self.state_controller.operation(operation_id)
+        attempt = self.state_controller.current_attempt(operation_id)
+        if attempt.attempt_id != attempt_id:
+            raise RuntimeError("Durable Approval Attempt 已变化")
+        expires = (
+            datetime.now().astimezone() + timedelta(seconds=self.approval_timeout_seconds)
+        ).isoformat(timespec="seconds")
+        state = self.state_controller.state(run_id)
+        self.state_controller.apply(CreateApprovalCommand(
+            command_id=uuid4().hex,
+            run_id=run_id,
+            expected_revision=state.revision,
+            gateway_epoch=self.state_controller.gateway_epoch,
+            approval=DurableApproval(
+                approval_id=request.approval_id,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                attempt_no=attempt.attempt_no,
+                stable_key=f"approval:{operation.stable_key}:{attempt.attempt_no}",
+                request_hash=operation.request_hash,
                 run_id=run_id,
-                expected_revision=state.revision,
-                gateway_epoch=self.state_controller.gateway_epoch,
-                approval=DurableApproval(
-                    approval_id=request.approval_id,
-                    operation_id=operation_id,
-                    attempt_id=attempt_id,
-                    attempt_no=attempt.attempt_no,
-                    stable_key=f"approval:{operation.stable_key}:{attempt.attempt_no}",
-                    request_hash=operation.request_hash,
-                    run_id=run_id,
-                    client_id=client_id,
-                    tool_name=tool_name,
-                    arguments_hash=_arguments_hash(arguments),
-                    arguments_json=_arguments_audit_json(arguments),
-                    created_at=request.created_at,
-                    expires_at=expires,
-                ),
-            ))
-        else:
-            self.store.save_approval(request)
+                client_id=client_id,
+                tool_name=tool_name,
+                arguments_hash=_arguments_hash(arguments),
+                arguments_json=_arguments_audit_json(arguments),
+                created_at=request.created_at,
+                expires_at=expires,
+            ),
+        ))
         try:
             await self.publish(request)
             if self.wait_for_client is not None and not await self.wait_for_client(client_id):
@@ -121,17 +119,14 @@ class GatewayApprovalBroker:
             try:
                 return await asyncio.wait_for(future, timeout=self.approval_timeout_seconds)
             except asyncio.TimeoutError:
-                if self.state_controller is not None:
-                    state = self.state_controller.state(run_id)
-                    self.state_controller.apply(ExpireApprovalCommand(
-                        command_id=uuid4().hex,
-                        run_id=run_id,
-                        expected_revision=state.revision,
-                        gateway_epoch=self.state_controller.gateway_epoch,
-                        approval_id=request.approval_id,
-                    ))
-                else:
-                    self.store.decide_approval(request.approval_id, False)
+                state = self.state_controller.state(run_id)
+                self.state_controller.apply(ExpireApprovalCommand(
+                    command_id=uuid4().hex,
+                    run_id=run_id,
+                    expected_revision=state.revision,
+                    gateway_epoch=self.state_controller.gateway_epoch,
+                    approval_id=request.approval_id,
+                ))
                 return False
         finally:
             # SQLite Approval 才是权威状态；任务取消或 Gateway 重启不自动拒绝。
@@ -164,7 +159,6 @@ class GatewayApprovalBroker:
                 request, future = pending
                 if request.client_id != client_id:
                     raise PermissionError("只有发起任务的客户端可以处理本次审批")
-                self.store.decide_approval(approval_id, approved)
             if future is not None and not future.done():
                 future.set_result(approved)
             return approved
@@ -191,7 +185,9 @@ class GatewayApprovalBroker:
                         reason="发起客户端断开",
                     ))
                 else:
-                    self.store.decide_approval(approval_id, False)
+                    # Constructor rejects this branch; kept only for source-compatible
+                    # type narrowing during the StateController authority migration.
+                    pass
                 if not future.done():
                     future.set_result(False)
         return len(selected)
@@ -207,7 +203,6 @@ class GatewayApprovalBroker:
         async with self._lock:
             selected = list(self._pending.items())
             for approval_id, (_, future) in selected:
-                self.store.decide_approval(approval_id, False)
                 if not future.done():
                     future.set_result(False)
 

@@ -609,6 +609,11 @@ class StateCommand(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
     command_id: str = Field(min_length=1)
+    # event_key 是同一 Command 内的稳定业务事件身份。默认 primary 保持现有
+    # “一个命令产生一个主事件”的调用方式，同时允许事务内显式写入更多事件。
+    event_key: str = Field(default="primary", min_length=1)
+    causation_id: str | None = Field(default=None, min_length=1)
+    correlation_id: str | None = Field(default=None, min_length=1)
     run_id: str = Field(min_length=1)
     expected_revision: int = Field(ge=0)
     gateway_epoch: str = Field(min_length=1)

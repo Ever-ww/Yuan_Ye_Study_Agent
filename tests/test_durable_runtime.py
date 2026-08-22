@@ -282,15 +282,17 @@ class DurableRuntimeTests(unittest.TestCase):
             dispatcher = OutboxDispatcher(
                 self.store.database_path,
                 self.store.runs_directory,
-                bus.publish,
+                bus.deliver_from_outbox,
             )
             await dispatcher.drain_once()
             with self.store._connect() as connection:
                 rows = connection.execute("SELECT * FROM event_outbox").fetchall()
+                deliveries = connection.execute(
+                    "SELECT sink_id,status FROM event_deliveries",
+                ).fetchall()
             self.assertTrue(rows)
-            self.assertTrue(all(row["eventbus_status"] == "sent" for row in rows))
-            self.assertTrue(all(row["jsonl_status"] == "sent" for row in rows))
-            self.assertTrue(all(row["delivered_at"] for row in rows))
+            self.assertTrue(all(row["status"] == "delivered" for row in deliveries))
+            self.assertTrue(all(row["completed_at"] for row in rows))
 
         asyncio.run(check())
 
@@ -307,23 +309,31 @@ class DurableRuntimeTests(unittest.TestCase):
             )
             original = dispatcher.jsonl.append_once
 
-            def fail_jsonl(event):
+            def fail_jsonl(*_args, **_kwargs):
                 raise OSError("injected jsonl failure")
 
             dispatcher.jsonl.append_once = fail_jsonl
             await dispatcher.drain_once()
             with self.store._connect() as connection:
-                first = connection.execute("SELECT * FROM event_outbox ORDER BY sequence LIMIT 1").fetchone()
-            self.assertEqual(first["eventbus_status"], "sent")
-            self.assertEqual(first["jsonl_status"], "failed")
-            self.assertIsNone(first["delivered_at"])
+                first = connection.execute(
+                    "SELECT o.completed_at,d.sink_id,d.status,d.attempt_count FROM event_outbox o "
+                    "JOIN event_deliveries d USING(event_id) ORDER BY o.created_at,d.sink_id",
+                ).fetchall()
+            by_sink = {row["sink_id"]: row for row in first}
+            self.assertEqual(by_sink["eventbus"]["status"], "delivered")
+            self.assertEqual(by_sink["jsonl"]["status"], "retrying")
+            self.assertIsNone(by_sink["jsonl"]["completed_at"])
             dispatcher.jsonl.append_once = original
             await dispatcher.drain_once()
             with self.store._connect() as connection:
-                final = connection.execute("SELECT * FROM event_outbox ORDER BY sequence LIMIT 1").fetchone()
-            self.assertEqual(final["eventbus_attempts"], 1)
-            self.assertEqual(final["jsonl_status"], "sent")
-            self.assertIsNotNone(final["delivered_at"])
+                final = connection.execute(
+                    "SELECT o.completed_at,d.sink_id,d.status,d.attempt_count FROM event_outbox o "
+                    "JOIN event_deliveries d USING(event_id) ORDER BY o.created_at,d.sink_id",
+                ).fetchall()
+            by_sink = {row["sink_id"]: row for row in final}
+            self.assertEqual(by_sink["eventbus"]["attempt_count"], 1)
+            self.assertEqual(by_sink["jsonl"]["status"], "delivered")
+            self.assertIsNotNone(by_sink["jsonl"]["completed_at"])
             self.assertEqual(len(published), 1)
 
         asyncio.run(check_jsonl_failure())

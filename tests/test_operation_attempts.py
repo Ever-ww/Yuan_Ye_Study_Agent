@@ -249,12 +249,16 @@ def test_outbox_dead_letters_only_the_failing_sink(durable, tmp_path: Path) -> N
     asyncio.run(dispatcher.drain_once())
     asyncio.run(dispatcher.drain_once())
     with controller._connection() as connection:
-        row = connection.execute(
-            "SELECT * FROM event_outbox ORDER BY sequence LIMIT 1",
-        ).fetchone()
-    assert row["eventbus_dead_letter_at"] is not None
-    assert row["jsonl_status"] == "sent"
-    assert row["delivered_at"] is None
+        rows = connection.execute(
+            "SELECT o.completed_at,d.sink_id,d.status,d.dead_lettered_at "
+            "FROM event_outbox o JOIN event_deliveries d USING(event_id) "
+            "ORDER BY o.created_at,d.sink_id",
+        ).fetchall()
+    by_sink = {row["sink_id"]: row for row in rows}
+    assert by_sink["eventbus"]["dead_lettered_at"] is not None
+    assert by_sink["eventbus"]["status"] == "dead_lettered"
+    assert by_sink["jsonl"]["status"] == "delivered"
+    assert by_sink["eventbus"]["completed_at"] is None
 
 
 def test_retryable_tool_uses_new_attempts_and_executes_until_success(durable, tmp_path: Path) -> None:

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from uuid import uuid4
 
 from Agent import RuntimeFailure, load_runtime_config
+from Agent.state import WorkloadKind
 from gateway.harness_evolution import GatewayHarnessEvolutionService
+from gateway.state_controller import StateController
 from gateway.store import GatewayStore
 from tool import default_tools
 from tools.harness_evolve import HarnessEvolveTool
@@ -77,7 +81,13 @@ class HarnessArchitectureTests(unittest.TestCase):
             )
             store = GatewayStore(agent_root / ".yy" / "gateway")
             project = store.register_project(workspace)
-            run = store.create_run(project.project_id, "client", "repair me", None)
+            controller = StateController(store.database_path, gateway_epoch="test")
+            run, _ = controller.create_run(
+                run_id=uuid4().hex, workload_kind=WorkloadKind.CHAT,
+                project_id=project.project_id, client_id="client", task="repair me",
+                idempotency_key=uuid4().hex,
+                request_hash=hashlib.sha256(b"repair me").hexdigest(),
+            )
             error = RuntimeError("captured defect")
             error.yy_failure_context = {
                 "messages": [{"role": "user", "content": "repair me"}],

@@ -15,9 +15,9 @@ ApprovalState = Literal["pending", "approved", "denied"]
 class GatewayEventEnvelope(BaseModel):
     """所有客户端共同消费的、可重放的事件信封。"""
 
-    model_config = ConfigDict(frozen=True, strict=True)
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
-    version: Literal[1] = 1
+    version: Literal[1, 2] = 1
     event_id: str = Field(min_length=1)
     sequence: int = Field(ge=1)
     timestamp: str = Field(min_length=1)
@@ -26,6 +26,17 @@ class GatewayEventEnvelope(BaseModel):
     run_id: str = Field(min_length=1)
     type: str = Field(min_length=1)
     payload: dict[str, Any] = Field(default_factory=dict)
+    # v2 canonical identity/contract fields. 旧 v1 JSON 没有这些字段，读取时
+    # 由 EventStore upcast 到内存投影，历史 canonical bytes 永远不改写。
+    command_id: str | None = None
+    event_key: str | None = None
+    stream_id: str | None = None
+    stream_sequence: int | None = Field(default=None, ge=1)
+    event_type: str | None = None
+    schema_version: int = Field(default=1, ge=1)
+    causation_id: str | None = None
+    correlation_id: str | None = None
+    payload_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class ProjectRecord(BaseModel):

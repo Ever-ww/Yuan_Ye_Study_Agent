@@ -559,7 +559,8 @@ class ExtensionRuntimeStateTests(unittest.TestCase):
             self.assertEqual(controller.events(run_id)[-1].type, "extension_hook_audit")
             with controller._connection() as connection:
                 row = connection.execute(
-                    "SELECT COUNT(*) AS value FROM event_outbox WHERE run_id=?",
+                    "SELECT COUNT(*) AS value FROM event_outbox o "
+                    "JOIN gateway_events e USING(event_id) WHERE e.run_id=?",
                     (run_id,),
                 ).fetchone()
             self.assertGreaterEqual(int(row["value"]), 2)

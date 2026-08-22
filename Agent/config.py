@@ -85,6 +85,10 @@ class RuntimeConfig(BaseModel):
     outbox_retry_base_seconds: float = Field(default=2.0, ge=0.1, le=300.0)
     outbox_retry_max_seconds: float = Field(default=900.0, ge=1.0, le=86400.0)
     outbox_dead_letter_enabled: StrictBool = True
+    gateway_event_archive_enabled: StrictBool = True
+    gateway_event_archive_schedule: str = Field(default="0 2 * * *", min_length=1, max_length=100)
+    gateway_event_hot_retention_days: StrictInt = Field(default=180, ge=1, le=3650)
+    gateway_event_archive_segment_max_events: StrictInt = Field(default=10000, ge=1, le=100000)
     cron_heartbeat_seconds: StrictInt = Field(default=60, ge=5)
     dream_enabled: StrictBool = True
     dream_schedule: str = Field(default="0 3 * * *", min_length=1, max_length=100)
@@ -158,6 +162,11 @@ class RuntimeConfig(BaseModel):
 
         if len(self.dream_schedule.split()) != 5 or not croniter.is_valid(self.dream_schedule):
             raise ValueError("dream_schedule 必须是合法的五段 Cron 表达式")
+        if (
+            len(self.gateway_event_archive_schedule.split()) != 5
+            or not croniter.is_valid(self.gateway_event_archive_schedule)
+        ):
+            raise ValueError("gateway_event_archive_schedule 必须是合法的五段 Cron 表达式")
         try:
             ZoneInfo(get_localzone_name() if self.dream_timezone == "local" else self.dream_timezone)
         except Exception as exc:

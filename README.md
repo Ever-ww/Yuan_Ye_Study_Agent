@@ -934,3 +934,28 @@ ref，但仍被活动或归档 branch ref 引用的 Git commit 不会被物理�
 交互式 Runtime 可用 `sandbox_checkpoint_history` 查看恢复点、分支生命周期和 Dream 合并记录；
 `sandbox_checkpoint_branch` 是需要统一高风险审批的管理入口，可明确重新启用或禁用某个归档分支的
 Dream 准入。两个入口都只操作隔离 Checkpoint 仓库，不修改项目 Git。
+
+## Gateway Canonical Event Store
+
+Gateway 的业务状态与事件历史统一以 SQLite 为 durable truth。所有领域命令都通过
+`StateController` 在同一个 `BEGIN IMMEDIATE` 事务中提交当前 Snapshot、不可变
+`gateway_events`、`event_outbox`、按 Sink 冻结的 `event_deliveries` 以及命令幂等证据。
+`event_id` 由 `command_id + event_key + stream_id` 确定性派生；同一个 Command 可以用不同
+`event_key` 产生多个同类型事件，而 `(command_id, event_key)` 和
+`(stream_id, stream_sequence)` 都由数据库唯一约束保护。
+
+`canonical_event_json` 是每个 Event 唯一的规范序列化。JSONL Sink 原样复制这段 UTF-8 JSON，
+EventBus 从它反序列化后投递；API、WebSocket replay 和 Projection rebuild 都通过
+`EventStore` 读取，不再把 JSONL 当作查询或 Recovery 后备。Delivery 创建时会冻结
+`required`、`sink_config_version` 和 `sink_config_hash`，Outbox 完成条件只读取这些不可变快照。
+Dispatcher 使用 Delivery revision CAS 创建唯一活跃 Attempt，物理投递失败不会重新执行业务命令。
+
+超过热保留期且满足安全条件的终态 Stream 可进入 Verified Archive。`PREPARING` 事务会先冻结精确
+member 集合；Archive Writer 只能处理这组成员。Archive 分别验证 Event 正文的
+`events_content_hash` 和不包含自身 Hash 的 `manifest_hash`，成员位置使用 UTF-8 byte offset。
+验证成功后只清空 SQLite 中的热正文，Event 索引行、Hash、Delivery 和 Attempt Evidence 永久保留。
+普通 retention 不得删除未归档 Canonical Event。
+
+权威层级固定为：Level 1 是 Run/AgentState/Operation/Attempt/Approval 与 Canonical Event；
+Level 2 是 Outbox、Delivery、Delivery Attempt、Consumer Cursor 和 Archive Evidence；Level 3 是
+JSONL、EventBus、WebSocket 与 UI Projection。Level 3 永远不能反向决定业务事实。
