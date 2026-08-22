@@ -185,6 +185,7 @@ def register_memory_callbacks(
         error = event.data.get("error")
         result = event.data.get("result")
         cancelled = bool(event.data.get("cancelled"))
+        observation_status = event.data.get("observation_status")
         content = (
             "工具执行已由用户按 Ctrl+C 终止"
             if cancelled
@@ -196,8 +197,16 @@ def register_memory_callbacks(
             tool_call_id=str(event.data.get("tool_call_id", "")),
             name=str(event.data.get("name", "")),
             content=content,
-            status="cancelled" if cancelled else "success" if error is None else "error",
+            status=(
+                str(observation_status)
+                if observation_status in {"success", "error", "cancelled", "skipped"}
+                else "cancelled" if cancelled else "success" if error is None else "error"
+            ),
             arguments=dict(event.data.get("arguments", {})),
+            record_id=(
+                str(event.data["observation_id"])
+                if event.data.get("observation_id") else None
+            ),
             audit=_audit(event),
         )
 
@@ -217,7 +226,7 @@ def register_memory_callbacks(
     registry.register(HookPoint.TURN_START, prepare_history, priority=-100)
     registry.register(HookPoint.MODEL_BEFORE, load_context, priority=-100)
     registry.register(HookPoint.MODEL_AFTER, persist_model_tool_calls, priority=100)
-    registry.register(HookPoint.TOOL_AFTER, persist_tool_result, priority=100)
+    registry.register_tool_observation_publisher(persist_tool_result, priority=100)
     registry.register(HookPoint.TURN_END, persist_answer, priority=100)
     registry.register(HookPoint.TRACE_END, clear_context_state, priority=100)
 

@@ -111,6 +111,7 @@ class ReferenceSearchTool:
     name = "reference_search"
     description = "检索全局论文资料库中的论文、可核验原文摘录与写作引用例句；支持全文和语义混合检索"
     risk = "read"
+    parallel_safe = True
     schema: dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -141,6 +142,7 @@ class ReferenceGetTool:
     name = "reference_get"
     description = "按稳定 ID 读取论文完整资料、原文摘录或写作引用例句"
     risk = "read"
+    parallel_safe = True
     schema = {
         "type": "object",
         "properties": {

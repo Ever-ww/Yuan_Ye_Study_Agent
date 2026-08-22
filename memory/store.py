@@ -6,6 +6,7 @@ import hashlib
 import os
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 from .profile import ProfileStore
 from .persistence import SessionPersistenceProjection
@@ -147,23 +148,39 @@ class MemoryStore:
         content: str,
         status: str,
         arguments: dict[str, Any],
+        record_id: str | None = None,
         audit: dict[str, object] | None = None,
     ) -> str:
         """记录工具成功结果或错误反馈。"""
         SessionPersistenceProjection.assert_no_ephemeral(arguments)
         content = SessionPersistenceProjection.strip_ephemeral(content)
         cache = self._ensure_cache(session_id)
-        record_id = self.sessions.append(session_id, "tool", content, {
+        selected_record_id = record_id or uuid4().hex
+        inserted = self.sessions.append_once(session_id, {
+            "role": "tool",
+            "content": content,
+            "record_id": selected_record_id,
             "tool_call_id": tool_call_id,
             "name": name,
             "status": status,
             "arguments": arguments,
             **(audit or {}),
         })
-        cache.append({
-            "role": "tool", "tool_call_id": tool_call_id, "name": name, "content": content,
-        })
-        return record_id
+        if inserted or not any(
+            item.get("record_id") == selected_record_id
+            or (
+                item.get("role") == "tool"
+                and item.get("tool_call_id") == tool_call_id
+                and item.get("name") == name
+                and item.get("content") == content
+            )
+            for item in cache
+        ):
+            cache.append({
+                "role": "tool", "tool_call_id": tool_call_id, "name": name,
+                "content": content, "record_id": selected_record_id,
+            })
+        return selected_record_id
 
     def record_cancellation(
         self,

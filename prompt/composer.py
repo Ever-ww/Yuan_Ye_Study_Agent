@@ -83,6 +83,11 @@ class SystemPromptComposer:
         agent = _read(self.config.agent_root / ".yy" / "agents" / "AGENT.md")
         sections = [
             skill_xml,
+            (
+                "# Tool concurrency\n"
+                "相互独立的只读工具可以在同一模型响应中一起调用；存在数据依赖时必须等待前一个结果。"
+                "不要并行规划写入、高风险或有副作用的工具。"
+            ),
             "# Agent 身份（SOUL）\n" + soul,
             (
                 "# Skill 使用策略\n"

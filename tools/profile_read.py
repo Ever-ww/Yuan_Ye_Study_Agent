@@ -13,6 +13,7 @@ class ProfileReadTool:
     name = "profile_read"
     description = "读取全局长期记忆中的指定 Profile Markdown，例如 RESEARCH、USER 或 OTHERS"
     risk = "read"
+    parallel_safe = True
     schema: dict[str, Any] = {
         "type": "object",
         "properties": {

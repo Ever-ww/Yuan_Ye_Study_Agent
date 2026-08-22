@@ -18,6 +18,8 @@ class EventType(str, Enum):
     MODEL_RETRY = "model_retry"
     MODEL_RECONNECTED = "model_reconnected"
     TOOL_REQUESTED = "tool_requested"
+    TOOL_BATCH_STARTED = "tool_batch_started"
+    TOOL_BATCH_COMPLETED = "tool_batch_completed"
     APPROVAL_REQUESTED = "approval_requested"
     TOOL_COMPLETED = "tool_completed"
     GATEWAY_RESTART_REQUIRED = "gateway_restart_required"

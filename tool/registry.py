@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import inspect
+from dataclasses import dataclass
 from typing import Annotated, Any, Awaitable, Callable, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
@@ -16,6 +17,34 @@ from .errors import ToolRequestError
 
 _STATIC_RISKS = {"read", "write", "high"}
 _ALL_RISKS = {*_STATIC_RISKS, "dynamic"}
+
+
+def _idempotency_name(value: object) -> str:
+    """Return the stable contract value for string- or Enum-based declarations."""
+    return str(getattr(value, "value", value)).strip().lower()
+
+
+@dataclass(frozen=True)
+class PreparedToolInvocation:
+    """Validated Tool request before approval, ledger creation and execution."""
+
+    tool: AsyncTool
+    name: str
+    arguments: dict[str, Any]
+    risk: ToolRisk
+    idempotency: str
+    approval_required: bool
+    parallel_safe: bool
+    tool_call_id: str
+
+
+@dataclass(frozen=True)
+class ToolExecutionResult:
+    """Tool body result plus its Durable identity."""
+
+    result: str
+    operation_id: str | None = None
+    attempt_id: str | None = None
 
 
 class AsyncToolRegistry:
@@ -69,7 +98,8 @@ class AsyncToolRegistry:
             name: {
                 "schema": tool.schema,
                 "risk": tool.risk,
-                "idempotency": str(getattr(tool, "idempotency", "PURE")),
+                "idempotency": _idempotency_name(getattr(tool, "idempotency", "PURE")),
+                "parallel_safe": bool(getattr(tool, "parallel_safe", False)),
                 "delegatable": bool(getattr(tool, "delegatable", True)),
                 "extension_preapproval": bool(getattr(tool, "extension_preapproval", False)),
                 "runtime_profiles": list(getattr(
@@ -133,6 +163,82 @@ class AsyncToolRegistry:
             raise ValueError(f"未知工具：{name}")
         predicate = getattr(tool, "ends_turn", None)
         return bool(predicate(result)) if callable(predicate) else False
+
+    def can_end_turn(self, name: str) -> bool:
+        tool = self._tools.get(name)
+        if tool is None:
+            raise ValueError(f"Unknown tool: {name}")
+        return callable(getattr(tool, "ends_turn", None))
+
+    def prepare_invocation(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        context: ToolContext,
+        *,
+        tool_call_id: str,
+    ) -> PreparedToolInvocation:
+        """Validate one request without creating approval or Durable state."""
+        tool = self._tools.get(name)
+        if tool is None:
+            raise ValueError(f"Unknown tool: {name}")
+        if not self.is_available(name, context):
+            if name == "bash":
+                from sandbox import BashUnavailableError
+                raise BashUnavailableError(
+                    "当前 Trace 未运行 Docker 沙箱；Bash 已禁用且不会回退到宿主机 Shell",
+                )
+            raise RuntimeError(f"工具在当前执行上下文中不可用：{name}")
+        try:
+            selected = self.prepare_arguments(name, arguments)
+            selected = self._validate(name, selected)
+            ensure_available = getattr(tool, "ensure_available", None)
+            if callable(ensure_available):
+                ensure_available(selected, context)
+        except ToolRequestError:
+            raise
+        except Exception as exc:
+            try:
+                setattr(exc, "tool_request_error", True)
+            except Exception:  # pragma: no cover
+                raise ToolRequestError(str(exc) or type(exc).__name__) from exc
+            raise
+        risk = self._resolved_risk(tool, selected)
+        idempotency = _idempotency_name(getattr(
+            tool,
+            "idempotency",
+            "PURE" if risk == "read" else "NON_IDEMPOTENT",
+        ))
+        needs_approval = risk != "read"
+        approval_required = getattr(tool, "approval_required", None)
+        if needs_approval and callable(approval_required):
+            needs_approval = bool(approval_required(selected, context))
+        runtime_allowed = True
+        extension_authorization = context.extension_authorization
+        if extension_authorization is not None:
+            runtime_allowed = bool(
+                name in extension_authorization.allowed_tools
+                and self.extension_preapproval_allowed(name)
+                and extension_authorization.tool_contract_hashes.get(name)
+                == self.tool_contract_hash(name)
+            )
+        return PreparedToolInvocation(
+            tool=tool,
+            name=name,
+            arguments=selected,
+            risk=risk,
+            idempotency=idempotency,
+            approval_required=needs_approval,
+            parallel_safe=bool(
+                getattr(tool, "parallel_safe", False)
+                and risk == "read"
+                and idempotency.upper() == "PURE"
+                and not needs_approval
+                and not self.can_end_turn(name)
+                and runtime_allowed
+            ),
+            tool_call_id=tool_call_id,
+        )
 
     def risk_of(self, name: str, arguments: dict[str, Any] | None = None) -> ToolRisk:
         """返回静态或基于已校验参数计算出的动态风险等级。"""
@@ -250,6 +356,108 @@ class AsyncToolRegistry:
                 lambda: tool.run(arguments, context),
             )
         except BaseException as exc:
+            if coordinator is not None:
+                await coordinator.preexecution_failed_if_safe(operation, exc)
+            raise
+
+    async def execute_prepared(
+        self,
+        prepared: PreparedToolInvocation,
+        context: ToolContext,
+        *,
+        prepared_operation: Any | None = None,
+        manage_execution_state: bool = True,
+        tool_batch_id: str | None = None,
+        tool_call_position: int | None = None,
+    ) -> ToolExecutionResult:
+        """Execute a validated request without repeating preflight."""
+        tool = prepared.tool
+        name = prepared.name
+        arguments = prepared.arguments
+        coordinator = context.operation_coordinator
+        operation = prepared_operation
+        if coordinator is not None and operation is None:
+            operation = await coordinator.prepare(
+                tool=tool,
+                name=name,
+                arguments=arguments,
+                risk=prepared.risk,
+                context=context,
+                tool_call_id=prepared.tool_call_id,
+                tool_batch_id=tool_batch_id,
+                tool_call_position=tool_call_position,
+            )
+        elif coordinator is None and operation is not None:
+            raise RuntimeError("Prepared Durable Operation requires a coordinator")
+        try:
+            extension_authorization = context.extension_authorization
+            extension_denial: str | None = None
+            if extension_authorization is not None:
+                expected_hash = extension_authorization.tool_contract_hashes.get(name)
+                if name not in extension_authorization.allowed_tools:
+                    extension_denial = "extension_tool_not_preapproved"
+                elif not self.extension_preapproval_allowed(name):
+                    extension_denial = "tool_disallows_extension_preapproval"
+                elif expected_hash != self.tool_contract_hash(name):
+                    extension_denial = "extension_tool_contract_changed"
+                if extension_denial is not None:
+                    if coordinator is not None and operation is not None:
+                        await coordinator.skip_denied(operation, reason=extension_denial)
+                    denied = PermissionError(
+                        f"Extension Tool invocation denied: {extension_denial}"
+                    )
+                    setattr(denied, "extension_policy_denial", True)
+                    raise denied
+            if prepared.approval_required:
+                if extension_authorization is not None:
+                    approved = True
+                else:
+                    if coordinator is not None:
+                        await coordinator.waiting_human(operation)
+                    approved = bool(
+                        context.approval is not None
+                        and await context.approval(name, arguments)
+                    )
+                denied_result = None
+                if coordinator is not None and extension_authorization is None:
+                    denied_result = await coordinator.approval_decided(
+                        operation, approved=approved,
+                    )
+                if not approved and denied_result is not None:
+                    return ToolExecutionResult(
+                        result=denied_result,
+                        operation_id=operation.operation_id if operation else None,
+                        attempt_id=(
+                            coordinator.controller.current_attempt(operation.operation_id).attempt_id
+                            if coordinator is not None and operation is not None else None
+                        ),
+                    )
+                if not approved:
+                    raise PermissionError(f"工具调用未获批准：{name}")
+            if coordinator is None:
+                return ToolExecutionResult(result=str(await tool.run(arguments, context)))
+            result = await coordinator.execute(
+                operation,
+                lambda: tool.run(arguments, context),
+                manage_execution_state=manage_execution_state,
+            )
+            attempt = coordinator.controller.current_attempt(operation.operation_id)
+            return ToolExecutionResult(
+                result=result,
+                operation_id=operation.operation_id,
+                attempt_id=attempt.attempt_id,
+            )
+        except BaseException as exc:
+            if operation is not None:
+                try:
+                    setattr(exc, "durable_operation_id", operation.operation_id)
+                    setattr(
+                        exc,
+                        "durable_attempt_id",
+                        coordinator.controller.current_attempt(operation.operation_id).attempt_id,
+                    )
+                except Exception:
+                    pass
             if coordinator is not None:
                 await coordinator.preexecution_failed_if_safe(operation, exc)
             raise

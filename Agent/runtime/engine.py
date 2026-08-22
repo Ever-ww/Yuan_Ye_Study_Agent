@@ -376,6 +376,7 @@ class AgentRuntime:
             self.hooks,
             self.config.max_steps,
             retry_policy=self.retry_policy,
+            max_parallel_tool_calls=self.config.max_parallel_tool_calls,
         )
         final_payload: dict[str, object] | None = None
         failure: BaseException | None = None

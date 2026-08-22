@@ -74,6 +74,7 @@ class WebSearchTool:
         "必须从 results 选择 URL 继续调用 web_fetch"
     )
     risk = "read"
+    parallel_safe = True
     schema: dict[str, Any] = {
         "type": "object",
         "properties": {

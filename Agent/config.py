@@ -50,6 +50,7 @@ class RuntimeConfig(BaseModel):
     proxy_url: str | None = None
     stream: StrictBool = False
     max_steps: StrictInt = Field(default=8, ge=1)
+    max_parallel_tool_calls: StrictInt = Field(default=4, ge=1, le=16)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     profile: str = Field(default="general", min_length=1)
     compression_threshold_tokens: StrictInt = Field(default=200000, ge=0)

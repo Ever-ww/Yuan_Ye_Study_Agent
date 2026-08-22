@@ -80,6 +80,7 @@ class WebFetchTool:
         "拒绝本机/内网地址、凭据 URL、二进制内容和不安全重定向"
     )
     risk = "read"
+    parallel_safe = True
     schema: dict[str, Any] = {
         "type": "object",
         "properties": {

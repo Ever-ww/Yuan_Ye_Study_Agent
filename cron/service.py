@@ -62,6 +62,9 @@ class CronService:
                 allowed_skills=previous.runtime_profile.allowed_skills if previous else (),
                 sandbox_policy=previous.runtime_profile.sandbox_policy if previous else "read_only",
                 preapproved_tools=selected,
+                max_parallel_tool_calls=(
+                    previous.runtime_profile.max_parallel_tool_calls if previous else 4
+                ),
                 limits=previous.runtime_profile.limits if previous else CronRuntimeProfile().limits,
             )
         return previous.runtime_profile if previous else CronRuntimeProfile()

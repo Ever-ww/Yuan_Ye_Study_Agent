@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from Agent import AgentRuntime, EventType, ExtensionCatalog, ModelRetryPolicy, RuntimeFailure, load_runtime_config
 from Agent.hook import HookRegistry
+from Agent.runtime.ephemeral import DurableIsolatedMemory
 from Agent.state import (
     BindSessionCommand,
     ExecutionOutcome,
@@ -317,7 +318,7 @@ class RuntimePool:
         runtime: AgentRuntime | None = None
         operation_token = None
         answer = ""
-        stateless_cron = original.client_id.startswith("cron:")
+        isolated_cron = original.client_id.startswith("cron:")
         session_key: tuple[str, str] | None = (
             (original.project_id, original.session_id) if original.session_id else None
         )
@@ -353,9 +354,9 @@ class RuntimePool:
                     async for event in runtime.run_task(current.task, current.session_id):
                         if event.type is EventType.STARTED:
                             session_id = str(event.payload["session_id"])
-                            if stateless_cron:
+                            if isolated_cron:
                                 await self._emit(
-                                    current, "cron_ephemeral_context_started",
+                                    current, "cron_durable_session_started",
                                     {"session_id": session_id, "persisted": True, "origin": "cron"},
                                 )
                                 continue
@@ -446,7 +447,7 @@ class RuntimePool:
                 entry = self._runtimes.get(session_key)
                 if entry is not None:
                     entry.last_used = monotonic()
-            if runtime is not None and stateless_cron:
+            if runtime is not None and isolated_cron:
                 await runtime.close()
             if session_key is not None:
                 await self.session_reservations.release_owner(original.run_id)
@@ -545,6 +546,20 @@ class RuntimePool:
             allowed_tools = tuple(profile.get("allowed_tools", ())) if isinstance(profile, dict) else ()
             # Cron starts from a deny-all surface. A durable snapshot selects tools.
             runtime.tools = runtime.tools.select(allowed_tools)
+            if isinstance(profile, dict):
+                requested_parallelism = profile.get("max_parallel_tool_calls", 4)
+                if isinstance(requested_parallelism, int) and not isinstance(
+                    requested_parallelism, bool,
+                ):
+                    runtime.config = runtime.config.model_copy(update={
+                        "max_parallel_tool_calls": max(
+                            1,
+                            min(
+                                runtime.config.max_parallel_tool_calls,
+                                requested_parallelism,
+                            ),
+                        ),
+                    })
         if (
             self.harness_evolution_service is not None
             and not run.client_id.startswith("cron:")
@@ -594,7 +609,7 @@ class RuntimePool:
             config = config.model_copy(update={"stream": False, "compression_threshold_tokens": 0})
             skills = SkillService(config.agent_root, workspace, config.coding_source_root)
             # A Cron dispatch has a fresh durable Session but never restores another Session.
-            memory = MemoryStore(
+            memory = DurableIsolatedMemory(
                 config.memory_dir,
                 workspace_root=config.workspace_root,
                 agent_root=config.agent_root,

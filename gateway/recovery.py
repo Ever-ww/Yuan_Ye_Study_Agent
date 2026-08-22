@@ -130,6 +130,39 @@ class RecoveryCoordinator:
         return counts
 
     def _recover_acting(self, run_id: str) -> bool:
+        active = [
+            operation for operation in self.controller.operations(run_id)
+            if operation.status in {
+                OperationStatus.PREPARED,
+                OperationStatus.RUNNING,
+                OperationStatus.UNKNOWN,
+            }
+        ]
+        if len(active) > 1 or any(item.tool_batch_id for item in active):
+            for operation in active:
+                attempt = self.controller.current_attempt(operation.operation_id)
+                if operation.side_effecting or attempt.status is OperationStatus.UNKNOWN:
+                    self._require_recovery(
+                        run_id,
+                        "Parallel Tool recovery found an unknown or side-effecting Attempt",
+                    )
+                    return False
+                if attempt.status in {OperationStatus.PREPARED, OperationStatus.RUNNING}:
+                    state = self.controller.state(run_id)
+                    self.controller.apply(AbandonOperationAttemptCommand(
+                        command_id=f"recovery:parallel-tool:{attempt.attempt_id}:abandon",
+                        run_id=run_id,
+                        expected_revision=state.revision,
+                        gateway_epoch=self.controller.gateway_epoch,
+                        attempt_id=attempt.attempt_id,
+                        abandonment_reason="Gateway restarted during a PURE Tool batch",
+                    ))
+            self._transition(
+                run_id,
+                execution=ExecutionState.OBSERVING,
+                reason="All interrupted parallel Tool Attempts were PURE and safely abandoned",
+            )
+            return True
         state = self.controller.state(run_id)
         operation = (
             self.controller.operation(state.current_operation_id)

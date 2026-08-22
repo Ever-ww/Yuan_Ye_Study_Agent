@@ -283,7 +283,23 @@ class CronStore:
 
     async def due_materialize(self, job: CronJob, dispatches: list[CronDispatch], next_run_at: str | None, *, now: str) -> None:
         """Atomically append scheduled dispatches and move the job's materialization cursor."""
-        updated = job.model_copy(update={"next_run_at": next_run_at, "updated_at": now, "revision": job.revision + 1})
+        missed = sum(
+            dispatch.coalesced_count
+            for dispatch in dispatches
+            if dispatch.status == "skipped"
+        )
+        overlap_skipped = sum(
+            dispatch.coalesced_count
+            for dispatch in dispatches
+            if dispatch.status == "skipped" and dispatch.error == "overlap_skipped"
+        )
+        updated = job.model_copy(update={
+            "next_run_at": next_run_at,
+            "missed_count": job.missed_count + missed,
+            "overlap_skipped": job.overlap_skipped + overlap_skipped,
+            "updated_at": now,
+            "revision": job.revision + 1,
+        })
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT revision FROM cron_jobs WHERE job_id=?", (job.job_id,)).fetchone()

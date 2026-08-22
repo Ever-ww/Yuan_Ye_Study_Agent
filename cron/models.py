@@ -76,6 +76,7 @@ class CronRuntimeProfile(BaseModel):
     allowed_skills: tuple[str, ...] = ()
     sandbox_policy: SandboxPolicy = "read_only"
     preapproved_tools: tuple[str, ...] = ()
+    max_parallel_tool_calls: int = Field(default=4, ge=1, le=16)
     limits: CronResourceLimits = Field(default_factory=CronResourceLimits)
 
     @model_validator(mode="after")

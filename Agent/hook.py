@@ -148,6 +148,7 @@ class HookRegistry:
 
     def __init__(self, executor: HookExecutor | None = None) -> None:
         self._callbacks: dict[HookPoint, list[HookRegistration]] = defaultdict(list)
+        self._tool_observation_publishers: list[HookRegistration] = []
         self._order = 0
         self._executor = executor or HookExecutor()
 
@@ -196,6 +197,31 @@ class HookRegistry:
             key=lambda item: (item.priority, item.order),
         )
         for registration in registrations:
+            await self._executor.execute(registration, event)
+        return event
+
+    def register_tool_observation_publisher(
+        self, callback: HookCallback, *, priority: int = 0,
+    ) -> HookCallback:
+        """Register an internal ordered persistence callback, not an Extension Hook point."""
+        registration = HookRegistration(
+            priority=priority,
+            order=self._order,
+            callback=callback,
+            identity=getattr(callback, "__name__", type(callback).__name__),
+            origin=HookOrigin.CORE,
+            failure_mode=HookFailureMode.FAIL_CLOSED,
+            timeout_seconds=30.0,
+        )
+        self._order += 1
+        self._tool_observation_publishers.append(registration)
+        return callback
+
+    async def publish_tool_observation(self, event: HookEvent) -> HookEvent:
+        for registration in sorted(
+            self._tool_observation_publishers,
+            key=lambda item: (item.priority, item.order),
+        ):
             await self._executor.execute(registration, event)
         return event
 

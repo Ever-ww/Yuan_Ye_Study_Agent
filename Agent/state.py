@@ -321,6 +321,8 @@ class ImmutableOperationMetadata(BaseModel):
     logical_model_call_id: str | None = None
     source_model_call_id: str | None = None
     tool_call_id: str | None = None
+    tool_batch_id: str | None = None
+    tool_call_position: int | None = Field(default=None, ge=0)
     external_idempotency_key: str | None = None
 
 
@@ -377,6 +379,35 @@ class OperationAttempt(BaseModel):
         if self.status is not OperationStatus.ABANDONED and self.abandonment_reason is not None:
             raise ValueError("只有 ABANDONED Attempt 可以包含 abandonment_reason")
         return self
+
+
+class ToolObservationState(str, Enum):
+    MATERIALIZED = "materialized"
+    PUBLISHED = "published"
+
+
+class MaterializedToolObservation(BaseModel):
+    """Durable, ordered projection of one finalized Tool observation."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    observation_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    operation_id: str | None = None
+    attempt_id: str | None = None
+    logical_model_call_id: str = Field(min_length=1)
+    tool_call_id: str = Field(min_length=1)
+    position: int = Field(ge=0)
+    name: str = Field(min_length=1)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    status: Literal["success", "error", "cancelled", "skipped"]
+    finalized_content: str
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    state: ToolObservationState = ToolObservationState.MATERIALIZED
+    session_record_id: str | None = None
+    revision: int = Field(default=0, ge=0)
+    created_at: str
+    published_at: str | None = None
 
 
 class OperationAggregate(BaseModel):
@@ -499,6 +530,8 @@ class OperationRecord(BaseModel):
     logical_model_call_id: str | None = None
     source_model_call_id: str | None = None
     tool_call_id: str | None = None
+    tool_batch_id: str | None = None
+    tool_call_position: int | None = Field(default=None, ge=0)
     external_idempotency_key: str | None = None
     retry_policy_snapshot: RetryPolicySnapshot = Field(
         default_factory=lambda: RetryPolicySnapshot(
@@ -535,6 +568,7 @@ class OperationRecord(BaseModel):
             idempotency=self.idempotency, side_effecting=self.side_effecting,
             logical_model_call_id=self.logical_model_call_id,
             source_model_call_id=self.source_model_call_id, tool_call_id=self.tool_call_id,
+            tool_batch_id=self.tool_batch_id, tool_call_position=self.tool_call_position,
             external_idempotency_key=self.external_idempotency_key,
         )
 
@@ -697,6 +731,8 @@ class CreateOperationWithAttemptCommand(StateCommand):
     logical_model_call_id: str | None = None
     source_model_call_id: str | None = None
     tool_call_id: str | None = None
+    tool_batch_id: str | None = None
+    tool_call_position: int | None = Field(default=None, ge=0)
     model_call_id: str | None = None
     external_request_id: str | None = None
     external_idempotency_key: str | None = None
@@ -979,13 +1015,13 @@ __all__ = [
     "FinalizeTerminalCommand",
     "HeartbeatOperationAttemptCommand", "HeartbeatOperationCommand", "ImmutableOperationMetadata", "INNER_TRANSITIONS",
     "InvalidateFinalizeGenerationCommand", "MarkOperationUnknownCommand", "OperationKind", "OperationRecord", "OperationStatus",
-    "MarkOperationAttemptUnknownCommand", "OperationAggregate", "OperationAttempt", "OperationFailureKind",
+    "MarkOperationAttemptUnknownCommand", "MaterializedToolObservation", "OperationAggregate", "OperationAttempt", "OperationFailureKind",
     "OUTER_TRANSITIONS", "ReconcileOperationCommand", "ReconcileResult", "ReconcileStatus", "RecoveryDecisionCommand",
     "RecordRuntimeEventCommand", "ReconcileOperationAttemptCommand", "RequestCancellationCommand",
     "PersistenceContract", "RetryPolicySnapshot", "SafeCheckpoint", "SkipOperationAttemptCommand", "StartFinalizeGenerationCommand", "StartOperationAttemptCommand",
     "StartReplacementFinalizeGenerationCommand",
     "StartOperationCommand", "StateCommand",
-    "TaskState", "TerminalTarget", "ToolIdempotency", "TransitionCommand",
+    "TaskState", "TerminalTarget", "ToolIdempotency", "ToolObservationState", "TransitionCommand",
     "UpdateStateMetadataCommand", "UpgradePersistenceContractCommand", "WorkloadKind", "is_runnable", "projected_run_status",
     "reduce_operation", "validate_inner_transition", "validate_outer_transition",
 ]

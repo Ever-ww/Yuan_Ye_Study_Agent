@@ -17,6 +17,7 @@ class SearchWorkspaceTool:
         "required": ["query"],
     }
     risk = "read"
+    parallel_safe = True
     _excluded_directories = {".git", ".yy", ".venv", "__pycache__"}
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> str:

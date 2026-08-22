@@ -14,6 +14,7 @@ class CurrentTimeTool:
     description = "获取当前本地时间"
     schema: dict[str, Any] = {"type": "object", "properties": {}}
     risk = "read"
+    parallel_safe = True
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> str:
         return datetime.now().astimezone().isoformat(timespec="seconds")

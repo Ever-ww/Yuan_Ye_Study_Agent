@@ -1631,7 +1631,20 @@ class GatewayApplication:
         job = await self.cron_service.get(dispatch.job_id)
         run_id = hashlib.sha256(f"cron-run:{dispatch.dispatch_id}".encode()).hexdigest()[:32]
         session_id = hashlib.sha256(f"cron-session:{dispatch.dispatch_id}".encode()).hexdigest()[:16]
-        self.store.project(job.project_id)
+        project = self.store.project(job.project_id)
+        # A Cron Run is born with a deterministic, durable Session identity.
+        # Materialize the file-backed Session before Runtime admission so the
+        # Memory TRACE_START hook can restore it instead of treating the
+        # pre-bound identity as a missing interactive Session.  A crash here is
+        # safe: reconcile reuses the same deterministic id and the orphan has no
+        # execution side effect.
+        memory = MemoryStore(
+            self.config.memory_dir,
+            workspace_root=Path(project.path),
+            agent_root=self.config.agent_root,
+        )
+        if not memory.has_session(session_id):
+            memory.create_session("", session_id=session_id)
         state, duplicate = self.state_controller.create_run(
             run_id=run_id,
             workload_kind=WorkloadKind.CRON,

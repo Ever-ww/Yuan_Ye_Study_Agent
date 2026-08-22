@@ -14,14 +14,13 @@ from cron import (
     CronScheduleCalculator,
     CronScheduler,
     CronService,
-    CronState,
     CronStore,
 )
 from tool import AsyncToolRegistry
 from tools import CronJobTool
 from Agent import RuntimeConfig
 from Agent import AgentRuntime
-from Agent.runtime.ephemeral import EphemeralMemory
+from Agent.contracts import ModelReply
 from Agent.state import PersistenceContract
 from bootstrap import initialize_project
 from gateway.api import create_gateway_api
@@ -29,6 +28,7 @@ from gateway.application import GatewayApplication
 from gateway.approval import GatewayApprovalBroker
 from gateway.store import GatewayStore
 from gateway.models import RunRecord
+from memory import MemoryStore
 from run_ui.cli import _handle_cron_command, _parse_interval
 
 
@@ -104,7 +104,8 @@ class CronStoreServiceTests(unittest.IsolatedAsyncioTestCase):
         self.temp.cleanup()
 
     async def test_initializes_and_manages_jobs(self) -> None:
-        self.assertTrue((self.root / ".yy" / "cron" / "jobs.json").is_file())
+        self.assertTrue(self.store.database_path.is_file())
+        self.assertFalse(self.store.path.exists())
         job = await self.service.create(CronJobCreateRequest(
             project_id="project",
             name="daily report",
@@ -116,20 +117,24 @@ class CronStoreServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.service.resume(job.job_id)).state, "scheduled")
         before_trigger = (await self.service.get(job.job_id)).next_run_at
         triggered = await self.service.trigger(job.job_id)
-        self.assertTrue(triggered.manual_run_requested)
         self.assertEqual(triggered.next_run_at, before_trigger)
-        await self.store.mutate(lambda state: setattr(
-            state.jobs[job.job_id], "manual_run_requested", False,
-        ))
+        history = await self.service.history(job.job_id)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].trigger, "run_now")
+        self.assertEqual(history[0].status, "pending")
         removed = await self.service.remove(job.job_id)
-        self.assertEqual(removed.job_id, job.job_id)
+        self.assertEqual(removed.state, "deleted")
+        self.assertEqual((await self.service.history(job.job_id))[0].status, "cancelled")
 
     async def test_corrupt_json_is_unhealthy_without_replacement(self) -> None:
-        self.store.path.write_text("{broken", encoding="utf-8")
-        status = await self.service.status()
+        legacy_root = self.root / "legacy-corrupt"
+        legacy_store = CronStore(legacy_root)
+        legacy_store.path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store.path.write_text("{broken", encoding="utf-8")
+        status = await CronService(legacy_store).status()
         self.assertFalse(status.healthy)
-        self.assertIn("损坏", status.last_error or "")
-        self.assertEqual(self.store.path.read_text(encoding="utf-8"), "{broken")
+        self.assertIn("legacy jobs.json invalid", status.last_error or "")
+        self.assertEqual(legacy_store.path.read_text(encoding="utf-8"), "{broken")
 
     async def test_paper_research_preset_is_idempotent_and_persisted(self) -> None:
         first = await self.service.ensure_paper_research_preset(
@@ -147,8 +152,10 @@ class CronStoreServiceTests(unittest.IsolatedAsyncioTestCase):
             first.preapproved_tools,
             ("paper_library_download", "paper_library_save", "reference_write"),
         )
-        self.assertEqual(len((await self.store.load()).jobs), 1)
-        self.assertIn(first.job_id, self.store.path.read_text(encoding="utf-8"))
+        jobs = await self.store.jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].job_id, first.job_id)
+        self.assertFalse(self.store.path.exists())
 
     async def test_cron_preapproval_rejects_recursive_and_self_modifying_tools(self) -> None:
         with self.assertRaisesRegex(ValueError, "harness_evolve"):
@@ -231,21 +238,24 @@ class CronSchedulerTests(unittest.IsolatedAsyncioTestCase):
         await self.store.ensure()
         self.now = datetime(2026, 8, 3, 0, 0, tzinfo=timezone.utc)
         self.submitted: list[tuple[str, str]] = []
-        self.runs: dict[str, SimpleNamespace] = {}
 
-        async def submit(job, run_id):
-            self.submitted.append((job.job_id, run_id))
-            self.runs[run_id] = SimpleNamespace(
-                status="queued", session_id=None, error=None, finished_at=None,
+        async def submit(dispatch):
+            run_id = f"run-{dispatch.dispatch_id}"
+            self.submitted.append((dispatch.job_id, run_id))
+            await self.store.bind_running(
+                dispatch.dispatch_id,
+                claim_token=str(dispatch.claim_token),
+                session_id=f"session-{dispatch.dispatch_id}",
+                run_id=run_id,
+                operation_id=f"operation-{dispatch.dispatch_id}",
+                attempt_id=f"attempt-{dispatch.dispatch_id}",
             )
 
-        def lookup(run_id):
-            if run_id not in self.runs:
-                raise KeyError(run_id)
-            return self.runs[run_id]
-
         self.scheduler = CronScheduler(
-            self.store, submit, lookup, clock=lambda: self.now,
+            self.store,
+            submit,
+            gateway_epoch=lambda: "test-gateway-epoch",
+            clock=lambda: self.now,
         )
 
     async def asyncTearDown(self) -> None:
@@ -260,19 +270,20 @@ class CronSchedulerTests(unittest.IsolatedAsyncioTestCase):
             schedule=CronSchedule(kind="interval", interval_seconds=interval),
         ))
 
-        def due(state: CronState) -> None:
-            state.jobs[job.job_id] = state.jobs[job.job_id].model_copy(update={
-                "next_run_at": (self.now - timedelta(minutes=30)).isoformat().replace("+00:00", "Z"),
-            })
-        await self.store.mutate(due)
-        return job
+        current = await self.store.job(job.job_id)
+        due = current.model_copy(update={
+            "next_run_at": (self.now - timedelta(minutes=30)).isoformat().replace("+00:00", "Z"),
+            "revision": current.revision + 1,
+        })
+        await self.store.save_job(due, expected_revision=current.revision)
+        return due
 
     async def test_due_job_runs_once_and_advances_beyond_now(self) -> None:
         job = await self._add_due()
         runs = await self.scheduler.tick()
         self.assertEqual(len(runs), 1)
-        current = (await self.store.load()).jobs[job.job_id]
-        self.assertEqual(current.active_run_id, runs[0])
+        current = await self.store.job(job.job_id)
+        self.assertEqual(current.current_run_id, runs[0])
         self.assertGreater(datetime.fromisoformat(current.next_run_at.replace("Z", "+00:00")), self.now)
         await self.scheduler.tick()
         self.assertEqual(len(self.submitted), 1)
@@ -280,32 +291,35 @@ class CronSchedulerTests(unittest.IsolatedAsyncioTestCase):
     async def test_overlap_is_skipped_and_terminal_run_is_settled(self) -> None:
         job = await self._add_due()
         run_id = (await self.scheduler.tick())[0]
-        current = (await self.store.load()).jobs[job.job_id]
-
-        def make_due(state: CronState) -> None:
-            state.jobs[job.job_id] = current.model_copy(update={
-                "next_run_at": (self.now - timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
-            })
-        await self.store.mutate(make_due)
+        current = await self.store.job(job.job_id)
+        due = current.model_copy(update={
+            "next_run_at": (self.now - timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+            "revision": current.revision + 1,
+        })
+        await self.store.save_job(due, expected_revision=current.revision)
         await self.scheduler.tick()
-        skipped = (await self.store.load()).jobs[job.job_id]
-        self.assertEqual(skipped.skipped_overlap_count, 1)
+        skipped = await self.store.job(job.job_id)
+        self.assertEqual(skipped.overlap_skipped, 1)
         self.assertEqual(len(self.submitted), 1)
 
-        self.runs[run_id] = SimpleNamespace(
-            status="completed", session_id=None, error=None,
-            finished_at=self.now.isoformat().replace("+00:00", "Z"),
+        running = await self.store.dispatch_by_run_id(run_id)
+        await self.store.mark_terminal(
+            running.dispatch_id,
+            status="succeeded",
+            result="done",
+            error=None,
+            completed_at=self.now.isoformat().replace("+00:00", "Z"),
         )
-        await self.scheduler.tick()
-        settled = (await self.store.load()).jobs[job.job_id]
-        self.assertIsNone(settled.active_run_id)
+        settled = await self.store.job(job.job_id)
+        self.assertIsNone(settled.current_run_id)
         self.assertEqual(settled.run_count, 1)
-        self.assertIsNone(settled.last_session_id)
+        self.assertEqual(settled.last_session_id, f"session-{running.dispatch_id}")
 
-    async def test_corrupt_state_does_not_prevent_scheduler_lifecycle(self) -> None:
+    async def test_legacy_json_is_not_re_read_after_migration(self) -> None:
+        self.store.path.parent.mkdir(parents=True, exist_ok=True)
         self.store.path.write_text("not-json", encoding="utf-8")
         await self.scheduler.start()
-        self.assertIn("损坏", self.scheduler.last_error or "")
+        self.assertIsNone(self.scheduler.last_error)
         await self.scheduler.close()
 
 
@@ -339,15 +353,16 @@ class CronGatewayApiTests(unittest.TestCase):
             )
             self.assertIn("cronjob", normal_runtime.tools.names())
             self.assertNotIn("cronjob", cron_runtime.tools.names())
-            self.assertIsInstance(cron_runtime.memory, EphemeralMemory)
+            self.assertIsInstance(cron_runtime.memory, MemoryStore)
             self.assertEqual(cron_runtime.memory.prompt_context("any"), "")
-            cron_prompt = cron_runtime.prompts.system.open_session("ephemeral-check").content
-            self.assertNotIn("无记忆后台子 Agent", cron_prompt)
+            cron_runtime.memory.create_session("", session_id="c0ffee0000000001")
+            cron_prompt = cron_runtime.prompts.system.open_session("c0ffee0000000001").content
+            self.assertNotIn("无记忆 Cron", cron_prompt)
             cron_query = cron_runtime.prompts.render_provider_query(
                 "check",
-                "ephemeral-check",
+                "c0ffee0000000001",
             )
-            self.assertIn("无记忆后台子 Agent", cron_query)
+            self.assertIn("无记忆 Cron", cron_query)
             self.assertNotIn("search-summary-paper", cron_runtime.memory.prompt_context("any"))
             asyncio.run(normal_runtime.close())
             asyncio.run(cron_runtime.close())
@@ -412,7 +427,7 @@ class CronGatewayApiTests(unittest.TestCase):
 
 
 class CronGatewayRuntimeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_each_trigger_is_sessionless_and_still_creates_inbox_result(self) -> None:
+    async def test_each_dispatch_gets_a_fresh_durable_session_and_inbox_result(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             initialize_project(root)
@@ -420,15 +435,24 @@ class CronGatewayRuntimeTests(unittest.IsolatedAsyncioTestCase):
             workspace.mkdir()
             config = RuntimeConfig(agent_root=root, workspace_root=workspace)
 
+            class AnswerProvider:
+                streaming = False
+
+                async def complete(self, messages, tools):
+                    del messages, tools
+                    return ModelReply(text="scheduled result")
+
             def runtime_factory(selected_workspace, approval):
                 return AgentRuntime(
                     config.model_copy(update={"workspace_root": selected_workspace}),
+                    provider=AnswerProvider(),
                     tools=AsyncToolRegistry(),
                     approval=approval,
                     enable_sandbox=False,
                     enable_skills=False,
                     enable_context_processing=False,
                     enable_extensions=False,
+                    session_origin="cron",
                 )
 
             gateway = GatewayApplication(config, runtime_factory=runtime_factory)
@@ -441,21 +465,27 @@ class CronGatewayRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     prompt="scheduled hello",
                     schedule=CronSchedule(kind="interval", interval_seconds=3600),
                 ))
+                session_ids: set[str] = set()
                 for _ in range(2):
                     await gateway.run_cron(job.job_id)
                     run_id = (await gateway.cron_scheduler.tick())[0]
-                    for _ in range(200):
+                    for _ in range(500):
                         run = gateway.store.run(run_id)
                         if run.status in {"completed", "failed", "cancelled", "interrupted"}:
                             break
                         await asyncio.sleep(0.01)
                     self.assertEqual(run.status, "completed")
-                    self.assertIsNone(run.session_id)
+                    self.assertIsNotNone(run.session_id)
+                    session_ids.add(str(run.session_id))
                     self.assertEqual(
                         gateway.state_controller.state(run_id).persistence_contract,
-                        PersistenceContract.CONTROL_ONLY,
+                        PersistenceContract.SESSION_BACKED_WORKLOAD,
                     )
+                    dispatch = await gateway.cron_store.dispatch_by_run_id(run_id)
+                    self.assertEqual(dispatch.status, "succeeded")
+                    self.assertEqual(dispatch.session_id, run.session_id)
                     await gateway.cron_scheduler.tick()
+                self.assertEqual(len(session_ids), 2)
                 inbox_runs = {item.run_id for item in gateway.store.list_inbox()}
                 self.assertGreaterEqual(len(inbox_runs), 2)
             finally:

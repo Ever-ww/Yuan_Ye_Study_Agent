@@ -4,27 +4,51 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 import math
 import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
-from uuid import uuid4
 
 from Agent.contracts import EventType, ModelProvider, ModelReply, RunEvent, ToolCall
 from Agent.errors import AgentExecutionLimitError, AgentInvariantError
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models.errors import is_retryable_model_error
 from Agent.retry import ModelRetryPolicy
+from Agent.state import MaterializedToolObservation
 from context_process import ContextBudgetEstimate, ContextBudgetExceeded
 from memory.persistence import SessionPersistenceProjection
 from tool import (
     AsyncToolRegistry,
+    PreparedToolInvocation,
     ToolContext,
     ToolExecutionObservationError,
     ToolRequestError,
 )
+
+
+@dataclass(frozen=True)
+class _PreparedCall:
+    position: int
+    invocation: PreparedToolInvocation
+
+
+@dataclass(frozen=True)
+class _ToolOutcome:
+    position: int
+    name: str
+    arguments: dict[str, Any]
+    tool_call_id: str
+    risk: str
+    result: str | None = None
+    error: BaseException | None = None
+    operation_id: str | None = None
+    attempt_id: str | None = None
+    status: str = "success"
 
 
 class ReactLoop:
@@ -37,9 +61,11 @@ class ReactLoop:
         hooks: HookRegistry,
         max_steps: int,
         retry_policy: ModelRetryPolicy | None = None,
+        max_parallel_tool_calls: int = 4,
     ) -> None:
         self.provider, self.tools, self.hooks, self.max_steps = provider, tools, hooks, max_steps
         self.retry_policy = retry_policy or ModelRetryPolicy(max_attempts=1, delay_seconds=0)
+        self.max_parallel_tool_calls = max(1, int(max_parallel_tool_calls))
 
     async def run(
         self,
@@ -56,6 +82,7 @@ class ReactLoop:
         ephemeral_context_tokens: int | None = None
         task_started_at = time.perf_counter()
         emergency_compression_count = 0
+        used_tool_call_ids: set[str] = set()
 
         successful_steps = 0
         context_loaded = False
@@ -278,7 +305,16 @@ class ReactLoop:
                     })
                 break
 
-            reply = _ensure_tool_call_ids(reply)
+            run_id = str(during.data.get("run_id") or session_id)
+            logical_tool_call_parent = str(
+                logical_model_call_id or model_call_id or f"model-step-{successful_steps}",
+            )
+            reply = _ensure_tool_call_ids(
+                reply,
+                run_id=run_id,
+                logical_model_call_id=logical_tool_call_parent,
+                used_ids=used_tool_call_ids,
+            )
             call_metric = _model_call_metric(
                 round((time.perf_counter() - started_at) * 1000, 2),
                 estimated_context,
@@ -307,7 +343,13 @@ class ReactLoop:
                 error = AgentInvariantError("model_after 必须保留 ModelReply 类型的 reply")
                 _attach_failure_context(error, messages, schemas, model, [])
                 raise error
-            reply = _ensure_tool_call_ids(reply)
+            reply = _ensure_tool_call_ids(
+                reply,
+                run_id=run_id,
+                logical_model_call_id=logical_tool_call_parent,
+                used_ids=used_tool_call_ids,
+                reserve=True,
+            )
             if reply.text and not streamed:
                 yield RunEvent(type=EventType.TEXT, payload={
                     "content": reply.text,
@@ -321,7 +363,11 @@ class ReactLoop:
                 messages.append(_assistant_tool_message(reply))
                 terminal_tool_answer = ""
                 try:
-                    async for event in self._execute_tools(prepared_calls, messages, context, task, session_id):
+                    async for event in self._execute_tools(
+                        prepared_calls, messages, context, task, session_id,
+                        run_id=run_id,
+                        logical_model_call_id=logical_tool_call_parent,
+                    ):
                         yield event
                         if event.type is EventType.FINAL:
                             terminal_tool_answer = str(event.payload.get("answer", ""))
@@ -353,121 +399,338 @@ class ReactLoop:
         context: ToolContext,
         task: str,
         session_id: str,
+        *,
+        run_id: str,
+        logical_model_call_id: str,
     ) -> AsyncIterator[RunEvent]:
-        """在当前无编号 Turn 内执行模型请求的全部工具。"""
+        async for event in self._execute_tools_streaming(
+            calls, messages, context, task, session_id,
+            run_id=run_id,
+            logical_model_call_id=logical_model_call_id,
+        ):
+            yield event
+
+    async def _execute_tools_streaming(
+        self,
+        calls: list[tuple[ToolCall, str]],
+        messages: list[dict[str, Any]],
+        context: ToolContext,
+        task: str,
+        session_id: str,
+        *,
+        run_id: str,
+        logical_model_call_id: str,
+    ) -> AsyncIterator[RunEvent]:
+        """Stream left-to-right and flush PURE reads at each serial barrier."""
+        pending: list[_PreparedCall] = []
+        group_sequence = 0
+
+        async def publish(
+            outcome: _ToolOutcome, *, run_after: bool = True,
+        ) -> tuple[RunEvent, str]:
+            after = HookEvent(point=HookPoint.TOOL_AFTER, session_id=session_id, data={
+                "task": task,
+                "name": outcome.name,
+                "arguments": outcome.arguments,
+                "tool_call_id": outcome.tool_call_id,
+                "result": outcome.result,
+                "error": outcome.error,
+                "cancelled": outcome.status == "cancelled",
+                "operation_id": outcome.operation_id,
+                "attempt_id": outcome.attempt_id,
+            })
+            if run_after:
+                await self.hooks.emit(after)
+            if outcome.status == "skipped":
+                content, status = str(outcome.result or "工具未执行"), "skipped"
+            elif outcome.error is not None:
+                content = f"工具执行失败：{str(outcome.error) or type(outcome.error).__name__}"
+                status = "cancelled" if outcome.status == "cancelled" else "error"
+            else:
+                content, status = str(after.data.get("result", outcome.result or "")), "success"
+            SessionPersistenceProjection.assert_no_ephemeral(outcome.arguments)
+            content = SessionPersistenceProjection.strip_ephemeral(content)
+
+            request_error = isinstance(outcome.error, ToolRequestError) or bool(
+                getattr(outcome.error, "tool_request_error", False)
+            )
+            if (
+                outcome.error is not None
+                and not request_error
+                and not isinstance(outcome.error, ToolExecutionObservationError)
+                and outcome.risk != "read"
+            ):
+                raise outcome.error
+
+            observation_id = f"tool-observation:{run_id}:{outcome.tool_call_id}"
+            coordinator = context.operation_coordinator
+            materialized = MaterializedToolObservation(
+                observation_id=observation_id,
+                run_id=run_id,
+                operation_id=outcome.operation_id,
+                attempt_id=outcome.attempt_id,
+                logical_model_call_id=logical_model_call_id,
+                tool_call_id=outcome.tool_call_id,
+                position=outcome.position,
+                name=outcome.name,
+                arguments=outcome.arguments,
+                status=status,
+                finalized_content=content,
+                content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                created_at=datetime.now().astimezone().isoformat(timespec="microseconds"),
+            )
+            if coordinator is not None:
+                materialized = coordinator.materialize_tool_observation(materialized)
+                content, status = materialized.finalized_content, materialized.status
+
+            publish_event = HookEvent(
+                point=HookPoint.TOOL_AFTER,
+                session_id=session_id,
+                data={
+                    **after.data,
+                    "result": content,
+                    "error": None,
+                    "cancelled": status == "cancelled",
+                    "observation_status": status,
+                    "observation_id": observation_id,
+                },
+            )
+            await self.hooks.publish_tool_observation(publish_event)
+            session_record_id = publish_event.data.get("session_record_id")
+            if coordinator is not None:
+                if not isinstance(session_record_id, str) or not session_record_id:
+                    raise AgentInvariantError(
+                        "Durable Tool observation was not persisted to the Session",
+                    )
+                coordinator.mark_tool_observation_published(
+                    observation_id, session_record_id,
+                )
+            _append_tool_message_once(
+                messages,
+                tool_call_id=outcome.tool_call_id,
+                name=outcome.name,
+                content=content,
+            )
+            return RunEvent(type=EventType.TOOL_COMPLETED, payload={
+                "name": outcome.name,
+                "content": content,
+                "status": status,
+                "observation_id": observation_id,
+            }), content
+
+        async def execute_one(
+            item: _PreparedCall,
+            *,
+            parallel: bool,
+            batch_id: str | None,
+            prepared_operation: Any | None = None,
+        ) -> _ToolOutcome:
+            selected = item.invocation
+            await self.hooks.emit(HookEvent(
+                point=HookPoint.TOOL_DURING,
+                session_id=session_id,
+                data={
+                    "task": task,
+                    "name": selected.name,
+                    "arguments": selected.arguments,
+                    "tool_call_id": selected.tool_call_id,
+                },
+            ))
+            try:
+                executed = await self.tools.execute_prepared(
+                    selected,
+                    context,
+                    prepared_operation=prepared_operation,
+                    manage_execution_state=not parallel,
+                    tool_batch_id=batch_id,
+                    tool_call_position=item.position,
+                )
+                return _ToolOutcome(
+                    position=item.position,
+                    name=selected.name,
+                    arguments=selected.arguments,
+                    tool_call_id=selected.tool_call_id,
+                    risk=selected.risk,
+                    result=executed.result,
+                    operation_id=executed.operation_id,
+                    attempt_id=executed.attempt_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return _ToolOutcome(
+                    position=item.position,
+                    name=selected.name,
+                    arguments=selected.arguments,
+                    tool_call_id=selected.tool_call_id,
+                    risk=selected.risk,
+                    error=exc,
+                    operation_id=getattr(exc, "durable_operation_id", None),
+                    attempt_id=getattr(exc, "durable_attempt_id", None),
+                    status="error",
+                )
+
+        async def flush_group() -> AsyncIterator[tuple[RunEvent, str]]:
+            nonlocal pending, group_sequence
+            if not pending:
+                return
+            selected, pending = pending, []
+            group_sequence += 1
+            batch_id = hashlib.sha256(
+                f"{run_id}:{logical_model_call_id}:{group_sequence}".encode("utf-8"),
+            ).hexdigest()
+            yield RunEvent(type=EventType.TOOL_BATCH_STARTED, payload={
+                "tool_batch_id": batch_id,
+                "tool_call_count": len(selected),
+            }), ""
+            coordinator = context.operation_coordinator
+            prepared_operations: dict[int, Any] = {}
+            if coordinator is not None:
+                # Ledger identity is established left-to-right before Tool bodies overlap.
+                for item in selected:
+                    invocation = item.invocation
+                    prepared_operations[item.position] = await coordinator.prepare(
+                        tool=invocation.tool,
+                        name=invocation.name,
+                        arguments=invocation.arguments,
+                        risk=invocation.risk,
+                        context=context,
+                        tool_call_id=invocation.tool_call_id,
+                        tool_batch_id=batch_id,
+                        tool_call_position=item.position,
+                    )
+            if coordinator is not None:
+                await coordinator.begin_parallel_group()
+            started_at = time.perf_counter()
+            tasks = [
+                asyncio.create_task(
+                    execute_one(
+                        item,
+                        parallel=True,
+                        batch_id=batch_id,
+                        prepared_operation=prepared_operations.get(item.position),
+                    ),
+                    name=f"tool-{batch_id[:12]}-{item.position}",
+                )
+                for item in selected
+            ]
+            try:
+                outcomes = await asyncio.gather(*tasks)
+            except BaseException:
+                # Ordinary Tool failures are converted to _ToolOutcome inside each Task.
+                # An exception escaping here is cancellation or a core execution invariant;
+                # cancel and settle every sibling before leaving ACTING.
+                for task_handle in tasks:
+                    if not task_handle.done():
+                        task_handle.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            finally:
+                if coordinator is not None:
+                    await coordinator.finish_parallel_group()
+            for outcome in sorted(outcomes, key=lambda item: item.position):
+                yield await publish(outcome)
+            yield RunEvent(type=EventType.TOOL_BATCH_COMPLETED, payload={
+                    "tool_batch_id": batch_id,
+                    "tool_call_count": len(selected),
+                    "peak_concurrency": len(selected),
+                    "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                    "success_count": sum(item.error is None for item in outcomes),
+                    "failure_count": sum(item.error is not None for item in outcomes),
+                }), ""
+
         for position, (call, call_id) in enumerate(calls):
             before = HookEvent(point=HookPoint.TOOL_BEFORE, session_id=session_id, data={
-                "task": task, "name": call.name, "arguments": dict(call.arguments), "tool_call_id": call_id,
+                "task": task,
+                "name": call.name,
+                "arguments": dict(call.arguments),
+                "tool_call_id": call_id,
             })
             await self.hooks.emit(before)
             name, arguments = before.data.get("name"), before.data.get("arguments")
             if not isinstance(name, str) or not isinstance(arguments, dict):
-                raise ValueError("tool_before 必须保留字符串 name 和对象 arguments")
+                raise ValueError("tool_before must preserve string name and object arguments")
             try:
-                arguments = self.tools.prepare_arguments(name, arguments)
+                prepared = self.tools.prepare_invocation(
+                    name, arguments, context, tool_call_id=call_id,
+                )
             except Exception as exc:
+                async for event, _ in flush_group():
+                    yield event
+                request_error = isinstance(exc, ToolRequestError) or bool(
+                    getattr(exc, "tool_request_error", False),
+                )
+                try:
+                    failed_risk = self.tools.risk_of(name, arguments)
+                except Exception:
+                    # Unknown names and malformed dynamic-risk inputs are model request errors.
+                    failed_risk = "read"
+                    request_error = True
+                if not request_error and failed_risk != "read":
+                    # Security/availability failures for write or high-risk Tools remain
+                    # fail-closed; converting these into model-visible errors could turn a
+                    # hard execution guard into a retry loop.
+                    raise
                 error = exc if isinstance(exc, ToolRequestError) else ToolRequestError(
                     str(exc) or type(exc).__name__,
                 )
-                await self.hooks.emit(HookEvent(
-                    point=HookPoint.TOOL_AFTER,
-                    session_id=session_id,
-                    data={
-                        "task": task,
-                        "name": name,
-                        "arguments": arguments,
-                        "tool_call_id": call_id,
-                        "result": None,
-                        "error": error,
-                    },
+                event, _ = await publish(_ToolOutcome(
+                    position=position,
+                    name=name,
+                    arguments=arguments,
+                    tool_call_id=call_id,
+                    risk=failed_risk,
+                    error=error,
+                    status="error",
                 ))
-                result = f"工具请求校验失败：{str(error) or type(error).__name__}"
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "name": name,
-                    "content": result,
-                })
-                yield RunEvent(type=EventType.TOOL_COMPLETED, payload={
-                    "name": name,
-                    "content": result,
-                    "status": "error",
-                })
+                yield event
                 continue
-            yield RunEvent(type=EventType.TOOL_REQUESTED, payload={"name": name, "arguments": arguments})
-            await self.hooks.emit(HookEvent(point=HookPoint.TOOL_DURING, session_id=session_id, data={
-                "task": task, "name": name, "arguments": arguments, "tool_call_id": call_id,
-            }))
-            try:
-                result = await self.tools.execute(name, arguments, context, tool_call_id=call_id)
-            except asyncio.CancelledError as exc:
-                await self.hooks.emit(HookEvent(point=HookPoint.TOOL_AFTER, session_id=session_id, data={
-                    "task": task,
-                    "name": name,
-                    "arguments": arguments,
-                    "tool_call_id": call_id,
-                    "result": None,
-                    "error": exc,
-                    "cancelled": True,
-                }))
-                raise
-            except Exception as exc:
-                await self.hooks.emit(HookEvent(point=HookPoint.TOOL_AFTER, session_id=session_id, data={
-                    "task": task, "name": name, "arguments": arguments, "tool_call_id": call_id, "result": None, "error": exc,
-                }))
-                # 只读工具失败没有未决副作用，可以作为结构化 observation 交还模型，
-                # 让它更换来源、参数或工具继续任务。写入和高风险工具仍保持 fail-closed。
-                request_error = isinstance(exc, ToolRequestError) or bool(
-                    getattr(exc, "tool_request_error", False)
-                )
-                if not request_error and not isinstance(exc, ToolExecutionObservationError) and (
-                    self.tools.risk_of(name, arguments) != "read"
+            item = _PreparedCall(position=position, invocation=prepared)
+            yield RunEvent(type=EventType.TOOL_REQUESTED, payload={
+                "name": prepared.name,
+                "arguments": prepared.arguments,
+            })
+            if prepared.parallel_safe and self.max_parallel_tool_calls > 1:
+                pending.append(item)
+                if len(pending) >= self.max_parallel_tool_calls:
+                    async for event, _ in flush_group():
+                        yield event
+                continue
+
+            async for event, _ in flush_group():
+                yield event
+            outcome = await execute_one(item, parallel=False, batch_id=None)
+            event, finalized = await publish(outcome)
+            yield event
+            if outcome.error is None and self.tools.ends_turn(prepared.name, finalized):
+                for skipped_position, (unprepared, unprepared_id) in enumerate(
+                    calls[position + 1:], start=position + 1,
                 ):
-                    raise
-                result = f"工具执行失败：{str(exc) or type(exc).__name__}"
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "name": name,
-                    "content": result,
-                })
-                yield RunEvent(type=EventType.TOOL_COMPLETED, payload={
-                    "name": name,
-                    "content": result,
-                    "status": "error",
-                })
-                continue
-            after = HookEvent(point=HookPoint.TOOL_AFTER, session_id=session_id, data={
-                "task": task, "name": name, "arguments": arguments, "tool_call_id": call_id, "result": result, "error": None,
-            })
-            await self.hooks.emit(after)
-            result = str(after.data.get("result", result))
-            yield RunEvent(type=EventType.TOOL_COMPLETED, payload={
-                "name": name, "content": result, "status": "success",
-            })
-            messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result})
-            if self.tools.ends_turn(name, result):
-                for pending, pending_id in calls[position + 1:]:
-                    skipped = (
-                        f"工具未执行：同一模型响应中的 {name} 已合并源码并要求重启 Gateway。"
-                    )
-                    messages.append({
-                        "role": "tool", "tool_call_id": pending_id,
-                        "name": pending.name, "content": skipped,
-                    })
-                    yield RunEvent(type=EventType.TOOL_COMPLETED, payload={
-                        "name": pending.name, "content": skipped, "status": "skipped",
-                    })
+                    skipped = f"工具未执行：前序工具 {prepared.name} 已结束当前 Turn。"
+                    skipped_event, _ = await publish(_ToolOutcome(
+                        position=skipped_position,
+                        name=unprepared.name,
+                        arguments=dict(unprepared.arguments),
+                        tool_call_id=unprepared_id,
+                        risk="read",
+                        result=skipped,
+                        status="skipped",
+                    ), run_after=False)
+                    yield skipped_event
                 answer = (
                     "Harness 已安全合并新的 Tool 源码。当前 Gateway 的 Tool Catalog 仍是旧快照，"
-                    "本次运行已正常结束；请重启 Gateway 后在原 Session 继续，下一次运行将加载新 Tool。"
+                    "本次运行已正常结束；请重启 Gateway 后在原 Session 继续。"
                 )
                 yield RunEvent(type=EventType.GATEWAY_RESTART_REQUIRED, payload={
-                    "tool": name,
+                    "tool": prepared.name,
                     "message": answer,
                 })
                 yield RunEvent(type=EventType.FINAL, payload={"answer": answer})
                 return
+
+        async for event, _ in flush_group():
+            yield event
+
 
 def _assistant_tool_message(reply: ModelReply) -> dict[str, Any]:
     """构造可再次发送给 OpenAI-compatible 接口的 assistant 工具消息。"""
@@ -479,12 +742,68 @@ def _assistant_tool_message(reply: ModelReply) -> dict[str, Any]:
     return {"role": "assistant", "content": reply.text or None, "tool_calls": serialized}
 
 
-def _ensure_tool_call_ids(reply: ModelReply) -> ModelReply:
+def _ensure_tool_call_ids(
+    reply: ModelReply,
+    *,
+    run_id: str,
+    logical_model_call_id: str,
+    used_ids: set[str] | None = None,
+    reserve: bool = False,
+) -> ModelReply:
     """在任何 model_after 回调前为工具调用补齐稳定 ID。"""
-    if not reply.tool_calls or all(call.id for call in reply.tool_calls):
+    if not reply.tool_calls:
         return reply
-    calls = tuple(ToolCall(name=call.name, arguments=dict(call.arguments), id=call.id or f"call_{uuid4().hex}") for call in reply.tool_calls)
-    return ModelReply(text=reply.text, tool_calls=calls, finished=reply.finished, usage=reply.usage, reasoning=reply.reasoning)
+    used: set[str] = set(used_ids or ())
+    calls: list[ToolCall] = []
+    for position, call in enumerate(reply.tool_calls):
+        selected = str(call.id or "")
+        if not selected or selected in used:
+            digest = hashlib.sha256(
+                f"{run_id}:{logical_model_call_id}:{position}".encode("utf-8"),
+            ).hexdigest()[:24]
+            selected = f"call_{digest}"
+            suffix = 0
+            while selected in used:
+                suffix += 1
+                selected = f"call_{digest}_{suffix}"
+        used.add(selected)
+        calls.append(ToolCall(
+            name=call.name,
+            arguments=dict(call.arguments),
+            id=selected,
+        ))
+    calls_tuple = tuple(calls)
+    if reserve and used_ids is not None:
+        used_ids.update(str(call.id) for call in calls_tuple if call.id)
+    if calls_tuple == reply.tool_calls:
+        return reply
+    return ModelReply(text=reply.text, tool_calls=calls_tuple, finished=reply.finished, usage=reply.usage, reasoning=reply.reasoning)
+
+
+def _append_tool_message_once(
+    messages: list[dict[str, Any]],
+    *,
+    tool_call_id: str,
+    name: str,
+    content: str,
+) -> None:
+    existing = [
+        item for item in messages
+        if item.get("role") == "tool" and item.get("tool_call_id") == tool_call_id
+    ]
+    if existing:
+        current = existing[-1]
+        if current.get("name") != name or current.get("content") != content:
+            raise AgentInvariantError(
+                f"Tool observation content conflict: {tool_call_id}",
+            )
+        return
+    messages.append({
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "name": name,
+        "content": content,
+    })
 
 
 def _model_call_metric(

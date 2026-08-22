@@ -121,7 +121,24 @@ class CronScheduler:
             return
         created: list[CronDispatch] = []
         snapshot = job.model_dump(mode="json")
-        if job.misfire_policy == "skip":
+        if job.current_dispatch_id or job.current_run_id:
+            # Non-overlapping jobs record a skipped scheduling fact instead of
+            # leaving a latent PENDING dispatch behind the active cycle.
+            skipped = self._new_dispatch(
+                job,
+                "scheduled",
+                snapshot,
+                scheduled_for=utc_iso(occurrences[-1]),
+                coalesced=len(occurrences),
+                now=utc_iso(now),
+            )
+            created.append(skipped.model_copy(update={
+                "status": "skipped",
+                "completed_at": utc_iso(now),
+                "error": "overlap_skipped",
+            }))
+            next_run = utc_iso(cursor) if cursor > now else None
+        elif job.misfire_policy == "skip":
             skipped = self._new_dispatch(job, "scheduled", snapshot, scheduled_for=utc_iso(occurrences[-1]),
                                          coalesced=len(occurrences), now=utc_iso(now))
             created.append(skipped.model_copy(update={"status": "skipped", "completed_at": utc_iso(now), "error": "misfire_skip"}))

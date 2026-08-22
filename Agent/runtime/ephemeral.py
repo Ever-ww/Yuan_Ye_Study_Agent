@@ -5,6 +5,25 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+from memory import MemoryStore
+
+
+class DurableIsolatedMemory(MemoryStore):
+    """Persist one workload Session without exposing long-term Profile memory."""
+
+    runtime_notice = (
+        "这是一次独立且可持久化审计的无记忆 Cron 执行。不得读取或假设长期 Profile、"
+        "其他 Session 或先前 Cron 周期的内容；当前任务所需事实必须在本次执行中取得。"
+    )
+
+    def profile_context(self, session_id: str | None = None) -> str:
+        del session_id
+        return ""
+
+    def prompt_context(self, session_id: str | None = None) -> str:
+        del session_id
+        return ""
+
 
 class EphemeralMemory:
     """Satisfy Runtime/Prompt contracts without reading or writing user memory."""

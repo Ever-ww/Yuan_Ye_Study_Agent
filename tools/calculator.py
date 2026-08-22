@@ -18,6 +18,7 @@ class CalculatorTool:
         "required": ["expression"],
     }
     risk = "read"
+    parallel_safe = True
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> str:
         tree = ast.parse(arguments["expression"], mode="eval")

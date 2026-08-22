@@ -48,6 +48,7 @@ from Agent.state import (
     HeartbeatOperationAttemptCommand,
     MarkOperationUnknownCommand,
     MarkOperationAttemptUnknownCommand,
+    MaterializedToolObservation,
     OperationKind,
     OperationAttempt,
     OperationFailureKind,
@@ -71,6 +72,7 @@ from Agent.state import (
     TERMINAL_STATES,
     TerminalTarget,
     ToolIdempotency,
+    ToolObservationState,
     TransitionCommand,
     UpdateStateMetadataCommand,
     UpgradePersistenceContractCommand,
@@ -104,7 +106,7 @@ class StateInvariantError(RuntimeError):
 class StateController:
     """以 SQLite 事务实现 command 幂等、CAS、FSM guard 和 Outbox。"""
 
-    SCHEMA_VERSION = 8
+    SCHEMA_VERSION = 9
 
     def __init__(
         self,
@@ -247,6 +249,27 @@ class StateController:
                         (status NOT IN ('failed','unknown') AND failure_kind IS NULL)
                     )
                 );
+                CREATE TABLE IF NOT EXISTS tool_observations (
+                    observation_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    operation_id TEXT,
+                    attempt_id TEXT,
+                    logical_model_call_id TEXT NOT NULL,
+                    tool_call_id TEXT NOT NULL,
+                    position INTEGER NOT NULL CHECK(position >= 0),
+                    state TEXT NOT NULL CHECK(state IN ('materialized','published')),
+                    observation_json TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(run_id,tool_call_id),
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id),
+                    FOREIGN KEY(operation_id) REFERENCES operation_ledger(operation_id),
+                    FOREIGN KEY(attempt_id) REFERENCES operation_attempts(attempt_id)
+                );
+                CREATE INDEX IF NOT EXISTS tool_observations_run_idx
+                    ON tool_observations(run_id,state,logical_model_call_id,position);
                 CREATE TABLE IF NOT EXISTS recovery_decisions (
                     decision_id TEXT PRIMARY KEY,
                     command_id TEXT NOT NULL UNIQUE,
@@ -1157,6 +1180,146 @@ class StateController:
     def current_attempt(self, operation_id: str) -> OperationAttempt:
         with self._connection() as connection:
             return self._current_attempt_in(connection, operation_id)
+
+    def materialize_tool_observation(
+        self, observation: MaterializedToolObservation,
+    ) -> MaterializedToolObservation:
+        """Insert an immutable finalized observation or verify an identical retry."""
+        if self.write_gate is not None:
+            self.write_gate.check_mutation_admission()
+        expected_hash = hashlib.sha256(
+            observation.finalized_content.encode("utf-8"),
+        ).hexdigest()
+        if observation.content_hash != expected_hash:
+            raise StateInvariantError("Tool observation content_hash mismatch")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._state_in(connection, observation.run_id)
+            if observation.operation_id is not None:
+                operation = self._operation_in(connection, observation.operation_id)
+                if operation.run_id != observation.run_id:
+                    raise StateInvariantError("Tool observation Operation belongs to another Run")
+                if operation.tool_call_id != observation.tool_call_id:
+                    raise StateInvariantError("Tool observation tool_call_id mismatch")
+            if observation.attempt_id is not None:
+                attempt = self._attempt_in(connection, observation.attempt_id)
+                if (
+                    attempt.run_id != observation.run_id
+                    or attempt.operation_id != observation.operation_id
+                ):
+                    raise StateInvariantError("Tool observation Attempt identity mismatch")
+                if attempt.status not in {
+                    OperationStatus.COMPLETED,
+                    OperationStatus.FAILED,
+                    OperationStatus.SKIPPED,
+                    OperationStatus.ABANDONED,
+                }:
+                    raise StateInvariantError("Tool observation requires a determined Attempt")
+            row = connection.execute(
+                "SELECT observation_json FROM tool_observations WHERE observation_id=?",
+                (observation.observation_id,),
+            ).fetchone()
+            if row is not None:
+                existing = MaterializedToolObservation.model_validate_json(
+                    row["observation_json"], strict=True,
+                )
+                immutable_fields = (
+                    "observation_id", "run_id", "operation_id", "attempt_id",
+                    "logical_model_call_id", "tool_call_id", "position", "name",
+                    "arguments", "status", "finalized_content", "content_hash",
+                )
+                if any(
+                    getattr(existing, field) != getattr(observation, field)
+                    for field in immutable_fields
+                ):
+                    raise StateConflictError(
+                        f"Tool observation content conflict: {observation.observation_id}",
+                    )
+                connection.commit()
+                return existing
+            timestamp = now_iso()
+            connection.execute(
+                "INSERT INTO tool_observations(observation_id,run_id,operation_id,attempt_id,"
+                "logical_model_call_id,tool_call_id,position,state,observation_json,content_hash,"
+                "revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    observation.observation_id, observation.run_id,
+                    observation.operation_id, observation.attempt_id,
+                    observation.logical_model_call_id, observation.tool_call_id,
+                    observation.position, observation.state.value,
+                    observation.model_dump_json(), observation.content_hash,
+                    observation.revision, observation.created_at, timestamp,
+                ),
+            )
+            connection.commit()
+            return observation
+
+    def mark_tool_observation_published(
+        self, observation_id: str, session_record_id: str,
+    ) -> MaterializedToolObservation:
+        """Mark Session publication after strict append_once has succeeded."""
+        if self.write_gate is not None:
+            self.write_gate.check_mutation_admission()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT observation_json FROM tool_observations WHERE observation_id=?",
+                (observation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown Tool observation: {observation_id}")
+            existing = MaterializedToolObservation.model_validate_json(
+                row["observation_json"], strict=True,
+            )
+            if existing.state is ToolObservationState.PUBLISHED:
+                if existing.session_record_id != session_record_id:
+                    raise StateConflictError("Published Tool observation record_id conflict")
+                connection.commit()
+                return existing
+            timestamp = now_iso()
+            published = existing.model_copy(update={
+                "state": ToolObservationState.PUBLISHED,
+                "session_record_id": session_record_id,
+                "published_at": timestamp,
+                "revision": existing.revision + 1,
+            })
+            connection.execute(
+                "UPDATE tool_observations SET state=?,observation_json=?,revision=?,updated_at=? "
+                "WHERE observation_id=? AND revision=?",
+                (
+                    published.state.value, published.model_dump_json(), published.revision,
+                    timestamp, observation_id, existing.revision,
+                ),
+            )
+            if connection.total_changes != 1:
+                raise StateConflictError("Tool observation publish revision conflict")
+            connection.commit()
+            return published
+
+    def tool_observation(self, observation_id: str) -> MaterializedToolObservation | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT observation_json FROM tool_observations WHERE observation_id=?",
+                (observation_id,),
+            ).fetchone()
+        return (
+            MaterializedToolObservation.model_validate_json(row["observation_json"], strict=True)
+            if row is not None else None
+        )
+
+    def unpublished_tool_observations(
+        self, run_id: str,
+    ) -> tuple[MaterializedToolObservation, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT observation_json FROM tool_observations WHERE run_id=? AND state='materialized' "
+                "ORDER BY created_at,position",
+                (run_id,),
+            ).fetchall()
+        return tuple(
+            MaterializedToolObservation.model_validate_json(row["observation_json"], strict=True)
+            for row in rows
+        )
 
     def current(self, run_id: str) -> AgentState:
         return self.state(run_id)
@@ -2298,6 +2461,8 @@ class StateController:
                 or operation.logical_model_call_id != command.logical_model_call_id
                 or operation.source_model_call_id != command.source_model_call_id
                 or operation.tool_call_id != command.tool_call_id
+                or operation.tool_batch_id != command.tool_batch_id
+                or operation.tool_call_position != command.tool_call_position
                 or operation.retry_policy_snapshot != command.retry_policy_snapshot
                 or operation.external_idempotency_key != command.external_idempotency_key
             ):
@@ -2310,6 +2475,8 @@ class StateController:
             idempotency=command.idempotency, side_effecting=command.side_effecting,
             logical_model_call_id=command.logical_model_call_id,
             source_model_call_id=command.source_model_call_id, tool_call_id=command.tool_call_id,
+            tool_batch_id=command.tool_batch_id,
+            tool_call_position=command.tool_call_position,
             external_idempotency_key=command.external_idempotency_key,
             retry_policy_snapshot=command.retry_policy_snapshot,
             created_at=timestamp, updated_at=timestamp,

@@ -32,6 +32,7 @@ class PaperLibraryLookupTool:
     name = "paper_library_lookup"
     description = "在下载前按 DOI、arXiv ID、规范 URL 或题名年份查询全局论文索引并去重"
     risk = "read"
+    parallel_safe = True
     schema = {
         "type": "object",
         "properties": {
@@ -100,6 +101,7 @@ class PaperLibraryReadTool:
     name = "paper_library_read"
     description = "按论文库 paper_id 分页读取已下载 PDF 的文字；扫描件会明确返回 ocr_required"
     risk = "read"
+    parallel_safe = True
     schema = {
         "type": "object",
         "properties": {

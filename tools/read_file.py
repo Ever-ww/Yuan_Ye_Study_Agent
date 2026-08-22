@@ -186,6 +186,7 @@ class ReadFileTool:
         "required": ["path"],
     }
     risk = "read"
+    parallel_safe = True
     _documents = DocumentReader()
     _unsupported_binary_suffixes = {
         ".7z", ".avi", ".bmp", ".exe", ".gif", ".gz", ".jpeg", ".jpg", ".m4a",

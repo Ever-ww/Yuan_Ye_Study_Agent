@@ -21,6 +21,7 @@ from Agent.state import (
     ExecutionState,
     FailOperationAttemptCommand,
     MarkOperationAttemptUnknownCommand,
+    MaterializedToolObservation,
     OperationKind,
     OperationFailureKind,
     OperationRecord,
@@ -76,12 +77,23 @@ class DurableToolCoordinator:
         self.retry_max_attempts = retry_max_attempts
         self.retry_base_seconds = retry_base_seconds
         self.retry_max_seconds = retry_max_seconds
+        self._run_locks: dict[str, asyncio.Lock] = {}
 
     def bind(self, run_id: str, turn_id: str | None = None) -> Token:
         return _RUN_BINDING.set(DurableRunBinding(run_id, turn_id or uuid4().hex))
 
     def reset(self, token: Token) -> None:
         _RUN_BINDING.reset(token)
+
+    def current_binding(self) -> DurableRunBinding | None:
+        return _RUN_BINDING.get()
+
+    def _run_lock(self, run_id: str) -> asyncio.Lock:
+        lock = self._run_locks.get(run_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._run_locks[run_id] = lock
+        return lock
 
     async def prepare(
         self,
@@ -92,6 +104,8 @@ class DurableToolCoordinator:
         risk: str,
         context: Any,
         tool_call_id: str,
+        tool_batch_id: str | None = None,
+        tool_call_position: int | None = None,
     ) -> OperationRecord:
         binding = self._binding()
         parent_operation_id = _CURRENT_OPERATION.get()
@@ -133,6 +147,8 @@ class DurableToolCoordinator:
             side_effecting=risk != "read",
             source_model_call_id=source_model_call_id,
             tool_call_id=tool_call_id,
+            tool_batch_id=tool_batch_id,
+            tool_call_position=tool_call_position,
             external_request_id=uuid4().hex if risk != "read" else None,
             external_idempotency_key=hashlib.sha256(stable_key.encode("utf-8")).hexdigest(),
             retry_policy_snapshot=RetryPolicySnapshot(
@@ -145,8 +161,6 @@ class DurableToolCoordinator:
             ),
         ))
         assert result.operation is not None and result.attempt is not None
-        _CURRENT_OPERATION.set(result.operation.operation_id)
-        _CURRENT_ATTEMPT.set(result.attempt.attempt_id)
         return result.operation
 
     async def waiting_human(self, operation: OperationRecord) -> None:
@@ -174,10 +188,8 @@ class DurableToolCoordinator:
                 reason=f"工具 {operation.name} 审批通过",
             ))
             return None
-        attempt_id = _CURRENT_ATTEMPT.get()
-        if attempt_id is None:
-            raise RuntimeError("Approval 拒绝时缺少对应 Attempt")
         current_attempt = self.controller.current_attempt(operation.operation_id)
+        attempt_id = current_attempt.attempt_id
         if current_attempt.status is OperationStatus.SKIPPED:
             skipped_state = state
         else:
@@ -206,11 +218,9 @@ class DurableToolCoordinator:
 
     async def skip_denied(self, operation: OperationRecord, *, reason: str) -> str:
         """Persist a policy denial without ever entering WAITING_HUMAN."""
-        attempt_id = _CURRENT_ATTEMPT.get()
-        if attempt_id is None:
-            raise RuntimeError("Policy denial is missing its OperationAttempt")
         state = self.controller.state(operation.run_id)
         attempt = self.controller.current_attempt(operation.operation_id)
+        attempt_id = attempt.attempt_id
         if attempt.status is not OperationStatus.SKIPPED:
             state = self.controller.apply(SkipOperationAttemptCommand(
                 command_id=uuid4().hex,
@@ -237,15 +247,66 @@ class DurableToolCoordinator:
             "reason": reason,
         }, ensure_ascii=False, sort_keys=True)
 
+    async def begin_parallel_group(self) -> None:
+        binding = self._binding()
+        async with self._run_lock(binding.run_id):
+            state = self.controller.state(binding.run_id)
+            if state.execution is None:
+                raise RuntimeError("Parallel Tool group requires an execution state")
+            if state.execution.state is ExecutionState.THINKING:
+                self.controller.apply(TransitionCommand(
+                    command_id=uuid4().hex,
+                    run_id=state.run_id,
+                    expected_revision=state.revision,
+                    gateway_epoch=self.controller.gateway_epoch,
+                    execution_state=ExecutionState.ACTING,
+                    reason="Begin parallel PURE Tool group",
+                ))
+            elif state.execution.state is not ExecutionState.ACTING:
+                raise RuntimeError(
+                    f"Cannot begin parallel Tool group from {state.execution.state.value}",
+                )
+
+    async def finish_parallel_group(self) -> None:
+        binding = self._binding()
+        async with self._run_lock(binding.run_id):
+            state = self.controller.state(binding.run_id)
+            if state.execution and state.execution.state is ExecutionState.ACTING:
+                self.controller.apply(TransitionCommand(
+                    command_id=uuid4().hex,
+                    run_id=state.run_id,
+                    expected_revision=state.revision,
+                    gateway_epoch=self.controller.gateway_epoch,
+                    execution_state=ExecutionState.OBSERVING,
+                    reason="Parallel PURE Tool group settled",
+                ))
+
+    def materialize_tool_observation(
+        self, observation: MaterializedToolObservation,
+    ) -> MaterializedToolObservation:
+        return self.controller.materialize_tool_observation(observation)
+
+    def mark_tool_observation_published(
+        self, observation_id: str, session_record_id: str,
+    ) -> MaterializedToolObservation:
+        return self.controller.mark_tool_observation_published(
+            observation_id, session_record_id,
+        )
+
     async def execute(
         self,
         operation: OperationRecord,
         invoke: Callable[[], Awaitable[str]],
+        *,
+        manage_execution_state: bool = True,
     ) -> str:
+        current_attempt = self.controller.current_attempt(operation.operation_id)
+        _CURRENT_OPERATION.set(operation.operation_id)
+        _CURRENT_ATTEMPT.set(current_attempt.attempt_id)
         state = self.controller.state(operation.run_id)
         if state.execution is None:
             raise RuntimeError("Tool Operation 缺少内层执行状态")
-        if state.execution.state is ExecutionState.THINKING:
+        if manage_execution_state and state.execution.state is ExecutionState.THINKING:
             state = self.controller.apply(TransitionCommand(
                 command_id=uuid4().hex,
                 run_id=state.run_id,
@@ -261,15 +322,16 @@ class DurableToolCoordinator:
             attempt_id = _CURRENT_ATTEMPT.get()
             if attempt_id is None:
                 raise RuntimeError("Tool Operation 缺少当前 Attempt")
-            state = self.controller.state(operation.run_id)
-            started = self.controller.apply(StartOperationAttemptCommand(
-                command_id=uuid4().hex, run_id=state.run_id,
-                expected_revision=state.revision, gateway_epoch=self.controller.gateway_epoch,
-                attempt_id=attempt_id, heartbeat_expires_at=_after_seconds(self.heartbeat_seconds),
-            ))
+            async with self._run_lock(operation.run_id):
+                state = self.controller.state(operation.run_id)
+                started = self.controller.apply(StartOperationAttemptCommand(
+                    command_id=uuid4().hex, run_id=state.run_id,
+                    expected_revision=state.revision, gateway_epoch=self.controller.gateway_epoch,
+                    attempt_id=attempt_id, heartbeat_expires_at=_after_seconds(self.heartbeat_seconds),
+                ))
             operation = started.operation or operation
             heartbeat = asyncio.create_task(
-                self._heartbeat_loop(operation),
+                self._heartbeat_loop(operation, attempt_id),
                 name=f"tool-heartbeat-{operation.operation_id}:{attempt_id}",
             )
             try:
@@ -277,7 +339,10 @@ class DurableToolCoordinator:
             except asyncio.CancelledError as exc:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)
-                await self._record_uncertain_or_failed(operation, exc, cancelled=True)
+                await self._record_uncertain_or_failed(
+                    operation, exc, cancelled=True,
+                    manage_execution_state=manage_execution_state,
+                )
                 raise
             except BaseException as exc:
                 heartbeat.cancel()
@@ -286,20 +351,24 @@ class DurableToolCoordinator:
                     ToolIdempotency.EXTERNALLY_IDEMPOTENT,
                     ToolIdempotency.NON_IDEMPOTENT,
                 }:
-                    await self._record_uncertain_or_failed(operation, exc, cancelled=False)
+                    await self._record_uncertain_or_failed(
+                        operation, exc, cancelled=False,
+                        manage_execution_state=manage_execution_state,
+                    )
                     raise
                 retryable = _is_retryable_tool_error(exc)
-                current = self.controller.state(operation.run_id)
-                failed = self.controller.apply(FailOperationAttemptCommand(
-                    command_id=uuid4().hex, run_id=current.run_id,
-                    expected_revision=current.revision, gateway_epoch=self.controller.gateway_epoch,
-                    attempt_id=attempt_id,
-                    failure_kind=(
-                        OperationFailureKind.RETRYABLE
-                        if retryable else OperationFailureKind.TERMINAL
-                    ),
-                    failure_reason=str(exc) or type(exc).__name__,
-                ))
+                async with self._run_lock(operation.run_id):
+                    current = self.controller.state(operation.run_id)
+                    failed = self.controller.apply(FailOperationAttemptCommand(
+                        command_id=uuid4().hex, run_id=current.run_id,
+                        expected_revision=current.revision, gateway_epoch=self.controller.gateway_epoch,
+                        attempt_id=attempt_id,
+                        failure_kind=(
+                            OperationFailureKind.RETRYABLE
+                            if retryable else OperationFailureKind.TERMINAL
+                        ),
+                        failure_reason=str(exc) or type(exc).__name__,
+                    ))
                 operation = failed.operation or operation
                 policy = operation.retry_policy_snapshot
                 if (
@@ -311,12 +380,13 @@ class DurableToolCoordinator:
                     # PURE/IDEMPOTENT 的失败已经由 Ledger 确认为 FAILED，不存在未知
                     # 副作用窗口；将其作为 observation 交给模型重新规划。外部幂等和
                     # 非幂等工具在上方走 UNKNOWN + RECOVERY_REQUIRED，绝不进入这里。
-                    self.controller.apply(TransitionCommand(
-                        command_id=uuid4().hex, run_id=current.run_id,
-                        expected_revision=current.revision, gateway_epoch=self.controller.gateway_epoch,
-                        execution_state=ExecutionState.OBSERVING,
-                        reason="Determined tool failure; return observation to model",
-                    ))
+                    if manage_execution_state:
+                        self.controller.apply(TransitionCommand(
+                            command_id=uuid4().hex, run_id=current.run_id,
+                            expected_revision=current.revision, gateway_epoch=self.controller.gateway_epoch,
+                            execution_state=ExecutionState.OBSERVING,
+                            reason="Determined tool failure; return observation to model",
+                        ))
                     _CURRENT_OPERATION.set(None)
                     _CURRENT_ATTEMPT.set(None)
                     raise ToolExecutionObservationError(
@@ -324,15 +394,16 @@ class DurableToolCoordinator:
                     ) from exc
                 retry_at = datetime.fromisoformat(operation.next_retry_at.replace("Z", "+00:00"))
                 await asyncio.sleep(max(0.0, (retry_at - datetime.now().astimezone()).total_seconds()))
-                current = self.controller.state(operation.run_id)
-                next_attempt = self.controller.apply(BeginOperationAttemptCommand(
-                    command_id=uuid4().hex, run_id=current.run_id,
-                    expected_revision=current.revision, gateway_epoch=self.controller.gateway_epoch,
-                    operation_id=operation.operation_id, attempt_id=uuid4().hex,
-                    expected_latest_attempt_no=operation.latest_attempt_no,
-                    request_hash=operation.request_hash,
-                    external_request_id=uuid4().hex if operation.side_effecting else None,
-                ))
+                async with self._run_lock(operation.run_id):
+                    current = self.controller.state(operation.run_id)
+                    next_attempt = self.controller.apply(BeginOperationAttemptCommand(
+                        command_id=uuid4().hex, run_id=current.run_id,
+                        expected_revision=current.revision, gateway_epoch=self.controller.gateway_epoch,
+                        operation_id=operation.operation_id, attempt_id=uuid4().hex,
+                        expected_latest_attempt_no=operation.latest_attempt_no,
+                        request_hash=operation.request_hash,
+                        external_request_id=uuid4().hex if operation.side_effecting else None,
+                    ))
                 operation = next_attempt.operation or operation
                 assert next_attempt.attempt is not None
                 _CURRENT_ATTEMPT.set(next_attempt.attempt.attempt_id)
@@ -341,17 +412,22 @@ class DurableToolCoordinator:
             await asyncio.gather(heartbeat, return_exceptions=True)
             break
         selected = str(result)
-        state = self.controller.state(operation.run_id)
-        self.controller.apply(CompleteOperationAttemptCommand(
-            command_id=uuid4().hex,
-            run_id=state.run_id,
-            expected_revision=state.revision,
-            gateway_epoch=self.controller.gateway_epoch,
-            attempt_id=attempt_id,
-            result=selected,
-            result_hash=hashlib.sha256(selected.encode("utf-8")).hexdigest(),
-            result_source="tool_return",
-        ))
+        async with self._run_lock(operation.run_id):
+            state = self.controller.state(operation.run_id)
+            self.controller.apply(CompleteOperationAttemptCommand(
+                command_id=uuid4().hex,
+                run_id=state.run_id,
+                expected_revision=state.revision,
+                gateway_epoch=self.controller.gateway_epoch,
+                attempt_id=attempt_id,
+                result=selected,
+                result_hash=hashlib.sha256(selected.encode("utf-8")).hexdigest(),
+                result_source="tool_return",
+            ))
+        if not manage_execution_state:
+            _CURRENT_OPERATION.set(None)
+            _CURRENT_ATTEMPT.set(None)
+            return selected
         state = self.controller.state(operation.run_id)
         self.controller.apply(TransitionCommand(
             command_id=uuid4().hex,
@@ -365,27 +441,25 @@ class DurableToolCoordinator:
         _CURRENT_ATTEMPT.set(None)
         return selected
 
-    async def _heartbeat_loop(self, operation: OperationRecord) -> None:
+    async def _heartbeat_loop(self, operation: OperationRecord, attempt_id: str) -> None:
         interval = max(2.0, self.heartbeat_seconds / 3)
         while True:
             await asyncio.sleep(interval)
             current = self.controller.operation(operation.operation_id)
             if current.status is not OperationStatus.RUNNING:
                 return
-            state = self.controller.state(operation.run_id)
-            timestamp = now_iso()
-            attempt_id = _CURRENT_ATTEMPT.get()
-            if attempt_id is None:
-                return
-            self.controller.apply(HeartbeatOperationAttemptCommand(
-                command_id=uuid4().hex,
-                run_id=state.run_id,
-                expected_revision=state.revision,
-                gateway_epoch=self.controller.gateway_epoch,
-                attempt_id=attempt_id,
-                heartbeat_at=timestamp,
-                heartbeat_expires_at=_after_seconds(self.heartbeat_seconds),
-            ))
+            async with self._run_lock(operation.run_id):
+                state = self.controller.state(operation.run_id)
+                timestamp = now_iso()
+                self.controller.apply(HeartbeatOperationAttemptCommand(
+                    command_id=uuid4().hex,
+                    run_id=state.run_id,
+                    expected_revision=state.revision,
+                    gateway_epoch=self.controller.gateway_epoch,
+                    attempt_id=attempt_id,
+                    heartbeat_at=timestamp,
+                    heartbeat_expires_at=_after_seconds(self.heartbeat_seconds),
+                ))
 
     async def preexecution_failed_if_safe(self, operation: OperationRecord | None, error: BaseException) -> None:
         if operation is None:
@@ -393,19 +467,18 @@ class DurableToolCoordinator:
         current = self.controller.operation(operation.operation_id)
         if current.status is not OperationStatus.PREPARED:
             return
-        attempt_id = _CURRENT_ATTEMPT.get()
-        if attempt_id is None:
-            return
-        state = self.controller.state(operation.run_id)
-        self.controller.apply(FailOperationAttemptCommand(
-            command_id=uuid4().hex,
-            run_id=state.run_id,
-            expected_revision=state.revision,
-            gateway_epoch=self.controller.gateway_epoch,
-            attempt_id=attempt_id,
-            failure_kind=OperationFailureKind.TERMINAL,
-            failure_reason=str(error) or type(error).__name__,
-        ))
+        attempt_id = self.controller.current_attempt(operation.operation_id).attempt_id
+        async with self._run_lock(operation.run_id):
+            state = self.controller.state(operation.run_id)
+            self.controller.apply(FailOperationAttemptCommand(
+                command_id=uuid4().hex,
+                run_id=state.run_id,
+                expected_revision=state.revision,
+                gateway_epoch=self.controller.gateway_epoch,
+                attempt_id=attempt_id,
+                failure_kind=OperationFailureKind.TERMINAL,
+                failure_reason=str(error) or type(error).__name__,
+            ))
         state = self.controller.state(operation.run_id)
         if state.execution and state.execution.state is ExecutionState.WAITING_HUMAN:
             self.controller.apply(TransitionCommand(
@@ -427,6 +500,7 @@ class DurableToolCoordinator:
         error: BaseException,
         *,
         cancelled: bool,
+        manage_execution_state: bool = True,
     ) -> None:
         state = self.controller.state(operation.run_id)
         message = str(error) or type(error).__name__
@@ -456,15 +530,19 @@ class DurableToolCoordinator:
                 reason="外部工具副作用结果未知",
             ))
             return
-        self.controller.apply(FailOperationAttemptCommand(
-            command_id=uuid4().hex,
-            run_id=state.run_id,
-            expected_revision=state.revision,
-            gateway_epoch=self.controller.gateway_epoch,
-            attempt_id=attempt_id,
-            failure_kind=OperationFailureKind.RETRYABLE,
-            failure_reason=message,
-        ))
+        async with self._run_lock(operation.run_id):
+            state = self.controller.state(operation.run_id)
+            self.controller.apply(FailOperationAttemptCommand(
+                command_id=uuid4().hex,
+                run_id=state.run_id,
+                expected_revision=state.revision,
+                gateway_epoch=self.controller.gateway_epoch,
+                attempt_id=attempt_id,
+                failure_kind=OperationFailureKind.RETRYABLE,
+                failure_reason=message,
+            ))
+        if not manage_execution_state:
+            return
         state = self.controller.state(operation.run_id)
         self.controller.apply(TransitionCommand(
             command_id=uuid4().hex,
@@ -505,6 +583,9 @@ class DurableModelHooks:
         self._heartbeat: ContextVar[asyncio.Task[None] | None] = ContextVar("durable_model_heartbeat", default=None)
 
     def register(self, hooks: HookRegistry) -> None:
+        self._hooks = hooks
+        if self.memory is not None:
+            hooks.register(HookPoint.TRACE_START, self.recover_tool_observations, priority=-80)
         hooks.register(HookPoint.TURN_START, self.annotate, priority=-200)
         hooks.register(HookPoint.MODEL_BEFORE, self.annotate, priority=-200)
         hooks.register(HookPoint.MODEL_DURING, self.model_during, priority=-100)
@@ -512,18 +593,153 @@ class DurableModelHooks:
         hooks.register(HookPoint.TOOL_AFTER, self.annotate, priority=-90)
         hooks.register(HookPoint.TURN_END, self.annotate, priority=-90)
         if self.memory is not None:
-            hooks.register(HookPoint.TOOL_AFTER, self.safe_checkpoint, priority=200)
+            hooks.register_tool_observation_publisher(self.safe_checkpoint, priority=200)
             hooks.register(HookPoint.TURN_END, self.safe_checkpoint, priority=200)
+
+    async def recover_tool_observations(self, event: HookEvent) -> None:
+        """Finish ordered Session publication without re-executing Tool bodies."""
+        binding = _RUN_BINDING.get()
+        if binding is None or self.memory is None:
+            return
+        operations = sorted(
+            (
+                item for item in self.controller.operations(binding.run_id)
+                if item.kind is OperationKind.TOOL and item.tool_call_position is not None
+            ),
+            key=lambda item: (
+                item.created_at,
+                item.tool_call_position or 0,
+            ),
+        )
+        persisted_arguments: dict[str, dict[str, Any]] = {}
+        for _, record in self.memory.sessions.read_all_records_strict(event.session_id):
+            if record.role != "assistant" or not record.tool_calls:
+                continue
+            for call in record.tool_calls:
+                if not isinstance(call, dict) or not isinstance(call.get("id"), str):
+                    continue
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                raw_arguments = function.get("arguments", "{}")
+                try:
+                    arguments = (
+                        json.loads(raw_arguments)
+                        if isinstance(raw_arguments, str)
+                        else raw_arguments
+                    )
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"Persisted Tool arguments are invalid: {call['id']}",
+                    ) from exc
+                if not isinstance(arguments, dict):
+                    raise RuntimeError(
+                        f"Persisted Tool arguments are not an object: {call['id']}",
+                    )
+                existing = persisted_arguments.get(call["id"])
+                if existing is not None and existing != arguments:
+                    raise RuntimeError(
+                        f"Persisted Tool Call identity conflict: {call['id']}",
+                    )
+                persisted_arguments[call["id"]] = arguments
+        for operation in operations:
+            observation_id = f"tool-observation:{binding.run_id}:{operation.tool_call_id}"
+            if self.controller.tool_observation(observation_id) is not None:
+                continue
+            attempt = self.controller.current_attempt(operation.operation_id)
+            if attempt.status not in {
+                OperationStatus.COMPLETED,
+                OperationStatus.FAILED,
+                OperationStatus.SKIPPED,
+                OperationStatus.ABANDONED,
+            }:
+                continue
+            if attempt.status is OperationStatus.COMPLETED:
+                result, error, status = attempt.result or "", None, "success"
+            elif attempt.status is OperationStatus.FAILED:
+                result = None
+                error = RuntimeError(attempt.failure_reason or "Tool execution failed")
+                status = "error"
+            else:
+                result = json.dumps({
+                    "status": "NOT_EXECUTED",
+                    "reason": attempt.skip_reason or attempt.abandonment_reason or "gateway_restart",
+                }, ensure_ascii=False, sort_keys=True)
+                error, status = None, "skipped"
+            tool_call_id = operation.tool_call_id or operation.operation_id
+            if tool_call_id not in persisted_arguments:
+                raise RuntimeError(
+                    f"Persisted Tool Call is missing for observation recovery: {tool_call_id}",
+                )
+            arguments = persisted_arguments[tool_call_id]
+            after = HookEvent(point=HookPoint.TOOL_AFTER, session_id=event.session_id, data={
+                "task": "recover durable Tool observation",
+                "name": operation.name,
+                "arguments": arguments,
+                "tool_call_id": tool_call_id,
+                "result": result,
+                "error": error,
+                "operation_id": operation.operation_id,
+                "attempt_id": attempt.attempt_id,
+            })
+            await self._hooks.emit(after)
+            content = (
+                f"工具执行失败：{str(error) or type(error).__name__}"
+                if error is not None
+                else str(after.data.get("result", result or ""))
+            )
+            self.controller.materialize_tool_observation(MaterializedToolObservation(
+                observation_id=observation_id,
+                run_id=binding.run_id,
+                operation_id=operation.operation_id,
+                attempt_id=attempt.attempt_id,
+                logical_model_call_id=operation.source_model_call_id or "model-call-unavailable",
+                tool_call_id=tool_call_id,
+                position=operation.tool_call_position or 0,
+                name=operation.name,
+                arguments=arguments,
+                status=status,
+                finalized_content=content,
+                content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                created_at=now_iso(),
+            ))
+
+        for observation in self.controller.unpublished_tool_observations(binding.run_id):
+            publish_event = HookEvent(point=HookPoint.TOOL_AFTER, session_id=event.session_id, data={
+                "task": "publish durable Tool observation",
+                "name": observation.name,
+                "arguments": observation.arguments,
+                "tool_call_id": observation.tool_call_id,
+                "result": observation.finalized_content,
+                "error": None,
+                "cancelled": observation.status == "cancelled",
+                "observation_status": observation.status,
+                "observation_id": observation.observation_id,
+                "operation_id": observation.operation_id,
+                "attempt_id": observation.attempt_id,
+            })
+            await self._hooks.publish_tool_observation(publish_event)
+            record_id = publish_event.data.get("session_record_id")
+            if not isinstance(record_id, str) or not record_id:
+                raise RuntimeError("Recovered Tool observation was not persisted")
+            self.controller.mark_tool_observation_published(
+                observation.observation_id, record_id,
+            )
 
     async def annotate(self, event: HookEvent) -> None:
         binding = _RUN_BINDING.get()
         if binding is None:
             return
         state = self.controller.state(binding.run_id)
+        selected_operation_id = event.data.get("operation_id")
         event.data["durable_audit"] = {
             "run_id": binding.run_id,
             "turn_id": binding.turn_id,
-            "operation_id": state.current_operation_id,
+            "operation_id": (
+                selected_operation_id
+                if isinstance(selected_operation_id, str) and selected_operation_id
+                else state.current_operation_id
+            ),
         }
 
     async def model_during(self, event: HookEvent) -> None:
@@ -661,6 +877,7 @@ class DurableModelHooks:
             model_attempt=attempt.attempt_no, last_progress_at=now_iso(),
         ))
         event.data.update({
+            "run_id": binding.run_id,
             "logical_model_call_id": operation.logical_model_call_id,
             "model_call_id": attempt.model_call_id,
             "attempt_no": attempt.attempt_no,
@@ -672,9 +889,15 @@ class DurableModelHooks:
         if binding is None or not isinstance(record_id, str) or not record_id:
             return
         state = self.controller.state(binding.run_id)
+        selected_operation_id = event.data.get("operation_id")
+        operation_id = (
+            selected_operation_id
+            if isinstance(selected_operation_id, str) and selected_operation_id
+            else state.current_operation_id
+        )
         operation = (
-            self.controller.operation(state.current_operation_id)
-            if state.current_operation_id
+            self.controller.operation(operation_id)
+            if operation_id
             else None
         )
         attempt = self.controller.current_attempt(operation.operation_id) if operation is not None else None
@@ -849,7 +1072,8 @@ def _idempotency_of(tool: Any, risk: str) -> ToolIdempotency:
         if isinstance(declared, ToolIdempotency):
             return declared
         try:
-            return ToolIdempotency(str(declared))
+            raw = getattr(declared, "value", declared)
+            return ToolIdempotency(str(raw).strip().lower())
         except ValueError as exc:
             raise ValueError(f"工具 {getattr(tool, 'name', '?')} 的 idempotency 声明无效") from exc
     if risk == "read":

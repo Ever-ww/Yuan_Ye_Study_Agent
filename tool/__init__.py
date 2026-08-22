@@ -3,12 +3,14 @@
 from .contracts import AsyncTool, ExtensionToolAuthorization, ToolContext, ToolRisk
 from .errors import ToolExecutionObservationError, ToolRequestError
 from .path_guard import safe_workspace_path
-from .registry import AsyncToolRegistry
+from .registry import AsyncToolRegistry, PreparedToolInvocation, ToolExecutionResult
 from .defaults import default_tools, register_subagent
 
 __all__ = [
     "AsyncTool",
     "AsyncToolRegistry",
+    "PreparedToolInvocation",
+    "ToolExecutionResult",
     "ExtensionToolAuthorization",
     "ToolContext",
     "ToolRisk",

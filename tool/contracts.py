@@ -35,6 +35,9 @@ class AsyncTool(Protocol):
     risk: ToolRisk
     # 可选声明；未声明时 Registry 根据风险采用保守等级。
     idempotency: str
+    # Explicit concurrency opt-in. Missing is treated as False. Runtime
+    # eligibility still requires resolved READ + PURE and no approval.
+    parallel_safe: bool
     # Explicit opt-in. Missing is treated as False by AsyncToolRegistry.
     extension_preapproval: bool
 

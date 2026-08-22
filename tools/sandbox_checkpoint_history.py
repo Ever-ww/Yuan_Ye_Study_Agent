@@ -20,6 +20,7 @@ class SandboxCheckpointHistoryTool:
         },
     }
     risk = "read"
+    parallel_safe = True
     idempotency = "PURE"
     runtime_profiles = ("interactive",)
     delegatable = False
