@@ -6,6 +6,8 @@ from pathlib import Path
 from Agent import AgentRuntime, load_runtime_config
 from Agent.contracts import ModelReply
 from memory import MemoryStore
+from memory import MemoryScope, MemoryWriteRequest
+from memory.retrieval import project_identity
 from memory.persistence import SessionPersistenceProjection
 from skill import SkillService
 from tool import AsyncToolRegistry, ToolContext
@@ -109,3 +111,45 @@ def test_ephemeral_context_is_rejected_inside_tool_arguments() -> None:
         SessionPersistenceProjection.assert_no_ephemeral({
             "nested": ['<agent_runtime_context ephemeral="true">'],
         })
+
+
+def test_long_term_memory_is_hook_retrieved_and_never_persisted(tmp_path: Path) -> None:
+    async def check() -> None:
+        config = load_runtime_config(tmp_path)
+        memory = MemoryStore(
+            config.memory_dir,
+            workspace_root=config.workspace_root,
+            agent_root=config.agent_root,
+        )
+        memory.memory_writer.write(MemoryWriteRequest(
+            scope=MemoryScope.PROJECT,
+            scope_key=project_identity(str(config.workspace_root)),
+            kind="preference",
+            content="Always provide concise technical explanations",
+            source="explicit_user",
+            source_ref="test:explicit",
+            confidence=1.0,
+            pinned=True,
+        ))
+        memory.memory_index_worker.reconcile()
+        provider = CapturingProvider()
+        runtime = AgentRuntime(
+            config,
+            provider=provider,
+            memory=memory,
+            tools=AsyncToolRegistry(),
+            enable_sandbox=False,
+            enable_subagent=False,
+            enable_references=False,
+            enable_paper_library=False,
+        )
+        result = await runtime.run("explain this")
+        query = provider.calls[0][0][-1]["content"]
+        assert '<relevant_memory ephemeral="true">' in query
+        assert "concise technical explanations" in query
+        records = memory.session_records(result.session_id)
+        assert "relevant_memory" not in str(records)
+        assert "concise technical explanations" not in str(records)
+        await runtime.close()
+
+    asyncio.run(check())

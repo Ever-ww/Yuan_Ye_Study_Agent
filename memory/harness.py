@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import ClassVar
@@ -14,6 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sandbox import WorkspaceLockManager
 
 from .profile import ProfileStore
+from .long_term import MemoryScope, MemoryWriteRequest
+from .structured import MemoryWriter, StructuredMemoryStore
 
 
 HARNESS_PROFILE_FILES = ("AGENT.md", "PROJECT.md", "CHANGES.md", "LESSONS.md")
@@ -93,7 +96,7 @@ class HarnessLongTermMemory(ProfileStore):
 
     defaults: ClassVar[tuple[str, ...]] = HARNESS_PROFILE_FILES
 
-    def __init__(self, directory: Path, *, agent_root: Path) -> None:
+    def __init__(self, directory: Path, *, agent_root: Path, source_root: Path | None = None) -> None:
         super().__init__(
             directory,
             HARNESS_PROFILE_FILES,
@@ -102,6 +105,10 @@ class HarnessLongTermMemory(ProfileStore):
             prompt_context_limit=None,
         )
         self.agent_root = agent_root.resolve()
+        selected_source = (source_root or agent_root).resolve()
+        self.source_identity = hashlib.sha256(str(selected_source).casefold().encode()).hexdigest()[:24]
+        self.structured = StructuredMemoryStore(directory.parent)
+        self.memory_writer = MemoryWriter(self.structured)
         self._state_locks = WorkspaceLockManager(self.agent_root, state_root=self.agent_root)
 
     def initialize(self) -> None:
@@ -183,6 +190,30 @@ class HarnessLongTermMemory(ProfileStore):
                 for path, content in old_values.items():
                     self._atomic_write(path, content)
                 raise
+        source_ref = "harness:" + hashlib.sha256(
+            update.change_entry_markdown.encode("utf-8")
+        ).hexdigest()
+        self.memory_writer.write(MemoryWriteRequest(
+            scope=MemoryScope.HARNESS,
+            scope_key=self.source_identity,
+            kind="verified_change",
+            content=update.change_entry_markdown,
+            source="harness_verified",
+            source_ref=source_ref,
+            confidence=1.0,
+            importance=0.8,
+        ))
+        if update.lesson_entry_markdown:
+            self.memory_writer.write(MemoryWriteRequest(
+                scope=MemoryScope.HARNESS,
+                scope_key=self.source_identity,
+                kind="lesson",
+                content=update.lesson_entry_markdown,
+                source="harness_verified",
+                source_ref=source_ref + ":lesson",
+                confidence=0.9,
+                importance=0.8,
+            ))
 
     def deterministic_update(
         self,

@@ -19,6 +19,9 @@ from Agent.retry import ModelRetryPolicy
 from prompt import compose_dream_consolidation_messages, compose_dream_extraction_messages
 from tool import AsyncToolRegistry
 from sandbox import WorkspaceLockManager
+from memory.long_term import MemoryScope, MemoryWriteRequest
+from memory.retrieval import project_identity
+from memory.structured import MemoryProfileProjector, MemoryWriter, StructuredMemoryStore
 
 from .archive import SessionArchiveReader, contains_secret
 from .models import (
@@ -93,6 +96,9 @@ class DreamService:
         self._running = False
         self._input_tokens = 0
         self._output_tokens = 0
+        self.memory_store = StructuredMemoryStore(config.memory_dir)
+        self.memory_writer = MemoryWriter(self.memory_store)
+        self.memory_projector = MemoryProfileProjector(self.memory_store)
         self._ensure()
 
     async def process_day(self, selected_date: date, *, run_id: str | None = None) -> DreamRunResult:
@@ -129,6 +135,7 @@ class DreamService:
                 if not backup.is_dir():
                     raise FileNotFoundError(f"Dream 备份不存在：{backup}")
                 self._restore_backup(backup)
+                self.memory_store.compensate_source(f"dream:{latest}:")
                 _write_json_atomic(self.runs_root / f"rollback_{uuid4().hex}.json", {
                     "type": "rollback", "run_id": latest, "timestamp": _now(),
                 })
@@ -391,6 +398,24 @@ class DreamService:
         transaction = self.transactions_root / f"{run_id}.json"
         _write_json_atomic(transaction, {"run_id": run_id, "backup": str(backup), "status": "prepared"})
         try:
+            # Canonical memory is committed independently from legacy files.
+            # The source-ref gives rollback a deterministic compensation key.
+            for candidate in candidates:
+                scope, scope_key = self._candidate_scope(candidate.target_file)
+                for evidence_id in candidate.evidence_ids:
+                    self.memory_writer.write(MemoryWriteRequest(
+                        scope=scope,
+                        scope_key=scope_key,
+                        kind=self._candidate_kind(candidate.target_file),
+                        content=candidate.statement,
+                        source="dream_consolidated",
+                        source_ref=f"dream:{run_id}:{evidence_id}",
+                        confidence=candidate.confidence,
+                        # Dream output has no structural SINGLE subject identity;
+                        # therefore update/supersede never auto-replaces a fact.
+                        replace_existing=False,
+                        locator=f"candidate:{candidate.target_file}",
+                    ))
             for path, content in rendered.items():
                 _write_text_atomic(path, content)
             _write_model_atomic(self.memories_path, memories)
@@ -398,9 +423,26 @@ class DreamService:
             self._write_run(result, candidates=candidates, rejected=rejected)
             transaction.unlink(missing_ok=True)
         except Exception:
+            self.memory_store.compensate_source(f"dream:{run_id}:")
             self._restore_backup(backup)
             transaction.unlink(missing_ok=True)
             raise
+
+    def _candidate_scope(self, target_file: str) -> tuple[MemoryScope, str]:
+        if target_file.upper().startswith("PROJECT"):
+            return MemoryScope.PROJECT, project_identity(str(self.config.workspace_root))
+        if _SESSION_PROFILE.fullmatch(target_file):
+            return MemoryScope.SESSION, Path(target_file).stem
+        return MemoryScope.USER, "local-user"
+
+    @staticmethod
+    def _candidate_kind(target_file: str) -> str:
+        upper = target_file.upper()
+        if upper == "RESEARCH.MD":
+            return "research"
+        if upper == "OTHERS.MD":
+            return "other"
+        return "profile"
 
     def _create_backup(self, run_id: str, paths: list[Path]) -> Path:
         backup = self.backups_root / run_id

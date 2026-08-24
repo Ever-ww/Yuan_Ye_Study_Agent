@@ -142,7 +142,7 @@ def create_gateway_api(
             "status": "ok",
             "service": "yuan-ye-agent-gateway",
             "version": 1,
-            **gateway.state_controller.health(),
+            **gateway.health(),
         }
 
     @app.post("/api/v1/backup/create", dependencies=[Depends(authorize)])

@@ -53,15 +53,24 @@ def register_context_callbacks(registry: HookRegistry, processor: ContextProcess
         if estimate.decision == "proceed" or not processor.memory.has_compressible_history(event.session_id):
             return
         reload_messages = event.data.get("reload_messages_after_compression")
-        event.data["compression_operation"] = lambda: processor.prepare_before_model(
-            event.session_id,
-            messages,
-            tools,
-            reload_messages=reload_messages if callable(reload_messages) else None,
-            ephemeral_preview=preview,
-            current_query=str(event.data.get("task", "")),
-            reason=estimate.reason,
-        )
+        async def compression_operation():
+            result = await processor.prepare_before_model(
+                event.session_id,
+                messages,
+                tools,
+                reload_messages=reload_messages if callable(reload_messages) else None,
+                ephemeral_preview=preview,
+                current_query=str(event.data.get("task", "")),
+                reason=estimate.reason,
+            )
+            if result is not None and result.status == "compressed":
+                register = event.data.get("set_continuity_fragment")
+                summary = processor.memory.latest_summary(event.session_id)
+                if callable(register) and summary:
+                    register(summary)
+            return result
+
+        event.data["compression_operation"] = compression_operation
 
     async def calibrate_after_model(event: HookEvent) -> None:
         reply = event.data.get("reply")

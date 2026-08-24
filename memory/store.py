@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -11,6 +13,15 @@ from uuid import uuid4
 from .profile import ProfileStore
 from .persistence import SessionPersistenceProjection
 from .session import SessionStore
+from .structured import (
+    LegacyMemoryMigrator,
+    MemoryIndexWorker,
+    MemoryProfileProjector,
+    MemoryWriter,
+    StructuredMemoryStore,
+)
+from .retrieval import MemoryRetriever, project_identity
+from .long_term import MemoryTurnSnapshot
 
 
 class MemoryStore:
@@ -24,10 +35,12 @@ class MemoryStore:
         agent_root: Path | None = None,
         partition_by_workspace: bool = True,
         profiles: ProfileStore | None = None,
-    ) -> str:
+        memory_identity_root: Path | None = None,
+    ) -> None:
         self.root = root.resolve()
         self.agent_root = (agent_root or _infer_agent_root(self.root)).resolve()
         self.workspace_root = (workspace_root or self.agent_root).resolve()
+        self.memory_identity_root = (memory_identity_root or self.workspace_root).resolve()
         session_directory = self.root / "session"
         self.partition_by_workspace = partition_by_workspace
         if partition_by_workspace and self.workspace_root != self.agent_root:
@@ -38,12 +51,68 @@ class MemoryStore:
             raise ValueError("ProfileStore 必须位于 MemoryStore 的 profile 目录")
         self.session_profiles_enabled = self.profiles.session_profiles_enabled
         self._message_cache: dict[str, list[dict[str, Any]]] = {}
+        self.memory_degraded_reason = ""
+        try:
+            self.structured = StructuredMemoryStore(self.root)
+            self.memory_writer = MemoryWriter(self.structured)
+            self.memory_index_worker = MemoryIndexWorker(self.structured)
+            self.memory_profile_projector = MemoryProfileProjector(self.structured)
+            self.memory_retriever = MemoryRetriever(self.structured)
+            self.memory_migrator = LegacyMemoryMigrator(
+                self.structured,
+                project_key=project_identity(str(self.memory_identity_root)),
+            )
+            self.memory_migrator.migrate()
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            # Conversation persistence remains available even when the optional
+            # long-term store cannot be opened. Writes fail closed; recall is empty.
+            self.memory_degraded_reason = f"{type(exc).__name__}: {str(exc)[:500]}"
+            self.structured = None
+            self.memory_writer = _UnavailableMemoryWriter(self.memory_degraded_reason)
+            self.memory_index_worker = _NoopMemoryWorker()
+            self.memory_profile_projector = _NoopMemoryWorker()
+            self.memory_retriever = _UnavailableMemoryRetriever(self.memory_degraded_reason)
+            self.memory_migrator = None
         self.initialize()
 
     def initialize(self) -> None:
         """确保首次运行所需目录、索引和默认 Profile 全部存在。"""
         self.sessions.initialize()
         self.profiles.initialize()
+        # Projection work is bounded and idempotent. It is safe for every
+        # Runtime construction to help drain a small amount of durable work;
+        # Gateway-owned workers can drain the remainder later.
+        self.memory_index_worker.reconcile(limit=100)
+        self.memory_profile_projector.reconcile(limit=100)
+
+    def memory_health(self) -> dict[str, object]:
+        if self.structured is None:
+            return {
+                "memory_record_count": 0,
+                "memory_index_pending": 0,
+                "memory_index_failed": 0,
+                "semantic_retrieval_available": False,
+                "memory_degraded": True,
+                "memory_degradation_reason": self.memory_degraded_reason,
+            }
+        value = self.structured.health()
+        value["retrieval_audit_failures"] = self.memory_retriever.retrieval_audit_failures
+        value["semantic_retrieval_available"] = (
+            self.memory_retriever.embedding_provider is not None
+        )
+        return value
+
+    def configure_long_term_retrieval(self, config) -> None:
+        """Attach only the explicitly configured Memory embedding provider."""
+        if self.structured is None:
+            return
+        from .embeddings import build_memory_embedding_provider
+
+        provider = build_memory_embedding_provider(config)
+        self.memory_retriever.configure_semantic(
+            provider,
+            version=int(getattr(config, "memory_embedding_version", 1)),
+        )
 
     def create_session(self, first_message: str, session_id: str | None = None) -> str:
         """创建会话并返回稳定哈希。"""
@@ -435,6 +504,27 @@ class MemoryStore:
             [record],
             skill_catalog=skill_catalog,
         )
+        if self.structured is not None:
+            try:
+                from .long_term import MemoryScope, MemoryWriteRequest
+
+                self.memory_writer.write(MemoryWriteRequest(
+                    scope=MemoryScope.SESSION,
+                    scope_key=session_id,
+                    kind="summary",
+                    content=summary,
+                    source="compression",
+                    source_ref=(
+                        f"compression:{session_id}:{source_file}:"
+                        + hashlib.sha256(summary.encode("utf-8")).hexdigest()
+                    ),
+                    confidence=0.9,
+                    importance=0.6,
+                ))
+            except Exception as exc:
+                self.memory_degraded_reason = (
+                    f"compression_memory_projection:{type(exc).__name__}: {str(exc)[:300]}"
+                )
         self.refresh_messages(session_id)
         return result
 
@@ -452,42 +542,16 @@ class MemoryStore:
         skill_catalog: dict[str, object] | None = None,
     ) -> tuple[Path | None, Path]:
         """协调 Profile 与新分段写入；切段失败时恢复旧 Profile 状态。"""
-        if not self.session_profiles_enabled:
-            return None, self.rollover_with_summary(
-                session_id,
-                context_summary,
-                source_file,
-                metadata=summary_metadata,
-                skill_catalog=skill_catalog,
-            )
-        profile_path = self.profiles.directory / f"{session_id}.md"
-        profile_backup = profile_path.read_bytes() if profile_path.exists() else None
-        index_backup = self.profiles.index_path.read_bytes() if self.profiles.index_path.exists() else None
-        try:
-            committed_profile = self.profiles.commit_session_profile(
-                session_id,
-                profile_markdown,
-                source_file=source_file,
-                conversation_turns=conversation_turns,
-                records_processed=records_processed,
-                tool_calls_processed=tool_calls_processed,
-            )
-            segment = self.rollover_with_summary(
-                session_id,
-                context_summary,
-                source_file,
-                metadata=summary_metadata,
-                skill_catalog=skill_catalog,
-            )
-            return committed_profile, segment
-        except Exception:
-            if profile_backup is None:
-                profile_path.unlink(missing_ok=True)
-            else:
-                profile_path.write_bytes(profile_backup)
-            if index_backup is not None:
-                self.profiles.index_path.write_bytes(index_backup)
-            raise
+        # Compatibility input only: cumulative Profile Markdown is no longer a
+        # Memory authority. Structured candidates must go through MemoryWriter.
+        del profile_markdown, conversation_turns, records_processed, tool_calls_processed
+        return None, self.rollover_with_summary(
+            session_id,
+            context_summary,
+            source_file,
+            metadata=summary_metadata,
+            skill_catalog=skill_catalog,
+        )
 
     def _ensure_cache(self, session_id: str) -> list[dict[str, Any]]:
         if session_id not in self._message_cache:
@@ -570,3 +634,41 @@ def _infer_agent_root(memory_root: Path) -> Path:
 def _workspace_key(path: Path) -> str:
     normalized = os.path.normcase(str(path.resolve()))
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+class _UnavailableMemoryWriter:
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    def write(self, request):
+        del request
+        raise RuntimeError(f"canonical long-term Memory is unavailable: {self.reason}")
+
+
+class _NoopMemoryWorker:
+    def reconcile(self, *, limit: int = 100) -> int:
+        del limit
+        return 0
+
+
+class _UnavailableMemoryRetriever:
+    retrieval_audit_failures = 0
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    def retrieve(self, query, access, *, session_id: str, run_id=None, turn_id=None):
+        return MemoryTurnSnapshot(
+            snapshot_id="mrs_degraded_" + hashlib.sha256(
+                f"{session_id}:{self.reason}".encode()
+            ).hexdigest()[:16],
+            session_id=session_id,
+            run_id=run_id,
+            turn_id=turn_id,
+            store_watermark=0,
+            query_hash=hashlib.sha256(str(query).encode()).hexdigest(),
+            token_budget=access.profile.token_budget,
+            used_tokens=0,
+            degradation_reason="canonical_store_unavailable",
+            created_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+        )

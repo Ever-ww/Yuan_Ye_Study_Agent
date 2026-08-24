@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,7 +17,7 @@ from Agent.models.providers import _http_client_options, build_provider
 from Agent.runtime.subagent import RuntimeSubagentRunner
 from bootstrap import ensure_project_initialized, is_project_initialized
 from context_process import ContextProcessor
-from memory import HarnessLongTermMemory, MemoryStore
+from memory import HarnessLongTermMemory, MemoryScope, MemoryStore
 from prompt import PromptComposer
 from sandbox import WorkspaceLockManager
 from tool import AsyncToolRegistry, ToolContext, default_tools
@@ -720,18 +721,22 @@ class CoreTests(unittest.TestCase):
             )
             self.assertEqual(memory.restore_messages(result.session_id)[0]["role"], "user")
             self.assertTrue(provider.messages[-1]["content"].startswith("<user_query>\n整理长上下文\n</user_query>"))
+            self.assertIn('<continuity_fragment ephemeral="true">', provider.messages[-1]["content"])
+            self.assertNotIn("continuity_fragment", str(active_records))
             compression_payload = json.loads(compressor.messages[-1]["content"])
             self.assertNotIn(
                 "整理长上下文",
                 json.dumps(compression_payload["session_records"], ensure_ascii=False),
             )
             profile = config.memory_dir / "profile" / f"{result.session_id}.md"
-            self.assertIn("偏好中文", profile.read_text(encoding="utf-8"))
-            index = json.loads((config.memory_dir / "profile" / "index.json").read_text(encoding="utf-8"))
-            metadata = index["profiles"][result.session_id]
-            self.assertEqual(metadata["segments_processed"], 1)
-            self.assertEqual(metadata["conversation_turns"], 1)
-            self.assertEqual(metadata["records_processed"], 2)
+            # Compression no longer replaces cumulative Profile Markdown. The
+            # continuation summary is a canonical SESSION-scoped candidate.
+            self.assertFalse(profile.exists())
+            summaries = memory.structured.records_for_scopes((
+                (MemoryScope.SESSION, result.session_id),
+            ))
+            self.assertEqual([item.kind for item in summaries], ["summary"])
+            self.assertNotIn("偏好中文", summaries[0].content)
             memory.record_user(result.session_id, "新分段问题")
             memory.record_assistant(result.session_id, "新分段回答")
             second_provider = CompressionProvider()
@@ -740,9 +745,15 @@ class CoreTests(unittest.TestCase):
             ).compress(result.session_id))
             self.assertEqual(second.status, "compressed")
             self.assertTrue(memory.active_filename(result.session_id).endswith("_003.jsonl"))
-            updated = json.loads((config.memory_dir / "profile" / "index.json").read_text(encoding="utf-8"))["profiles"][result.session_id]
-            self.assertEqual(updated["segments_processed"], 2)
-            self.assertEqual(updated["conversation_turns"], 3)
+            with closing(memory.structured._connect()) as database:
+                self.assertEqual(database.execute(
+                    "SELECT COUNT(*) FROM memory_records WHERE scope='session' AND scope_key=? AND kind='summary'",
+                    (result.session_id,),
+                ).fetchone()[0], 1)
+                self.assertEqual(database.execute(
+                    "SELECT COUNT(*) FROM memory_evidence WHERE memory_id=?",
+                    (summaries[0].memory_id,),
+                ).fetchone()[0], 2)
 
     def test_tool_chain_is_compressed_before_the_followup_model_call(self) -> None:
         with tempfile.TemporaryDirectory() as value:

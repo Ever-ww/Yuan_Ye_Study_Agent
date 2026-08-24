@@ -70,7 +70,9 @@ class _CompressionOutput(BaseModel):
 class _SummaryOnlyOutput(BaseModel):
     """禁用 Session Profile 时压缩模型只允许返回上下文摘要。"""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    # Ignore the legacy profile_markdown field for one compatibility release.
+    # It is never persisted or projected; new prompts request summary only.
+    model_config = ConfigDict(extra="ignore", strict=True)
 
     context_summary_markdown: str = Field(min_length=1)
 
@@ -150,8 +152,12 @@ class ContextProcessor:
                 message="当前请求只有受保护的近期上下文，没有可安全压缩的完整历史块",
             )
         normalized = _normalize_records(compressible)
-        include_profile = self.memory.session_profiles_enabled
-        existing = self.memory.profiles.session_profile(session_id) if include_profile else ""
+        # Compression owns continuity only. Long-term facts must be written
+        # through MemoryWriter with structured scope and evidence; asking this
+        # model to regenerate a cumulative Markdown profile would reintroduce a
+        # second Memory authority.
+        include_profile = False
+        existing = ""
         validation_error = ""
         input_tokens = estimate_tokens(canonical_json(normalized))
         providers, provider_fallback_reason = self._compression_provider_candidates(input_tokens)

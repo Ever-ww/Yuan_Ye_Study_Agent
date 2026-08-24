@@ -13,7 +13,6 @@ from time import monotonic
 from uuid import uuid4
 
 from Agent import AgentRuntime, EventType, ExtensionCatalog, ModelRetryPolicy, RuntimeFailure, load_runtime_config
-from Agent.hook import HookRegistry
 from Agent.runtime.ephemeral import DurableIsolatedMemory
 from Agent.state import (
     BindSessionCommand,
@@ -560,6 +559,12 @@ class RuntimePool:
                             ),
                         ),
                     })
+                if hasattr(runtime, "memory"):
+                    runtime.memory.runtime_memory_access = str(profile.get("memory_access", "none"))
+                    selected_kinds = profile.get("allowed_memory_kinds", ())
+                    runtime.memory.runtime_allowed_memory_kinds = tuple(selected_kinds) if isinstance(
+                        selected_kinds, (list, tuple)
+                    ) else ()
         if (
             self.harness_evolution_service is not None
             and not run.client_id.startswith("cron:")
@@ -614,11 +619,11 @@ class RuntimePool:
                 workspace_root=config.workspace_root,
                 agent_root=config.agent_root,
             )
-            hooks = HookRegistry()
+            if run.session_id and not memory.has_session(run.session_id):
+                memory.create_session(run.task, session_id=run.session_id)
             return AgentRuntime(
                 config,
                 memory=memory,
-                hooks=hooks,
                 skills=skills,
                 approval=approvals,
                 enable_context_processing=False,

@@ -12,12 +12,20 @@ EPHEMERAL_CONTEXT_OPEN = '<harness_runtime_context ephemeral="true">'
 EPHEMERAL_CONTEXT_CLOSE = "</harness_runtime_context>"
 AGENT_EPHEMERAL_CONTEXT_OPEN = '<agent_runtime_context ephemeral="true">'
 AGENT_EPHEMERAL_CONTEXT_CLOSE = "</agent_runtime_context>"
+MEMORY_EPHEMERAL_CONTEXT_OPEN = '<relevant_memory ephemeral="true">'
+MEMORY_EPHEMERAL_CONTEXT_CLOSE = "</relevant_memory>"
+CONTINUITY_EPHEMERAL_CONTEXT_OPEN = '<continuity_fragment ephemeral="true">'
+CONTINUITY_EPHEMERAL_CONTEXT_CLOSE = "</continuity_fragment>"
 
 _EPHEMERAL_MARKERS = (
     EPHEMERAL_CONTEXT_OPEN,
     EPHEMERAL_CONTEXT_CLOSE,
     AGENT_EPHEMERAL_CONTEXT_OPEN,
     AGENT_EPHEMERAL_CONTEXT_CLOSE,
+    MEMORY_EPHEMERAL_CONTEXT_OPEN,
+    MEMORY_EPHEMERAL_CONTEXT_CLOSE,
+    CONTINUITY_EPHEMERAL_CONTEXT_OPEN,
+    CONTINUITY_EPHEMERAL_CONTEXT_CLOSE,
 )
 
 
@@ -48,7 +56,10 @@ class SessionPersistenceProjection:
     def strip_ephemeral(content: str) -> str:
         """Remove a complete echoed envelope; reject incomplete marker fragments."""
         projected = content
-        for name in ("harness_runtime_context", "agent_runtime_context"):
+        for name in (
+            "harness_runtime_context", "agent_runtime_context", "relevant_memory",
+            "continuity_fragment",
+        ):
             pattern = re.compile(
                 rf"\n*<{name} ephemeral=\"true\">.*?</{name}>\s*",
                 re.DOTALL,

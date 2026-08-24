@@ -286,6 +286,7 @@ def build_default_hooks(
     context_processor: ContextProcessor | None = None,
     prompts: Any | None = None,
     session_origin: Literal["interactive", "cron", "maintenance"] = "interactive",
+    runtime_profile: Literal["interactive", "cron", "harness", "maintenance", "memoryless"] | None = None,
 ) -> HookRegistry:
     """组合项目与记忆回调；Memory 仍只是普通回调集合。"""
     from memory.callbacks import register_memory_callbacks
@@ -297,6 +298,7 @@ def build_default_hooks(
         memory or MemoryStore(memory_dir),
         prompts,
         session_origin=session_origin,
+        runtime_profile=runtime_profile,
     )
     if context_processor is not None:
         from context_process import register_context_callbacks

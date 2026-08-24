@@ -7,6 +7,7 @@ import threading
 from pathlib import Path
 
 from prompt.composer import SystemPromptSnapshot
+from prompt.runtime_context import ProviderContextFragmentRegistry
 from skill import SkillCatalogSnapshot
 
 from .models import HarnessPromptProfile, HarnessRuntimeProfile
@@ -81,6 +82,19 @@ class HarnessPromptComposer:
         )
         self._snapshots: dict[str, SystemPromptSnapshot] = {}
         self.rebuild_count = 1
+        self.dynamic_context = _HarnessFragmentContext()
+
+    def render_provider_query(
+        self, original_query: str, session_id: str, *, origin_refs=None,
+    ) -> str:
+        del origin_refs
+        return self.dynamic_context.render(original_query, session_id, track=True)
+
+    def preview_provider_query(
+        self, original_query: str, session_id: str, *, origin_refs=None,
+    ) -> str:
+        del origin_refs
+        return self.dynamic_context.render(original_query, session_id, track=False)
 
     def open_session(
         self,
@@ -139,3 +153,12 @@ class HarnessPromptComposer:
     def set_sandbox_status(self, status) -> None:
         # Sandbox status is dynamic and belongs in the ephemeral tail, not the cached prefix.
         del status
+
+
+class _HarnessFragmentContext:
+    def __init__(self) -> None:
+        self.fragments = ProviderContextFragmentRegistry()
+
+    def render(self, query: str, session_id: str, *, track: bool) -> str:
+        fragment = self.fragments.render(session_id, consume_once=track)
+        return query + ("\n\n" + fragment if fragment else "")

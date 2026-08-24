@@ -175,6 +175,8 @@ class AgentRuntime:
                 if memory.workspace_root != self.config.workspace_root:
                     raise ValueError("MemoryStore.workspace_root 必须与 RuntimeConfig.workspace_root 一致")
             self.memory = memory
+        if hasattr(self.memory, "configure_long_term_retrieval"):
+            self.memory.configure_long_term_retrieval(self.config)
         if enable_skills:
             if skills is not None:
                 if skills.agent_root != self.config.agent_root:
@@ -269,6 +271,7 @@ class AgentRuntime:
         self.hooks = hooks or build_default_hooks(
             self.config.memory_dir, self.memory, self.context_processor, self.prompts,
             session_origin=session_origin,
+            runtime_profile=runtime_profile,
         )
         if self._owns_sandbox and self.sandbox is not None:
             register_sandbox_callbacks(self.hooks, self.sandbox)

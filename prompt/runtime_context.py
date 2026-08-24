@@ -52,6 +52,45 @@ class AgentRuntimeContextEnvelope(BaseModel):
         return hashlib.sha256(self.canonical_payload().encode("utf-8")).hexdigest()
 
 
+class ProviderContextFragmentRegistry:
+    """Trace-local provider-only fragments, rendered after the stable prefix.
+
+    The registry is intentionally in-memory. Every recovery-sensitive fact in a
+    fragment must already exist in its canonical store before registration.
+    """
+
+    def __init__(self) -> None:
+        self._fragments: dict[str, dict[str, str]] = {}
+        self._once: dict[str, set[str]] = {}
+
+    def set(self, session_id: str, name: str, content: str, *, once: bool = False) -> None:
+        selected = content.strip()
+        if selected:
+            self._fragments.setdefault(session_id, {})[name] = selected
+            if once:
+                self._once.setdefault(session_id, set()).add(name)
+        else:
+            self.remove(session_id, name)
+
+    def remove(self, session_id: str, name: str) -> None:
+        self._fragments.get(session_id, {}).pop(name, None)
+        self._once.get(session_id, set()).discard(name)
+
+    def render(self, session_id: str, *, consume_once: bool) -> str:
+        fragments = self._fragments.get(session_id, {})
+        priority = {"memory": -70, "continuity": -60, "harness": -50}
+        names = sorted(fragments, key=lambda name: (priority.get(name, 0), name))
+        rendered = "\n\n".join(fragments[name] for name in names)
+        if consume_once:
+            for name in tuple(self._once.get(session_id, ())):
+                self.remove(session_id, name)
+        return rendered
+
+    def clear(self, session_id: str) -> None:
+        self._fragments.pop(session_id, None)
+        self._once.pop(session_id, None)
+
+
 class AgentDynamicContextBuilder:
     def __init__(self, config: "RuntimeConfig", memory: "MemoryStore") -> None:
         self.config = config
@@ -59,6 +98,7 @@ class AgentDynamicContextBuilder:
         self.sandbox_mode = "closed"
         self.last_envelope_hash = ""
         self.injection_count = 0
+        self.fragments = ProviderContextFragmentRegistry()
 
     def set_sandbox_mode(self, mode: str) -> None:
         self.sandbox_mode = mode
@@ -70,8 +110,6 @@ class AgentDynamicContextBuilder:
         origin_refs: dict[str, str] | None = None,
     ) -> AgentRuntimeContextEnvelope:
         now = datetime.now().astimezone()
-        profile = self.memory.prompt_context(session_id)
-        summary = self.memory.latest_summary(session_id)
         return AgentRuntimeContextEnvelope(
             session_id=session_id,
             session_created_at=self.memory.session_created_at(session_id),
@@ -84,12 +122,15 @@ class AgentDynamicContextBuilder:
             current_time=now.isoformat(),
             sandbox_mode=self.sandbox_mode,
             runtime_notice=str(getattr(self.memory, "runtime_notice", "")).strip(),
-            profile_context=profile,
-            conversation_summary=summary,
+            # Long-term memory and continuation summaries are separate Hook
+            # fragments. Keeping them out of this generic envelope avoids an
+            # unconditional full-profile read on every model request.
+            profile_context="",
+            conversation_summary="",
             origin_refs=dict(sorted((origin_refs or {}).items())),
             source_hashes={
-                "profile": hashlib.sha256(profile.encode("utf-8")).hexdigest(),
-                "summary": hashlib.sha256(summary.encode("utf-8")).hexdigest(),
+                "profile": hashlib.sha256(b"").hexdigest(),
+                "summary": hashlib.sha256(b"").hexdigest(),
             },
         )
 
@@ -107,8 +148,10 @@ class AgentDynamicContextBuilder:
         if track:
             self.last_envelope_hash = envelope.digest
             self.injection_count += 1
-        return (
+        fragments = self.fragments.render(session_id, consume_once=track)
+        rendered = (
             f"<user_query>\n{original_query}\n</user_query>\n\n"
             f"{AGENT_EPHEMERAL_CONTEXT_OPEN}\n{envelope.canonical_payload()}\n"
             f"{AGENT_EPHEMERAL_CONTEXT_CLOSE}"
         )
+        return rendered + (f"\n\n{fragments}" if fragments else "")

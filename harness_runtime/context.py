@@ -121,7 +121,11 @@ def register_harness_context_callbacks(
         if not event.data.get("first_model_call"):
             return
 
+        prior_renderer = event.data.get("render_ephemeral_context")
+
         def render_ephemeral_context(messages: list[dict[str, Any]]) -> None:
+            if callable(prior_renderer):
+                prior_renderer(messages)
             if not messages:
                 raise ValueError("Harness context injection requires model messages")
             current = messages[-1]

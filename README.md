@@ -14,7 +14,7 @@ Yuan Ye Study Agent 是一个本地优先、单一异步 Runtime 驱动的学习
 
 CLI chat 能保存完整错误现场，并在用户确认后创建隔离 Git worktree，再启动一个复用正式 `AgentRuntime` 类的 Coding Agent。Coding Runtime 的 `workspace_root`、ToolContext、Docker 挂载（可用时）和文件工具全部指向该 worktree；控制器会在运行前校验这一边界。Skill 则始终读取 Yuan Ye 主源码仓库的 `skills/`，不会改从临时 worktree 或 `~/.yy/skills/` 加载。它拥有专属 Memory、项目结构 Profile、上下文压缩和已审核 Skill，工具严格限定为 `read_file`、`search_workspace`、`edit`、`write`、`sandbox_rollback`、`web_fetch`、`skill_read`、`subagent`，配置 Brave Key 后增加 `web_search`，Docker 可用时增加 `bash`。论文、Reference、Cron、计算、时间和 Skill 安装均不会进入 Harness Schema。用户确认启动 Harness 后，隔离 worktree 内的既有 Coding 工具自动获批；变更仍必须通过固定测试，才会提交并本地快进合并。测试失败或无变更时删除 worktree，Harness 不会 stash 脏主工作区，也不会自动推送 GitHub。
 
-Coding Agent 的记忆位于 Agent 根目录的 `.yy/harness-evolution/memory/`，与普通聊天 Memory 和目标 workspace 分离。每次 Harness 更新创建全新的 Session JSONL，不恢复上一项修复的临时对话；同一次更新发生压缩时，继续使用相同 Session 哈希生成 `_002.jsonl`、`_003.jsonl`。跨更新只共享 `profile/AGENT.md`、`PROJECT.md`、`CHANGES.md` 和 `LESSONS.md` 四个长期文件。
+Coding Agent 的记忆位于 Agent 根目录的 `.yy/harness-evolution/memory/`，与普通聊天 Memory 和目标 workspace 分离。每次 Harness 更新创建全新的 Session JSONL，不恢复上一项修复的临时对话；同一次更新发生压缩时，继续使用相同 Session 哈希生成 `_002.jsonl`、`_003.jsonl`。跨更新事实以该目录的 `memory.sqlite3` 为权威，并通过 Hook 按 source repository scope 召回；`profile/AGENT.md` 保留稳定规则，其余 Markdown 是可重建的人类可读投影。
 
 `AGENT.md` 首次创建后只由用户维护；`PROJECT.md` 保存当前架构和 Tool/Hook 等开发规范；`CHANGES.md` 与 `LESSONS.md` 只追加已经通过测试并成功合并的事实。每个 Coding Session 都把 `AGENT.md`、`PROJECT.md` 全文和预算内的最新日志条目注入 System Prompt。合并成功后由无工具维护 Runtime 更新长期记忆，模型不可用时使用确定性项目扫描降级；失败、无变更或未合并的尝试只保留在 JSONL 和错误快照中。
 
@@ -66,12 +66,12 @@ tests/      核心行为与 UI 安全测试
 .yy/gateway/ SQLite、可重放 Run 事件与 Inbox（进程控制文件位于外部控制面）
 .yy-backups/ 加密备份、Restore Journal/Fence、维护锁与 Gateway 进程控制（位于 Agent Home 外）
 .yy/dream/  每日巩固状态、结构化记忆、运行审计、事务与 Profile 备份（不提交）
-.yy/memory/ Agent Home 中的会话 JSONL、会话索引与长期 Profile（不提交）
+.yy/memory/ Agent Home 中的会话 JSONL、Canonical 长期 Memory、可重建索引与 Profile 投影（不提交）
 .yy/papers/ 全局论文 PDF、中文总结与审计索引（不提交）
 run.py      唯一源码树入口
 ```
 
-`memory/` 永远不保存用户数据。首次运行在用户 `~/.yy` 创建 `memory/`：会话消息按 workspace 隔离后写入 `session/` 下的 JSONL，长期 Profile 写入所有 workspace 共享的 `profile/` Markdown。启动 Agent 时所在的目录不会生成记忆或模型配置文件。
+仓库内的 `memory/` Python 包永远不保存用户数据。首次运行在用户 `~/.yy` 创建 `memory/`：会话消息按 workspace 隔离后写入 `session/` 下的 JSONL；长期事实、Evidence、Mutation 与 Projection Intent 写入 `memory.sqlite3`。`index.sqlite3` 和 `profile/` Markdown 均可由 Canonical Store 重建。启动 Agent 时所在的目录不会生成记忆或模型配置文件。
 
 ## 从零开始
 
@@ -595,7 +595,7 @@ Agent 自身 workspace：
 .yy/memory/session/<workspace-hash>/YYYY-MM-DD_<会话哈希>_001.jsonl
 ```
 
-这些路径都位于 Agent 根目录的 `.yy/memory/`，不是外部 workspace。不要手工修改 `index.json`。恢复只读取当前 workspace 分区索引中的 `latest_file`；上下文压缩成功后，新分段保留同一哈希并使用 `_002.jsonl`、`_003.jsonl` 等编号，首行是结构化 `summary`。压缩会同时更新全局 `profile/<会话哈希>.md` 和 `profile/index.json`，USER、RESEARCH、OTHERS 与普通扩展 Profile 可供所有 workspace 使用。
+这些路径都位于 Agent 根目录的 `.yy/memory/`，不是外部 workspace。不要手工修改 `index.json`。恢复只读取当前 workspace 分区索引中的 `latest_file`；上下文压缩成功后，新分段保留同一哈希并使用 `_002.jsonl`、`_003.jsonl` 等编号，首行是结构化 `summary`。压缩只提交 Session continuity summary；长期事实必须通过结构化 MemoryWriter 进入 `memory.sqlite3`，不会再由压缩模型累积改写 Session Profile Markdown。
 
 工具调用也使用接近模型输入的格式逐条保存：模型请求写为带 `tool_calls` 的 assistant 记录，工具成功或失败写为带相同 `tool_call_id` 的 tool 记录。这样恢复和压缩都能看到完整工具链。
 
@@ -804,7 +804,7 @@ Dream 使用独立、非流式且无 Tool/Skill/Memory/Sandbox/Extension 的临�
 - Agent Home 的 `.yy/sandbox/locks/` 保存按 workspace 隔离的空锁载体文件；Windows 使用 `LockFileEx`，Linux/macOS 使用 `flock`，进程退出后不依赖删除文件即可释放锁。
 - `tests/error/*.jsonl` 只保存代码类缺陷的完整上下文、请求与异常栈，可能包含隐私，只在本机保留并由 Git 忽略。
 - 本机模型配置：`.yy/settings.local.json`，可放置 `provider`、`model`、`base_url` 与 `api_key`；初始化模板由源码中的 `bootstrap/templates/` 提供。
-- 普通聊天记忆位于 Agent Home 的 `.yy/memory/`；Harness 专属记忆位于 `.yy/harness-evolution/memory/`。两者都不写入目标 workspace。普通 Session 按 workspace 路径哈希分区；Harness 每次更新使用独立 Session，并只跨更新共享四个固定 Markdown。
+- 普通聊天记忆位于 Agent Home 的 `.yy/memory/`；Harness 专属记忆位于 `.yy/harness-evolution/memory/`。两者都不写入目标 workspace。普通 Session 按 workspace 路径哈希分区；Harness 每次更新使用独立 Session。两者的长期事实均以各自 `memory.sqlite3` 为权威，Markdown 仅承担稳定规则或可重建投影。
 - Session JSONL、Session 索引和 Profile 索引读取时均经过 Pydantic 校验；非法角色、损坏的工具链关联或错误索引会明确失败，不会静默污染下一轮上下文。
 - 首次运行自动创建 `profile/USER.md`、`profile/RESEARCH.md`、`profile/OTHERS.md` 和索引。普通命名的扩展 Profile 全局加载；16 位会话哈希命名的 Profile 只注入对应 Session，避免跨会话污染。
 - 新模型实现 `Agent.contracts.ModelProvider`；新工具实现 `tools.AsyncTool`；新回调通过 `HookRegistry.register()` 或 `HookRegistry.on()` 注册。

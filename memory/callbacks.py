@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from typing import Literal
 
 from Agent.contracts import ModelReply
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models.errors import is_retryable_model_error
 from memory.store import MemoryStore
+from memory.long_term import MemoryTurnSnapshot
+from memory.retrieval import (
+    MemoryContextProjector,
+    MemoryQueryBuilder,
+    access_snapshot,
+    project_identity,
+)
 from prompt import PromptComposer
 
 
@@ -18,9 +26,16 @@ def register_memory_callbacks(
     prompts: PromptComposer | None = None,
     *,
     session_origin: Literal["interactive", "cron", "maintenance"] = "interactive",
+    runtime_profile: Literal["interactive", "cron", "harness", "maintenance", "memoryless"] | None = None,
 ) -> None:
     """注册会话创建、上下文加载和最终回复持久化回调。"""
     base_systems: dict[str, dict[str, object]] = {}
+    turn_snapshots: dict[str, MemoryTurnSnapshot] = {}
+    access_snapshots: dict[str, object] = {}
+    selected_profile = runtime_profile or (
+        "cron" if session_origin == "cron" else
+        "maintenance" if session_origin == "maintenance" else "interactive"
+    )
 
     async def create_or_restore_session(event: HookEvent) -> None:
         if memory.has_session(event.session_id):
@@ -49,6 +64,16 @@ def register_memory_callbacks(
         render_provider_query = getattr(prompts, "render_provider_query", None)
         preview_provider_query = getattr(prompts, "preview_provider_query", None)
         origin_refs = _audit(event)
+        dynamic = getattr(prompts, "dynamic_context", None)
+        fragments = getattr(dynamic, "fragments", None)
+        if fragments is not None:
+            event.data["set_continuity_fragment"] = lambda summary: fragments.set(
+                event.session_id,
+                "continuity",
+                '<continuity_fragment ephemeral="true">\n' + str(summary).strip()
+                + '\n</continuity_fragment>',
+                once=True,
+            )
 
         def rebuild_messages(*, refresh_system: bool = False) -> list[dict[str, object]]:
             nonlocal base_system
@@ -74,26 +99,32 @@ def register_memory_callbacks(
                     audit=_audit(event),
                 )
             )
-            if callable(render_provider_query):
-                def render_ephemeral_context(target_messages: list[dict[str, object]]) -> None:
-                    if not target_messages or target_messages[-1].get("role") != "user":
-                        raise ValueError("Agent runtime context requires the current user query at the tail")
-                    original = target_messages[-1].get("content")
-                    if not isinstance(original, str):
-                        raise ValueError("Agent user query must be text")
-                    target_messages[-1]["content"] = render_provider_query(
-                        original,
-                        event.session_id,
-                        origin_refs=origin_refs,
-                    )
+        if callable(render_provider_query):
+            def render_ephemeral_context(target_messages: list[dict[str, object]]) -> None:
+                selected = next((
+                    message for message in reversed(target_messages)
+                    if message.get("role") == "user" and message.get("content") == task
+                ), None)
+                if selected is None:
+                    # The current Turn was already rendered and no compression
+                    # reload replaced it. Do not duplicate the envelope.
+                    return
+                original = selected.get("content")
+                if not isinstance(original, str):
+                    raise ValueError("Agent user query must be text")
+                selected["content"] = render_provider_query(
+                    original,
+                    event.session_id,
+                    origin_refs=origin_refs,
+                )
 
-                event.data["render_ephemeral_context"] = render_ephemeral_context
-                if callable(preview_provider_query):
-                    event.data["preview_ephemeral_context"] = lambda: preview_provider_query(
-                        str((current_user_message or {}).get("content", task)),
-                        event.session_id,
-                        origin_refs=origin_refs,
-                    )
+            event.data["render_ephemeral_context"] = render_ephemeral_context
+            if callable(preview_provider_query):
+                event.data["preview_ephemeral_context"] = lambda: preview_provider_query(
+                    task,
+                    event.session_id,
+                    origin_refs=origin_refs,
+                )
         # Summary/Profile are provider-tail facts; compression must not rebuild the stable prefix.
         event.data["reload_messages_after_compression"] = lambda: rebuild_messages(refresh_system=False)
 
@@ -114,6 +145,88 @@ def register_memory_callbacks(
 
     async def clear_context_state(event: HookEvent) -> None:
         base_systems.pop(event.session_id, None)
+        turn_snapshots.pop(event.session_id, None)
+        access_snapshots.pop(event.session_id, None)
+        dynamic = getattr(prompts, "dynamic_context", None)
+        fragments = getattr(dynamic, "fragments", None)
+        if fragments is not None:
+            fragments.clear(event.session_id)
+
+    async def retrieve_turn_memory(event: HookEvent) -> None:
+        """Freeze visibility at TURN_START; failures degrade to empty recall."""
+        dynamic = getattr(prompts, "dynamic_context", None)
+        fragments = getattr(dynamic, "fragments", None)
+        if fragments is None or not hasattr(memory, "memory_retriever"):
+            return
+        audit = _audit(event)
+        config = event.data.get("config")
+        if config is not None and not bool(getattr(config, "memory_retrieval_enabled", True)):
+            fragments.remove(event.session_id, "memory")
+            return
+        workspace = str(getattr(config, "workspace_root", memory.workspace_root))
+        if selected_profile == "harness" and hasattr(memory, "memory_identity_root"):
+            workspace = str(memory.memory_identity_root)
+        run_id = audit.get("run_id")
+        turn_id = audit.get("turn_id")
+        cron_access = str(
+            event.data.get("memory_access", getattr(memory, "runtime_memory_access", "none"))
+        )
+        allowed_kinds = getattr(memory, "runtime_allowed_memory_kinds", ())
+        access = access_snapshot(
+            runtime_profile=selected_profile,
+            workspace_root=workspace,
+            session_id=event.session_id,
+            run_id=run_id,
+            cron_memory_access=cron_access,
+            allowed_kinds=allowed_kinds,
+        )
+        access_snapshots[event.session_id] = access
+        try:
+            # Help the eventually-consistent local index catch up before the
+            # visibility watermark is frozen. This is idempotent and never
+            # crosses the canonical/index database transaction boundary.
+            memory.memory_index_worker.reconcile(limit=100)
+            recent = []
+            for message in memory.restore_messages(event.session_id)[-6:]:
+                if message.get("role") not in {"user", "assistant", "summary"}:
+                    continue
+                content = message.get("content")
+                if isinstance(content, str) and content:
+                    recent.append(content)
+            query = MemoryQueryBuilder.build(
+                str(event.data.get("task", "")),
+                project_identity=project_identity(workspace),
+                objective=str(event.data.get("active_objective", "")),
+                recent_context="\n".join(recent),
+                origin_refs=tuple(str(value) for value in audit.values()),
+            )
+            snapshot = await memory.memory_retriever.retrieve_async(
+                query,
+                access,
+                session_id=event.session_id,
+                run_id=run_id,
+                turn_id=turn_id,
+            )
+        except Exception as exc:
+            # Recall is an enhancement. Store corruption, scope ambiguity, or
+            # retrieval implementation errors must not kill a normal Agent Turn.
+            snapshot = MemoryTurnSnapshot(
+                snapshot_id="mrs_degraded_" + hashlib.sha256(
+                    f"{event.session_id}:{type(exc).__name__}".encode()
+                ).hexdigest()[:16],
+                session_id=event.session_id,
+                run_id=run_id,
+                turn_id=turn_id,
+                store_watermark=0,
+                query_hash=hashlib.sha256(str(event.data.get("task", "")).encode()).hexdigest(),
+                token_budget=access.profile.token_budget,
+                used_tokens=0,
+                degradation_reason=f"retrieval_failed:{type(exc).__name__}",
+                created_at=access.created_at,
+            )
+        turn_snapshots[event.session_id] = snapshot
+        fragments.set(event.session_id, "memory", MemoryContextProjector.render(snapshot))
+        event.data["memory_turn_snapshot"] = snapshot.model_dump(mode="python")
 
     async def persist_answer(event: HookEvent) -> None:
         if event.data.get("cancelled"):
@@ -150,6 +263,24 @@ def register_memory_callbacks(
             reasoning=str(event.data["reasoning"]) if isinstance(event.data.get("reasoning"), str) else None,
             audit=_audit(event),
         )
+
+    async def record_retrieval_feedback(event: HookEvent) -> None:
+        snapshot = turn_snapshots.get(event.session_id)
+        structured = getattr(memory, "structured", None)
+        if snapshot is None or structured is None:
+            return
+        try:
+            structured.record_retrieval_feedback(
+                snapshot.snapshot_id,
+                outcome=(
+                    "cancelled" if event.data.get("cancelled") else
+                    "failed" if event.data.get("error") is not None else
+                    "completed" if event.data.get("completed") else "incomplete"
+                ),
+                selected_memory_ids=[item.record.memory_id for item in snapshot.selected],
+            )
+        except Exception:
+            memory.memory_retriever.retrieval_audit_failures += 1
 
     async def persist_model_tool_calls(event: HookEvent) -> None:
         """把每次模型返回的工具调用作为标准 assistant 消息落盘。"""
@@ -224,10 +355,12 @@ def register_memory_callbacks(
 
     registry.register(HookPoint.TRACE_START, create_or_restore_session, priority=-100)
     registry.register(HookPoint.TURN_START, prepare_history, priority=-100)
+    registry.register(HookPoint.TURN_START, retrieve_turn_memory, priority=-70)
     registry.register(HookPoint.MODEL_BEFORE, load_context, priority=-100)
     registry.register(HookPoint.MODEL_AFTER, persist_model_tool_calls, priority=100)
     registry.register_tool_observation_publisher(persist_tool_result, priority=100)
     registry.register(HookPoint.TURN_END, persist_answer, priority=100)
+    registry.register(HookPoint.TURN_END, record_retrieval_feedback, priority=110)
     registry.register(HookPoint.TRACE_END, clear_context_state, priority=100)
 
 

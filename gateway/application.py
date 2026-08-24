@@ -75,7 +75,7 @@ from gateway.models import (
 )
 from gateway.runtime_pool import RuntimeFactory, RuntimePool
 from gateway.store import GatewayStore
-from memory import MemoryStore
+from memory import MemoryEmbeddingWorker, MemoryStore, build_memory_embedding_provider
 from reference import (
     ReferenceEmbeddingWorker,
     ReferenceService,
@@ -158,6 +158,18 @@ class GatewayApplication:
             heartbeat_seconds=config.cron_heartbeat_seconds,
         )
         self.cron_service = CronService(self.cron_store, CronScheduleCalculator())
+        self.memory_store = MemoryStore(
+            config.memory_dir,
+            workspace_root=config.workspace_root,
+            agent_root=config.agent_root,
+        )
+        self.memory_store.configure_long_term_retrieval(config)
+        self.memory_embedding_provider = build_memory_embedding_provider(config)
+        self.memory_embedding_worker = MemoryEmbeddingWorker(
+            self.memory_store.structured,
+            self.memory_embedding_provider,
+            version=config.memory_embedding_version,
+        ) if self.memory_store.structured is not None else None
         self.reference_store = ReferenceStore(config.reference_database_path)
         self.reference_embedding_provider = build_embedding_provider(config)
         self.reference_embedding_worker = ReferenceEmbeddingWorker(
@@ -178,6 +190,7 @@ class GatewayApplication:
             state_controller=self.state_controller,
         )
         self._harness_dream_tick_lock = asyncio.Lock()
+
         self.pool = RuntimePool(
             agent_root=config.agent_root,
             store=self.store,
@@ -248,6 +261,8 @@ class GatewayApplication:
         self.maintenance.register("dream", self.dream_scheduler)
         self.maintenance.register("outbox", self.outbox)
         self.maintenance.register("reference_embedding", self.reference_embedding_worker)
+        if self.memory_embedding_worker is not None:
+            self.maintenance.register("memory_embedding", self.memory_embedding_worker)
         self.maintenance.register("harness", self.code_sessions)
         self.restart_coordinator = GatewayRestartCoordinator(
             agent_root=config.agent_root, source_root=source_root,
@@ -278,6 +293,10 @@ class GatewayApplication:
             on_result=self._record_backup_result,
             heartbeat_seconds=config.cron_heartbeat_seconds,
         )
+
+    def health(self) -> dict[str, object]:
+        """Merge existing Gateway diagnostics with canonical Memory health."""
+        return {**self.state_controller.health(), **self.memory_store.memory_health()}
 
     def _reconcile_extension_grant_intents(self, source_root: Path) -> None:
         for row in self.state_controller.pending_extension_grant_intents():
@@ -324,6 +343,8 @@ class GatewayApplication:
         self.outbox.reconcile_startup()
         self.event_archive.recover_preparing()
         await self.reference_embedding_worker.start()
+        if self.memory_embedding_worker is not None:
+            await self.memory_embedding_worker.start()
         try:
             await self.pool.start()
             await self.cron_store.ensure()
@@ -340,6 +361,8 @@ class GatewayApplication:
         except Exception:
             await self.outbox.close()
             await self.reference_embedding_worker.close()
+            if self.memory_embedding_worker is not None:
+                await self.memory_embedding_worker.close()
             raise
 
     async def _reconcile_cron_dispatches(self) -> None:
@@ -511,6 +534,8 @@ class GatewayApplication:
             await self.code_sessions.close()
             await self.pool.close()
         finally:
+            if self.memory_embedding_worker is not None:
+                await self.memory_embedding_worker.close()
             await self.reference_embedding_worker.close()
             await self.outbox.close()
 

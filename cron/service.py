@@ -65,6 +65,8 @@ class CronService:
                 max_parallel_tool_calls=(
                     previous.runtime_profile.max_parallel_tool_calls if previous else 4
                 ),
+                memory_access=previous.runtime_profile.memory_access if previous else "none",
+                allowed_memory_kinds=previous.runtime_profile.allowed_memory_kinds if previous else (),
                 limits=previous.runtime_profile.limits if previous else CronRuntimeProfile().limits,
             )
         return previous.runtime_profile if previous else CronRuntimeProfile()

@@ -114,6 +114,11 @@ class RuntimeConfig(BaseModel):
     reference_embedding_api_key: str | None = None
     reference_keyword_weight: float = Field(default=0.4, ge=0.0, le=1.0)
     reference_semantic_weight: float = Field(default=0.6, ge=0.0, le=1.0)
+    memory_retrieval_enabled: StrictBool = True
+    memory_embedding_model: str = ""
+    memory_embedding_base_url: str | None = None
+    memory_embedding_api_key: str | None = None
+    memory_embedding_version: StrictInt = Field(default=1, ge=1)
 
     @field_validator("agent_root", "workspace_root", "coding_source_root", "backup_directory")
     @classmethod
@@ -150,6 +155,8 @@ class RuntimeConfig(BaseModel):
             raise ValueError("reference_keyword_weight 与 reference_semantic_weight 之和必须大于 0")
         if self.reference_embedding_base_url and not self.reference_embedding_base_url.startswith(("http://", "https://")):
             raise ValueError("reference_embedding_base_url 只支持 http:// 或 https://")
+        if self.memory_embedding_base_url and not self.memory_embedding_base_url.startswith(("http://", "https://")):
+            raise ValueError("memory_embedding_base_url must use http:// or https://")
         if self.compression_base_url and not self.compression_base_url.startswith(("http://", "https://")):
             raise ValueError("compression_base_url 只支持 http:// 或 https://")
         if self.compression_safety_margin_tokens >= self.model_context_window_tokens:
@@ -216,6 +223,7 @@ def load_runtime_config(
         "web_search_api_key",
         "reference_embedding_api_key",
         "compression_api_key",
+        "memory_embedding_api_key",
     }.intersection(shared)
     if sensitive_keys:
         raise ValueError(

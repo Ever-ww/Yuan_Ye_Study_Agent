@@ -29,11 +29,22 @@ class AgentHomeDurabilityCatalog:
         ".yy/harness-evolution/worktrees",
     }
     _REBUILDABLE_SUFFIXES = {".events.idx"}
+    _REBUILDABLE_FILES = {
+        ".yy/memory/index.sqlite3",
+        ".yy/harness-evolution/memory/index.sqlite3",
+        ".yy/harness-evolution/memory/profile/CHANGES.md",
+        ".yy/harness-evolution/memory/profile/LESSONS.md",
+    }
+    _REBUILDABLE_DIRS = {".yy/memory/profile"}
 
     def classify(self, relative: PurePosixPath) -> DurabilityClass:
         value = relative.as_posix().lstrip("./")
         if value in self._TRANSIENT_FILES:
             return DurabilityClass.TRANSIENT
+        if value in self._REBUILDABLE_FILES:
+            return DurabilityClass.REBUILDABLE
+        if any(value == prefix or value.startswith(prefix + "/") for prefix in self._REBUILDABLE_DIRS):
+            return DurabilityClass.REBUILDABLE
         if any(value == prefix or value.startswith(prefix + "/") for prefix in self._TRANSIENT_DIRS):
             return DurabilityClass.TRANSIENT
         if value.endswith(("-wal", "-shm")):

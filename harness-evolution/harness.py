@@ -734,6 +734,7 @@ def create_coding_runtime(
     long_term = HarnessLongTermMemory(
         memory_root / "profile",
         agent_root=isolated.agent_root,
+        source_root=config.coding_source_root or Path(__file__).resolve().parents[1],
     )
     long_term.ensure_project_initialized(isolated.workspace_root)
     memory = MemoryStore(
@@ -742,7 +743,10 @@ def create_coding_runtime(
         agent_root=isolated.agent_root,
         partition_by_workspace=False,
         profiles=long_term,
+        memory_identity_root=config.coding_source_root or Path(__file__).resolve().parents[1],
     )
+    # Harness recall is shared by source repository identity, never by the
+    # disposable worktree path of one invocation.
     session_id = uuid4().hex[:16]
     memory.create_session("Harness Coding Agent 本次更新", session_id=session_id)
     tools = resource_loader.build_tools(selected_profile, isolated, skills)
@@ -912,6 +916,7 @@ class HarnessEvolutionRunner:
         long_term = HarnessLongTermMemory(
             request.config.agent_root / ".yy" / "harness-evolution" / "memory" / "profile",
             agent_root=request.config.agent_root,
+            source_root=root,
         )
         long_term.ensure_project_initialized(root)
         mode = "model"
@@ -1699,6 +1704,7 @@ class HarnessEvolutionEngine:
         long_term = HarnessLongTermMemory(
             self.config.agent_root / ".yy" / "harness-evolution" / "memory" / "profile",
             agent_root=self.config.agent_root,
+            source_root=root,
         )
         long_term.ensure_project_initialized(root)
         update = long_term.deterministic_update(
