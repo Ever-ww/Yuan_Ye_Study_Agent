@@ -196,7 +196,7 @@ async def _render_gateway(
                         lines.append("[green]模型网络连接已恢复[/]")
                     elif event.type == EventType.SANDBOX_FALLBACK.value:
                         lines.append(
-                            f"[yellow]{event.payload.get('message', 'Docker 不可用，已进入 checkpoint-only；Bash 已禁用')}[/]"
+                            f"[yellow]{event.payload.get('message', '沙箱后端不可用，已进入 checkpoint-only；Bash/Shell 已禁用')}[/]"
                         )
                     elif event.type == EventType.TOOL_REQUESTED.value:
                         if streaming_text:
@@ -312,7 +312,7 @@ async def _render(
                         lines.append("[green]模型网络连接已恢复，继续当前任务[/]")
                     elif event.type is EventType.SANDBOX_FALLBACK:
                         lines.append(
-                            f"[yellow]{event.payload.get('message', 'Docker 不可用，已进入 checkpoint-only；Bash 已禁用')}[/]"
+                            f"[yellow]{event.payload.get('message', '沙箱后端不可用，已进入 checkpoint-only；Bash/Shell 已禁用')}[/]"
                         )
                     elif event.type is EventType.TOOL_REQUESTED:
                         if streaming_text:

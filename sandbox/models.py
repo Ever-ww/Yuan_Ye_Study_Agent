@@ -1,4 +1,4 @@
-"""Docker 沙箱与分支化本地 checkpoint 的持久化数据模型。"""
+"""沙箱后端能力与分支化本地 checkpoint 的持久化数据模型。"""
 
 from __future__ import annotations
 
@@ -14,19 +14,21 @@ MergeAttemptOutcome = Literal["merged", "blocked", "deferred", "unknown", "skipp
 
 
 class SandboxStatus(BaseModel):
-    """当前 Trace 的 Docker/Checkpoint 能力状态。"""
+    """当前 Trace 的 OS/Docker/Checkpoint 能力状态。"""
 
     model_config = ConfigDict(frozen=True, strict=True)
 
-    mode: Literal["pending", "docker", "checkpoint_only", "closed"]
+    mode: Literal["pending", "os", "docker", "checkpoint_only", "closed"]
     bash_available: bool
     reason_code: str | None = None
     message: str = Field(min_length=1)
+    backend: str | None = None
+    shell: str | None = None
 
     @model_validator(mode="after")
     def validate_capabilities(self) -> "SandboxStatus":
-        if self.bash_available != (self.mode == "docker"):
-            raise ValueError("只有 docker 模式可以声明 Bash 可用")
+        if self.bash_available != (self.mode in {"os", "docker"}):
+            raise ValueError("只有 os/docker 模式可以声明 Bash 可用")
         return self
 
 

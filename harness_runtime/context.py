@@ -108,6 +108,7 @@ class HarnessDynamicContextController:
 def register_harness_context_callbacks(
     registry: HookRegistry,
     controller: HarnessDynamicContextController,
+    *, sandbox=None,
 ) -> HarnessTraceContextScope:
     """Inject the current envelope after Memory rebuilds messages but before Provider I/O."""
 
@@ -120,6 +121,12 @@ def register_harness_context_callbacks(
     async def inject(event: HookEvent) -> None:
         if not event.data.get("first_model_call"):
             return
+        if sandbox is not None:
+            from sandbox import sandbox_status_of
+            controller.worktree_state = {
+                **controller.worktree_state,
+                "sandbox": sandbox_status_of(sandbox).model_dump(mode="json"),
+            }
 
         prior_renderer = event.data.get("render_ephemeral_context")
 

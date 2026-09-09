@@ -12,7 +12,7 @@ Yuan Ye Study Agent 是一个本地优先、单一异步 Runtime 驱动的学习
 
 所谓 **Harness 自进化**，不是让模型不受控制地改写自己，而是建立一条可审计的成长闭环：传统框架依赖硬编码固定逻辑，面对长对话、Token 波动、复杂子任务、新增交互场景容易失效，只能靠人工改代码、重启服务来适配。本 Agent 在发现代码类缺陷并取得用户确认后，会在隔离环境中生成和校验代码补丁。这是对“身体”和“大脑”的共同进化，而不是只优化“大脑”（Skill）。
 
-CLI chat 能保存完整错误现场，并在用户确认后创建隔离 Git worktree，再启动一个复用正式 `AgentRuntime` 类的 Coding Agent。Coding Runtime 的 `workspace_root`、ToolContext、Docker 挂载（可用时）和文件工具全部指向该 worktree；控制器会在运行前校验这一边界。Skill 则始终读取 Yuan Ye 主源码仓库的 `skills/`，不会改从临时 worktree 或 `~/.yy/skills/` 加载。它拥有专属 Memory、项目结构 Profile、上下文压缩和已审核 Skill，工具严格限定为 `read_file`、`search_workspace`、`edit`、`write`、`sandbox_rollback`、`web_fetch`、`skill_read`、`subagent`，配置 Brave Key 后增加 `web_search`，Docker 可用时增加 `bash`。论文、Reference、Cron、计算、时间和 Skill 安装均不会进入 Harness Schema。用户确认启动 Harness 后，隔离 worktree 内的既有 Coding 工具自动获批；变更仍必须通过固定测试，才会提交并本地快进合并。测试失败或无变更时删除 worktree，Harness 不会 stash 脏主工作区，也不会自动推送 GitHub。
+CLI chat 能保存完整错误现场，并在用户确认后创建隔离 Git worktree，再启动一个复用正式 `AgentRuntime` 类的 Coding Agent。Coding Runtime 的 `workspace_root`、ToolContext、沙箱工作目录和文件工具全部指向该 worktree；控制器会在运行前校验这一边界。Skill 则始终读取 Yuan Ye 主源码仓库的 `skills/`，不会改从临时 worktree 或 `~/.yy/skills/` 加载。它拥有专属 Memory、项目结构 Profile、上下文压缩和已审核 Skill，工具严格限定为 `read_file`、`search_workspace`、`edit`、`write`、`sandbox_rollback`、`web_fetch`、`skill_read`、`subagent`，配置 Brave Key 后增加 `web_search`，沙箱可用时增加 `bash`。论文、Reference、Cron、计算、时间和 Skill 安装均不会进入 Harness Schema。用户确认启动 Harness 后，隔离 worktree 内的既有 Coding 工具自动获批；变更仍必须通过固定测试，才会提交并本地快进合并。测试失败或无变更时删除 worktree，Harness 不会 stash 脏主工作区，也不会自动推送 GitHub。
 
 Coding Agent 的记忆位于 Agent 根目录的 `.yy/harness-evolution/memory/`，与普通聊天 Memory 和目标 workspace 分离。每次 Harness 更新创建全新的 Session JSONL，不恢复上一项修复的临时对话；同一次更新发生压缩时，继续使用相同 Session 哈希生成 `_002.jsonl`、`_003.jsonl`。跨更新事实以该目录的 `memory.sqlite3` 为权威，并通过 Hook 按 source repository scope 召回；`profile/AGENT.md` 保留稳定规则，其余 Markdown 是可重建的人类可读投影。
 
@@ -33,7 +33,7 @@ paper_library/ 全局论文索引、下载、去重、分页解析与总结持�
 context_process/ Token 阈值压缩、Profile 合并与失败裁剪
 harness-evolution/ 错误快照、隔离 worktree、诊断与验证流水线
 prompt/     单一 System Prompt、任务时间与上下文缓存组合
-sandbox/    Trace 级 Docker、独立本地 Git checkpoint 与跨进程文件锁
+sandbox/    Trace 级 OS/Docker 沙箱、独立本地 Git checkpoint 与跨进程文件锁
 skill/      Skill 获取、格式解析、静态审核、可信索引与安装事务
 skills/     System Prompt 与 skill_read 唯一读取的正式 Skill 目录（由 Git 跟踪）
 tool/       工具共用框架（不包含模型可直接调用的工具）
@@ -42,7 +42,7 @@ tool/       工具共用框架（不包含模型可直接调用的工具）
   defaults.py          默认工具装配入口
   path_guard.py        工作区路径与敏感目录边界
 tools/      仅保存模型可直接调用的受控工具实现
-  bash.py              Docker 内受限 Bash
+  bash.py              OS/Docker 内受限 Shell
   read_file.py         统一读取源码、文本、PDF 与 Office 文档
   edit.py              已有文件的精确多块替换并创建 checkpoint
   write.py             新建或整文件覆盖并创建 checkpoint
@@ -120,16 +120,16 @@ uv run python --version
 uv tree
 ```
 
-### 4. 可选：安装并启动 Docker Desktop
+### 4. OS 沙箱默认启用，Docker 为可选后端
 
-只有需要 `bash` 工具时才必须安装 Docker Desktop。安装后先启动它，再确认客户端和服务端都能响应：
+`bash` 默认使用 OS 沙箱：Linux/WSL2 使用 Bubblewrap，macOS 使用 Seatbelt，Windows 使用 AppContainer（默认 PowerShell，可配置 Git Bash）。Linux 需安装系统 bubblewrap 包；无法启动安全后端时进入 checkpoint-only，不执行无隔离 Shell。配置与边界见 [OS 沙箱说明](docs/os-sandbox.md)。如需备用 Docker 后端，在 Agent Home 的 `settings.local.json` 设置 `"sandbox_backend": "docker"`，安装并启动 Docker 后确认：
 
 ```powershell
 docker version
 docker info
 ```
 
-首次 Docker Trace 会自动构建本项目的 `yy-agent-sandbox:local` 镜像。容器运行时无网络、移除 Linux capabilities、限制 CPU/内存/进程数，并把容器根文件系统设为只读。若 Docker CLI 缺失或 daemon 离线，Runtime 会自动进入 `checkpoint_only`：对话、Memory、Skill、Subagent、读取、`edit`、`write` 和回溯继续工作，`bash` 会从模型工具列表和 Subagent 可选工具中移除，且绝不回退到 PowerShell、CMD、WSL 或宿主机 Shell。镜像构建、容器创建或基线 checkpoint 失败仍会终止 Trace。
+选择 Docker 时，首次 Trace 会构建 `yy-agent-sandbox:local` 镜像，并使用原有无网络、只读容器根及资源限制。默认 OS 后端不依赖 Docker。后端不可用时，文件编辑与 Checkpoint 继续工作，Bash 从工具目录移除；不存在自动切换到无隔离宿主机 Shell 的路径。每个 Trace 固定所选后端，切换配置后重启 Gateway。
 
 ### 5. 首次启动并自动初始化 `.yy`
 
@@ -161,7 +161,7 @@ uv run python run.py init
 
 ### 6. 在其他 workspace 中运行
 
-Agent Home 负责模型配置、记忆和本机状态；启动命令时的当前目录才是 Gateway 注册的项目，也是文件工具、Docker 挂载和 checkpoint 要处理的 workspace。例如：
+Agent Home 负责模型配置、记忆和本机状态；启动命令时的当前目录才是 Gateway 注册的项目，也是文件工具、沙箱工作目录和 checkpoint 要处理的 workspace。例如：
 
 ```powershell
 $AgentRoot = "D:\Ever_workspace\Yuan_Ye_Study_Agent"
@@ -169,7 +169,7 @@ cd D:\Ever_workspace\My_Project
 uv run --project $AgentRoot yy-agent chat
 ```
 
-上述命令从用户 `~/.yy/settings.local.json` 读取模型配置，并把该 workspace 的会话写入 `~/.yy/memory/session/<workspace-hash>/`；`My_Project` 不会生成 `.yy`。其他 workspace 看不到也不能恢复这些 Session，但 USER、RESEARCH、OTHERS 和普通扩展 Profile 仍全局共享。`read_file`、`edit`、`write`、搜索、Docker Bash 和回溯只允许操作 `My_Project`，checkpoint 捕获的也是该目录。checkpoint 对象库按 workspace 隔离保存在 `~/.yy`，不会写进用户项目的 `.git`。
+上述命令从用户 `~/.yy/settings.local.json` 读取模型配置，并把该 workspace 的会话写入 `~/.yy/memory/session/<workspace-hash>/`；`My_Project` 不会生成 `.yy`。其他 workspace 看不到也不能恢复这些 Session，但 USER、RESEARCH、OTHERS 和普通扩展 Profile 仍全局共享。`read_file`、`edit`、`write`、搜索、沙箱 Shell 和回溯只允许操作 `My_Project`，checkpoint 捕获的也是该目录。checkpoint 对象库按 workspace 隔离保存在 `~/.yy`，不会写进用户项目的 `.git`。
 
 ### 7. 先进行离线启动验证
 
@@ -349,7 +349,7 @@ Google Scholar 仍只是候选链接来源；工具不会绕过验证码、登�
 
 `sandbox_checkpoint_limit` 默认是 `17`，必须是大于等于 1 的整数。它只限制每个 Session 中可供用户精确回退的恢复点数量，基线也计入上限；超过后淘汰最老恢复点引用，但归档分支仍需要的提交继续由 branch ref 保护，不改写项目主仓库。
 
-Gateway 默认监听 `127.0.0.1:8765`，不同 Session 最多同时运行 4 个任务，同一 Session 同时只允许一个任务。`gateway_runtime_idle_seconds=900` 表示 Session Runtime 空闲 15 分钟后关闭 Trace 与 Docker；Session JSONL 不会删除，下一次请求仍可恢复。
+Gateway 默认监听 `127.0.0.1:8765`，不同 Session 最多同时运行 4 个任务，同一 Session 同时只允许一个任务。`gateway_runtime_idle_seconds=900` 表示 Session Runtime 空闲 15 分钟后关闭 Trace 与沙箱后端；Session JSONL 不会删除，下一次请求仍可恢复。
 
 Durable 重试参数分为 `model_retry_*`、`tool_retry_*` 和 `outbox_retry_*`。策略会在
 Logical Operation 创建时固化，后续修改配置只影响新 Operation。Outbox 默认最多尝试
@@ -406,7 +406,7 @@ Restore 是整体替换而不是状态合并。破坏性替换前会显示 Backu
 Harness worktree 本体和旧 `.git` 指针不会进入跨机器归档。维护冻结时只导出 repository identity、required commits、tracked/staged diff、untracked bundle、Session metadata 与验证证据；目标机器缺少仓库或 Commit 时会标记为 offline/incompatible，而不会按同名目录误关联。
 
 Gateway 停止时先拒绝新任务，并给正在运行的任务一个短暂收尾窗口，随后通过
-`CANCELLING → FINALIZING → CANCELLED` 关闭 Runtime 与 Docker。异常重启不会把全部未完成
+`CANCELLING → FINALIZING → CANCELLED` 关闭 Runtime 与沙箱后端。异常重启不会把全部未完成
 任务粗暴改成 `interrupted`：可证明安全的任务从持久化 State 与 SafeCheckpoint 恢复，等待审批
 的任务继续等待到 `expires_at`，外部副作用不确定时进入非终态 `RECOVERY_REQUIRED`。
 只有数据库损坏、Checkpoint 丢失或版本不兼容等无法建立可信恢复路径的情况才进入永久终态
@@ -506,7 +506,7 @@ Code > /exit
 ```
 
 同一次 Coding 模式始终复用同一个隔离 Git worktree、Coding Runtime、短期 Memory、
-上下文压缩、Skill、Subagent、Docker 和 checkpoint。worktree 位于 Agent Home：
+上下文压缩、Skill、Subagent、OS/Docker 沙箱和 checkpoint。worktree 位于 Agent Home：
 
 ```text
 .yy/harness-evolution/worktrees/<source-hash>/<code-session-id>/
@@ -527,7 +527,7 @@ Code > /exit
 - `/skill list`、`/skill install`、`/skill update`、`/skill audit` 和 `/skill refresh` 管理本机 Skill；安装或更新不会自动修改当前 Prompt，只有 `/skill refresh` 成功后才重新扫描并加载 Skill XML。
 - `stream=true` 时，OpenAI-compatible Provider 会通过 SSE 逐段显示文本。
 - 高风险工具会显示方向键审批菜单：使用 ↑/↓ 选择“允许本次 / 当前会话始终允许该工具 / 拒绝”，按 Enter 确认、Esc 取消，默认选中“允许本次”。30 秒内没有确认输入时仍会自动拒绝，避免危险操作悬挂；审批由发起任务的客户端优先处理，该客户端断开时也会立即拒绝。
-- `bash` 只在当前 Trace 的无网络 Docker 容器中运行。Docker 不可用时它不会出现在主模型或 Subagent 的工具 Schema 中，伪造调用也会在审批前拒绝。容器读写挂载启动时的 workspace，因此命令造成的文件变化会立即出现在宿主机；一次成功 Bash 调用无论修改多少文件都只创建一个 checkpoint，没有变化则不创建。
+- `bash` 只在当前 Trace 的 OS/Docker 无网络沙箱内执行，实际 shell 随平台和配置确定，并通过临时上下文提供给模型。后端不可用时移除 Schema，伪造调用也会在审批前拒绝。文件修改进入 workspace；一次成功调用最多创建一个 checkpoint，无变化不创建。
 - `edit` 参考 PI Agent 的精确编辑语义：一次可提交多个 `{oldText,newText}`，每个 `oldText` 必须在原文件中唯一存在，所有定位都基于修改前的原文且不能重叠；工具保留 UTF-8 BOM 与原换行风格。它适合小范围修改已有文件。
 - `write` 用于创建新文件或明确替换整个文件。`edit` 与 `write` 都在宿主机执行原子替换，每次实际变化后创建一个 checkpoint；内容未变化不会制造空快照。可让 Agent 调用高风险 `sandbox_rollback` 按步数恢复，执行前仍需审批。
 - `read_file` 是唯一文件读取工具：源码和普通文本保持原始文本返回；PDF 论文、DOCX、PPTX、XLSX/XLSM、Jupyter Notebook 与 HTML 根据扩展名自动进入结构化解析。PDF 按页、PPTX 按幻灯片、XLSX 按工作表选择范围；长内容通过 `offset_chars` 和 `max_chars` 继续读取。它只提取文本，不执行宏、脚本、外部链接或嵌入对象。
@@ -654,7 +654,7 @@ Skill 遵循 [Agent Skills 规范](https://agentskills.io/specification)。一�
 </available_skills>
 ```
 
-模型需要完整说明、`references/` 或脚本文本时调用只读 `skill_read`。该工具只读取当前 Session 快照中登记的仓库 Skill，不执行任何脚本，并拒绝绝对路径、`..`、符号链接、二进制和超大结果。Session 运行期间若仓库 Skill 摘要发生变化，读取会被拒绝并提示 `/skill refresh`。Skill 自带脚本若确有必要，只能在 Docker 可用时通过 Bash 执行，仍受 Schema、审批、沙箱和 checkpoint 约束；checkpoint-only 模式不会执行这些脚本。
+模型需要完整说明、`references/` 或脚本文本时调用只读 `skill_read`。该工具只读取当前 Session 快照中登记的仓库 Skill，不执行任何脚本，并拒绝绝对路径、`..`、符号链接、二进制和超大结果。Session 运行期间若仓库 Skill 摘要发生变化，读取会被拒绝并提示 `/skill refresh`。Skill 自带脚本若确有必要，只能在沙箱可用时通过 Bash/Shell 执行，仍受 Schema、审批、沙箱和 checkpoint 约束；checkpoint-only 模式不会执行这些脚本。
 
 ## Hook、Turn 与 Session
 
@@ -673,7 +673,7 @@ tool_before  tool_during  tool_after
 
 时序固定为 `trace_start → turn_start → (model_* → tool_* …)* → turn_end → … → trace_end`。第二个用户问题同样会触发新的 `turn_start`，并且发生在该问题进入上下文前。`model_before` 可修改 `event.data["messages"]` 和 `event.data["tools"]`；`tool_before` 可修改工具名称和参数，修改后的参数仍会重新执行 JSON Schema 校验。`during` 在进入真实 Provider 或工具函数前通知一次，不会按流式文本片段重复触发；`after` 同时覆盖成功与失败，并通过 `result/reply/error` 暴露结果。
 
-默认 Runtime 在 `trace_start` 通过同一 Hook 注册器探测 Docker，并始终创建基线 checkpoint。Docker 可用时启动容器并在 `trace_end` 删除；CLI 缺失或 daemon 离线时进入 checkpoint-only，Trace 结束只关闭状态并保留快照。Subagent 复用父 Runtime 的同一个安全上下文及动态工具目录；上下文压缩 Runtime 没有危险工具，因此显式禁用沙箱。Harness Coding Runtime 对隔离 Git worktree 使用同样的自适应逻辑，绝不复用主聊天 workspace 的容器或 checkpoint。
+默认 Runtime 在 `trace_start` 通过同一 Hook 注册器启动 OS 沙箱并创建基线 checkpoint；`trace_end` 释放后端资源并保留快照。显式 `sandbox_backend=docker` 使用 Docker。安全后端不可用时进入 checkpoint-only。Subagent 复用父 Runtime 的安全上下文；压缩 Runtime 不需要危险工具，显式禁用沙箱。Harness Coding Runtime 使用同一工厂与生命周期，但 workspace 和 checkpoint 始终绑定自己的隔离 Git worktree。
 
 Checkpoint 不写入 workspace 自身的 `.git`。当 workspace 就是 Agent 根目录时，每个 Session 在 `.yy/sandbox/checkpoints/<session-id>/` 使用独立 Git 对象库；外部 workspace 则保存到 `.yy/sandbox/checkpoints/<workspace-hash>/<session-id>/`。对象库用无父 commit 保存 workspace 快照，因此 workspace 的 `git status`、当前分支和 `git push` 都不会包含这些 commit。回溯采用 hard-reset 语义恢复非忽略文件，workspace 中的 `.git`、`.yy`、`.env*` 等敏感或运行期路径不会进入快照。
 
@@ -808,7 +808,7 @@ Dream 使用独立、非流式且无 Tool/Skill/Memory/Sandbox/Extension 的临�
 - Session JSONL、Session 索引和 Profile 索引读取时均经过 Pydantic 校验；非法角色、损坏的工具链关联或错误索引会明确失败，不会静默污染下一轮上下文。
 - 首次运行自动创建 `profile/USER.md`、`profile/RESEARCH.md`、`profile/OTHERS.md` 和索引。普通命名的扩展 Profile 全局加载；16 位会话哈希命名的 Profile 只注入对应 Session，避免跨会话污染。
 - 新模型实现 `Agent.contracts.ModelProvider`；新工具实现 `tools.AsyncTool`；新回调通过 `HookRegistry.register()` 或 `HookRegistry.on()` 注册。
-- 文件读取、搜索和写入必须使用 Runtime 注入的跨进程锁；写文件、Docker Bash 和 checkpoint 回溯还必须通过审批回调。写入路径不能越出项目工作区，Bash 不允许在宿主机执行。
+- 文件读取、搜索和写入必须使用 Runtime 注入的跨进程锁；写文件、沙箱 Shell 和 checkpoint 回溯还必须通过审批回调。写入路径不能越出项目工作区，模型命令不允许在无隔离的宿主机 Shell 中执行。
 - Gateway/Web 只监听 `127.0.0.1`；256 位以上访问令牌保存在 Agent Home，浏览器使用一次性启动码、HttpOnly Cookie、CSRF、Origin 白名单、安全响应头与禁止缓存。`ChannelAdapter` 只预留未来飞书等渠道所需的身份映射、收发、审批和路由协议，本阶段没有公网监听或飞书实现。
 
 ## 常见问题
@@ -838,9 +838,9 @@ uv cache dir
 使用无效 API Key 直连时收到 HTTP 401，说明网络与 TLS 已经到达服务端；它属于认证错误，
 不是连接失败。确实需要代理时再按“配置真实模型”中的两种手动代理方式任选其一。
 
-### 提示 Docker CLI 或服务不可用
+### 提示沙箱后端不可用
 
-这是可恢复状态：Agent 会显示一次黄色降级提示并继续使用 checkpoint-only；`edit`、`write` 和回溯仍可用。若确实需要 Bash，启动 Docker Desktop，再分别执行 `docker version` 和 `docker info`，两条命令都成功后关闭并重新打开 Session。运行中的 Session 不会热切换到 Docker。系统在任何情况下都不会把 Bash 改到 PowerShell、CMD、WSL 或宿主机 Bash 中执行。
+Agent 会显示一次降级提示并继续使用 checkpoint-only；`edit`、`write` 和回退仍可用。OS 后端请检查系统能力与 `sandbox_reason`；Docker 后端请确认 CLI/daemon。安装好后端或调整 `sandbox_backend` 后重启 Gateway。状态查询只发现 OS 后端，Trace 内还需通过真实隔离自检；不会静默回退到无隔离 Shell。
 
 ## 全局论文 Reference 资料库
 

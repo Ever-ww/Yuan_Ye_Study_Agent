@@ -41,7 +41,7 @@ class SystemPromptComposer:
         self.config = config
         self.memory = memory
         self.skills = skills
-        self.sandbox_mode = "docker" if sandbox_enabled else "closed"
+        self.sandbox_mode = "pending" if sandbox_enabled else "closed"
         self._snapshots: dict[str, SystemPromptSnapshot] = {}
         self.rebuild_count = 0
 
@@ -204,6 +204,7 @@ class PromptComposer:
     def set_sandbox_status(self, status: "SandboxStatus") -> None:
         self.system.set_sandbox_status(status)
         self.dynamic_context.set_sandbox_mode(status.mode)
+        self.dynamic_context.sandbox_shell = status.shell or ("bash" if status.mode == "docker" else None)
 
     def render_provider_query(
         self,

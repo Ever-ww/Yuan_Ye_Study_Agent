@@ -133,7 +133,7 @@ class AsyncToolRegistry:
         if name == "bash":
             from sandbox import sandbox_status_of
             status = sandbox_status_of(context.sandbox)
-            return status.mode == "docker" and status.bash_available
+            return status.bash_available
         predicate = getattr(tool, "is_available", None)
         return bool(predicate(context)) if callable(predicate) else True
 
@@ -186,7 +186,7 @@ class AsyncToolRegistry:
             if name == "bash":
                 from sandbox import BashUnavailableError
                 raise BashUnavailableError(
-                    "当前 Trace 未运行 Docker 沙箱；Bash 已禁用且不会回退到宿主机 Shell",
+                    "当前 Trace 未运行安全沙箱；Bash 已禁用且不会回退到无隔离的宿主机 Shell",
                 )
             raise RuntimeError(f"工具在当前执行上下文中不可用：{name}")
         try:
@@ -276,7 +276,7 @@ class AsyncToolRegistry:
             if name == "bash":
                 from sandbox import BashUnavailableError
                 raise BashUnavailableError(
-                    "当前 Trace 未运行 Docker 沙箱，Bash 已禁用且不会回退到宿主机 Shell",
+                    "当前 Trace 未运行安全沙箱，Bash 已禁用且不会回退到无隔离的宿主机 Shell",
                 )
             raise RuntimeError(f"工具在当前执行上下文中不可用：{name}")
         try:

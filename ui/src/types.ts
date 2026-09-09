@@ -55,7 +55,9 @@ export type GatewayStatus = {
   model: string;
   stream: boolean;
   sandbox: boolean;
-  sandbox_mode: "docker" | "checkpoint_only" | "pending" | "closed";
+  sandbox_mode: "os" | "docker" | "checkpoint_only" | "pending" | "closed";
+  sandbox_backend?: string | null;
+  sandbox_shell?: string | null;
   bash_available: boolean;
   sandbox_reason: string | null;
   max_concurrent_runs: number;

@@ -799,7 +799,7 @@ def create_coding_runtime(
         enable_references=False,
         runtime_profile="harness",
     )
-    register_harness_context_callbacks(runtime.hooks, dynamic_context)
+    register_harness_context_callbacks(runtime.hooks, dynamic_context, sandbox=runtime.sandbox)
     runtime.coding_session_id = session_id
     runtime.harness_long_term_memory = long_term
     runtime.harness_runtime_profile = selected_profile

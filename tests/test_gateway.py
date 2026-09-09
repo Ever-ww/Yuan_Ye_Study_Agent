@@ -399,7 +399,7 @@ class GatewayTests(unittest.TestCase):
                 reason_code="docker_daemon_unavailable",
                 message="Docker daemon 无法连接",
             )
-            with patch("gateway.api.probe_docker_status", AsyncMock(return_value=fallback)):
+            with patch("gateway.api.probe_sandbox_status", AsyncMock(return_value=fallback)):
                 with TestClient(create_gateway_api(application, access_token="test-token")) as client:
                     response = client.get(
                         "/api/v1/status",

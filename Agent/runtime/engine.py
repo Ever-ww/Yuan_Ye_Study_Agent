@@ -34,7 +34,7 @@ from paper_library import PaperLibraryService
 from prompt import PromptComposer
 from reference import ReferenceService, ReferenceStore, build_embedding_provider
 from sandbox import (
-    DockerSandboxSession,
+    create_sandbox_session,
     SandboxSessionProtocol,
     WorkspaceLockManager,
     sandbox_status_of,
@@ -135,10 +135,8 @@ class AgentRuntime:
             self.sandbox = sandbox
             self._owns_sandbox = True
         elif enable_sandbox:
-            self.sandbox = DockerSandboxSession(
-                self.config.workspace_root,
-                state_root=self.config.agent_root,
-                checkpoint_limit=self.config.sandbox_checkpoint_limit,
+            self.sandbox = create_sandbox_session(
+                self.config,
                 file_locks=self.file_locks,
             )
             self._owns_sandbox = True

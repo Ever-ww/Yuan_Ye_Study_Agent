@@ -33,6 +33,7 @@ class AgentRuntimeContextEnvelope(BaseModel):
     timezone: str
     current_time: str
     sandbox_mode: str
+    sandbox_shell: str | None = None
     runtime_notice: str = ""
     profile_context: str = ""
     conversation_summary: str = ""
@@ -96,6 +97,7 @@ class AgentDynamicContextBuilder:
         self.config = config
         self.memory = memory
         self.sandbox_mode = "closed"
+        self.sandbox_shell = None
         self.last_envelope_hash = ""
         self.injection_count = 0
         self.fragments = ProviderContextFragmentRegistry()
@@ -121,6 +123,7 @@ class AgentDynamicContextBuilder:
             timezone=now.tzname() or str(now.tzinfo),
             current_time=now.isoformat(),
             sandbox_mode=self.sandbox_mode,
+            sandbox_shell=self.sandbox_shell,
             runtime_notice=str(getattr(self.memory, "runtime_notice", "")).strip(),
             # Long-term memory and continuation summaries are separate Hook
             # fragments. Keeping them out of this generic envelope avoids an

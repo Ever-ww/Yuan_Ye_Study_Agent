@@ -195,6 +195,10 @@ export default function App() {
                 ? "检测中"
                 : status.sandbox_mode === "docker"
                   ? "Docker Sandbox"
+                  : status.sandbox_mode === "os"
+                    ? "OS Sandbox"
+                  : status.sandbox_mode === "pending"
+                    ? "OS Sandbox · 待会话自检"
                   : "Checkpoint only"}
             </span>
             <span title={status?.cron.last_error || status?.cron.heartbeat?.next_tick_at || ""}>

@@ -74,6 +74,9 @@ class RuntimeConfig(BaseModel):
     tool_output_protect_recent_groups: StrictInt = Field(default=1, ge=1, le=100)
     tool_output_diagnostic_max_chars: StrictInt = Field(default=600, ge=0, le=4000)
     sandbox_checkpoint_limit: StrictInt = Field(default=17, ge=1)
+    sandbox_backend: Literal["os", "docker"] = "os"
+    sandbox_shell: str | None = None
+    sandbox_readable_roots: tuple[Path, ...] = ()
     sandbox_checkpoint_merged_branch_retention_days: StrictInt = Field(default=30, ge=1, le=3650)
     gateway_port: StrictInt = Field(default=8765, ge=1024, le=65535)
     gateway_max_concurrent_runs: StrictInt = Field(default=4, ge=1, le=32)

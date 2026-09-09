@@ -1,4 +1,4 @@
-"""把 Docker 沙箱生命周期注册到现有十阶段 Hook。"""
+"""把所选沙箱后端生命周期注册到现有十阶段 Hook。"""
 
 from __future__ import annotations
 

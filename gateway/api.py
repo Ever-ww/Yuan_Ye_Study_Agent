@@ -34,7 +34,7 @@ from gateway.models import (
     ExtensionReenableRequest,
 )
 from gateway.security import GatewayCredentials, bearer_value
-from sandbox import probe_docker_status
+from sandbox import probe_sandbox_status
 from backup import BackupCreateRequest, MaintenanceBlockedError, external_control_root
 
 
@@ -165,7 +165,7 @@ def create_gateway_api(
 
     @app.get("/api/v1/status", dependencies=[Depends(authorize)])
     async def status():
-        sandbox_status = await probe_docker_status()
+        sandbox_status = await probe_sandbox_status(config)
         cron_status = await gateway.cron_status()
         dream_status = gateway.dream_status()
         return {
@@ -181,6 +181,8 @@ def create_gateway_api(
             ),
             "sandbox": sandbox_status.bash_available,
             "sandbox_mode": sandbox_status.mode,
+            "sandbox_backend": sandbox_status.backend,
+            "sandbox_shell": sandbox_status.shell,
             "bash_available": sandbox_status.bash_available,
             "sandbox_reason": (
                 sandbox_status.message

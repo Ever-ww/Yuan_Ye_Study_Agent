@@ -1,4 +1,4 @@
-"""Docker 沙箱与本地 checkpoint 的正式公共接口。"""
+"""OS/Docker 沙箱与本地 checkpoint 的正式公共接口。"""
 
 from .checkpoint import CheckpointStore
 from .checkpoint_dream import (
@@ -18,6 +18,8 @@ from .docker import (
     sandbox_status_of,
 )
 from .locks import WorkspaceLockManager
+from .factory import create_sandbox_session, probe_sandbox_status
+from .native import NativeSandboxSession
 from .models import (
     BashResult,
     CheckpointAuditEvent,
@@ -56,6 +58,9 @@ __all__ = [
     "CheckpointValueAssessment",
     "CommandResult",
     "DockerSandboxSession",
+    "NativeSandboxSession",
+    "create_sandbox_session",
+    "probe_sandbox_status",
     "DockerUnavailableError",
     "RollbackResult",
     "SandboxSessionProtocol",
