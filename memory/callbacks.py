@@ -10,6 +10,7 @@ from Agent.contracts import ModelReply
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models.errors import is_retryable_model_error
 from memory.store import MemoryStore
+from memory.tool_projection import ToolOutputProjectionPolicy
 from memory.long_term import MemoryTurnSnapshot
 from memory.retrieval import (
     MemoryContextProjector,
@@ -72,8 +73,14 @@ def register_memory_callbacks(
                 "continuity",
                 '<continuity_fragment ephemeral="true">\n' + str(summary).strip()
                 + '\n</continuity_fragment>',
-                once=True,
+                once=False,
             )
+            # Conversation continuity is mandatory, independent of optional recall.
+            summary = memory.latest_summary(event.session_id)
+            if summary:
+                event.data["set_continuity_fragment"](summary)
+            else:
+                fragments.remove(event.session_id, "continuity")
 
         def rebuild_messages(*, refresh_system: bool = False) -> list[dict[str, object]]:
             nonlocal base_system
@@ -129,6 +136,10 @@ def register_memory_callbacks(
         event.data["reload_messages_after_compression"] = lambda: rebuild_messages(refresh_system=False)
 
         def rebuild_after_emergency() -> list[dict[str, object]]:
+            if fragments is not None:
+                summary = memory.latest_summary(event.session_id)
+                if summary:
+                    event.data["set_continuity_fragment"](summary)
             rebuilt = [dict(base_system), *memory.restore_messages(event.session_id)]
             if callable(render_provider_query):
                 for message in reversed(rebuilt):
@@ -179,6 +190,7 @@ def register_memory_callbacks(
             run_id=run_id,
             cron_memory_access=cron_access,
             allowed_kinds=allowed_kinds,
+            recall_summaries=bool(getattr(config, "memory_recall_summaries", False)),
         )
         access_snapshots[event.session_id] = access
         try:
@@ -346,11 +358,18 @@ def register_memory_callbacks(
         config = event.data.get("config")
         if config is None:
             return
+        policy = ToolOutputProjectionPolicy.from_config(config)
+        if not event.data.get("history_recall_available", False):
+            # A custom/memoryless Registry cannot be expected to recover a
+            # 50-character preview if it has no scoped history reader.
+            policy = ToolOutputProjectionPolicy(max_chars=0)
         memory.prepare_historical_tool_outputs(
             event.session_id,
             max_chars=int(getattr(config, "tool_output_max_chars", 0)),
             head_ratio=float(getattr(config, "tool_output_head_ratio", 0.20)),
             tail_ratio=float(getattr(config, "tool_output_tail_ratio", 0.20)),
+            policy=policy,
+            current_run_id=_audit(event).get("run_id"),
         )
 
     registry.register(HookPoint.TRACE_START, create_or_restore_session, priority=-100)

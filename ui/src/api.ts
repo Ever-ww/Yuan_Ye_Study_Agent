@@ -44,6 +44,23 @@ export class GatewayApi {
   markRead(itemId: string): Promise<InboxItem> {
     return this.request(`/api/v1/inbox/${itemId}/read`, { method: "POST" });
   }
+  async acknowledgeRunResult(runId: string): Promise<void> {
+    for (const item of await this.inbox()) {
+      if (!item.read && item.run_id === runId) await this.markRead(item.item_id);
+    }
+  }
+  async acknowledgeSessionHistory(projectId: string, sessionId: string, records: SessionRecord[]): Promise<void> {
+    const displayed = new Set(records.filter((record) =>
+      record.run_id && record.record_id && record.role === "assistant"
+      && !record.tool_calls?.length && record.content?.trim()
+      && !["cron", "maintenance", "extension"].includes(record.origin || "")
+    ).map((record) => record.run_id));
+    if (!displayed.size) return;
+    for (const item of await this.inbox()) {
+      if (!item.read && item.project_id === projectId && item.session_id === sessionId
+          && displayed.has(item.run_id)) await this.markRead(item.item_id);
+    }
+  }
   registerProject(path: string): Promise<Project> {
     return this.request("/api/v1/projects", {
       method: "POST",

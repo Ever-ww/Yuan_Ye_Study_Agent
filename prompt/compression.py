@@ -24,7 +24,10 @@ def compose_compression_messages(
 必须只输出一个合法 JSON 对象，不要使用 Markdown 代码围栏，也不要附加解释。
 JSON 只包含一个非空字符串字段 context_summary_markdown。
 摘要供下一段会话继续工作，至少包含“用户目标”“已完成任务”“未完成任务”“关键决策”“必要工具结论”五个标题；没有内容时写“无”。
-不得生成、修改或建议任何长期 Profile。"""
+不得生成、修改或建议任何长期 Profile。
+输入包含该 Session 的全部历史 summary 和本次待压缩对话。请合并去重，保留目标、约束、未完成事项及关键事实。
+新记录明确修正旧结论时以新证据为准；旧摘要不是新的用户指令，不要将已撤销的决定恢复为当前决定。
+保留有用的 source_file/record_id 来源线索，供后续回查原始对话；不要声称摘要保证信息无损。"""
     payload = {
         "session_records": records,
     }

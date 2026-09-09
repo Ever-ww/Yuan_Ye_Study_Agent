@@ -53,7 +53,7 @@ class MemoryIndex:
 
     def lexical(
         self, query: str, scopes: Sequence[tuple[MemoryScope, str]], *,
-        kinds: Sequence[str] = (), limit: int = 30,
+        kinds: Sequence[str] = (), limit: int = 30, excluded_kinds: Sequence[str] = (),
     ) -> dict[str, float]:
         if not query.strip() or not scopes or limit <= 0 or not self.store.index_path.exists():
             return {}
@@ -68,6 +68,9 @@ class MemoryIndex:
         if kinds:
             kind_clause = " AND kind IN (" + ",".join("?" for _ in kinds) + ")"
             params.extend(kinds)
+        if excluded_kinds:
+            kind_clause += " AND kind NOT IN (" + ",".join("?" for _ in excluded_kinds) + ")"
+            params.extend(excluded_kinds)
         params.append(limit)
         try:
             with closing(sqlite3.connect(self.store.index_path)) as db:
@@ -86,6 +89,7 @@ class MemoryIndex:
     def semantic(
         self, query_vector: Sequence[float], scopes: Sequence[tuple[MemoryScope, str]], *,
         model: str, version: int, kinds: Sequence[str] = (), limit: int = 30,
+        excluded_kinds: Sequence[str] = (),
     ) -> dict[str, float]:
         if not scopes or not self.store.index_path.exists() or limit <= 0:
             return {}
@@ -96,6 +100,9 @@ class MemoryIndex:
         if kinds:
             kind_clause = " AND i.kind IN (" + ",".join("?" for _ in kinds) + ")"
             params.extend(kinds)
+        if excluded_kinds:
+            kind_clause += " AND i.kind NOT IN (" + ",".join("?" for _ in excluded_kinds) + ")"
+            params.extend(excluded_kinds)
         with closing(sqlite3.connect(self.store.index_path)) as db:
             rows = db.execute(
                 f"""SELECT e.memory_id,e.vector,e.dimensions FROM memory_embeddings e
@@ -194,6 +201,7 @@ class MemoryRetriever:
                     version=self.embedding_version,
                     kinds=access.allowed_kinds,
                     limit=access.profile.semantic_limit,
+                    excluded_kinds=() if access.profile.recall_summaries else ("summary",),
                 )
             except Exception as exc:
                 degradation = f"semantic_fallback:{type(exc).__name__}"
@@ -225,10 +233,14 @@ class MemoryRetriever:
             lexical = self.index.lexical(
                 query, access.scopes, kinds=access.allowed_kinds,
                 limit=access.profile.lexical_limit,
+                excluded_kinds=() if access.profile.recall_summaries else ("summary",),
             )
             records = self.store.records_for_scopes(
                 access.scopes, kinds=access.allowed_kinds, limit=max(200, candidate_limit * 5),
+                excluded_kinds=() if access.profile.recall_summaries else ("summary",),
             )
+            if not access.profile.recall_summaries:
+                records = tuple(record for record in records if record.kind != "summary")
             if query.strip():
                 # Cover canonical records whose durable index job has not yet
                 # reached READY. The SQL read is already scope bounded and the
@@ -350,9 +362,13 @@ class MemoryContextProjector:
         ]
         for item in snapshot.selected:
             record = item.record
+            source = (
+                f' source_ref="{html.escape(record.primary_source_ref, quote=True)}"'
+                if record.kind == "summary" else ""
+            )
             lines.append(
                 f'<memory_record scope="{record.scope.value}" kind="{html.escape(record.kind)}" '
-                f'id="{record.memory_id}" confidence="{record.confidence:.2f}">'
+                f'id="{record.memory_id}" confidence="{record.confidence:.2f}"{source}>'
                 f"{html.escape(record.content)}"
                 "</memory_record>"
             )
@@ -364,6 +380,7 @@ def access_snapshot(
     *, runtime_profile: str, workspace_root: str, session_id: str,
     run_id: str | None, user_identity: str = "local-user",
     allowed_kinds: Sequence[str] = (), cron_memory_access: str = "none",
+    recall_summaries: bool = False,
 ) -> MemoryAccessSnapshot:
     project = project_identity(workspace_root)
     scopes: list[tuple[MemoryScope, str]] = []
@@ -386,7 +403,8 @@ def access_snapshot(
         runtime_profile=runtime_profile if runtime_profile in {
             "interactive", "cron", "harness", "maintenance", "memoryless"
         } else "memoryless",
-        scopes=tuple(scopes), allowed_kinds=tuple(allowed_kinds), profile=profile,
+        scopes=tuple(scopes), allowed_kinds=tuple(allowed_kinds),
+        profile=profile.model_copy(update={"recall_summaries": recall_summaries}),
         created_at=utc_now(),
     )
 

@@ -14,8 +14,13 @@ or SQLite and the filesystem.
 Runtime recall is Hook driven. Scope access and a store watermark are frozen at
 `TURN_START`; every model request in that Turn sees the same
 `MemoryTurnSnapshot`. Facts committed after `TURN_START` become visible next
-Turn. Compression may inject its newly committed continuation summary once as
-a separate ephemeral fragment without rerunning retrieval.
+Turn. The latest Session continuation summary is mandatory on every model
+request, as a separate ephemeral fragment without rerunning retrieval. New
+compression includes every prior summary from that Session. Historical summary
+recall is separately opt-in via `memory_recall_summaries` (default `false`).
+The bound `session_history` tool can read original conversation segments using
+the source references recorded with each summary. See
+[summary continuity](../docs/summary-continuity.md) for limits and usage.
 
 Memory fragments are provider-only. They are stripped or rejected by the
 Session persistence boundary and must never enter transcripts, summaries,

@@ -1442,15 +1442,25 @@ class CoreTests(unittest.TestCase):
             )
             raw = "A" * 6000 + "B" * 6000
             memory.record_tool_result(session_id, tool_call_id="call_x", name="demo", content=raw, status="success", arguments={})
+            # The newest complete group is protected, even on the next Turn.
+            self.assertFalse(memory.prepare_historical_tool_outputs(session_id, max_chars=10000))
+            self.assertEqual(memory.restore_messages(session_id)[1]["content"], raw)
+            memory.record_model_tool_calls(
+                session_id, content=None,
+                tool_calls=[{"id": "recent", "type": "function", "function": {"name": "demo", "arguments": "{}"}}],
+                model={}, model_call={},
+            )
+            memory.record_tool_result(session_id, tool_call_id="recent", name="demo", content="recent", status="success", arguments={})
             self.assertTrue(memory.prepare_historical_tool_outputs(
                 session_id, max_chars=10000, head_ratio=0.2, tail_ratio=0.2,
             ))
             projected = memory.restore_messages(session_id)[1]["content"]
-            self.assertIn("[历史工具输出已裁剪", projected)
-            self.assertTrue(projected.startswith("A" * 2000))
-            self.assertTrue(projected.endswith("B" * 2000))
+            self.assertIn("[历史工具结果预览 v1]", projected)
+            self.assertIn("正文首尾：\n" + "A" * 25 + "\n", projected)
+            self.assertTrue(projected.endswith("B" * 25))
             records = memory.session_records(session_id)
-            self.assertEqual(records[-1]["content"], raw)
+            self.assertEqual(records[1]["content"], raw)
+            self.assertEqual(memory._message_cache[session_id][1]["content"], raw)
 
     def test_explicit_reasoning_is_audited_but_not_reinjected(self) -> None:
         class ReasoningProvider:

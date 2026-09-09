@@ -19,6 +19,9 @@ export type SessionRecord = {
   timestamp?: string;
   tool_calls?: unknown[];
   name?: string;
+  run_id?: string;
+  record_id?: string;
+  origin?: string;
 };
 
 export type InboxItem = {

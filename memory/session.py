@@ -109,6 +109,9 @@ class SessionStore:
         selected: list[tuple[str, SessionRecord]] = []
         for filename in entry["files"]:
             path = self.directory / str(filename)
+            if (self.directory.is_symlink() or path.is_symlink()
+                    or path.resolve().parent != self.directory.resolve()):
+                raise ValueError("Session segment escapes its authorized directory")
             if not path.is_file():
                 raise ValueError(f"Session index references missing segment: {filename}")
             with path.open("r", encoding="utf-8") as handle:

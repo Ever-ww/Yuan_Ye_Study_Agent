@@ -300,9 +300,48 @@ class GatewayClient:
             params={"unread_only": str(unread_only).lower()},
         ))
 
+    async def session_tool_result(
+        self, project_id: str, session_id: str, *, record_id: str | None = None,
+        tool_call_id: str | None = None, content_offset: int = 0,
+    ) -> dict[str, Any]:
+        params = {key: value for key, value in {
+            "record_id": record_id, "tool_call_id": tool_call_id, "content_offset": content_offset,
+        }.items() if value is not None}
+        return dict(await self._request(
+            "GET", f"/api/v1/projects/{project_id}/sessions/{session_id}/tool-results", params=params,
+        ))
+
     async def mark_inbox_read(self, item_id: str) -> dict[str, Any]:
         """将一条后台结果标记为已读。"""
         return dict(await self._request("POST", f"/api/v1/inbox/{item_id}/read"))
+
+    async def acknowledge_run_result(self, run_id: str) -> None:
+        """Call only after displaying a terminal result, regardless of delivery transport."""
+        for item in await self.inbox(unread_only=True):
+            if item.get("run_id") == run_id:
+                await self.mark_inbox_read(str(item["item_id"]))
+
+    async def acknowledge_session_history(
+        self, project_id: str, session_id: str, records: list[dict[str, Any]],
+    ) -> None:
+        """Acknowledge only exact terminal assistant records actually rendered by the client.
+
+        A user/tool message or rolling summary is not proof that a Run result
+        was shown. Legacy records without identity deliberately remain unread.
+        """
+        displayed_runs = {
+            record["run_id"] for record in records
+            if isinstance(record.get("run_id"), str) and record.get("record_id")
+            and record.get("role") == "assistant" and not record.get("tool_calls")
+            and isinstance(record.get("content"), str) and record["content"].strip()
+            and record.get("origin") not in {"cron", "maintenance", "extension"}
+        }
+        if not displayed_runs:
+            return
+        for item in await self.inbox(unread_only=True):
+            if (item.get("project_id") == project_id and item.get("session_id") == session_id
+                    and item.get("run_id") in displayed_runs):
+                await self.mark_inbox_read(str(item["item_id"]))
 
     async def browser_url(self) -> str:
         value = await self._request("POST", "/api/v1/browser/code")

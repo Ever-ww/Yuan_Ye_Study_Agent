@@ -350,6 +350,16 @@ def create_gateway_api(
     async def show_session(project_id: str, session_id: str):
         return gateway.session_records(project_id, session_id)
 
+    @app.get("/api/v1/projects/{project_id}/sessions/{session_id}/tool-results", dependencies=[Depends(authorize)])
+    async def session_tool_result(
+        project_id: str, session_id: str, record_id: str | None = None,
+        tool_call_id: str | None = None, run_id: str | None = None, content_offset: int = 0,
+    ):
+        return await gateway.session_tool_result(
+            project_id, session_id, record_id=record_id, tool_call_id=tool_call_id,
+            run_id=run_id, content_offset=content_offset,
+        )
+
     @app.post("/api/v1/runs", dependencies=[Depends(authorize_write)])
     async def start_run(
         payload: RunCreateRequest,

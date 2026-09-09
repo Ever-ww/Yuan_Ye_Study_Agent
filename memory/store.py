@@ -22,6 +22,7 @@ from .structured import (
 )
 from .retrieval import MemoryRetriever, project_identity
 from .long_term import MemoryTurnSnapshot
+from .tool_projection import ToolOutputProjectionPolicy, ToolOutputProjector
 
 
 class MemoryStore:
@@ -51,6 +52,7 @@ class MemoryStore:
             raise ValueError("ProfileStore 必须位于 MemoryStore 的 profile 目录")
         self.session_profiles_enabled = self.profiles.session_profiles_enabled
         self._message_cache: dict[str, list[dict[str, Any]]] = {}
+        self._tool_projectors: dict[str, ToolOutputProjector] = {}
         self.memory_degraded_reason = ""
         try:
             self.structured = StructuredMemoryStore(self.root)
@@ -384,7 +386,14 @@ class MemoryStore:
 
     def restore_messages(self, session_id: str) -> list[dict[str, Any]]:
         """恢复索引指向的最新会话分段。"""
-        return [dict(message) for message in self._ensure_cache(session_id)]
+        messages = [dict(message) for message in self._ensure_cache(session_id)]
+        # record_id is Session evidence, not a Provider message field. The preview
+        # embeds the exact reference in content without changing request shape
+        # across cache restoration or Gateway restart.
+        for message in messages:
+            message.pop("record_id", None)
+        self.project_historical_tool_outputs(session_id, messages)
+        return messages
 
     def refresh_messages(self, session_id: str) -> list[dict[str, Any]]:
         """显式从最新 JSONL 重建内存消息缓存。"""
@@ -396,29 +405,29 @@ class MemoryStore:
         session_id: str,
         *,
         max_chars: int,
-        head_ratio: float,
-        tail_ratio: float,
+        head_ratio: float = 0.20,
+        tail_ratio: float = 0.20,
+        policy: ToolOutputProjectionPolicy | None = None,
+        current_run_id: str | None = None,
     ) -> bool:
-        """仅在下一用户任务开始前，对内存中的旧工具结果建立裁剪投影。"""
-        if max_chars <= 0:
-            return False
-        messages = self._ensure_cache(session_id)
-        changed = False
-        for message in messages:
-            if message.get("role") != "tool" or not isinstance(message.get("content"), str):
-                continue
-            content = str(message["content"])
-            if len(content) <= max_chars or "[历史工具输出已裁剪" in content:
-                continue
-            head = int(max_chars * head_ratio)
-            tail = int(max_chars * tail_ratio)
-            omitted = max(0, len(content) - head - tail)
-            message["content"] = (
-                f"{content[:head]}\n\n[历史工具输出已裁剪：原始 {len(content)} 字符，"
-                f"省略 {omitted} 字符]\n\n{content[-tail:] if tail else ''}"
-            )
-            changed = True
-        return changed
+        """Freeze historical evidence at TURN_START; never trim canonical cache/JSONL.
+
+        Legacy ratio arguments remain accepted but fixed character previews now
+        define the policy; there is no second ratio-based truncation algorithm.
+        """
+        del head_ratio, tail_ratio
+        self._tool_projectors[session_id] = ToolOutputProjector(
+            policy or ToolOutputProjectionPolicy(max_chars=max_chars), self.session_context_records(session_id),
+            current_run_id=current_run_id,
+        )
+        messages = [dict(message) for message in self._ensure_cache(session_id)]
+        return bool(self.project_historical_tool_outputs(session_id, messages))
+
+    def project_historical_tool_outputs(
+        self, session_id: str, messages: list[dict[str, Any]], *, protect_current_turn: bool = False,
+    ) -> int:
+        projector = self._tool_projectors.get(session_id)
+        return projector.project(messages, protect_current_turn=protect_current_turn) if projector else 0
 
     def has_session(self, session_id: str) -> bool:
         """判断会话哈希是否可恢复。"""
@@ -477,7 +486,22 @@ class MemoryStore:
         self.sessions.set_skill_catalog(session_id, catalog)
 
     def latest_summary(self, session_id: str) -> str:
-        return self.sessions.latest_summary(session_id)
+        import json
+
+        for record in self.sessions.read_records(session_id):
+            if record.get("role") == "summary" and isinstance(record.get("content"), str):
+                sources = sorted({
+                    str(ref["segment"])
+                    for key in ("summary_source_refs", "summary_history_refs")
+                    for ref in record.get(key, [])
+                    if isinstance(ref, dict) and ref.get("segment")
+                } | ({str(record["source_file"])} if record.get("source_file") else set())
+                  | {name for name in record.get("summary_original_segments", []) if isinstance(name, str)})
+                return str(record["content"]) + (
+                    "\n\n原始对话来源（当前 Session；可用 session_history 按 segment/query 回查）："
+                    + json.dumps(sources, ensure_ascii=False) if sources else ""
+                )
+        return ""
 
     def invalidate_session_cache(self, session_id: str) -> None:
         self._message_cache.pop(session_id, None)
@@ -518,6 +542,7 @@ class MemoryStore:
                         f"compression:{session_id}:{source_file}:"
                         + hashlib.sha256(summary.encode("utf-8")).hexdigest()
                     ),
+                    locator=source_file,
                     confidence=0.9,
                     importance=0.6,
                 ))

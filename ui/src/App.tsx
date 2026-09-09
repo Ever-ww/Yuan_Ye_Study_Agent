@@ -39,6 +39,22 @@ export default function App() {
     api.initialize().then(refresh).catch((reason) => setError(String(reason)));
   }, []);
 
+  // Explicit receipts run after rendering, including replay by a new client.
+  const displayedTerminal = [...events].reverse().find((event) => terminalEvents.has(event.type));
+  useEffect(() => {
+    if (!displayedTerminal) return;
+    api.acknowledgeRunResult(displayedTerminal.run_id)
+      .then(() => api.inbox()).then(setInbox)
+      .catch(() => setError("结果已显示，但 Inbox 已读确认失败；未读记录已保留。"));
+  }, [api, displayedTerminal?.event_id]);
+
+  useEffect(() => {
+    if (!project || !sessionId || !history.length) return;
+    api.acknowledgeSessionHistory(project.project_id, sessionId, history)
+      .then(() => api.inbox()).then(setInbox)
+      .catch(() => setError("历史已恢复，但 Inbox 已读确认失败；未读记录已保留。"));
+  }, [api, project?.project_id, sessionId, history]);
+
   async function addProject() {
     try {
       let path = "";

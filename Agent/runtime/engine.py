@@ -255,6 +255,14 @@ class AgentRuntime:
                 runner = subagent_runner or RuntimeSubagentRunner(self.config, base_tools)
                 register_subagent(base_tools, runner)
             self.tools = base_tools
+        if (
+            tools is None and hooks is None
+            and (runtime_profile or session_origin) in {"interactive", "harness"}
+            and hasattr(self.memory, "sessions")
+        ):
+            from tools.session_history import SessionHistoryTool
+
+            self.tools.register(SessionHistoryTool(self.memory))
         self.context_processor = None
         if enable_context_processing:
             self.context_processor = context_processor or ContextProcessor(
@@ -363,7 +371,8 @@ class AgentRuntime:
             await self.hooks.emit(HookEvent(
                 point=HookPoint.TURN_START,
                 session_id=active_id,
-                data={"task": task, "config": self.config},
+                data={"task": task, "config": self.config,
+                      "history_recall_available": "session_history" in self.tools.names()},
             ))
             turn_started = True
             messages = self.prompts.compose(task, active_id)

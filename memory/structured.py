@@ -319,6 +319,7 @@ class StructuredMemoryStore:
     def records_for_scopes(
         self, scopes: Sequence[tuple[MemoryScope, str]], *, kinds: Sequence[str] = (),
         statuses: Sequence[MemoryStatus] = (MemoryStatus.ACTIVE,), limit: int = 200,
+        excluded_kinds: Sequence[str] = (),
     ) -> tuple[MemoryRecord, ...]:
         if not scopes or limit <= 0:
             return ()
@@ -330,6 +331,9 @@ class StructuredMemoryStore:
         if kinds:
             kind_clause = " AND kind IN (" + ",".join("?" for _ in kinds) + ")"
             params.extend(kinds)
+        if excluded_kinds:
+            kind_clause += " AND kind NOT IN (" + ",".join("?" for _ in excluded_kinds) + ")"
+            params.extend(excluded_kinds)
         params.append(limit)
         with closing(self._connect()) as db:
             rows = db.execute(

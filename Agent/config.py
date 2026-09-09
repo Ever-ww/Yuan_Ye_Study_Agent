@@ -69,6 +69,10 @@ class RuntimeConfig(BaseModel):
     tool_output_max_chars: StrictInt = Field(default=10000, ge=0)
     tool_output_head_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
     tool_output_tail_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
+    tool_output_preview_head_chars: StrictInt = Field(default=25, ge=0, le=1000)
+    tool_output_preview_tail_chars: StrictInt = Field(default=25, ge=0, le=1000)
+    tool_output_protect_recent_groups: StrictInt = Field(default=1, ge=1, le=100)
+    tool_output_diagnostic_max_chars: StrictInt = Field(default=600, ge=0, le=4000)
     sandbox_checkpoint_limit: StrictInt = Field(default=17, ge=1)
     sandbox_checkpoint_merged_branch_retention_days: StrictInt = Field(default=30, ge=1, le=3650)
     gateway_port: StrictInt = Field(default=8765, ge=1024, le=65535)
@@ -115,6 +119,7 @@ class RuntimeConfig(BaseModel):
     reference_keyword_weight: float = Field(default=0.4, ge=0.0, le=1.0)
     reference_semantic_weight: float = Field(default=0.6, ge=0.0, le=1.0)
     memory_retrieval_enabled: StrictBool = True
+    memory_recall_summaries: StrictBool = False
     memory_embedding_model: str = ""
     memory_embedding_base_url: str | None = None
     memory_embedding_api_key: str | None = None

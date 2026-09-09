@@ -750,6 +750,9 @@ def create_coding_runtime(
     session_id = uuid4().hex[:16]
     memory.create_session("Harness Coding Agent 本次更新", session_id=session_id)
     tools = resource_loader.build_tools(selected_profile, isolated, skills)
+    from tools.session_history import SessionHistoryTool
+
+    tools.register(SessionHistoryTool(memory))
     tool_catalog_hash = resource_loader.tool_catalog_hash(tools)
     prompts = HarnessPromptComposer(
         selected_profile,
@@ -823,6 +826,11 @@ def _runtime_profile_and_trace(
         workspace_root=isolated.workspace_root,
     )
     tools = resource_loader.build_tools(profile, isolated, skills)
+    from tools.session_history import SessionHistoryTool
+
+    # This registry is used only to freeze schema hashes; the real runtime
+    # binds its own MemoryStore when create_coding_runtime is called.
+    tools.register(SessionHistoryTool(None))
     tool_hash = resource_loader.tool_catalog_hash(tools)
     prompts = HarnessPromptComposer(profile, skills, tool_catalog_hash=tool_hash)
     trace = HarnessTraceContext(

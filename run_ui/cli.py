@@ -208,6 +208,10 @@ async def _render_gateway(
                             lines.append(f"[red]工具失败[/] {event.payload.get('name', '')}")
                         else:
                             lines.append(f"[green]工具完成[/] {event.payload.get('name', '')}")
+                        reference = event.payload.get("observation_id")
+                        if isinstance(reference, str) and reference:
+                            from rich.markup import escape
+                            lines.append(f"[dim]详情：/tool-result {escape(shlex.quote(reference))}[/]")
                     elif event.type == EventType.GATEWAY_RESTART_REQUIRED.value:
                         lines.append(f"[bold yellow]{event.payload.get('message', '需要重启 Gateway')}[/]")
                     elif event.type == "approval_requested":
@@ -253,7 +257,15 @@ async def _render_gateway(
                         if answer and not streaming_text:
                             lines.append(f"[bold green]{answer}[/]")
                     display = lines[-12:] + ([streaming_text] if streaming_text else [])
-                    live.update(Panel("\n".join(display) or "正在运行…", title="Yuan Ye Gateway"))
+                    terminal = event.type in {"run_completed", "run_failed", "run_cancelled", "run_interrupted"}
+                    live.update(Panel("\n".join(display) or "正在运行…", title="Yuan Ye Gateway"), refresh=terminal)
+                    if terminal:
+                        try:
+                            await client.acknowledge_run_result(event.run_id)
+                        except Exception:
+                            # Read receipts must not turn a displayed, successful Run
+                            # into a failure or cause its model/tools to be rerun.
+                            console.print("[yellow]结果已显示，但 Inbox 已读确认失败；可稍后用 /inbox 查看。[/]")
         except asyncio.CancelledError:
             await client.cancel_run(run.run_id)
             raise
@@ -396,6 +408,7 @@ async def _chat_gateway(
         records = await client.session(project_id, session_id)
         console.print(f"[green]已恢复会话[/] {session_id}（{len(records)} 条记录）")
         _render_restored_history(records)
+        await _acknowledge_displayed_history(client, project_id, session_id, records)
     interrupt_controller.bind(asyncio.get_running_loop())
     unread = await client.inbox(unread_only=True)
     if unread:
@@ -413,6 +426,7 @@ async def _chat_gateway(
                 "/code 进入 Hook Extension Coding 模式；"
                 "/compress；/context refresh；/skill list|install|update|audit|refresh；/exit；"
                 "/inbox [all|show <ID>|read <ID>|read-all]；"
+                "/tool-result <record_id|tool_call_id> [字符偏移]；"
                 "/extension status|grant|revoke|reenable（管理员 override）；"
                 "/cron list|status|add|at|preview|edit|pause|resume|run|remove；"
                 "/dream status|run|backfill|rollback；"
@@ -427,6 +441,9 @@ async def _chat_gateway(
             continue
         if task == "/inbox" or task.startswith("/inbox "):
             await _handle_inbox_command(client, task)
+            continue
+        if task == "/tool-result" or task.startswith("/tool-result "):
+            await _handle_tool_result_command(client, project_id, session_id, task)
             continue
         if task == "/cron" or task.startswith("/cron "):
             await _handle_cron_command(client, project_id, task)
@@ -665,6 +682,50 @@ async def _resolve_inbox_item(
         console.print(f"[red]Inbox ID 前缀不唯一，请输入更多字符：{item_id_or_prefix}[/]")
         return None
     return dict(matches[0])
+
+
+async def _handle_tool_result_command(client, project_id: str, session_id: str | None, task: str) -> None:
+    """On-demand canonical observation detail; never execute the original tool."""
+    if not session_id:
+        console.print("[yellow]请先开始或恢复一个 Session。[/]")
+        return
+    try:
+        parts = shlex.split(task)
+        if len(parts) not in {2, 3}:
+            raise ValueError("用法：/tool-result <record_id|tool_call_id> [字符偏移]")
+        offset = int(parts[2]) if len(parts) == 3 else 0
+        if offset < 0:
+            raise ValueError("字符偏移不能为负数")
+        result = await client.session_tool_result(project_id, session_id, record_id=parts[1], content_offset=offset)
+        if not result.get("records"):
+            result = await client.session_tool_result(project_id, session_id, tool_call_id=parts[1], content_offset=offset)
+        if result.get("ambiguous"):
+            console.print("调用 ID 对应多条历史记录，请使用以下精确 record_id：")
+            for record in result.get("matches", []):
+                console.print(str(record.get("record_id")), markup=False)
+            return
+        if not result.get("records"):
+            console.print("当前 Session 中未找到该工具结果。")
+            return
+        for record in result["records"]:
+            from rich.text import Text
+            console.print(Panel(Text(str(record.get("content", ""))), title="历史工具结果（非重新执行）"))
+            console.print(f"工具={record.get('name')} 状态={record.get('status')} record_id={record.get('record_id')}", markup=False)
+            console.print(f"content_sha256={record.get('content_sha256')}", markup=False)
+            if record.get("next_content_offset") is not None:
+                reference = record.get("record_id") or record.get("tool_call_id")
+                console.print(f"下一页：/tool-result {shlex.quote(str(reference))} {record['next_content_offset']}", markup=False)
+    except Exception as exc:
+        console.print("历史结果读取失败：" + str(exc), markup=False)
+
+
+async def _acknowledge_displayed_history(
+    client: GatewayClient, project_id: str, session_id: str, records: list[dict[str, object]],
+) -> None:
+    try:
+        await client.acknowledge_session_history(project_id, session_id, records)
+    except Exception:
+        console.print("[yellow]历史已恢复，但 Inbox 已读确认失败；未读记录已保留。[/]")
 
 
 def _render_restored_history(records: list[dict[str, object]]) -> None:
@@ -1279,19 +1340,21 @@ def session_list() -> None:
 @session_app.command("show")
 def session_show(session_id: str) -> None:
     """通过 Gateway 显示指定会话最新分段。"""
-    async def load() -> list[dict[str, object]]:
+    async def show() -> None:
         client = _gateway_client()
         project = await _gateway_project(client)
-        return await client.session(str(project["project_id"]), session_id)
+        project_id = str(project["project_id"])
+        records = await client.session(project_id, session_id)
+        table = Table(title=f"会话 {session_id}")
+        table.add_column("时间", style="dim")
+        table.add_column("角色", style="cyan")
+        table.add_column("内容")
+        for record in records:
+            table.add_row(str(record.get("timestamp", "")), str(record.get("role", "")), str(record.get("content", "")))
+        console.print(table)
+        await _acknowledge_displayed_history(client, project_id, session_id, records)
 
-    records = asyncio.run(load())
-    table = Table(title=f"会话 {session_id}")
-    table.add_column("时间", style="dim")
-    table.add_column("角色", style="cyan")
-    table.add_column("内容")
-    for record in records:
-        table.add_row(str(record.get("timestamp", "")), str(record.get("role", "")), str(record.get("content", "")))
-    console.print(table)
+    asyncio.run(show())
 
 
 @gateway_app.command("start")

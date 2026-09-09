@@ -152,6 +152,37 @@ class ContextProcessor:
                 message="当前请求只有受保护的近期上下文，没有可安全压缩的完整历史块",
             )
         normalized = _normalize_records(compressible)
+        # Use the exact indexed history, including all previous rolling summaries.
+        history = self.memory.sessions.read_all_records_strict(session_id)
+        previous_summaries = [
+            {"role": "summary", "content": record.content, "source_file": filename,
+             "record_id": record.record_id}
+            for filename, record in history if record.role == "summary"
+        ]
+        indexed_segments = {filename for filename, _ in history}
+        original_segments = {source_file}
+        for _, record in history:
+            if record.role != "summary":
+                continue
+            previous = record.model_dump(mode="python", exclude_unset=True)
+            if previous.get("source_file") in indexed_segments:
+                original_segments.add(previous["source_file"])
+            original_segments.update(
+                name for name in previous.get("summary_original_segments", [])
+                if isinstance(name, str) and name in indexed_segments
+            )
+
+        def source_refs(selected):
+            digests = {self.memory.sessions.record_digest(item) for item in selected}
+            return [
+                {"segment": filename, "record_id": record.record_id,
+                 "sha256": self.memory.sessions.record_digest(value)}
+                for filename, record in history
+                if self.memory.sessions.record_digest(
+                    value := record.model_dump(mode="python", exclude_unset=True)
+                ) in digests
+            ]
+        normalized = previous_summaries + [item for item in normalized if item["role"] != "summary"]
         # Compression owns continuity only. Long-term facts must be written
         # through MemoryWriter with structured scope and evidence; asking this
         # model to regenerate a cumulative Markdown profile would reintroduce a
@@ -174,6 +205,13 @@ class ContextProcessor:
                         validation_error,
                         include_profile=include_profile,
                     )
+                    window = (
+                        self.config.compression_context_window_tokens or self.config.model_context_window_tokens
+                        if provider_name.startswith("auxiliary:") else self.config.model_context_window_tokens
+                    )
+                    if (_message_tokens(messages) + self.config.compression_output_reserve_tokens
+                            >= window - self.config.compression_safety_margin_tokens):
+                        raise ContextBudgetExceeded("全部历史摘要与待压缩对话超过压缩模型窗口；未截断摘要或修改原始记录")
                     raw = await self._run_compression_agent(messages, provider_factory())
                     profile, summary = _parse_output(raw, include_profile=include_profile)
                     turns = sum(1 for record in compressible if record.get("role") == "user")
@@ -188,6 +226,12 @@ class ContextProcessor:
                         if record.get("role") == "user" and record.get("content") == current_query
                     ), None)
                     metadata.update({
+                        "summary_original_segments": sorted(original_segments),
+                        "summary_source_refs": source_refs(compressible),
+                        "summary_history_refs": source_refs(
+                            [record.model_dump(mode="python", exclude_unset=True)
+                                         for _, record in history if record.role == "summary"],
+                        ),
                         "compression_reason": reason,
                         "protected_tail_refs": self.memory.protected_tail_refs(
                             session_id, protected,
@@ -324,10 +368,9 @@ class ContextProcessor:
         first = self.forecast(session_id, messages, tools)
         projected = 0
         if first.decision in {"compress", "reject"}:
-            projected = _project_large_tool_outputs(
-                messages,
-                max_chars=self.config.tool_output_max_chars,
-            )
+            before = _message_tokens(messages)
+            self.memory.project_historical_tool_outputs(session_id, messages, protect_current_turn=True)
+            projected = max(0, before - _message_tokens(messages))
         result = self.forecast(session_id, messages, tools)
         if projected:
             result = result.model_copy(update={"projected_tool_output_tokens": projected})
@@ -574,29 +617,6 @@ def _select_compression_records(
     protected = [record for record in conversational if id(record) in protected_ids]
     compressible = [*summaries, *(record for record in conversational if id(record) not in protected_ids)]
     return compressible, protected
-
-
-def _project_large_tool_outputs(messages: list[dict[str, Any]], *, max_chars: int) -> int:
-    """Trim completed historical tool results in the provider projection only."""
-    if max_chars <= 0:
-        return 0
-    projected_tokens = 0
-    cutoff = max(0, len(messages) - 3)
-    for index, message in enumerate(messages):
-        content = message.get("content")
-        if index >= cutoff or message.get("role") != "tool" or not isinstance(content, str):
-            continue
-        if len(content) <= max_chars or "[历史工具输出投影" in content:
-            continue
-        head = max_chars // 2
-        tail = max_chars - head
-        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        message["content"] = (
-            f"{content[:head]}\n\n[历史工具输出投影：sha256={digest}，原始字符={len(content)}]"
-            f"\n\n{content[-tail:] if tail else ''}"
-        )
-        projected_tokens += estimate_tokens(content) - estimate_tokens(str(message["content"]))
-    return max(0, projected_tokens)
 
 
 def _message_tokens(messages: list[dict[str, Any]]) -> int:

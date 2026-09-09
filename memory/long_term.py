@@ -133,6 +133,7 @@ class MemoryRetrievalProfile(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
     candidate_limit: int = Field(default=30, ge=0, le=500)
+    recall_summaries: bool = False
     lexical_limit: int = Field(default=30, ge=0, le=500)
     semantic_limit: int = Field(default=30, ge=0, le=500)
     max_records: int = Field(default=10, ge=0, le=100)
@@ -190,4 +191,3 @@ class MemoryTurnSnapshot(BaseModel):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
-

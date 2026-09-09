@@ -1812,6 +1812,28 @@ class GatewayApplication:
         )
         return memory.session_records(session_id)
 
+    async def session_tool_result(
+        self, project_id: str, session_id: str, *, record_id: str | None = None,
+        tool_call_id: str | None = None, run_id: str | None = None, content_offset: int = 0,
+    ) -> dict[str, Any]:
+        """Read-only diagnostic query sharing the runtime's scoped history reader."""
+        from tools.session_history import SessionHistoryTool
+        from tool.contracts import ToolContext
+
+        if not record_id and not tool_call_id:
+            raise ValueError("record_id or tool_call_id is required")
+        project = self.store.project(project_id)
+        memory = MemoryStore(self.config.memory_dir, workspace_root=Path(project.path), agent_root=self.config.agent_root)
+        if not memory.has_session(session_id):
+            raise KeyError(session_id)
+        arguments = {key: value for key, value in {
+            "record_id": record_id, "tool_call_id": tool_call_id, "run_id": run_id,
+            "content_offset": content_offset, "role": "tool", "limit": 1,
+        }.items() if value is not None}
+        return json.loads(await SessionHistoryTool(memory).run(
+            arguments, ToolContext(project_root=Path(project.path), session_id=session_id),
+        ))
+
     def skills(self, project_id: str) -> SkillService:
         project = self.store.project(project_id)
         return SkillService(
