@@ -722,7 +722,8 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(memory.restore_messages(result.session_id)[0]["role"], "user")
             self.assertTrue(provider.messages[-1]["content"].startswith("<user_query>\n整理长上下文\n</user_query>"))
             self.assertIn('<continuity_fragment ephemeral="true">', provider.messages[-1]["content"])
-            self.assertNotIn("continuity_fragment", str(active_records))
+            self.assertNotIn("continuity_fragment", str(active_records[1]["content"]))
+            self.assertIn("continuity_fragment", active_records[1]["provider_context"]["fragments"]["continuity"])
             compression_payload = json.loads(compressor.messages[-1]["content"])
             self.assertNotIn(
                 "整理长上下文",

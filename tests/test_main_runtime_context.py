@@ -68,7 +68,9 @@ def test_main_agent_uses_stable_prefix_and_provider_only_dynamic_tail(tmp_path: 
             "first query",
             "second query",
         ]
-        assert "agent_runtime_context" not in str(records)
+        assert second_messages[:len(first_messages)] == first_messages
+        assert "agent_runtime_context" in records[0]["provider_context"]["fragments"]["agent"]
+        assert all("agent_runtime_context" not in str(r.get("content")) for r in records)
         # run() closes each Trace; rebuilt snapshots remain byte-identical across all three traces.
         assert runtime.prompts.system.rebuild_count == 3
         await runtime.close()
@@ -113,7 +115,7 @@ def test_ephemeral_context_is_rejected_inside_tool_arguments() -> None:
         })
 
 
-def test_long_term_memory_is_hook_retrieved_and_never_persisted(tmp_path: Path) -> None:
+def test_long_term_memory_is_hook_retrieved_and_only_persisted_as_metadata(tmp_path: Path) -> None:
     async def check() -> None:
         config = load_runtime_config(tmp_path)
         memory = MemoryStore(
@@ -148,8 +150,9 @@ def test_long_term_memory_is_hook_retrieved_and_never_persisted(tmp_path: Path) 
         assert '<relevant_memory ephemeral="true">' in query
         assert "concise technical explanations" in query
         records = memory.session_records(result.session_id)
-        assert "relevant_memory" not in str(records)
-        assert "concise technical explanations" not in str(records)
+        assert "concise technical explanations" in records[0]["provider_context"]["fragments"]["memory"]
+        assert all("relevant_memory" not in str(r.get("content")) for r in records)
+        assert "concise technical explanations" not in str(memory.restore_messages(result.session_id))
         await runtime.close()
 
     asyncio.run(check())

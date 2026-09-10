@@ -128,11 +128,15 @@ class MemoryStore:
         *,
         origin: Literal["interactive", "cron", "maintenance"] = "interactive",
         audit: dict[str, object] | None = None,
-    ) -> None:
+        provider_context: dict[str, object] | None = None,
+    ) -> str:
         """记录一条用户输入。"""
         SessionPersistenceProjection.assert_persistable(content)
         cache = self._ensure_cache(session_id)
-        record_id = self.sessions.append(session_id, "user", content, {"origin": origin, **(audit or {})})
+        metadata = {"origin": origin, **(audit or {})}
+        if provider_context is not None:
+            metadata["provider_context"] = provider_context
+        record_id = self.sessions.append(session_id, "user", content, metadata)
         cache.append({"role": "user", "content": content})
         return record_id
 
@@ -384,9 +388,12 @@ class MemoryStore:
         cache.append({"role": "assistant", "content": content})
         return record_id
 
-    def restore_messages(self, session_id: str) -> list[dict[str, Any]]:
+    def restore_messages(self, session_id: str, *, provider_context: bool = False) -> list[dict[str, Any]]:
         """恢复索引指向的最新会话分段。"""
-        messages = [dict(message) for message in self._ensure_cache(session_id)]
+        messages = (
+            self.sessions.restore(session_id, provider_context=True) if provider_context
+            else [dict(message) for message in self._ensure_cache(session_id)]
+        )
         # record_id is Session evidence, not a Provider message field. The preview
         # embeds the exact reference in content without changing request shape
         # across cache restoration or Gateway restart.

@@ -107,8 +107,9 @@ class SystemPromptComposer:
             "# 项目说明（AGENT）\n" + agent,
             (
                 "# 运行时上下文规则\n"
-                "当前时间、工作区、Session、Sandbox、长期记忆和压缩摘要只会出现在当前 "
-                "user query 末尾的 ephemeral agent_runtime_context 中。该区块不属于用户原文，"
+                "时间、工作区、Session、Sandbox、相关记忆和压缩摘要以增量区块附在 user query 后。"
+                "同名区块以最近一次更新为准；active=false 表示撤回。没有新更新时沿用历史区块。"
+                "这些区块保留在请求历史中，独立于用户原文；ephemeral 标记表示不属于对话正文，"
                 "不得整块复制到回答、Memory、文件、日志或 Tool 参数中。"
             ),
         ]

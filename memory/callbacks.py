@@ -12,6 +12,7 @@ from Agent.models.errors import is_retryable_model_error
 from memory.store import MemoryStore
 from memory.tool_projection import ToolOutputProjectionPolicy
 from memory.long_term import MemoryTurnSnapshot
+from memory.provider_context import ProviderContextRecord, context_baseline, effective_contexts
 from memory.retrieval import (
     MemoryContextProjector,
     MemoryQueryBuilder,
@@ -33,6 +34,9 @@ def register_memory_callbacks(
     base_systems: dict[str, dict[str, object]] = {}
     turn_snapshots: dict[str, MemoryTurnSnapshot] = {}
     access_snapshots: dict[str, object] = {}
+    # Mutable only at first call / compaction boundary; never re-render a
+    # committed Turn on a network retry or subsequent tool/model iteration.
+    provider_turns: dict[str, dict] = {}
     selected_profile = runtime_profile or (
         "cron" if session_origin == "cron" else
         "maintenance" if session_origin == "maintenance" else "interactive"
@@ -55,6 +59,7 @@ def register_memory_callbacks(
                 raise ValueError("Memory 回调需要基础 system/user 消息")
             base_systems[event.session_id] = dict(messages[0])
             current_user_message = dict(messages[-1])
+            provider_turns[event.session_id] = {}
         else:
             current_user_message = None
         base_system = base_systems.get(event.session_id)
@@ -67,7 +72,11 @@ def register_memory_callbacks(
         origin_refs = _audit(event)
         dynamic = getattr(prompts, "dynamic_context", None)
         fragments = getattr(dynamic, "fragments", None)
+        turn = provider_turns.setdefault(event.session_id, {})
         if fragments is not None:
+            event.data["register_provider_context_fragment"] = lambda name, content: fragments.set(
+                event.session_id, name, content,
+            )
             event.data["set_continuity_fragment"] = lambda summary: fragments.set(
                 event.session_id,
                 "continuity",
@@ -90,7 +99,7 @@ def register_memory_callbacks(
             system = dict(base_system)
             rebuilt: list[dict[str, object]] = [
                 system,
-                *memory.restore_messages(event.session_id),
+                *memory.restore_messages(event.session_id, provider_context=True),
             ]
             if first_model_call:
                 rebuilt.append(current_user_message or {"role": "user", "content": task})
@@ -98,39 +107,78 @@ def register_memory_callbacks(
 
         if first_model_call:
             messages[:] = rebuild_messages()
-            event.data["persist_current_user_operation"] = (
-                lambda: memory.record_user(
+            def persist_current_user() -> str:
+                if turn.get("record_id"):
+                    return turn["record_id"]
+                packet = turn.get("packet")
+                turn["record_id"] = memory.record_user(
                     event.session_id,
                     task,
                     origin=session_origin,
                     audit=_audit(event),
+                    provider_context=packet.model_dump(mode="json") if packet else None,
                 )
-            )
+                return turn["record_id"]
+            event.data["persist_current_user_operation"] = persist_current_user
         if callable(render_provider_query):
+            def prepare_packet() -> ProviderContextRecord:
+                records = memory.session_context_records(event.session_id)
+                # When compaction retained the current query, its replacement
+                # projection belongs to the new epoch. Compare only against
+                # preceding visible messages, not the old projection itself.
+                if turn.get("record_id"):
+                    position = next((i for i, r in enumerate(records)
+                                     if r.get("record_id") == turn["record_id"]), None)
+                    if position is None:
+                        raise ValueError("Compaction lost the current user record")
+                    records = records[:position]
+                return dynamic.prepare(task, event.session_id, origin_refs=origin_refs,
+                                       context_epoch=memory.active_path(event.session_id).name,
+                                       baseline=context_baseline(records))
+
             def render_ephemeral_context(target_messages: list[dict[str, object]]) -> None:
+                epoch = memory.active_path(event.session_id).name
+                if turn.get("epoch") == epoch:
+                    return
                 selected = next((
                     message for message in reversed(target_messages)
-                    if message.get("role") == "user" and message.get("content") == task
+                    if message.get("role") == "user"
+                    and message.get("content") in {task, turn.get("rendered")}
                 ), None)
+                if selected is None and turn.get("record_id"):
+                    records = memory.session_context_records(event.session_id)
+                    old = effective_contexts(records).get(turn["record_id"])
+                    old_text = old.render(task) if old else task
+                    selected = next((m for m in reversed(target_messages)
+                                     if m.get("role") == "user" and m.get("content") == old_text), None)
                 if selected is None:
-                    # The current Turn was already rendered and no compression
-                    # reload replaced it. Do not duplicate the envelope.
-                    return
-                original = selected.get("content")
-                if not isinstance(original, str):
-                    raise ValueError("Agent user query must be text")
-                selected["content"] = render_provider_query(
-                    original,
-                    event.session_id,
-                    origin_refs=origin_refs,
-                )
+                    raise ValueError("Current user query missing during context reconstruction")
+                packet = prepare_packet()
+                rendered = packet.render(task)
+                if turn.get("record_id"):
+                    # A mid-Turn/emergency compaction is an explicit history
+                    # boundary. Append an amendment; never overwrite the user.
+                    identity = hashlib.sha256(
+                        f'{event.session_id}:{epoch}:{turn["record_id"]}'.encode()
+                    ).hexdigest()
+                    memory.sessions.append_once(event.session_id, {
+                        "role": "provider_context", "content": None,
+                        "record_id": f"provider-context:{identity}",
+                        "timestamp": memory.session_created_at(event.session_id),
+                        "context_target_record_id": turn["record_id"],
+                        "provider_context": packet.model_dump(mode="json"),
+                        **origin_refs,
+                    })
+                selected["content"] = rendered
+                turn.update(packet=packet, rendered=rendered, epoch=epoch)
+                dynamic.last_envelope_hash = packet.content_hash
+                dynamic.injection_count += bool(packet.fragments)
 
             event.data["render_ephemeral_context"] = render_ephemeral_context
             if callable(preview_provider_query):
-                event.data["preview_ephemeral_context"] = lambda: preview_provider_query(
-                    task,
-                    event.session_id,
-                    origin_refs=origin_refs,
+                event.data["preview_ephemeral_context"] = lambda: (
+                    turn["rendered"] if turn.get("epoch") == memory.active_path(event.session_id).name
+                    else prepare_packet().render(task)
                 )
         # Summary/Profile are provider-tail facts; compression must not rebuild the stable prefix.
         event.data["reload_messages_after_compression"] = lambda: rebuild_messages(refresh_system=False)
@@ -140,16 +188,9 @@ def register_memory_callbacks(
                 summary = memory.latest_summary(event.session_id)
                 if summary:
                     event.data["set_continuity_fragment"](summary)
-            rebuilt = [dict(base_system), *memory.restore_messages(event.session_id)]
+            rebuilt = [dict(base_system), *memory.restore_messages(event.session_id, provider_context=True)]
             if callable(render_provider_query):
-                for message in reversed(rebuilt):
-                    if message.get("role") == "user" and message.get("content") == task:
-                        message["content"] = render_provider_query(
-                            task,
-                            event.session_id,
-                            origin_refs=origin_refs,
-                        )
-                        break
+                render_ephemeral_context(rebuilt)
             return rebuilt
 
         event.data["reload_messages_after_emergency_compression"] = rebuild_after_emergency
@@ -158,6 +199,7 @@ def register_memory_callbacks(
         base_systems.pop(event.session_id, None)
         turn_snapshots.pop(event.session_id, None)
         access_snapshots.pop(event.session_id, None)
+        provider_turns.pop(event.session_id, None)
         dynamic = getattr(prompts, "dynamic_context", None)
         fragments = getattr(dynamic, "fragments", None)
         if fragments is not None:

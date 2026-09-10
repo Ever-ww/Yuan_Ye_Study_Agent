@@ -110,7 +110,9 @@ def test_ephemeral_context_is_provider_only_and_prompt_prefix_is_reused(tmp_path
             "first query",
             "second query",
         ]
-        assert "harness_runtime_context" not in str(records)
+        assert second_messages[:len(first_messages)] == first_messages
+        assert "harness_runtime_context" in records[0]["provider_context"]["fragments"]["harness"]
+        assert all("harness_runtime_context" not in str(r.get("content")) for r in records)
         await runtime.close()
 
     asyncio.run(check())

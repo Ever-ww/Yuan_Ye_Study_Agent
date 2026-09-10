@@ -129,6 +129,16 @@ def register_harness_context_callbacks(
             }
 
         prior_renderer = event.data.get("render_ephemeral_context")
+        register_fragment = event.data.get("register_provider_context_fragment")
+        if callable(register_fragment):
+            envelope = controller.envelope()
+            register_fragment(
+                "harness",
+                f"{EPHEMERAL_CONTEXT_OPEN}\n{envelope.canonical_payload()}\n{EPHEMERAL_CONTEXT_CLOSE}",
+            )
+            controller.last_envelope_hash = envelope.digest
+            event.data["ephemeral_context_hash_provider"] = lambda: controller.last_envelope_hash
+            return
 
         def render_ephemeral_context(messages: list[dict[str, Any]]) -> None:
             if callable(prior_renderer):

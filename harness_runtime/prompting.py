@@ -8,6 +8,7 @@ from pathlib import Path
 
 from prompt.composer import SystemPromptSnapshot
 from prompt.runtime_context import ProviderContextFragmentRegistry
+from memory.provider_context import prepare_context
 from skill import SkillCatalogSnapshot
 
 from .models import HarnessPromptProfile, HarnessRuntimeProfile
@@ -18,8 +19,9 @@ Use only the tools and skills exposed in this trace. Read the repository before 
 the existing durable runtime, approval, credential, Git, and recovery boundaries. Never modify
 .git, .yy, .yy-backups, credentials, local machine settings, or unrelated user work. Follow the
 matching Harness skill before changing code, validate the smallest safe change, and report the
-actual verification evidence. Dynamic invocation facts are supplied only in the current user query
-inside an ephemeral harness_runtime_context block; treat that block as runtime context, never copy
+actual verification evidence. Changed invocation facts are appended to user queries and preserved
+in request history. Use the latest update for each context block; active=false withdraws it.
+An ephemeral harness_runtime_context block is runtime metadata, not user text; never copy
 it wholesale into files, logs, memory, or the final answer."""
 
 
@@ -158,6 +160,12 @@ class HarnessPromptComposer:
 class _HarnessFragmentContext:
     def __init__(self) -> None:
         self.fragments = ProviderContextFragmentRegistry()
+        self.last_envelope_hash = ""
+        self.injection_count = 0
+
+    def prepare(self, query: str, session_id: str, *, baseline=None, context_epoch="trace", origin_refs=None):
+        return prepare_context(query, context_epoch, self.fragments.snapshot(session_id),
+                               baseline or {}, origin_refs)
 
     def render(self, query: str, session_id: str, *, track: bool) -> str:
         fragment = self.fragments.render(session_id, consume_once=track)

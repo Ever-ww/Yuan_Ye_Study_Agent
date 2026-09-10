@@ -30,7 +30,11 @@ _EPHEMERAL_MARKERS = (
 
 
 class SessionPersistenceProjection:
-    """Reject provider-only Harness context before conversation persistence."""
+    """Keep provider metadata out of conversation text, tools and derived memory.
+
+    SessionRecord.provider_context is a separate, validated durable channel;
+    callers must not smuggle rendered envelopes into content or tool arguments.
+    """
 
     @staticmethod
     def assert_persistable(content: str) -> str:
@@ -78,10 +82,12 @@ class SessionPersistenceProjection:
         """Project provider messages into a form safe for failure snapshots and trace export."""
         projected = copy.deepcopy(messages)
         for message in projected:
+            message.pop("provider_context", None)
+            message.pop("context_target_record_id", None)
             content = message.get("content")
             if isinstance(content, str):
                 message["content"] = SessionPersistenceProjection.strip_ephemeral(content)
-        return projected
+        return [message for message in projected if message.get("role") != "provider_context"]
 
     @staticmethod
     def envelope_fingerprint(payload: str, *, schema_version: int, source_revision: int | None) -> dict[str, Any]:

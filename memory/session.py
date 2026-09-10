@@ -152,10 +152,12 @@ class SessionStore:
             record, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
         )
 
-    def restore(self, session_id: str) -> list[dict[str, Any]]:
+    def restore(self, session_id: str, *, provider_context: bool = False) -> list[dict[str, Any]]:
         """恢复最新分段并移除时间戳、模型指标等审计字段。"""
         records: list[dict[str, Any]] = []
         context_records = self.context_records(session_id)
+        from .provider_context import effective_contexts
+        projections = effective_contexts(context_records) if provider_context else {}
         summary = next((value for value in context_records if value.get("role") == "summary"), None)
         protected_current = (
             summary.get("protected_current_query_record_id")
@@ -165,6 +167,9 @@ class SessionStore:
         for value in context_records:
             role, content = value.get("role"), value.get("content")
             if role == "user" and isinstance(content, str):
+                packet = projections.get(str(value.get("record_id")))
+                if packet is not None:
+                    content = packet.render(content)
                 records.append({"role": "user", "content": content})
             elif role == "assistant" and (isinstance(content, str) or content is None):
                 message: dict[str, Any] = {"role": "assistant", "content": content}

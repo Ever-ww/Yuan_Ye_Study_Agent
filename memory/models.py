@@ -6,6 +6,7 @@ import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from .provider_context import ProviderContextRecord
 
 
 class SessionRecord(BaseModel):
@@ -13,7 +14,7 @@ class SessionRecord(BaseModel):
 
     model_config = ConfigDict(extra="allow", strict=True)
 
-    role: Literal["user", "assistant", "tool", "summary", "extension"]
+    role: Literal["user", "assistant", "tool", "summary", "extension", "provider_context"]
     content: str | None
     timestamp: str = Field(min_length=1)
     tool_calls: list[dict[str, Any]] | None = None
@@ -25,10 +26,22 @@ class SessionRecord(BaseModel):
     run_id: str | None = Field(default=None, min_length=1)
     turn_id: str | None = Field(default=None, min_length=1)
     operation_id: str | None = Field(default=None, min_length=1)
+    provider_context: ProviderContextRecord | None = None
+    context_target_record_id: str | None = None
 
     @model_validator(mode="after")
     def _validate_role_payload(self) -> "SessionRecord":
         """按角色约束正文和工具关联字段，防止坏记录进入历史。"""
+        if self.provider_context is not None:
+            if self.role not in {"user", "provider_context"}:
+                raise ValueError("Only user/context records may carry a provider projection")
+            if self.role == "user":
+                self.provider_context.render(self.content or "")
+        if self.role == "provider_context":
+            if self.content is not None or not self.context_target_record_id or self.provider_context is None:
+                raise ValueError("Context amendments require a target and packet, not conversation content")
+        if self.context_target_record_id and self.role != "provider_context":
+            raise ValueError("Context target is only valid on context amendments")
         if self.role in {"user", "summary"} and not isinstance(self.content, str):
             raise ValueError(f"{self.role} 记录必须包含字符串 content")
         if self.role == "assistant" and self.content is None and not self.tool_calls:

@@ -162,7 +162,10 @@ class SandboxTests(unittest.TestCase):
             )
             self.assertTrue(provider.tool_names)
             self.assertTrue(all("bash" not in names for names in provider.tool_names))
-            self.assertTrue(all("checkpoint_only" in query for query in provider.user_queries))
+            self.assertIn("checkpoint_only", provider.user_queries[0])
+            # Unchanged context remains in the immutable prior user message;
+            # the next query is not padded with a duplicate copy.
+            self.assertNotIn("checkpoint_only", provider.user_queries[-1])
             self.assertTrue(all("Checkpoint-only（Bash 禁用" not in prompt for prompt in provider.system_prompts))
             await runtime.close()
             self.assertFalse(sandbox.active)

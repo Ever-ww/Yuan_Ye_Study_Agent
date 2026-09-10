@@ -23,6 +23,7 @@ from .structured import (
     StructuredMemoryStore,
 )
 from .embeddings import MemoryEmbeddingWorker, build_memory_embedding_provider
+from .provider_context import ProviderContextRecord
 
 __all__ = [
     "HarnessLongTermMemory", "HarnessMemoryUpdate", "MemoryStore",
@@ -33,4 +34,5 @@ __all__ = [
     "MemoryProfileProjector", "MemoryWriter", "StructuredMemoryStore",
     "LegacyMemoryMigrator",
     "MemoryEmbeddingWorker", "build_memory_embedding_provider",
+    "ProviderContextRecord",
 ]

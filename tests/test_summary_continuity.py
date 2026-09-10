@@ -40,9 +40,13 @@ def test_summary_survives_turns_restart_and_disabled_recall(tmp_path):
                                tools=AsyncToolRegistry(), enable_sandbox=False)
         assert asyncio.run(runtime.run(question, sid)).completed
         request = provider.requests[-1]
-        assert "mandatory continuity" in request[-1]["content"]
-        assert source in request[-1]["content"]
-        assert request[-1]["content"].count('<continuity_fragment ephemeral="true">') == 1
+        contents = "\n".join(str(m.get("content", "")) for m in request)
+        assert "mandatory continuity" in contents
+        assert source in contents
+        assert contents.count('<continuity_fragment ephemeral="true">') == 1
+        if question == "second":
+            assert request[-1]["content"] == "second"
+            assert request[:len(provider.requests[0])] == provider.requests[0]
     assert all("continuity_fragment" not in (r.content or "")
                for _, r in memory.sessions.read_all_records_strict(sid))
 

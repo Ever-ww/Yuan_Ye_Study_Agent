@@ -1,16 +1,19 @@
-"""Provider-only dynamic context for the main Agent request tail."""
+"""Changed-only context updates with immutable, durable provider projections."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import platform
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal, TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from memory.persistence import AGENT_EPHEMERAL_CONTEXT_CLOSE, AGENT_EPHEMERAL_CONTEXT_OPEN
+from memory.provider_context import ProviderContextRecord, context_baseline, prepare_context
+
+DYNAMIC_CONTEXT_REFRESH_INTERVAL = timedelta(hours=2)
 
 if TYPE_CHECKING:
     from Agent.config import RuntimeConfig
@@ -18,7 +21,7 @@ if TYPE_CHECKING:
 
 
 class AgentRuntimeContextEnvelope(BaseModel):
-    """Rebuildable current facts that must not enter the conversation Session."""
+    """Current facts, persisted only as dedicated provider-context metadata."""
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
@@ -91,6 +94,9 @@ class ProviderContextFragmentRegistry:
         self._fragments.pop(session_id, None)
         self._once.pop(session_id, None)
 
+    def snapshot(self, session_id: str) -> dict[str, str]:
+        return dict(self._fragments.get(session_id, {}))
+
 
 class AgentDynamicContextBuilder:
     def __init__(self, config: "RuntimeConfig", memory: "MemoryStore") -> None:
@@ -110,6 +116,7 @@ class AgentDynamicContextBuilder:
         session_id: str,
         *,
         origin_refs: dict[str, str] | None = None,
+        current_time: str | None = None,
     ) -> AgentRuntimeContextEnvelope:
         now = datetime.now().astimezone()
         return AgentRuntimeContextEnvelope(
@@ -121,7 +128,7 @@ class AgentDynamicContextBuilder:
             architecture=platform.machine(),
             python_version=platform.python_version(),
             timezone=now.tzname() or str(now.tzinfo),
-            current_time=now.isoformat(),
+            current_time=current_time or now.isoformat(timespec="seconds"),
             sandbox_mode=self.sandbox_mode,
             sandbox_shell=self.sandbox_shell,
             runtime_notice=str(getattr(self.memory, "runtime_notice", "")).strip(),
@@ -130,11 +137,51 @@ class AgentDynamicContextBuilder:
             # unconditional full-profile read on every model request.
             profile_context="",
             conversation_summary="",
-            origin_refs=dict(sorted((origin_refs or {}).items())),
+            # Run/Turn IDs are provenance, not changing semantic context. They
+            # belong in the durable packet metadata, not every provider update.
+            origin_refs={},
             source_hashes={
                 "profile": hashlib.sha256(b"").hexdigest(),
                 "summary": hashlib.sha256(b"").hexdigest(),
             },
+        )
+
+    def prepare(
+        self, original_query: str, session_id: str, *, origin_refs=None,
+        baseline: dict[str, str] | None = None,
+        context_epoch: str | None = None,
+    ) -> ProviderContextRecord:
+        now = datetime.now().astimezone()
+        current = self.fragments.snapshot(session_id)
+        if baseline is None:
+            reader = getattr(self.memory, "session_context_records", None)
+            baseline = context_baseline(reader(session_id)) if callable(reader) else {}
+        baseline_time = _agent_context_time(baseline.get("agent", ""))
+        reuse_time = (
+            baseline_time is not None
+            and timedelta(0) <= now - baseline_time < DYNAMIC_CONTEXT_REFRESH_INTERVAL
+        )
+        selected_time = baseline_time.isoformat(timespec="seconds") if reuse_time else now.isoformat(timespec="seconds")
+        envelope = self.envelope(session_id, current_time=selected_time)
+        current["agent"] = _render_agent_envelope(envelope)
+
+        # Any other context update creates a new visible context baseline. The
+        # two-hour clock therefore starts at this update, including a segment
+        # change caused by compaction. Non-time Agent facts (sandbox/notice)
+        # follow the same rule.
+        managed = {"memory", "continuity", "harness"}
+        other_changed = any(
+            current.get(key) != baseline.get(key)
+            and not (key not in current and _is_withdrawal(baseline.get(key, "")))
+            for key in managed
+        )
+        agent_changed = current["agent"] != baseline.get("agent")
+        if reuse_time and (other_changed or agent_changed):
+            envelope = self.envelope(session_id, current_time=now.isoformat(timespec="seconds"))
+            current["agent"] = _render_agent_envelope(envelope)
+        return prepare_context(
+            original_query, context_epoch or self.memory.active_path(session_id).name,
+            current, baseline, origin_refs,
         )
 
     def render(
@@ -145,16 +192,34 @@ class AgentDynamicContextBuilder:
         origin_refs: dict[str, str] | None = None,
         track: bool = True,
     ) -> str:
-        if AGENT_EPHEMERAL_CONTEXT_OPEN in original_query or AGENT_EPHEMERAL_CONTEXT_CLOSE in original_query:
-            raise ValueError("The persisted user query contains a reserved Agent context marker")
-        envelope = self.envelope(session_id, origin_refs=origin_refs)
+        packet = self.prepare(original_query, session_id, origin_refs=origin_refs)
         if track:
-            self.last_envelope_hash = envelope.digest
-            self.injection_count += 1
-        fragments = self.fragments.render(session_id, consume_once=track)
-        rendered = (
-            f"<user_query>\n{original_query}\n</user_query>\n\n"
-            f"{AGENT_EPHEMERAL_CONTEXT_OPEN}\n{envelope.canonical_payload()}\n"
-            f"{AGENT_EPHEMERAL_CONTEXT_CLOSE}"
-        )
-        return rendered + (f"\n\n{fragments}" if fragments else "")
+            self.last_envelope_hash = packet.content_hash
+            self.injection_count += bool(packet.fragments)
+        return packet.render(original_query)
+
+
+def _render_agent_envelope(envelope: AgentRuntimeContextEnvelope) -> str:
+    return (
+        f"{AGENT_EPHEMERAL_CONTEXT_OPEN}\n{envelope.canonical_payload()}\n"
+        f"{AGENT_EPHEMERAL_CONTEXT_CLOSE}"
+    )
+
+
+def _agent_context_time(fragment: str) -> datetime | None:
+    if not fragment.startswith(AGENT_EPHEMERAL_CONTEXT_OPEN):
+        return None
+    try:
+        payload = fragment[len(AGENT_EPHEMERAL_CONTEXT_OPEN):]
+        payload = payload.removesuffix(AGENT_EPHEMERAL_CONTEXT_CLOSE).strip()
+        value = json.loads(payload).get("current_time")
+        selected = datetime.fromisoformat(value) if isinstance(value, str) else None
+        return selected if selected is not None and selected.tzinfo is not None else None
+    except (ValueError, TypeError, json.JSONDecodeError):
+        # Legacy date-only or malformed context is never trusted as a clock
+        # anchor; the next query writes a fresh versioned snapshot.
+        return None
+
+
+def _is_withdrawal(fragment: str) -> bool:
+    return '"active":false' in fragment

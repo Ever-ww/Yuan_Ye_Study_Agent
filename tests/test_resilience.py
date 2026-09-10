@@ -664,7 +664,8 @@ class ResilienceTests(unittest.TestCase):
             self.assertEqual(sandbox.writes, ["fixed.py"])
             self.assertGreaterEqual(sandbox.closed, 1)
             records = runtime.memory.session_records(runtime.coding_session_id)
-            self.assertNotIn("harness_runtime_context", str(records))
+            self.assertNotIn("harness_runtime_context", str(records[0]["content"]))
+            self.assertIn("harness_runtime_context", records[0]["provider_context"]["fragments"]["harness"])
             self.assertEqual([record["role"] for record in records[-4:]], [
                 "user",
                 "assistant",
