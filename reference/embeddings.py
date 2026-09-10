@@ -150,16 +150,23 @@ class ReferenceEmbeddingWorker:
             async with self._job_lock:
                 if self._maintenance_epoch is not None:
                     continue
-                job = self.store.claim_embedding_job(self.provider.model)
-                if job is not None:
-                    try:
-                        document = self.store.search_document(job.document_id)
-                        vector = (await self.provider.embed((str(document["search_text"]),)))[0]
-                        self.store.complete_embedding(job, pack_vector(vector), len(vector))
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        self.store.fail_embedding(job, f"{type(exc).__name__}: {str(exc)[:800]}")
+                from contextlib import nullcontext
+                from backup.maintenance import MaintenanceBlockedError
+                gate = getattr(self, "write_gate", None)
+                try:
+                    with gate.work("reference_embedding", "embedding") if gate else nullcontext():
+                        job = self.store.claim_embedding_job(self.provider.model)
+                        if job is not None:
+                            try:
+                                document = self.store.search_document(job.document_id)
+                                vector = (await self.provider.embed((str(document["search_text"]),)))[0]
+                                self.store.complete_embedding(job, pack_vector(vector), len(vector))
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                self.store.fail_embedding(job, f"{type(exc).__name__}: {str(exc)[:800]}")
+                except MaintenanceBlockedError:
+                    pass
             if job is None:
                 self._wake.clear()
                 try:

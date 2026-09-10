@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from backup.maintenance import lifecycle_mutation
 from datetime import datetime
 from pathlib import Path
 
@@ -69,6 +70,7 @@ class GatewayStore:
             )
             self._ensure_run_columns(connection)
 
+    @lifecycle_mutation
     def register_project(self, path: Path, name: str | None = None) -> ProjectRecord:
         resolved = path.resolve()
         if not resolved.is_dir():
@@ -108,6 +110,7 @@ class GatewayStore:
             raise KeyError(f"Unknown project: {project_id}")
         return ProjectRecord(**dict(row))
 
+    @lifecycle_mutation
     def remove_project(self, project_id: str) -> None:
         with self._connect() as connection:
             active = connection.execute(
@@ -155,6 +158,7 @@ class GatewayStore:
             rows = connection.execute(query).fetchall()
         return [_inbox_item(row) for row in rows]
 
+    @lifecycle_mutation
     def mark_inbox_read(self, item_id: str) -> InboxItem:
         with self._connect() as connection:
             cursor = connection.execute("UPDATE inbox SET is_read=1 WHERE item_id=?", (item_id,))
@@ -163,6 +167,7 @@ class GatewayStore:
             raise KeyError(f"Unknown Inbox item: {item_id}")
         return _inbox_item(row)
 
+    @lifecycle_mutation
     def mark_run_inbox_read(self, run_id: str) -> InboxItem | None:
         with self._connect() as connection:
             connection.execute("UPDATE inbox SET is_read=1 WHERE run_id=?", (run_id,))

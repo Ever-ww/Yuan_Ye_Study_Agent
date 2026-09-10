@@ -97,6 +97,7 @@ class BackupService:
             frozen = True
         maintenance = self.control_root / "maintenance" / str(epoch)
         maintenance.mkdir(parents=True, exist_ok=True)
+        completed = False
         try:
             sources, logical_size = self._consistent_sources(maintenance)
             backup_id = uuid4().hex
@@ -139,11 +140,17 @@ class BackupService:
             self._record_backup(record)
             if kind == "automatic":
                 self.apply_retention()
+            completed = True
             return record
-        finally:
+        except BaseException as exc:
             if frozen and self.coordinator is not None:
+                await self.coordinator.fail(f"Backup failed: {type(exc).__name__}")
+            raise
+        finally:
+            if completed and frozen and self.coordinator is not None:
                 await self.coordinator.resume(epoch)
-            shutil.rmtree(maintenance, ignore_errors=True)
+            if completed:
+                shutil.rmtree(maintenance, ignore_errors=True)
 
     def verify(self, archive: Path, passphrase: str) -> BackupVerificationResult:
         errors: list[str] = []

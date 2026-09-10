@@ -75,6 +75,9 @@ class BackupScheduler:
 
     async def tick(self) -> str | None:
         async with self._tick_lock:
+            from .models import MaintenanceState
+            if self.write_gate.state != MaintenanceState.RUNNING:
+                return None
             if not self.enabled or not self._is_due():
                 return None
             now = self._now()
@@ -123,7 +126,12 @@ class BackupScheduler:
 
     async def _run(self) -> None:
         while not self._closing:
-            await self.tick()
+            try:
+                await self.tick()
+            except Exception as exc:
+                # Lifecycle failure remains canonical; do not write .yy to report
+                # a backup error after maintenance has closed the write gate.
+                self.last_error = type(exc).__name__
             self._wake.clear()
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=self.heartbeat_seconds)

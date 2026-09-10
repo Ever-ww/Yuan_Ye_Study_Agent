@@ -36,6 +36,7 @@ from gateway.models import (
 from gateway.security import GatewayCredentials, bearer_value
 from sandbox import probe_sandbox_status
 from backup import BackupCreateRequest, MaintenanceBlockedError, external_control_root
+from backup.models import MaintenanceQuiesceRequest, MaintenanceResumeRequest
 
 
 def create_gateway_api(
@@ -65,6 +66,17 @@ def create_gateway_api(
             await gateway.close()
 
     app = FastAPI(lifespan=lifespan)
+    app.state.gateway = gateway
+
+    @app.exception_handler(MaintenanceBlockedError)
+    async def maintenance_blocked(request, exc):
+        try:
+            snapshot = gateway.maintenance.snapshot.model_dump(mode="json")
+        except Exception:
+            # A broken control store must not turn a refusal into an exception
+            # handler recursion or a fabricated RUNNING/FAILED durable state.
+            snapshot = None
+        return _json_response({"detail": str(exc), "maintenance": snapshot, "accepting_work": False}, 503)
 
     @app.exception_handler(KeyError)
     async def key_error_handler(request, exc):
@@ -95,7 +107,7 @@ def create_gateway_api(
             raise HTTPException(401, "Gateway 访问凭据无效")
         return supplied
 
-    async def authorize_write(
+    async def authorize_control(
         request: Request,
         authorization: str | None = Header(default=None),
         yy_gateway: str | None = Cookie(default=None),
@@ -112,10 +124,14 @@ def create_gateway_api(
             "http://tauri.localhost",
         }:
             raise HTTPException(403, "Origin 不在本机客户端白名单")
+        return supplied
+
+    async def authorize_write(request: Request, supplied=Depends(authorize_control)):
         try:
             async with gateway.write_gate.operation(
                 "gateway-api",
                 f"{request.method}:{request.url.path}:{uuid4().hex}",
+                kind="request",
             ):
                 yield supplied
         except MaintenanceBlockedError as exc:
@@ -145,7 +161,19 @@ def create_gateway_api(
             **gateway.health(),
         }
 
-    @app.post("/api/v1/backup/create", dependencies=[Depends(authorize)])
+    @app.get("/api/v1/maintenance", dependencies=[Depends(authorize)])
+    async def maintenance_status():
+        return gateway.maintenance.snapshot
+
+    @app.post("/api/v1/maintenance/quiesce", dependencies=[Depends(authorize_control)])
+    async def quiesce_gateway(request: MaintenanceQuiesceRequest):
+        return await gateway.quiesce(request.timeout, request.reason)
+
+    @app.post("/api/v1/maintenance/resume", dependencies=[Depends(authorize_control)])
+    async def resume_gateway(request: MaintenanceResumeRequest):
+        return await gateway.resume(request.maintenance_epoch, expected_revision=request.expected_revision)
+
+    @app.post("/api/v1/backup/create", dependencies=[Depends(authorize_control)])
     async def create_backup(request: BackupCreateRequest):
         # This endpoint deliberately does not acquire a normal write scope: it is
         # the maintenance initiator and must transition the gate to DRAINING.
@@ -169,7 +197,7 @@ def create_gateway_api(
         cron_status = await gateway.cron_status()
         dream_status = gateway.dream_status()
         return {
-            "gateway": "running",
+            "gateway": gateway.write_gate.state.value,
             "version": 1,
             "provider": config.provider,
             "model": config.model,
@@ -413,7 +441,7 @@ def create_gateway_api(
     async def recover_run(run_id: str, payload: RecoveryDecisionRequest):
         return await gateway.recover_run(run_id, payload)
 
-    @app.post("/api/v1/runs/{run_id}/cancel", dependencies=[Depends(authorize_write)])
+    @app.post("/api/v1/runs/{run_id}/cancel", dependencies=[Depends(authorize_control)])
     async def cancel_run(run_id: str):
         return {"cancelled": await gateway.cancel_run(run_id)}
 
@@ -449,7 +477,7 @@ def create_gateway_api(
     async def run_events(run_id: str, after_sequence: int = 0):
         return gateway.run_events(run_id, after_sequence)
 
-    @app.post("/api/v1/approvals/{approval_id}", dependencies=[Depends(authorize_write)])
+    @app.post("/api/v1/approvals/{approval_id}", dependencies=[Depends(authorize_control)])
     async def approval(approval_id: str, decision: ApprovalDecision):
         return {"approved": await gateway.decide_approval(approval_id, decision)}
 

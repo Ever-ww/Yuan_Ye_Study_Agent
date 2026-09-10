@@ -125,7 +125,7 @@ class BackupTests(unittest.TestCase):
             await task
             await gate.wait_for_idle(1)
             await gate.freeze(1)
-            self.assertEqual(gate.state.value, "frozen")
+            self.assertEqual(gate.state.value, "quiesced")
 
         asyncio.run(scenario())
 
@@ -164,6 +164,9 @@ class BackupTests(unittest.TestCase):
             self.assertEqual(len(restore_id), 32)
             self.assertEqual((home / "profile.txt").read_text(encoding="utf-8"), "before")
             self.assertFalse((root / ".yy-backups" / "restores" / "active-fence.json").exists())
+            from backup.lifecycle_store import LifecycleStore
+            from backup.models import MaintenanceState
+            self.assertEqual(LifecycleStore(root).read().state, MaintenanceState.RESTORING)
 
     def test_restore_refuses_while_gateway_instance_lock_is_held(self) -> None:
         with tempfile.TemporaryDirectory() as value:

@@ -37,6 +37,7 @@ from gateway.session_reservation import SessionReservationRegistry
 from memory import MemoryStore
 from reference import ReferenceService
 from backup import AgentHomeWriteGate, QuiesceResult
+from backup.maintenance import lifecycle_work
 
 
 RuntimeFactory = Callable[[Path, GatewayApprovalBroker], AgentRuntime]
@@ -126,6 +127,7 @@ class RuntimePool:
         if self._reaper is None:
             self._reaper = asyncio.create_task(self._reap_idle(), name="gateway-runtime-reaper")
 
+    @lifecycle_work(continuation=True)
     async def submit(self, run: RunRecord) -> None:
         if self._closing or self._maintenance_epoch is not None:
             raise RuntimeError("Gateway 正在关闭，不能接收新任务")
@@ -178,7 +180,7 @@ class RuntimePool:
             await self._execute(run)
             return
         try:
-            async with self.write_gate.operation("runtime_pool", run.run_id):
+            async with self.write_gate.operation("runtime_pool", run.run_id, continuation=True):
                 started.set()
                 await self._execute(run)
         finally:
@@ -224,6 +226,7 @@ class RuntimePool:
         for entry in entries:
             await entry.runtime.close()
 
+    @lifecycle_work()
     async def refresh_skills(self, project_id: str, session_id: str):
         """刷新指定的持久化 Session；空闲时自动恢复 Runtime。"""
         if self._maintenance_epoch is not None:
@@ -292,7 +295,9 @@ class RuntimePool:
         self._maintenance_epoch = maintenance_epoch
         active = [task for task in self._tasks.values() if not task.done()]
         if active:
-            await asyncio.gather(*active, return_exceptions=True)
+            # Timeout cancels only the waiter, never the accepted Run tasks.
+            await asyncio.gather(*(asyncio.shield(task) for task in active), return_exceptions=True)
+        await self.release_idle_for_maintenance()
         return QuiesceResult(
             participant="runtime_pool",
             maintenance_epoch=maintenance_epoch,
@@ -303,6 +308,16 @@ class RuntimePool:
     async def resume(self, maintenance_epoch: int) -> None:
         if self._maintenance_epoch == maintenance_epoch:
             self._maintenance_epoch = None
+
+    async def release_idle_for_maintenance(self):
+        """Recreate normal Runtime instances after a validated maintenance resume."""
+        if any(not task.done() for task in self._tasks.values()):
+            raise RuntimeError("Cannot refresh Runtime while a Run is active")
+        async with self._lock:
+            entries = list(self._runtimes.values())
+            self._runtimes.clear()
+        for entry in entries:
+            await entry.runtime.close()
 
     async def invalidate_profile_context(self, after_active_turn: bool = True) -> None:
         """Profile 更新后刷新空闲 Runtime；活动 Turn 在结束后再刷新。"""
@@ -681,15 +696,23 @@ class RuntimePool:
         await self._emit(run, "approval_requested", request.model_dump(mode="json"))
 
     async def _reap_idle(self) -> None:
+        from backup.maintenance import MaintenanceBlockedError
         interval = max(5.0, min(60.0, self.idle_timeout_seconds / 2))
         while True:
             await asyncio.sleep(interval)
-            now = monotonic()
-            selected: list[RuntimeEntry] = []
-            async with self._lock:
-                for key, entry in tuple(self._runtimes.items()):
-                    if key not in self.session_reservations.busy_keys and now - entry.last_used >= self.idle_timeout_seconds:
-                        selected.append(entry)
-                        self._runtimes.pop(key, None)
-            for entry in selected:
-                await entry.runtime.close()
+            try:
+                await self._reap_idle_once()
+            except MaintenanceBlockedError:
+                pass
+
+    @lifecycle_work("background")
+    async def _reap_idle_once(self):
+        now = monotonic()
+        selected: list[RuntimeEntry] = []
+        async with self._lock:
+            for key, entry in tuple(self._runtimes.items()):
+                if key not in self.session_reservations.busy_keys and now - entry.last_used >= self.idle_timeout_seconds:
+                    selected.append(entry)
+                    self._runtimes.pop(key, None)
+        for entry in selected:
+            await entry.runtime.close()

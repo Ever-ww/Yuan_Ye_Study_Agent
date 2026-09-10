@@ -14,6 +14,7 @@ from types import ModuleType
 
 from Agent import RuntimeConfig
 from backup import QuiesceResult, SensitiveEnvSanitizer
+from backup.maintenance import lifecycle_work
 from gateway.models import CodeFinalizeResult, CodeSessionRecord, CodeTurnResult
 
 
@@ -44,6 +45,7 @@ class CodeSessionManager:
         ).resolve()
         self.module = _load_harness(self.source_root)
         self.grant_backend = grant_backend
+        self.write_gate = getattr(grant_backend, "write_gate", None)
         self._sessions: dict[str, object] = {}
         self._sources: dict[Path, str] = {}
         self._owners: dict[str, tuple[str, str]] = {}
@@ -51,6 +53,7 @@ class CodeSessionManager:
         self._lock = asyncio.Lock()
         self._maintenance_epoch: int | None = None
 
+    @lifecycle_work("run", continuation=True)
     async def start(
         self, project_id: str, client_id: str, *,
         origin_session_id: str | None = None, origin_run_id: str,
@@ -92,6 +95,7 @@ class CodeSessionManager:
             self._turn_locks[session_id] = asyncio.Lock()
             return self._record(raw, project_id, client_id)
 
+    @lifecycle_work("run", continuation=True)
     async def run_turn(self, session_id: str, client_id: str, task: str) -> CodeTurnResult:
         self._require_available()
         controller = self._owned(session_id, client_id)
@@ -103,6 +107,7 @@ class CodeSessionManager:
             raw = await controller.run_turn(task)
         return CodeTurnResult.model_validate(raw.model_dump(mode="json"))
 
+    @lifecycle_work("run", continuation=True)
     async def finalize(
         self, session_id: str, client_id: str, *, approved_plan_hash: str | None = None,
         run_id: str | None = None,
@@ -129,6 +134,7 @@ class CodeSessionManager:
             self._forget(session_id)
         return result
 
+    @lifecycle_work("run", continuation=True)
     async def abort(self, session_id: str, client_id: str) -> CodeFinalizeResult:
         self._require_available()
         controller = self._owned(session_id, client_id)
@@ -163,6 +169,12 @@ class CodeSessionManager:
         destination.mkdir(parents=True, exist_ok=True)
         active: list[str] = []
         for session_id, controller in tuple(self._sessions.items()):
+            runtime = getattr(controller, "runtime", None)
+            if runtime is not None:
+                # End the Trace while drain still permits final writes. Keep the
+                # Runtime object/worktree: run_task reopens a Trace on the next
+                # admitted Turn, using the same persisted Memory session.
+                await runtime.close()
             await self._export_candidate(session_id, controller, destination / session_id)
             active.append(session_id)
         return QuiesceResult(
@@ -185,7 +197,8 @@ class CodeSessionManager:
             if runtime is not None:
                 await runtime.close()
                 controller.runtime = None
-            if record is not None:
+            from backup.models import MaintenanceState
+            if record is not None and (self.write_gate is None or self.write_gate.state == MaintenanceState.RUNNING):
                 controller.audit.append_event(
                     record.audit_path,
                     "code_session_interrupted",

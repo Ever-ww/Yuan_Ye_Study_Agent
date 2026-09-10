@@ -100,12 +100,15 @@ class SubagentTool:
         return "read"
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        from backup.maintenance import child_work
+
         names = list(arguments.get("tools", []))
         if "subagent" in names:
             raise ValueError("子 Agent 不允许递归调用 subagent")
-        return await self.runner(
-            arguments["task"],
-            arguments.get("instructions", ""),
-            names,
-            context,
-        )
+        with child_work("subagent", "subagent-invocation"):
+            return await self.runner(
+                arguments["task"],
+                arguments.get("instructions", ""),
+                names,
+                context,
+            )

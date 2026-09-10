@@ -18,6 +18,7 @@ from typing import Any
 from Agent import RuntimeConfig, RuntimeFailure
 from gateway.audit import AuditSanitizer
 from memory import MemoryStore
+from backup.maintenance import lifecycle_work
 from gateway.harness_dream import (
     DreamEvolutionContext,
     HarnessDreamChangeScanner,
@@ -46,6 +47,7 @@ class GatewayHarnessEvolutionService:
         self.config = config
         self.store = store
         self.state_controller = state_controller
+        self.write_gate = getattr(state_controller, "write_gate", None)
         self.source_root = (config.coding_source_root or Path(__file__).resolve().parents[1]).resolve()
         self.module = _load_harness(self.source_root)
         self.proposals_root = (
@@ -55,6 +57,7 @@ class GatewayHarnessEvolutionService:
             config.agent_root, self.source_root, config.dream_timezone,
         )
 
+    @lifecycle_work("run")
     async def evolve_capability(
         self, *, operation_id: str, task: str, capability_gap: dict[str, Any],
     ) -> dict[str, Any]:
@@ -165,6 +168,7 @@ class GatewayHarnessEvolutionService:
     ) -> HarnessDreamChangeSet:
         return self.dream_scanner.scan(selected_date, cutoff_at=cutoff_at)
 
+    @lifecycle_work("run", continuation=True)
     async def execute_dream(
         self,
         changeset: HarnessDreamChangeSet,
@@ -310,6 +314,7 @@ class GatewayHarnessEvolutionService:
         self._write_proposal(proposal)
         return proposal
 
+    @lifecycle_work("run", continuation=True)
     async def execute_error(self, proposal_id: str) -> dict[str, Any]:
         proposal = self.proposal(proposal_id)
         if proposal["status"] not in {"confirmed", "running"}:

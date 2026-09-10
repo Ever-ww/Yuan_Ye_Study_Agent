@@ -109,7 +109,8 @@ class GatewayRestartCoordinator:
                 f"Harness Dream restart {request_id}", timeout_seconds=remaining,
             )
         except Exception:
-            self.state_controller.mark_harness_dream_restart_timeout(stable_key, request_id)
+            with self.maintenance.gate.existing_work_control(request_id):
+                self.state_controller.mark_harness_dream_restart_timeout(stable_key, request_id)
             return
         helper = _restart_helper_command(
             self.agent_root, self.source_root, self.port, os.getpid(), request_id,
@@ -160,6 +161,23 @@ def run_restart_helper(
         if expected_commit and head != expected_commit:
             _update_restart_row(agent_root, request_id, "commit_mismatch")
             return
+        # A replacement Gateway boots control-only after a persisted quiesce.
+        # Only the helper owning this exact restart may request validated resume.
+        import httpx
+        with httpx.Client(base_url=manager.base_url,
+                          headers={"Authorization": f"Bearer {manager.token()}"},
+                          timeout=timeout_seconds, trust_env=False) as client:
+            response = client.get("/api/v1/maintenance")
+            response.raise_for_status()
+            lifecycle = response.json()
+            if lifecycle["state"] != "running":
+                if lifecycle["state"] != "quiesced" or lifecycle.get("reason") != f"Harness Dream restart {request_id}":
+                    raise RuntimeError("Restart helper does not own current maintenance")
+                response = client.post("/api/v1/maintenance/resume", json={
+                    "maintenance_epoch": lifecycle["maintenance_epoch"],
+                    "expected_revision": lifecycle["revision"],
+                })
+                response.raise_for_status()
         _update_restart_row(agent_root, request_id, "completed")
     except Exception:
         _update_restart_row(agent_root, request_id, "failed")

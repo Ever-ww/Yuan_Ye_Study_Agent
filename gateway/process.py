@@ -11,6 +11,9 @@ import socket
 import subprocess
 import sys
 import time
+import hashlib
+from datetime import datetime
+from uuid import uuid4
 from pathlib import Path
 from typing import IO
 
@@ -18,6 +21,9 @@ import httpx
 
 from gateway.security import GatewayCredentials
 from backup import SensitiveEnvSanitizer, assert_restore_inactive, external_control_root
+from backup.control import _atomic_json
+from backup.models import GatewayControlRequest, MaintenanceState
+from backup.lifecycle_store import LifecycleStore
 
 
 class GatewayProcessManager:
@@ -30,6 +36,7 @@ class GatewayProcessManager:
         self.startup_lock_path = self.directory / "startup.lock"
         self.log_path = self.directory / "gateway.log"
         self.stop_request_path = self.directory / "stop.request"
+        self.stop_ack_path = self.directory / "stop.ack"
         self.restart_request_path = self.directory / "restart.request"
         # This is the external control plane, never the replaceable `.yy` tree.
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -56,6 +63,8 @@ class GatewayProcessManager:
             "port": self.port,
             "base_url": self.base_url,
             "log_path": str(self.log_path),
+            "maintenance": (LifecycleStore(self.agent_root).read().model_dump(mode="json")
+                            if (self.directory / "lifecycle.sqlite3").exists() else None),
         }
 
     def ensure_running(self, timeout_seconds: float = 15.0) -> dict[str, object]:
@@ -140,29 +149,22 @@ class GatewayProcessManager:
                     "检测到失联 Gateway 持有状态锁，但旧锁没有 PID；"
                     "请结束对应的 gateway run-internal 进程后重试",
                 )
-            try:
-                self.stop_request_path.write_text(str(pid), encoding="utf-8")
-            except OSError:
-                pass
+            metadata = self._metadata()
+            if not metadata.get("instance_id"):
+                raise RuntimeError("Legacy Gateway has no control identity; stop it explicitly before upgrading")
+            request = GatewayControlRequest(
+                request_id=uuid4().hex, instance_id=str(metadata["instance_id"]), action="stop",
+                reason="operator stop", requested_at=datetime.now().astimezone(),
+                requested_by="gateway-process-manager", timeout_seconds=timeout_seconds,
+            )
+            _atomic_json(self.stop_request_path, request.model_dump_json())
             deadline = time.monotonic() + timeout_seconds
             while time.monotonic() < deadline:
                 if not _pid_alive(pid) or not self._instance_lock_held():
                     self._cleanup_stopped_instance()
                     return True
                 time.sleep(0.1)
-            # 健康接口已经失效时，优雅停止请求可能无人消费；仅终止由
-            # instance.json/instance.lock 明确记录的 Gateway PID。
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
-            forced_deadline = time.monotonic() + 2.0
-            while time.monotonic() < forced_deadline:
-                if not _pid_alive(pid) or not self._instance_lock_held():
-                    self._cleanup_stopped_instance()
-                    return True
-                time.sleep(0.1)
-            raise RuntimeError(f"Gateway 未在 {timeout_seconds + 2:g} 秒内停止")
+            raise RuntimeError(f"Gateway drain 超过 {timeout_seconds:g} 秒；未强杀任务，请检查 stop.ack 与 maintenance 状态")
         finally:
             startup_lock.close()
 
@@ -328,21 +330,23 @@ def run_gateway(agent_root: Path, port: int) -> None:
             if manager._healthy():
                 return
             raise RuntimeError(f"端口 {port} 已被占用")
-        manager.stop_request_path.unlink(missing_ok=True)
         token = manager.token()
+        instance_id = uuid4().hex
         metadata = {
             "pid": os.getpid(),
             "port": port,
             "started_at": now_iso(),
             "version": 1,
+            "instance_id": instance_id,
         }
         temporary = manager.instance_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temporary.replace(manager.instance_path)
         try:
             config = load_runtime_config(root, gateway_port=port)
+            api = create_gateway_api(access_token=token)
             server = uvicorn.Server(uvicorn.Config(
-                create_gateway_api(access_token=token),
+                api,
                 host="127.0.0.1",
                 port=port,
                 log_config=None,
@@ -367,7 +371,23 @@ def run_gateway(agent_root: Path, port: int) -> None:
                 serving = asyncio.create_task(server.serve())
                 try:
                     while not serving.done():
-                        if manager.stop_request_path.exists() or manager.restart_request_path.exists():
+                        if not server.started:
+                            # Lifespan bootstrap must settle before the stop
+                            # participant set can truthfully acknowledge drain.
+                            await asyncio.sleep(0.2)
+                            continue
+                        stop_ready = False
+                        if manager.stop_request_path.exists():
+                            try:
+                                stop_ready = await process_control_request(manager, api.state.gateway, instance_id)
+                            except Exception as exc:
+                                # Control-file I/O failure is not permission to
+                                # shut down/cancel active user work.
+                                logging.getLogger(__name__).error("Gateway control request failed: %s", type(exc).__name__)
+                        if stop_ready:
+                            server.should_exit = True
+                            break
+                        if manager.restart_request_path.exists():
                             server.should_exit = True
                             break
                         await asyncio.sleep(0.2)
@@ -384,9 +404,45 @@ def run_gateway(agent_root: Path, port: int) -> None:
             asyncio.run(serve_until_stopped())
         finally:
             manager.instance_path.unlink(missing_ok=True)
-            manager.stop_request_path.unlink(missing_ok=True)
     finally:
         instance_lock.close()
+
+
+async def process_control_request(manager, gateway, instance_id: str) -> bool:
+    """Request and ack are delivery evidence; only lifecycle decides readiness."""
+    try:
+        raw = manager.stop_request_path.read_bytes()
+    except FileNotFoundError:
+        return False
+    digest = hashlib.sha256(raw).hexdigest()
+    if manager.stop_ack_path.exists():
+        try:
+            ack = json.loads(manager.stop_ack_path.read_text(encoding="utf-8"))
+            if not isinstance(ack, dict):
+                ack = {}
+        except (OSError, ValueError):
+            ack = {}  # Rebuild delivery result from the request and canonical state.
+        if ack.get("request_hash") == digest and ack.get("instance_id") == instance_id:
+            return bool(ack.get("status") == "completed" and ack.get("action") == "stop"
+                        and ack.get("instance_id") == instance_id
+                        and gateway.write_gate.state == MaintenanceState.QUIESCED)
+    result = {"version": 1, "request_hash": digest, "instance_id": instance_id,
+              "completed_at": datetime.now().astimezone().isoformat()}
+    try:
+        request = GatewayControlRequest.model_validate_json(raw)
+        result.update(request_id=request.request_id, action=request.action)
+        if request.instance_id != instance_id:
+            raise ValueError("Control request targets a different Gateway instance")
+        if gateway.write_gate.state != MaintenanceState.QUIESCED:
+            await gateway.quiesce(request.timeout_seconds, request.reason)
+        result.update(status="completed", lifecycle_revision=gateway.maintenance.snapshot.revision,
+                      state=gateway.write_gate.state.value)
+    except Exception as exc:
+        result.update(status="failed", error_type=type(exc).__name__,
+                      state=gateway.write_gate.state.value)
+    result["completed_at"] = datetime.now().astimezone().isoformat()
+    _atomic_json(manager.stop_ack_path, json.dumps(result, sort_keys=True))
+    return result.get("status") == "completed" and result.get("action") == "stop"
 
 
 class _GatewayProtocolNoiseFilter(logging.Filter):

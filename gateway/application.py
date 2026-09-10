@@ -9,10 +9,13 @@ import os
 import secrets
 import subprocess
 import sys
+import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
 from uuid import uuid4
+from backup.maintenance import lifecycle_work, lifecycle_mutation, validate_home_databases, MaintenanceBlockedError
+from backup.models import MaintenanceState
 
 from Agent import ExtensionCapability, ExtensionLoader, RuntimeConfig
 from Agent.state import (
@@ -120,6 +123,7 @@ class GatewayApplication:
         # never enters RuntimeConfig or ToolContext.
         self._backup_passphrase = SensitiveEnvSanitizer.consume_backup_passphrase()
         self.store = store or GatewayStore(config.agent_root / ".yy" / "gateway")
+        self.store.write_gate = self.write_gate
         self.events = GatewayEventBus()
         self.gateway_epoch = uuid4().hex
         self.state_controller = StateController(
@@ -150,7 +154,8 @@ class GatewayApplication:
             dead_letter_enabled=config.outbox_dead_letter_enabled,
         )
         source_root = config.coding_source_root or Path(__file__).resolve().parents[1]
-        self._reconcile_extension_grant_intents(source_root)
+        if self.write_gate.state == MaintenanceState.RUNNING:
+            self._reconcile_extension_grant_intents(source_root)
         self.extensions = ExtensionLoader(source_root).scan()
         self.cron_store = CronStore(
             config.agent_root,
@@ -293,10 +298,79 @@ class GatewayApplication:
             on_result=self._record_backup_result,
             heartbeat_seconds=config.cron_heartbeat_seconds,
         )
+        self._services_started = False
+        self.maintenance.health_check = self._maintenance_health_check
+        self.maintenance.flush = self._maintenance_flush
+        self.event_archive_scheduler.write_gate = self.write_gate
+        self.reference_embedding_worker.write_gate = self.write_gate
+        if self.memory_embedding_worker:
+            self.memory_embedding_worker.write_gate = self.write_gate
+        self.maintenance.register("event_archive", self.event_archive_scheduler)
 
     def health(self) -> dict[str, object]:
         """Merge existing Gateway diagnostics with canonical Memory health."""
-        return {**self.state_controller.health(), **self.memory_store.memory_health()}
+        return {**self.state_controller.health(), **self.memory_store.memory_health(),
+                "maintenance": self.maintenance.snapshot.model_dump(mode="json"),
+                "accepting_work": self.write_gate.state == MaintenanceState.RUNNING}
+
+    async def quiesce(self, timeout: float = 30, reason: str = "maintenance"):
+        return await self.maintenance.quiesce(reason, timeout)
+
+    async def resume(self, epoch: int, *, expected_revision: int | None = None):
+        await self.maintenance.resume(epoch, expected_revision=expected_revision)
+        try:
+            if not self._services_started:
+                await self.start()
+        except BaseException:
+            await self.maintenance.fail("Gateway services could not restart")
+            raise
+        return self.maintenance.snapshot
+
+    async def _maintenance_flush(self):
+        # All producers have drained and participants have stopped delivery.
+        # SQLite transactions/file writes already fsync at their own boundaries.
+        # Backlog is durable and need not be delivered to offline clients.
+        def flush():
+            validate_home_databases(self.config.agent_root)
+            for path in (self.config.agent_root / ".yy").rglob("*.sqlite3"):
+                db = sqlite3.connect(path, timeout=5)
+                try:
+                    busy, _, _ = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    if busy:
+                        raise RuntimeError(f"Database remains busy: {path.name}")
+                finally:
+                    db.close()
+        flushing = asyncio.create_task(asyncio.to_thread(flush))
+        try:
+            await asyncio.shield(flushing)
+        except asyncio.CancelledError:
+            # Cancelling an asyncio waiter cannot stop a SQLite worker thread.
+            # Do not release maintenance ownership while it is still checkpointing.
+            await flushing
+            raise
+
+    async def _maintenance_health_check(self):
+        # Whole-home restore remains offline (instance lock + restore fence).
+        # Never reuse an in-process DB/cache across a directory replacement.
+        await asyncio.to_thread(validate_home_databases, self.config.agent_root)
+        db = sqlite3.connect(self.store.database_path)
+        try:
+            if db.execute("PRAGMA user_version").fetchone()[0] != self.state_controller.SCHEMA_VERSION:
+                raise RuntimeError("Gateway schema version does not match this binary")
+        finally:
+            db.close()
+        await self.pool.release_idle_for_maintenance()
+        self.outbox.reconcile_startup()
+        self.event_archive.recover_preparing()
+        registry = self._interactive_tool_registry()
+        registry.schemas()
+        self.skills_for_maintenance().catalog()
+        self.state_controller.health()
+        if self.memory_store.structured:
+            self.memory_store.structured.watermark()
+
+    def skills_for_maintenance(self):
+        return SkillService(self.config.agent_root, self.config.workspace_root, self.config.coding_source_root)
 
     def _reconcile_extension_grant_intents(self, source_root: Path) -> None:
         for row in self.state_controller.pending_extension_grant_intents():
@@ -337,6 +411,15 @@ class GatewayApplication:
                 self.state_controller.mark_extension_grant_recovery_required(plan_hash)
 
     async def start(self) -> None:
+        if self._services_started:
+            return
+        if self.write_gate.state != MaintenanceState.RUNNING:
+            if self.write_gate.state in {MaintenanceState.QUIESCING, MaintenanceState.RESUMING}:
+                await self.maintenance.fail(f"Interrupted {self.write_gate.state.value} at Gateway startup")
+            # Control-only startup: preserve stable maintenance states, or record
+            # an interrupted transition as FAILED. Neither admits new work.
+            # Only explicit resume after health checks can launch recovery/workers.
+            return
         self.state_controller.prune_retention()
         # Delivery and archive evidence are reconciled before any runtime recovery
         # may append new events.  The dispatcher itself starts only after recovery.
@@ -358,8 +441,10 @@ class GatewayApplication:
             await self.cron_scheduler.start()
             await self.dream_scheduler.start()
             await self.backup_scheduler.start()
+            self._services_started = True
         except Exception:
             await self.outbox.close()
+            self.maintenance.close()
             await self.reference_embedding_worker.close()
             if self.memory_embedding_worker is not None:
                 await self.memory_embedding_worker.close()
@@ -538,7 +623,10 @@ class GatewayApplication:
                 await self.memory_embedding_worker.close()
             await self.reference_embedding_worker.close()
             await self.outbox.close()
+            self.maintenance.close()
+            self._services_started = False
 
+    @lifecycle_work("request")
     async def start_code_session(self, request: CodeSessionCreateRequest):
         project = self.store.project(request.project_id)
         origin_session_id = request.origin_session_id
@@ -673,6 +761,7 @@ class GatewayApplication:
             runtime_profile="interactive",
         )
 
+    @lifecycle_work("request")
     async def run_code_turn(self, session_id: str, request: CodeTurnRequest):
         project_id = self._code_project(session_id)
         return await self._run_code_workload(
@@ -683,6 +772,7 @@ class GatewayApplication:
             lambda _run_id: self.harness_manual_tool.turn(session_id, request.client_id, request.task),
         )
 
+    @lifecycle_work("request")
     async def finalize_code_session(
         self, session_id: str, client_id: str,
         approved_plan_hash: str | None = None,
@@ -699,6 +789,7 @@ class GatewayApplication:
             ),
         )
 
+    @lifecycle_work("request")
     async def abort_code_session(self, session_id: str, client_id: str):
         project_id = self._code_project(session_id)
         return await self._run_code_workload(
@@ -762,6 +853,7 @@ class GatewayApplication:
             "trigger_evidence": {"entry": "/code"},
         }
 
+    @lifecycle_work("request")
     async def decide_harness_evolution(
         self, proposal_id: str, decision: HarnessEvolutionDecision,
     ) -> dict[str, object]:
@@ -812,17 +904,20 @@ class GatewayApplication:
     def register_project(self, path: Path, name: str | None = None) -> ProjectRecord:
         return self.store.register_project(path, name)
 
+    @lifecycle_work("request")
     async def remove_project(self, project_id: str) -> None:
         if await self.cron_service.project_has_jobs(project_id):
             raise RuntimeError("项目仍有关联 Cron Job，必须先删除计划任务")
         self.store.remove_project(project_id)
 
+    @lifecycle_work("request")
     async def create_cron(self, request: CronJobCreateRequest) -> CronJob:
         self.store.project(request.project_id)
         result = await self.cron_service.create(request)
         self.cron_scheduler.wake()
         return result
 
+    @lifecycle_work("request")
     async def initialize_paper_research_cron(
         self,
         request: CronPaperResearchPresetRequest,
@@ -836,6 +931,7 @@ class GatewayApplication:
         self.cron_scheduler.wake()
         return result
 
+    @lifecycle_work("request")
     async def edit_cron(self, job_id: str, request: CronJobEditRequest) -> CronJob:
         current = await self.cron_service.get(job_id)
         self.store.project(current.project_id)
@@ -843,21 +939,25 @@ class GatewayApplication:
         self.cron_scheduler.wake()
         return result
 
+    @lifecycle_work("request")
     async def pause_cron(self, job_id: str) -> CronJob:
         result = await self.cron_service.pause(job_id)
         self.cron_scheduler.wake()
         return result
 
+    @lifecycle_work("request")
     async def resume_cron(self, job_id: str) -> CronJob:
         result = await self.cron_service.resume(job_id)
         self.cron_scheduler.wake()
         return result
 
+    @lifecycle_work("request")
     async def run_cron(self, job_id: str) -> CronJob:
         result = await self.cron_service.trigger(job_id)
         self.cron_scheduler.wake()
         return result
 
+    @lifecycle_work("request")
     async def retry_cron_dispatch(self, dispatch_id: str) -> CronDispatch:
         result = await self.cron_service.retry(dispatch_id)
         self.cron_scheduler.wake()
@@ -866,6 +966,7 @@ class GatewayApplication:
     async def cron_history(self, job_id: str, *, limit: int = 100) -> tuple[CronDispatch, ...]:
         return await self.cron_service.history(job_id, limit=limit)
 
+    @lifecycle_work("request")
     async def remove_cron(self, job_id: str) -> CronJob:
         result = await self.cron_service.remove(job_id)
         self.cron_scheduler.wake()
@@ -906,6 +1007,7 @@ class GatewayApplication:
             "date": selected,
         }
 
+    @lifecycle_work("request")
     async def run_harness_dream(
         self,
         selected: str | None,
@@ -1153,6 +1255,7 @@ class GatewayApplication:
             restart_required=bool(raw.get("restart_required")),
         )
 
+    @lifecycle_work("request")
     async def decide_harness_dream(
         self, operation_id: str, request: HarnessDreamDecisionRequest,
     ) -> HarnessDreamRunResult | dict[str, object]:
@@ -1247,6 +1350,7 @@ class GatewayApplication:
             run_id=result.run_id,
         )
 
+    @lifecycle_work("request")
     async def create_harness_dream_revert(
         self, operation_id: str, *, actor: str,
     ) -> dict[str, object]:
@@ -1382,6 +1486,7 @@ class GatewayApplication:
             created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
         )
 
+    @lifecycle_work("request")
     async def decide_harness_dream_revert(
         self, proposal_id: str, request: HarnessDreamDecisionRequest,
     ) -> dict[str, object]:
@@ -1451,6 +1556,7 @@ class GatewayApplication:
             return proposal.model_copy(update={"status": "blocked"})
         return proposal.model_copy(update={"status": "merged"})
 
+    @lifecycle_work("request")
     async def run_dream(self, selected: str | None = None):
         if not self.pool.is_idle():
             raise RuntimeError("普通 Agent 任务仍在运行，Dream 将在任务结束后执行")
@@ -1460,6 +1566,7 @@ class GatewayApplication:
         await self.checkpoint_dream.process_due(target)
         return result
 
+    @lifecycle_work("request")
     async def backfill_dream(self, start: str, end: str):
         if not self.pool.is_idle():
             raise RuntimeError("普通 Agent 任务仍在运行，不能开始 Dream backfill")
@@ -1527,6 +1634,7 @@ class GatewayApplication:
         self.outbox.wake()
         return state
 
+    @lifecycle_work("request")
     async def rollback_dream(self, run_id: str | None = None):
         if not self.pool.is_idle():
             raise RuntimeError("普通 Agent 任务仍在运行，不能回滚 Dream")
@@ -1606,6 +1714,7 @@ class GatewayApplication:
     def cron_preview(self, schedule: CronSchedule, count: int = 5):
         return self.cron_service.preview(schedule, count=count)
 
+    @lifecycle_work("request")
     async def start_run(self, request: RunCreateRequest) -> RunRecord:
         self.store.project(request.project_id)
         request_body = json.dumps(
@@ -1652,6 +1761,7 @@ class GatewayApplication:
             raise
         return run
 
+    @lifecycle_work("request")
     async def recover_run(self, run_id: str, request: RecoveryDecisionRequest):
         result = self.state_controller.apply(RecoveryDecisionCommand(
             command_id=request.command_id, run_id=run_id,
@@ -1672,6 +1782,7 @@ class GatewayApplication:
             return self.state_controller.state(run_id)
         return result
 
+    @lifecycle_work("request")
     async def _submit_cron_dispatch(self, dispatch: CronDispatch) -> None:
         job = await self.cron_service.get(dispatch.job_id)
         run_id = hashlib.sha256(f"cron-run:{dispatch.dispatch_id}".encode()).hexdigest()[:32]
@@ -1773,7 +1884,8 @@ class GatewayApplication:
 
     async def cancel_run(self, run_id: str) -> bool:
         self.store.run(run_id)
-        return await self.pool.cancel(run_id)
+        with self.write_gate.existing_work_control(run_id):
+            return await self.pool.cancel(run_id)
 
     def run_events(self, run_id: str, after_sequence: int = 0):
         return self.event_store.read_projection_stream(
@@ -1782,18 +1894,18 @@ class GatewayApplication:
 
     async def decide_approval(self, approval_id: str, decision: ApprovalDecision) -> bool:
         approval = self.state_controller.approval(approval_id)
-        result = await self.pool.approvals.decide(
-            approval_id,
-            decision.client_id,
-            decision.approved,
-        )
-        if not self.pool.has_active_run(approval.run_id):
+        with self.write_gate.existing_work_control(approval.run_id):
+            result = await self.pool.approvals.decide(
+                approval_id, decision.client_id, decision.approved,
+            )
+        if self.write_gate.state == MaintenanceState.RUNNING and not self.pool.has_active_run(approval.run_id):
             await self.recovery.recover()
         return result
 
     async def disconnect_client(self, client_id: str) -> int:
         return await self.pool.approvals.deny_client(client_id)
 
+    @lifecycle_mutation
     def sessions(self, project_id: str) -> list[dict[str, object]]:
         project = self.store.project(project_id)
         memory = MemoryStore(
@@ -1803,6 +1915,7 @@ class GatewayApplication:
         )
         return memory.list_sessions()
 
+    @lifecycle_mutation
     def session_records(self, project_id: str, session_id: str) -> list[dict[str, object]]:
         project = self.store.project(project_id)
         memory = MemoryStore(
@@ -1812,6 +1925,7 @@ class GatewayApplication:
         )
         return memory.session_records(session_id)
 
+    @lifecycle_work()
     async def session_tool_result(
         self, project_id: str, session_id: str, *, record_id: str | None = None,
         tool_call_id: str | None = None, run_id: str | None = None, content_offset: int = 0,
@@ -1834,6 +1948,7 @@ class GatewayApplication:
             arguments, ToolContext(project_root=Path(project.path), session_id=session_id),
         ))
 
+    @lifecycle_mutation
     def skills(self, project_id: str) -> SkillService:
         project = self.store.project(project_id)
         return SkillService(
@@ -1842,6 +1957,7 @@ class GatewayApplication:
             self.config.coding_source_root,
         )
 
+    @lifecycle_work("request")
     async def manage_skill(self, request: SkillManageRequest):
         project = self.store.project(request.project_id)
 

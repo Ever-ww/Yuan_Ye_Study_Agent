@@ -416,12 +416,16 @@ Windows 下 CLI 首次发现 Gateway 未运行时，会使用 `CREATE_NO_WINDOW`
 
 CLI、Web 和桌面端同时启动时会先竞争独立的 `startup.lock`，只有一个客户端创建后台
 进程，其余客户端等待同一健康接口。正式实例通过 `instance.lock` 与保留的 PID 标识；
-一次健康请求超时不会再删除 PID。若进程失联，`gateway stop` 仍会先请求优雅关闭，超时
-后只终止锁中明确记录的 Gateway PID。Windows 后台进程强制使用 UTF-8 日志，并过滤
+一次健康请求超时不会再删除 PID。`gateway stop` 使用绑定实例身份的结构化请求与 ACK，
+排空超时会明确失败并保留现场，不再回退到强杀 PID。Windows 后台进程强制使用 UTF-8 日志，并过滤
 h11 在连接已经关闭后重复发送 400 所产生的特定无害回调栈。
 
 Gateway 的持久业务状态位于 Agent Home 的 `.yy/gateway/`；Token、PID、锁、停止请求和日志位于
 `<agent_root>/.yy-backups/control/gateway/`，因此 Restore 替换 `.yy` 时不会丢失进程级隔离状态。
+其中 `lifecycle.sqlite3` 是唯一维护状态权威：`RUNNING → QUIESCING → QUIESCED → RESUMING → RUNNING`；
+离线 Restore 经过 `RESTORING`，失败保持 `FAILED`。`gateway quiesce --timeout 30` 排空已有任务并阻止新业务；
+`gateway status` 查看 epoch/revision，`gateway resume --epoch <epoch> --revision <revision>` 检查健康后恢复。
+维护中重启不会自动开放服务，完整 Restore 后也需要显式 resume。详见[维护状态机与恢复边界](docs/gateway-maintenance.md)。
 SQLite 中的 `agent_states` 是当前 Runtime
 State 的唯一权威来源；`state_transitions` 只保存真实 FSM 迁移，`operation_ledger` 保存模型、
 工具、审批与收尾操作，`gateway_events + event_outbox` 负责可靠事件投递。EventBus 与

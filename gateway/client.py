@@ -77,6 +77,23 @@ class GatewayClient:
             response.raise_for_status()
             return dict(response.json())
 
+    async def maintenance_status(self):
+        return await self._request("GET", "/api/v1/maintenance")
+
+    async def quiesce(self, timeout: float = 30, reason: str = "operator maintenance"):
+        async with httpx.AsyncClient(headers=self._headers, timeout=timeout + 10, trust_env=False) as client:
+            response = await client.post(f"{self.base_url}/api/v1/maintenance/quiesce",
+                                         json={"timeout": timeout, "reason": reason})
+            response.raise_for_status()
+            return response.json()
+
+    async def resume(self, maintenance_epoch: int, expected_revision: int):
+        async with httpx.AsyncClient(headers=self._headers, timeout=300, trust_env=False) as client:
+            response = await client.post(f"{self.base_url}/api/v1/maintenance/resume", json={
+                "maintenance_epoch": maintenance_epoch, "expected_revision": expected_revision})
+            response.raise_for_status()
+            return response.json()
+
     async def create_backup(self, passphrase: str, output: Path | None = None) -> BackupRecord:
         request = BackupCreateRequest(passphrase=passphrase, output=output)
         value = await self._request(

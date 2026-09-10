@@ -176,7 +176,7 @@ class OutboxDispatcher:
         self._wake.set()
 
     async def quiesce(self, maintenance_epoch: int) -> QuiesceResult:
-        if self._paused_epoch is not None and maintenance_epoch <= self._paused_epoch:
+        if self._paused_epoch is not None and maintenance_epoch < self._paused_epoch:
             return QuiesceResult(
                 participant="outbox", maintenance_epoch=maintenance_epoch,
                 acknowledged=maintenance_epoch == self._paused_epoch,
@@ -199,6 +199,8 @@ class OutboxDispatcher:
 
     async def drain_once(self) -> int:
         async with self._drain_lock:
+            if self._paused_epoch is not None:
+                return 0
             due = self._due_deliveries()
             claimed_count = 0
             for candidate in due:

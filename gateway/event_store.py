@@ -620,6 +620,42 @@ class GatewayEventArchiveScheduler:
         self.segment_max_events = segment_max_events
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
+        self.write_gate = None
+        self._maintenance_epoch = None
+        self._work_lock = asyncio.Lock()
+
+    async def quiesce(self, maintenance_epoch):
+        from backup.models import QuiesceResult
+        self._maintenance_epoch = maintenance_epoch
+        async with self._work_lock:
+            pass
+        return QuiesceResult(participant="event_archive", maintenance_epoch=maintenance_epoch,
+                             acknowledged=True, safe_boundary="archive_worker_idle")
+
+    async def resume(self, maintenance_epoch):
+        if self._maintenance_epoch == maintenance_epoch:
+            self._maintenance_epoch = None
+
+    async def process_due(self, due):
+        from backup.maintenance import MaintenanceBlockedError
+        from contextlib import nullcontext
+        async with self._work_lock:
+            if self._maintenance_epoch is not None:
+                return
+            guard = (self.write_gate.work("event_archive", str(due))
+                     if self.write_gate else nullcontext())
+            try:
+                with guard:
+                    task = asyncio.create_task(asyncio.to_thread(
+                        self.service.process_eligible, now=due,
+                        retention_days=self.retention_days, segment_max_events=self.segment_max_events))
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        await asyncio.shield(task)
+                        raise
+            except MaintenanceBlockedError:
+                return
 
     async def start(self) -> None:
         if self._task is None:
@@ -644,12 +680,7 @@ class GatewayEventArchiveScheduler:
                 await asyncio.wait_for(self._stop.wait(), timeout=delay)
                 return
             except asyncio.TimeoutError:
-                await asyncio.to_thread(
-                    self.service.process_eligible,
-                    now=due,
-                    retention_days=self.retention_days,
-                    segment_max_events=self.segment_max_events,
-                )
+                await self.process_due(due)
 
 
 def _fsync_directory(directory: Path) -> bool:

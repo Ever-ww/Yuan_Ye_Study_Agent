@@ -1385,6 +1385,25 @@ def gateway_status(port: int | None = typer.Option(None, "--port")) -> None:
         f"[{style}]状态：{'running' if status['running'] else 'stopped'}[/]\n"
         f"PID：{status['pid'] or '-'}\n地址：{status['base_url']}\n日志：{status['log_path']}"
     )
+    if status.get("maintenance"):
+        console.print(status["maintenance"])
+
+
+@gateway_app.command("quiesce")
+def gateway_quiesce(timeout: float = typer.Option(30, min=1, max=3600),
+                    reason: str = typer.Option("operator maintenance")) -> None:
+    """关闭新工作准入，等待现有工作安全完成；超时不强杀。"""
+    config = load_runtime_config()
+    client = GatewayClient(config.agent_root, port=config.gateway_port)
+    console.print(asyncio.run(client.quiesce(timeout, reason)))
+
+
+@gateway_app.command("resume")
+def gateway_resume(epoch: int = typer.Option(..., min=1), revision: int = typer.Option(..., min=0)) -> None:
+    """按精确 maintenance epoch/revision 健康检查后恢复。"""
+    config = load_runtime_config()
+    client = GatewayClient(config.agent_root, port=config.gateway_port)
+    console.print(asyncio.run(client.resume(epoch, revision)))
 
 
 @gateway_app.command("logs")

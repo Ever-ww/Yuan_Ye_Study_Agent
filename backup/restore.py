@@ -25,6 +25,8 @@ from .control import (
 from .models import RestoreFence, RestorePlan, RestoreState
 from .service import BackupService
 from .security import SensitiveEnvSanitizer
+from .maintenance import AgentHomeMaintenanceCoordinator, AgentHomeWriteGate
+from .models import MaintenanceState
 
 
 class RestoreConfirmationError(RuntimeError):
@@ -124,15 +126,24 @@ class RestoreService:
             target_agent_root_identity=_path_identity(self.agent_root),
             created_at=datetime.now().astimezone(),
         )
+        lifecycle = None
         try:
+            lifecycle = AgentHomeMaintenanceCoordinator(self.agent_root, AgentHomeWriteGate())
             create_restore_fence(self.agent_root, fence)
-        except Exception:
+        except BaseException:
             gateway_lock.close()
             restore_lock.close()
+            if lifecycle is not None:
+                lifecycle.close()
             raise
         gateway_lock.close()
-        journal.append("restore_state", {"state": RestoreState.PREPARING.value})
         try:
+            journal.append("restore_state", {"state": RestoreState.PREPARING.value})
+            if lifecycle.snapshot.state in {MaintenanceState.RUNNING, MaintenanceState.FAILED}:
+                await lifecycle.freeze("offline restore")
+            elif lifecycle.snapshot.state != MaintenanceState.QUIESCED:
+                raise RestoreRecoveryRequired("Lifecycle is already in an unfinished maintenance operation")
+            await lifecycle.begin_restore(lifecycle.snapshot.maintenance_epoch)
             EncryptedBackupArchive.extract(archive, passphrase, staging)
             journal.append("restore_state", {
                 "state": RestoreState.PREPARED.value,
@@ -158,13 +169,18 @@ class RestoreService:
             remove_restore_fence(self.agent_root, restore_id)
             shutil.rmtree(rollback, ignore_errors=True)
             restore_lock.close()
+            lifecycle.close()
+            # Remain RESTORING until the next Gateway validates registries/stores
+            # through explicit resume. Restored .yy can never overwrite this state.
             return restore_id
-        except Exception as exc:
-            journal.append("restore_failure", {"message": str(exc) or type(exc).__name__})
+        except BaseException as exc:
             try:
+                await lifecycle.fail(f"Offline restore failed: {type(exc).__name__}")
+                journal.append("restore_failure", {"message": str(exc) or type(exc).__name__})
                 await self._rollback(journal, restore_id, staging, rollback)
             finally:
                 restore_lock.close()
+                lifecycle.close()
             raise
 
     async def recover_interrupted_restore(self) -> RestoreState:

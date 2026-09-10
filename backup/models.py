@@ -12,8 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class MaintenanceState(str, Enum):
     RUNNING = "running"
-    DRAINING = "draining"
-    FROZEN = "frozen"
+    QUIESCING = "quiescing"
+    QUIESCED = "quiesced"
+    RESTORING = "restoring"
+    # Compatibility names, not additional lifecycle states.
+    DRAINING = "quiescing"
+    FROZEN = "quiesced"
     RESUMING = "resuming"
     FAILED = "failed"
 
@@ -61,6 +65,38 @@ class MaintenanceSnapshot(BaseModel):
     started_at: datetime | None = None
     participant_status: dict[str, QuiesceResult] = Field(default_factory=dict)
     failure_reason: str | None = None
+    operation_id: str | None = None
+    revision: int = Field(default=0, ge=0)
+    since: datetime | None = None
+    active_runs: int = 0
+    active_tool_calls: int = 0
+    active_background_jobs: int = 0
+    active_db_transactions: int = 0
+    active_work: tuple[dict[str, Any], ...] = ()
+
+
+class MaintenanceQuiesceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = Field(default="operator maintenance", min_length=1, max_length=500)
+    timeout: float = Field(default=30, gt=0, le=3600)
+
+
+class MaintenanceResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    maintenance_epoch: int = Field(ge=1)
+    expected_revision: int = Field(ge=0)
+
+
+class GatewayControlRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: Literal[1] = 1
+    request_id: str = Field(min_length=1, max_length=100)
+    instance_id: str = Field(min_length=1, max_length=100)
+    action: Literal["stop", "quiesce"]
+    reason: str = Field(min_length=1, max_length=500)
+    requested_at: datetime
+    requested_by: str = Field(min_length=1, max_length=100)
+    timeout_seconds: float = Field(default=30, gt=0, le=3600)
 
 
 class ExternalDependency(BaseModel):

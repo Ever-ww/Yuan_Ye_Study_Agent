@@ -71,6 +71,16 @@ class MemoryEmbeddingWorker:
         self._wake.set()
 
     async def drain_once(self) -> bool:
+        from contextlib import nullcontext
+        from backup.maintenance import MaintenanceBlockedError
+        gate = getattr(self, "write_gate", None)
+        try:
+            with gate.work("memory_embedding", "embedding") if gate else nullcontext():
+                return await self._guarded_drain_once()
+        except MaintenanceBlockedError:
+            return False
+
+    async def _guarded_drain_once(self) -> bool:
         if self.provider is None:
             return False
         if self._maintenance_epoch is not None:

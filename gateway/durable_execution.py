@@ -39,6 +39,7 @@ from Agent.hook import HookEvent, HookPoint, HookRegistry
 from gateway.models import now_iso
 from gateway.state_controller import StateController
 from tool.errors import ToolExecutionObservationError
+from backup.maintenance import lifecycle_work
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,7 @@ class DurableToolCoordinator:
         retry_max_seconds: float = 60.0,
     ) -> None:
         self.controller = controller
+        self.write_gate = controller.write_gate
         self.heartbeat_seconds = max(5, heartbeat_seconds)
         self.retry_max_attempts = retry_max_attempts
         self.retry_base_seconds = retry_base_seconds
@@ -237,7 +239,7 @@ class DurableToolCoordinator:
                 expected_revision=state.revision,
                 gateway_epoch=self.controller.gateway_epoch,
                 execution_state=ExecutionState.OBSERVING,
-                reason=f"Tool {operation.name} denied by Extension preauthorization policy",
+                reason=f"Tool {operation.name} denied: {reason}",
             )).state
         _CURRENT_OPERATION.set(None)
         _CURRENT_ATTEMPT.set(None)
@@ -293,6 +295,7 @@ class DurableToolCoordinator:
             observation_id, session_record_id,
         )
 
+    @lifecycle_work("tool", continuation=True)
     async def execute(
         self,
         operation: OperationRecord,
@@ -300,6 +303,15 @@ class DurableToolCoordinator:
         *,
         manage_execution_state: bool = True,
     ) -> str:
+        if self.write_gate and operation.name in {
+            "subagent", "cronjob", "harness_capability", "harness_evolve",
+            "harness_manual", "harness_error", "harness_dream",
+        }:
+            from backup.models import MaintenanceState
+            if self.write_gate.state != MaintenanceState.RUNNING:
+                # Denial is proved before invoking the body, not an UNKNOWN
+                # non-idempotent effect or an online approval request.
+                return await self.skip_denied(operation, reason="maintenance_new_work_denied")
         current_attempt = self.controller.current_attempt(operation.operation_id)
         _CURRENT_OPERATION.set(operation.operation_id)
         _CURRENT_ATTEMPT.set(current_attempt.attempt_id)

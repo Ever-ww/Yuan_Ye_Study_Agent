@@ -50,6 +50,8 @@ class CronScheduler:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         with contextlib.suppress(Exception):
+            if self.write_gate:
+                self.write_gate.check_mutation_admission()
             heartbeat = await self.store.heartbeat()
             await self.store.set_heartbeat(heartbeat.model_copy(update={"status": "stopped", "next_tick_at": None}))
 
@@ -183,6 +185,7 @@ class CronScheduler:
             self._maintenance_epoch = None; self._wake.set()
 
     async def _run(self) -> None:
+        from backup.maintenance import MaintenanceBlockedError
         while not self._closing:
             try:
                 state = await self.store.heartbeat()
@@ -196,6 +199,9 @@ class CronScheduler:
                     await self.tick()
             except asyncio.CancelledError:
                 raise
+            except MaintenanceBlockedError:
+                # No heartbeat mutation while .yy is frozen.
+                await asyncio.sleep(max(1, self.store.heartbeat_seconds))
             except Exception as exc:
                 self.last_error = str(exc) or type(exc).__name__
                 heartbeat = await self.store.heartbeat()
