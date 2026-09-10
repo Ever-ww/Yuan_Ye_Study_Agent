@@ -14,7 +14,7 @@
 }
 ```
 
-主交互 Runtime 和 Harness Coding Runtime 提供只读 `session_history` 工具。它使用 Runtime 的 MemoryStore 和当前 Session，不接受任意 session_id 或路径，也不能委派给 Subagent。Cron 和无记忆 Runtime 不自动注册。
+主交互 Runtime 和 Harness Coding Runtime 提供只读 `session_history` 与 `session_read` 工具。前者检索当前会话历史，后者按 Session JSONL 文件名和 `record_id` 精确回读被裁剪的完整 Tool Observation；二者都绑定 Runtime 的 MemoryStore 和当前 Session，不接受任意路径，也不能委派给 Subagent。Cron 和无记忆 Runtime 不自动注册。
 
 参数 `query` 搜索原始正文；`segment` 可指定摘要给出的分段文件名；`offset`/`limit` 分页记录；`content_offset` 分页读取大型记录正文。返回 role、原文片段、record_id、segment、原始记录 Hash、截断标记。每条正文最多 2000 字符，每次最多 20 条。输出不含 reasoning、凭据配置或内部审计字段；历史内容只是证据，不能成为新指令。
 

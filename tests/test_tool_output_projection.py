@@ -10,25 +10,30 @@ from memory import MemoryStore
 from memory.tool_projection import MARKER, ToolOutputProjectionPolicy, ToolOutputProjector
 from tool import ToolContext
 from tools.session_history import SessionHistoryTool
+from tools.session_read import SessionReadTool
 
 
 def group(ids, *, body=None, name="demo", status="success"):
     return [{"role": "assistant", "content": None, "tool_calls": [
         {"id": ident, "type": "function", "function": {"name": name, "arguments": "{}"}} for ident in ids
     ]}] + [{"role": "tool", "name": name, "tool_call_id": ident, "record_id": "record-" + ident,
+            "session_file": "2026-09-10_deadbeefdeadbeef_001.jsonl",
             "status": status, "content": body or (ident * 12000)} for ident in ids]
 
 
-def test_preview_25_characters_and_complete_parallel_group_protection():
-    body = "甲" * 25 + "中" * 12000 + "乙" * 25
-    original = group(["old"], body=body) + group(["a", "b", "c", "d"])
+def test_preview_427_characters_and_current_conversation_protection():
+    body = "甲" * 427 + "中" * 12000 + "乙" * 427
+    original = group(["old"], body=body) + [{"role": "user", "content": "now"}] + group(["a", "b", "c", "d"])
     messages = copy.deepcopy(original)
     projector = ToolOutputProjector(ToolOutputProjectionPolicy(), original)
     assert projector.project(messages) > 0
-    assert messages[1]["content"].endswith("甲" * 25 + "\n…[中间已省略]…\n" + "乙" * 25)
+    assert messages[1]["content"].startswith("甲" * 427)
+    assert messages[1]["content"].endswith("乙" * 427)
     assert all(left == right for left, right in zip(messages[2:], original[2:]))
     assert "record-old" in messages[1]["content"]
-    assert hashlib.sha256(body.encode()).hexdigest() in messages[1]["content"]
+    assert '"limited":1' in messages[1]["content"]
+    assert '"offset":0' in messages[1]["content"]
+    assert '"session_id":"2026-09-10_deadbeefdeadbeef_001.jsonl"' in messages[1]["content"]
     frozen = copy.deepcopy(messages)
     assert projector.project(messages) == 0
     assert messages == frozen
@@ -43,8 +48,9 @@ def test_incomplete_orphan_and_current_groups_never_trimmed():
     messages = copy.deepcopy(original)
     projector = ToolOutputProjector(ToolOutputProjectionPolicy(), old)
     projector.project(messages, protect_current_turn=True)
-    assert messages[1]["content"].startswith(MARKER)
-    assert messages[2:] == original[2:]
+    assert MARKER in messages[1]["content"]
+    assert MARKER in messages[3]["content"]
+    assert messages[4:] == original[4:]
 
 
 def test_recovered_current_run_is_not_mistaken_for_historical_output():
@@ -52,41 +58,40 @@ def test_recovered_current_run_is_not_mistaken_for_historical_output():
     current = group(["current1"]) + group(["current2"])
     for record in current:
         record["run_id"] = "recovering-run"
-    original = old + current
+    original = old + [{"role": "user", "content": "continue"}] + current
     messages = copy.deepcopy(original)
     ToolOutputProjector(ToolOutputProjectionPolicy(), original, current_run_id="recovering-run").project(messages)
-    assert messages[1]["content"].startswith(MARKER)
-    assert messages[2:] == original[2:]
+    assert MARKER in messages[1]["content"]
+    assert MARKER in messages[3]["content"]
+    assert messages[5:] == original[5:]
 
 
-def test_failure_excerpts_and_json_metadata_not_only_head_tail():
-    log = "startup\n" + "noise\n" * 2000 + "FAILED tests/test_mid.py::test_case - AssertionError expected 3\n" + "noise\n" * 2000
-    records = group(["log"], body=log, name="bash", status="error") + group(["last"])
+def test_chinese_and_english_thresholds_are_independent_and_strict():
+    policy = ToolOutputProjectionPolicy(max_chars=0, head_chars=3, tail_chars=3)
+    assert not policy.should_trim("中" * 1000)
+    assert policy.should_trim("中" * 1001)
+    assert not policy.should_trim("word " * 1000)
+    assert policy.should_trim("word " * 1001)
+    records = group(["log"], body="word " * 1001) + [{"role": "user", "content": "now"}]
     messages = copy.deepcopy(records)
-    ToolOutputProjector(ToolOutputProjectionPolicy(), records).project(messages)
-    assert "FAILED tests/test_mid.py" in messages[1]["content"]
-    assert '"status":"error"' in messages[1]["content"]
-    document = json.dumps({"path": "src/example.py", "format": "text", "offset_chars": 500,
-                           "truncated": True, "content": "正文" * 9000}, ensure_ascii=False)
-    records = group(["doc"], body=document, name="read_file") + group(["last"])
-    messages = copy.deepcopy(records)
-    ToolOutputProjector(ToolOutputProjectionPolicy(), records).project(messages)
-    assert "path=src/example.py" in messages[1]["content"]
-    assert "offset_chars=500" in messages[1]["content"]
+    ToolOutputProjector(policy, records).project(messages)
+    assert messages[1]["content"].startswith("wor\n" + MARKER)
+    assert messages[1]["content"].endswith("rd ")
 
 
 def test_unproven_ambiguous_and_small_observations_are_preserved():
-    records = group(["old"]) + group(["last"])
+    records = group(["old"]) + [{"role": "user", "content": "now"}]
     for evidence in ([], [*records, records[1]]):
         messages = copy.deepcopy(records)
         assert ToolOutputProjector(ToolOutputProjectionPolicy(), evidence).project(messages) == 0
         assert messages == records
-    small = group(["small"], body="only 60 chars" * 5) + group(["last"])
+    small = group(["small"], body="only sixty chars") + [{"role": "user", "content": "now"}]
     assert ToolOutputProjector(ToolOutputProjectionPolicy(max_chars=50), small).project(copy.deepcopy(small)) == 0
-    assert ToolOutputProjector(ToolOutputProjectionPolicy(max_chars=0), records).project(copy.deepcopy(records)) == 0
+    disabled = ToolOutputProjectionPolicy(cjk_threshold_chars=0, english_threshold_words=0, max_chars=0)
+    assert ToolOutputProjector(disabled, records).project(copy.deepcopy(records)) == 0
 
 
-def test_frozen_turn_evidence_protection_and_reload_keep_canonical_intact(tmp_path):
+def test_provider_projection_keeps_canonical_session_and_cache_intact(tmp_path):
     memory = MemoryStore(tmp_path / ".yy" / "memory")
     sid = memory.create_session("task")
     def write(ident):
@@ -97,18 +102,13 @@ def test_frozen_turn_evidence_protection_and_reload_keep_canonical_intact(tmp_pa
     write("old")
     write("recent")
     before = memory.sessions._active_path(sid).read_bytes()
-    memory.prepare_historical_tool_outputs(sid, max_chars=10000)
     first = memory.restore_messages(sid)
-    assert next(m for m in first if m.get("tool_call_id") == "old")["content"].startswith(MARKER)
+    first.append({"role": "user", "content": "now"})
+    records = memory.session_context_records_with_locations(sid)
+    assert ToolOutputProjector(ToolOutputProjectionPolicy(), records).project(first) > 0
+    assert MARKER in next(m for m in first if m.get("tool_call_id") == "old")["content"]
     assert memory.sessions._active_path(sid).read_bytes() == before
-    assert first == memory.refresh_messages(sid)
-    write("current")
-    later = memory.restore_messages(sid)
-    for ident in ("recent", "current"):
-        assert next(m for m in later if m.get("tool_call_id") == ident)["content"] == ident * 12000
-    # Next Turn may now reduce 'recent', but still protects 'current'.
-    memory.prepare_historical_tool_outputs(sid, max_chars=10000)
-    assert next(m for m in memory.restore_messages(sid) if m.get("tool_call_id") == "recent")["content"].startswith(MARKER)
+    assert MARKER not in str(memory.refresh_messages(sid))
     assert all(MARKER not in str(record.get("content")) for record in memory.session_records(sid))
 
 
@@ -145,10 +145,42 @@ def test_exact_history_recall_across_segments_and_duplicate_call_ids(tmp_path):
     assert not json.loads(asyncio.run(tool.run({"record_id": record_id}, other_context)))["records"]
 
 
+def test_session_read_uses_filename_record_anchor_and_defaults(tmp_path):
+    memory = MemoryStore(tmp_path / ".yy" / "memory")
+    sid = memory.create_session("task")
+    memory.record_user(sid, "question")
+    first_id = memory.record_tool_result(
+        sid, tool_call_id="one", name="demo", content="完整工具输出", status="success", arguments={},
+    )
+    memory.record_assistant(sid, "answer")
+    filename = memory.active_filename(sid)
+    tool = SessionReadTool(memory)
+    context = ToolContext(project_root=memory.workspace_root, session_id=sid)
+
+    default_result = json.loads(asyncio.run(tool.run({
+        "session_id": filename,
+        "record_id": first_id,
+    }, context)))
+    assert default_result["limited"] == 1
+    assert default_result["offset"] == 0
+    assert default_result["records"][0]["content"] == "完整工具输出"
+
+    following = json.loads(asyncio.run(tool.run({
+        "session_id": filename,
+        "record_id": first_id,
+        "offset": 1,
+        "limited": 1,
+    }, context)))
+    assert following["records"][0]["content"] == "answer"
+    with pytest.raises(PermissionError):
+        asyncio.run(tool.run({"session_id": "other.jsonl", "record_id": first_id}, context))
+
+
 def test_preview_policy_config_defaults_and_validation(tmp_path):
     config = load_runtime_config(tmp_path)
     policy = ToolOutputProjectionPolicy.from_config(config)
-    assert (policy.head_chars, policy.tail_chars, policy.protect_recent_groups) == (25, 25, 1)
+    assert (policy.cjk_threshold_chars, policy.english_threshold_words) == (1000, 1000)
+    assert (policy.head_chars, policy.tail_chars) == (427, 427)
     with pytest.raises(ValueError):
         load_runtime_config(tmp_path, tool_output_protect_recent_groups=0)
 
@@ -237,8 +269,11 @@ def test_runtime_hook_preview_requires_history_tool_and_keeps_prefix(tmp_path, h
             self.requests.append(copy.deepcopy(messages))
             return ModelReply(text="answer")
     provider = Provider()
-    registry = AsyncToolRegistry([SessionHistoryTool(memory)] if history_available else [])
-    runtime = AgentRuntime(config, memory=memory, tools=registry, provider=provider, enable_sandbox=False)
+    registry = AsyncToolRegistry([SessionReadTool(memory)] if history_available else [])
+    runtime = AgentRuntime(
+        config, memory=memory, tools=registry, provider=provider,
+        enable_sandbox=False, enable_context_processing=False,
+    )
     async def check():
         for question in ("first", "second"):
             assert (await runtime.run(question, sid)).completed
@@ -246,25 +281,24 @@ def test_runtime_hook_preview_requires_history_tool_and_keeps_prefix(tmp_path, h
     asyncio.run(check())
     for request in provider.requests:
         old = next(m for m in request if m.get("tool_call_id") == "old")["content"]
-        assert old.startswith(MARKER) is history_available
-        assert next(m for m in request if m.get("tool_call_id") == "recent")["content"] == "recent" * 12000
+        assert (MARKER in old) is history_available
+        recent = next(m for m in request if m.get("tool_call_id") == "recent")["content"]
+        assert (MARKER in recent) is history_available
     assert provider.requests[0][0] == provider.requests[1][0]
     assert all(MARKER not in str(record.get("content")) for record in memory.session_records(sid))
 
 
-def test_budget_recheck_uses_same_projector_and_does_not_retrim(tmp_path):
+def test_budget_recheck_does_not_own_tool_output_trimming(tmp_path):
     from context_process import ContextProcessor
     config = load_runtime_config(tmp_path, compression_threshold_tokens=1000)
     memory = MemoryStore(config.memory_dir)
     sid = memory.create_session("task")
     records = group(["old"]) + group(["recent"])
-    memory._tool_projectors[sid] = ToolOutputProjector(ToolOutputProjectionPolicy(), records)
     messages = [{"role": "system", "content": "stable"}, *copy.deepcopy(records),
                 {"role": "user", "content": "now"}, *group(["current"])]
     processor = ContextProcessor(config, memory)
-    estimate = processor.finalize_request(sid, messages, [])
-    assert estimate.projected_tool_output_tokens > 0
     first = copy.deepcopy(messages)
-    processor.finalize_request(sid, messages, [])
+    estimate = processor.finalize_request(sid, messages, [])
+    assert estimate.projected_tool_output_tokens == 0
     assert messages == first
-    assert next(m for m in messages if m.get("tool_call_id") == "recent")["content"] == "recent" * 12000
+    assert all(MARKER not in str(m.get("content")) for m in messages)

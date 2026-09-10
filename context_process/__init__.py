@@ -2,6 +2,7 @@
 
 from .compression import CompressionResult, ContextProcessor
 from .callbacks import register_context_callbacks
+from .tool_trimming import register_tool_output_trimming_callbacks
 from .budget import (
     ContextBudgetController,
     ContextBudgetEstimate,
@@ -19,4 +20,5 @@ __all__ = [
     "ContextProcessor",
     "ContextUsageCalibration",
     "register_context_callbacks",
+    "register_tool_output_trimming_callbacks",
 ]

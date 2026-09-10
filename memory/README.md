@@ -21,6 +21,9 @@ recall is separately opt-in via `memory_recall_summaries` (default `false`).
 The bound `session_history` tool can read original conversation segments using
 the source references recorded with each summary. See
 [summary continuity](../docs/summary-continuity.md) for limits and usage.
+Oversized historical Tool observations use the separate MODEL_BEFORE trimming
+Hook and an exact `session_read(session_id=<segment filename>, record_id=...)`
+selector; neither trimming nor exact replay changes canonical Session JSONL.
 
 Memory fragments are provider-only. They are stripped or rejected by the
 Session persistence boundary and must never enter transcripts, summaries,

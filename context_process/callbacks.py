@@ -34,16 +34,27 @@ def register_context_callbacks(registry: HookRegistry, processor: ContextProcess
         event.data["final_context_budget_check"] = lambda selected_messages, selected_tools: (
             processor.finalize_request(event.session_id, selected_messages, selected_tools)
         )
+        trim_tool_outputs = event.data.get("trim_historical_tool_outputs")
         emergency_reload = event.data.get("reload_messages_after_emergency_compression")
-        event.data["recover_context_overflow"] = lambda selected_messages, selected_tools: (
-            processor.recover_from_overflow(
+        def reload_and_trim_after_emergency():
+            if not callable(emergency_reload):
+                return None
+            rebuilt = emergency_reload()
+            if callable(trim_tool_outputs):
+                trim_tool_outputs(rebuilt)
+            return rebuilt
+        async def recover_context_overflow(selected_messages, selected_tools):
+            result = await processor.recover_from_overflow(
                 event.session_id,
                 selected_messages,
                 selected_tools,
                 current_query=str(event.data.get("task", "")),
-                reload_messages=emergency_reload if callable(emergency_reload) else None,
+                reload_messages=reload_and_trim_after_emergency if callable(emergency_reload) else None,
             )
-        )
+            if callable(trim_tool_outputs):
+                trim_tool_outputs(selected_messages)
+            return result
+        event.data["recover_context_overflow"] = recover_context_overflow
         if threshold <= 0:
             return
         if processor.fallback_active(event.session_id):
@@ -68,6 +79,8 @@ def register_context_callbacks(registry: HookRegistry, processor: ContextProcess
                 summary = processor.memory.latest_summary(event.session_id)
                 if callable(register) and summary:
                     register(summary)
+            if callable(trim_tool_outputs):
+                trim_tool_outputs(messages)
             return result
 
         event.data["compression_operation"] = compression_operation

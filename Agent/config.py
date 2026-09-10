@@ -66,11 +66,15 @@ class RuntimeConfig(BaseModel):
     compression_base_url: str | None = None
     compression_api_key: str | None = None
     compression_context_window_tokens: StrictInt | None = Field(default=None, ge=1024)
+    # Historical Tool observations are projected by an independent
+    # MODEL_BEFORE Hook.  These limits never modify canonical Session JSONL.
+    tool_output_cjk_threshold_chars: StrictInt = Field(default=1000, ge=0)
+    tool_output_english_threshold_words: StrictInt = Field(default=1000, ge=0)
     tool_output_max_chars: StrictInt = Field(default=10000, ge=0)
     tool_output_head_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
     tool_output_tail_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
-    tool_output_preview_head_chars: StrictInt = Field(default=25, ge=0, le=1000)
-    tool_output_preview_tail_chars: StrictInt = Field(default=25, ge=0, le=1000)
+    tool_output_preview_head_chars: StrictInt = Field(default=427, ge=0, le=10000)
+    tool_output_preview_tail_chars: StrictInt = Field(default=427, ge=0, le=10000)
     tool_output_protect_recent_groups: StrictInt = Field(default=1, ge=1, le=100)
     tool_output_diagnostic_max_chars: StrictInt = Field(default=600, ge=0, le=4000)
     sandbox_checkpoint_limit: StrictInt = Field(default=17, ge=1)

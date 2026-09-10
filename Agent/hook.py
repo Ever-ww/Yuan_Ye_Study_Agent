@@ -287,19 +287,30 @@ def build_default_hooks(
     prompts: Any | None = None,
     session_origin: Literal["interactive", "cron", "maintenance"] = "interactive",
     runtime_profile: Literal["interactive", "cron", "harness", "maintenance", "memoryless"] | None = None,
+    session_read_available: bool = False,
+    runtime_config: Any | None = None,
 ) -> HookRegistry:
     """组合项目与记忆回调；Memory 仍只是普通回调集合。"""
     from memory.callbacks import register_memory_callbacks
     from memory.store import MemoryStore
 
     registry = HookRegistry()
+    selected_memory = memory or MemoryStore(memory_dir)
     register_memory_callbacks(
         registry,
-        memory or MemoryStore(memory_dir),
+        selected_memory,
         prompts,
         session_origin=session_origin,
         runtime_profile=runtime_profile,
     )
+    if runtime_config is not None:
+        from context_process import register_tool_output_trimming_callbacks
+        register_tool_output_trimming_callbacks(
+            registry,
+            selected_memory,
+            runtime_config,
+            session_read_available=session_read_available,
+        )
     if context_processor is not None:
         from context_process import register_context_callbacks
         register_context_callbacks(registry, context_processor)

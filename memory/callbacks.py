@@ -10,7 +10,6 @@ from Agent.contracts import ModelReply
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models.errors import is_retryable_model_error
 from memory.store import MemoryStore
-from memory.tool_projection import ToolOutputProjectionPolicy
 from memory.long_term import MemoryTurnSnapshot
 from memory.provider_context import ProviderContextRecord, context_baseline, effective_contexts
 from memory.retrieval import (
@@ -395,27 +394,7 @@ def register_memory_callbacks(
             audit=_audit(event),
         )
 
-    async def prepare_history(event: HookEvent) -> None:
-        """当前用户任务开始前只裁剪此前任务的工具输出投影。"""
-        config = event.data.get("config")
-        if config is None:
-            return
-        policy = ToolOutputProjectionPolicy.from_config(config)
-        if not event.data.get("history_recall_available", False):
-            # A custom/memoryless Registry cannot be expected to recover a
-            # 50-character preview if it has no scoped history reader.
-            policy = ToolOutputProjectionPolicy(max_chars=0)
-        memory.prepare_historical_tool_outputs(
-            event.session_id,
-            max_chars=int(getattr(config, "tool_output_max_chars", 0)),
-            head_ratio=float(getattr(config, "tool_output_head_ratio", 0.20)),
-            tail_ratio=float(getattr(config, "tool_output_tail_ratio", 0.20)),
-            policy=policy,
-            current_run_id=_audit(event).get("run_id"),
-        )
-
     registry.register(HookPoint.TRACE_START, create_or_restore_session, priority=-100)
-    registry.register(HookPoint.TURN_START, prepare_history, priority=-100)
     registry.register(HookPoint.TURN_START, retrieve_turn_memory, priority=-70)
     registry.register(HookPoint.MODEL_BEFORE, load_context, priority=-100)
     registry.register(HookPoint.MODEL_AFTER, persist_model_tool_calls, priority=100)

@@ -86,7 +86,7 @@ class _SummaryOnlyOutput(BaseModel):
 
 
 class ContextProcessor:
-    """压缩当前分段，并在失败后对模型输入执行非破坏性裁剪。"""
+    """压缩当前分段，并在超限失败后保护性缩减完整对话块。"""
 
     def __init__(
         self,
@@ -364,17 +364,8 @@ class ContextProcessor:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
     ) -> ContextBudgetEstimate:
-        """Apply transient large-tool projection, then enforce the hard provider boundary."""
-        first = self.forecast(session_id, messages, tools)
-        projected = 0
-        if first.decision in {"compress", "reject"}:
-            before = _message_tokens(messages)
-            self.memory.project_historical_tool_outputs(session_id, messages, protect_current_turn=True)
-            projected = max(0, before - _message_tokens(messages))
+        """Enforce the hard provider boundary after all MODEL_BEFORE projections."""
         result = self.forecast(session_id, messages, tools)
-        if projected:
-            result = result.model_copy(update={"projected_tool_output_tokens": projected})
-            self._last_pressure[session_id] = result
         if result.projected_total_tokens >= result.hard_limit_tokens:
             raise ContextBudgetExceeded(
                 "当前Query、稳定Prompt、Tool Schema与必要近期上下文超过模型硬限制，无法安全裁剪",

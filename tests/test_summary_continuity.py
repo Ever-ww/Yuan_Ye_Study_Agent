@@ -160,6 +160,7 @@ def test_harness_trace_catalog_includes_bound_history_tool(tmp_path):
     )
     runtime = harness.create_coding_runtime(config, worktree, profile=profile, trace_context=trace)
     assert "session_history" in runtime.tools.names()
+    assert "session_read" in runtime.tools.names()
     assert runtime.harness_trace_context.tool_catalog_hash == trace.tool_catalog_hash
     asyncio.run(runtime.close())
 
@@ -171,4 +172,5 @@ def test_history_tool_default_runtime_registration_is_isolated(tmp_path):
             config, runtime_profile=profile, enable_sandbox=False, enable_subagent=False,
         )
         assert ("session_history" in runtime.tools.names()) is expected
+        assert ("session_read" in runtime.tools.names()) is expected
         asyncio.run(runtime.close())

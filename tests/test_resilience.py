@@ -608,6 +608,7 @@ class ResilienceTests(unittest.TestCase):
                 "subagent",
                 "harness_manual_preflight",
                 "session_history",
+                "session_read",
             })
             self.assertTrue({
                 "calculator",
@@ -624,7 +625,7 @@ class ResilienceTests(unittest.TestCase):
             )
             self.assertEqual(
                 set(subagent_schema["properties"]["tools"]["items"]["enum"]),
-                names - {"subagent", "harness_manual_preflight", "session_history"},
+                names - {"subagent", "harness_manual_preflight", "session_history", "session_read"},
             )
             self.assertIsNotNone(runtime.skills)
             self.assertEqual(runtime.skills.source_root, worktree.resolve())

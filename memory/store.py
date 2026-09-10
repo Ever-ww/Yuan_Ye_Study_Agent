@@ -22,7 +22,6 @@ from .structured import (
 )
 from .retrieval import MemoryRetriever, project_identity
 from .long_term import MemoryTurnSnapshot
-from .tool_projection import ToolOutputProjectionPolicy, ToolOutputProjector
 
 
 class MemoryStore:
@@ -52,7 +51,6 @@ class MemoryStore:
             raise ValueError("ProfileStore 必须位于 MemoryStore 的 profile 目录")
         self.session_profiles_enabled = self.profiles.session_profiles_enabled
         self._message_cache: dict[str, list[dict[str, Any]]] = {}
-        self._tool_projectors: dict[str, ToolOutputProjector] = {}
         self.memory_degraded_reason = ""
         try:
             self.structured = StructuredMemoryStore(self.root)
@@ -399,42 +397,12 @@ class MemoryStore:
         # across cache restoration or Gateway restart.
         for message in messages:
             message.pop("record_id", None)
-        self.project_historical_tool_outputs(session_id, messages)
         return messages
 
     def refresh_messages(self, session_id: str) -> list[dict[str, Any]]:
         """显式从最新 JSONL 重建内存消息缓存。"""
         self._message_cache[session_id] = self.sessions.restore(session_id)
         return self.restore_messages(session_id)
-
-    def prepare_historical_tool_outputs(
-        self,
-        session_id: str,
-        *,
-        max_chars: int,
-        head_ratio: float = 0.20,
-        tail_ratio: float = 0.20,
-        policy: ToolOutputProjectionPolicy | None = None,
-        current_run_id: str | None = None,
-    ) -> bool:
-        """Freeze historical evidence at TURN_START; never trim canonical cache/JSONL.
-
-        Legacy ratio arguments remain accepted but fixed character previews now
-        define the policy; there is no second ratio-based truncation algorithm.
-        """
-        del head_ratio, tail_ratio
-        self._tool_projectors[session_id] = ToolOutputProjector(
-            policy or ToolOutputProjectionPolicy(max_chars=max_chars), self.session_context_records(session_id),
-            current_run_id=current_run_id,
-        )
-        messages = [dict(message) for message in self._ensure_cache(session_id)]
-        return bool(self.project_historical_tool_outputs(session_id, messages))
-
-    def project_historical_tool_outputs(
-        self, session_id: str, messages: list[dict[str, Any]], *, protect_current_turn: bool = False,
-    ) -> int:
-        projector = self._tool_projectors.get(session_id)
-        return projector.project(messages, protect_current_turn=protect_current_turn) if projector else 0
 
     def has_session(self, session_id: str) -> bool:
         """判断会话哈希是否可恢复。"""
@@ -451,6 +419,30 @@ class MemoryStore:
     def session_context_records(self, session_id: str) -> list[dict[str, object]]:
         """读取当前摘要及其Hash校验的受保护尾部，供下一次压缩使用。"""
         return self.sessions.context_records(session_id)
+
+    def session_context_records_with_locations(
+        self,
+        session_id: str,
+    ) -> list[dict[str, object]]:
+        """Return visible records annotated with their exact Session filename.
+
+        ``session_file`` is a transient recovery selector.  It is never written
+        back into canonical Session JSONL and is added only when a record ID maps
+        to exactly one indexed file.
+        """
+        locations: dict[str, list[str]] = {}
+        for filename, record in self.sessions.read_all_records_strict(session_id):
+            if record.record_id:
+                locations.setdefault(record.record_id, []).append(filename)
+        selected: list[dict[str, object]] = []
+        for record in self.sessions.context_records(session_id):
+            value = dict(record)
+            record_id = value.get("record_id")
+            matches = locations.get(str(record_id), []) if record_id else []
+            if len(matches) == 1:
+                value["session_file"] = matches[0]
+            selected.append(value)
+        return selected
 
     def protected_tail_refs(
         self,

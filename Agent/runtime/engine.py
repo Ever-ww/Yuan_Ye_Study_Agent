@@ -259,8 +259,10 @@ class AgentRuntime:
             and hasattr(self.memory, "sessions")
         ):
             from tools.session_history import SessionHistoryTool
+            from tools.session_read import SessionReadTool
 
             self.tools.register(SessionHistoryTool(self.memory))
+            self.tools.register(SessionReadTool(self.memory))
         self.context_processor = None
         if enable_context_processing:
             self.context_processor = context_processor or ContextProcessor(
@@ -278,6 +280,8 @@ class AgentRuntime:
             self.config.memory_dir, self.memory, self.context_processor, self.prompts,
             session_origin=session_origin,
             runtime_profile=runtime_profile,
+            session_read_available="session_read" in self.tools.names(),
+            runtime_config=self.config,
         )
         if self._owns_sandbox and self.sandbox is not None:
             register_sandbox_callbacks(self.hooks, self.sandbox)
@@ -370,7 +374,8 @@ class AgentRuntime:
                 point=HookPoint.TURN_START,
                 session_id=active_id,
                 data={"task": task, "config": self.config,
-                      "history_recall_available": "session_history" in self.tools.names()},
+                      "history_recall_available": "session_history" in self.tools.names(),
+                      "session_read_available": "session_read" in self.tools.names()},
             ))
             turn_started = True
             messages = self.prompts.compose(task, active_id)

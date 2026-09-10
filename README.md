@@ -233,9 +233,13 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
   "compression_base_url": null,
   "compression_api_key": null,
   "compression_context_window_tokens": null,
+  "tool_output_cjk_threshold_chars": 1000,
+  "tool_output_english_threshold_words": 1000,
   "tool_output_max_chars": 10000,
   "tool_output_head_ratio": 0.2,
   "tool_output_tail_ratio": 0.2,
+  "tool_output_preview_head_chars": 427,
+  "tool_output_preview_tail_chars": 427,
   "sandbox_checkpoint_limit": 17,
   "sandbox_checkpoint_merged_branch_retention_days": 30,
   "gateway_port": 8765,
@@ -345,7 +349,7 @@ Google Scholar 仍只是候选链接来源；工具不会绕过验证码、登�
 
 可通过 `compression_provider`、`compression_model`、`compression_base_url`、`compression_api_key` 和 `compression_context_window_tokens` 配置独立压缩模型；窗口不足或服务不可用时回退主模型。`compression_api_key` 只能位于本机 `settings.local.json`。`compression_micro_compact` 默认关闭，避免每 Turn 增加额外模型调用。将 `compression_threshold_tokens` 设为 `0` 可关闭自动压缩，但仍可手动使用 `/compress`；模型硬窗口检查仍然生效。
 
-`tool_output_max_chars` 默认是 `10000`。在下一次用户任务开始时，超过该阈值的历史工具输出仅在模型上下文中裁剪：保留前 `tool_output_head_ratio`（默认 20%）和后 `tool_output_tail_ratio`（默认 20%），中段替换为审计标记。当前任务内的工具结果始终完整；Session JSONL 与错误快照也始终保存完整原文。设为 `0` 可关闭此裁剪。
+历史 Tool 输出裁剪由独立的 `MODEL_BEFORE` Hook 执行，不属于压缩器。历史结果超过 `tool_output_cjk_threshold_chars=1000` 个中日韩统一表意字符、超过 `tool_output_english_threshold_words=1000` 个英文单词，或超过防御性硬上限 `tool_output_max_chars=10000` 字符时，仅在发给模型的消息副本中保留头尾各 `427` 字符（可通过 `tool_output_preview_head_chars` / `tool_output_preview_tail_chars` 调整）。中间会给出可直接调用的 `session_read` 参数；该工具用 Session JSONL 文件名、`record_id`、`offset` 和 `limited` 精确读取原文。最近一次用户对话之后产生的 Tool 结果保持完整，Session JSONL、Memory缓存与错误快照始终保留原文。三个阈值都设为 `0` 可关闭裁剪。旧 `tool_output_head_ratio` / `tool_output_tail_ratio` 仅为配置兼容保留。
 
 `sandbox_checkpoint_limit` 默认是 `17`，必须是大于等于 1 的整数。它只限制每个 Session 中可供用户精确回退的恢复点数量，基线也计入上限；超过后淘汰最老恢复点引用，但归档分支仍需要的提交继续由 branch ref 保护，不改写项目主仓库。
 
