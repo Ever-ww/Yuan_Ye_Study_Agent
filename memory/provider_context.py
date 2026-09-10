@@ -75,12 +75,25 @@ def effective_contexts(records: list[dict[str, Any]]) -> dict[str, ProviderConte
     return result
 
 
-def context_baseline(records: list[dict[str, Any]]) -> dict[str, str]:
+def context_baseline(
+    records: list[dict[str, Any]],
+    *,
+    before_record_id: str | None = None,
+) -> dict[str, str]:
+    """Resolve the effective fragment baseline before a selected user record.
+
+    Provider-context amendments are append-only and may physically occur after
+    their target user record.  Resolve all amendments first, then stop at the
+    logical user boundary instead of slicing the raw record list.
+    """
     contexts = effective_contexts(records)
     baseline: dict[str, str] = {}
     for record in records:
         if record.get("role") == "user":
-            packet = contexts.get(str(record.get("record_id")))
+            record_id = str(record.get("record_id"))
+            if before_record_id is not None and record_id == before_record_id:
+                break
+            packet = contexts.get(record_id)
             if packet:
                 baseline.update(packet.fragments)
     return baseline

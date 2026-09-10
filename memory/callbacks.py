@@ -85,10 +85,61 @@ def register_memory_callbacks(
             )
             # Conversation continuity is mandatory, independent of optional recall.
             summary = memory.latest_summary(event.session_id)
-            if summary:
+            if summary and not turn.get("continuity_target_record_id"):
                 event.data["set_continuity_fragment"](summary)
             else:
                 fragments.remove(event.session_id, "continuity")
+
+            def place_compressed_continuity(
+                selected_summary: str,
+                target_record_id: str | None,
+            ) -> None:
+                continuity = (
+                    '<continuity_fragment ephemeral="true">\n'
+                    + str(selected_summary).strip()
+                    + '\n</continuity_fragment>'
+                )
+                if target_record_id is None:
+                    turn.pop("continuity_target_record_id", None)
+                    fragments.set(event.session_id, "continuity", continuity, once=False)
+                    return
+                records = memory.session_context_records(event.session_id)
+                users = {
+                    str(record.get("record_id")): record
+                    for record in records
+                    if record.get("role") == "user" and isinstance(record.get("record_id"), str)
+                }
+                target = users.get(target_record_id)
+                if target is None:
+                    raise ValueError("Compressed continuity target is not visible in the new Session segment")
+                existing = effective_contexts(records).get(target_record_id)
+                target_fragments = dict(existing.fragments) if existing is not None else {}
+                target_fragments["continuity"] = continuity
+                packet = ProviderContextRecord.create(
+                    str(target.get("content", "")),
+                    memory.active_path(event.session_id).name,
+                    target_fragments,
+                    origin_refs=origin_refs,
+                )
+                identity = hashlib.sha256(
+                    (
+                        f"{event.session_id}:{memory.active_path(event.session_id).name}:"
+                        f"{target_record_id}:{packet.content_hash}"
+                    ).encode()
+                ).hexdigest()
+                memory.sessions.append_once(event.session_id, {
+                    "role": "provider_context",
+                    "content": None,
+                    "record_id": f"provider-context:{identity}",
+                    "timestamp": memory.session_created_at(event.session_id),
+                    "context_target_record_id": target_record_id,
+                    "provider_context": packet.model_dump(mode="json"),
+                    **origin_refs,
+                })
+                turn["continuity_target_record_id"] = target_record_id
+                fragments.remove(event.session_id, "continuity")
+
+            event.data["place_compressed_continuity"] = place_compressed_continuity
 
         def rebuild_messages(*, refresh_system: bool = False) -> list[dict[str, object]]:
             nonlocal base_system
@@ -126,14 +177,14 @@ def register_memory_callbacks(
                 # projection belongs to the new epoch. Compare only against
                 # preceding visible messages, not the old projection itself.
                 if turn.get("record_id"):
-                    position = next((i for i, r in enumerate(records)
-                                     if r.get("record_id") == turn["record_id"]), None)
-                    if position is None:
+                    if not any(r.get("record_id") == turn["record_id"] for r in records):
                         raise ValueError("Compaction lost the current user record")
-                    records = records[:position]
                 return dynamic.prepare(task, event.session_id, origin_refs=origin_refs,
                                        context_epoch=memory.active_path(event.session_id).name,
-                                       baseline=context_baseline(records))
+                                       baseline=context_baseline(
+                                           records,
+                                           before_record_id=turn.get("record_id"),
+                                       ))
 
             def render_ephemeral_context(target_messages: list[dict[str, object]]) -> None:
                 epoch = memory.active_path(event.session_id).name
@@ -183,14 +234,9 @@ def register_memory_callbacks(
         event.data["reload_messages_after_compression"] = lambda: rebuild_messages(refresh_system=False)
 
         def rebuild_after_emergency() -> list[dict[str, object]]:
-            if fragments is not None:
-                summary = memory.latest_summary(event.session_id)
-                if summary:
-                    event.data["set_continuity_fragment"](summary)
-            rebuilt = [dict(base_system), *memory.restore_messages(event.session_id, provider_context=True)]
-            if callable(render_provider_query):
-                render_ephemeral_context(rebuilt)
-            return rebuilt
+            # The retry starts a fresh MODEL_BEFORE pass, which renders the
+            # current provider query after all restored amendments are visible.
+            return [dict(base_system), *memory.restore_messages(event.session_id, provider_context=True)]
 
         event.data["reload_messages_after_emergency_compression"] = rebuild_after_emergency
 

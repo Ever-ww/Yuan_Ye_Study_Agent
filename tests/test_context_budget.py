@@ -19,9 +19,11 @@ class _CompressionProvider:
 
     def __init__(self) -> None:
         self.calls = 0
+        self.messages = []
 
     async def complete(self, messages, tools):
         self.calls += 1
+        self.messages = [dict(item) for item in messages]
         return ModelReply(text=json.dumps({
             "profile_markdown": "# Profile\n稳定偏好",
             "context_summary_markdown": "# Summary\n已压缩历史",
@@ -132,6 +134,8 @@ def test_protected_tail_is_hash_referenced_not_copied() -> None:
             config, memory, provider_factory=lambda: compressor,
         ).compress_with_policy(session_id))
         assert result.status == "compressed"
+        assert result.boundary == "turn_start"
+        assert result.continuity_target_record_id is None
         assert result.protected_tail_messages == 2
         active = memory.session_records(session_id)
         assert [item["role"] for item in active] == ["summary"]
@@ -146,6 +150,58 @@ def test_protected_tail_is_hash_referenced_not_copied() -> None:
         memory.invalidate_session_cache(session_id)
         with pytest.raises(ValueError, match="Hash"):
             memory.restore_messages(session_id)
+
+
+def test_mid_turn_compression_protects_previous_turn_and_current_tool_trace() -> None:
+    with tempfile.TemporaryDirectory() as value:
+        root = Path(value)
+        config = _config(root, compression_threshold_tokens=2000)
+        memory = MemoryStore(config.memory_dir)
+        session_id = memory.create_session("old")
+        memory.record_user(session_id, "older question")
+        memory.record_assistant(session_id, "older answer")
+        memory.record_user(session_id, "previous question")
+        memory.record_assistant(session_id, "previous answer")
+        memory.record_user(session_id, "current question")
+        memory.record_model_tool_calls(
+            session_id,
+            content=None,
+            tool_calls=[{
+                "id": "call_current",
+                "type": "function",
+                "function": {"name": "demo", "arguments": "{}"},
+            }],
+            model={},
+            model_call={},
+        )
+        memory.record_tool_result(
+            session_id,
+            tool_call_id="call_current",
+            name="demo",
+            content="current tool result",
+            status="success",
+            arguments={},
+        )
+        compressor = _CompressionProvider()
+
+        result = asyncio.run(ContextProcessor(
+            config, memory, provider_factory=lambda: compressor,
+        ).compress_with_policy(session_id, current_query="current question"))
+
+        assert result.status == "compressed"
+        assert result.boundary == "turn_internal"
+        assert result.protected_tail_messages == 5
+        assert result.continuity_target_record_id is not None
+        payload = json.loads(compressor.messages[-1]["content"])
+        assert [record["content"] for record in payload["session_records"]] == [
+            "older question", "older answer",
+        ]
+        restored = memory.restore_messages(session_id)
+        assert [record["role"] for record in restored] == [
+            "user", "assistant", "user", "assistant", "tool",
+        ]
+        assert restored[-2]["tool_calls"][0]["id"] == "call_current"
+        assert restored[-1]["content"] == "current tool result"
 
 
 def test_hard_limit_rejects_before_provider() -> None:
@@ -174,6 +230,8 @@ def test_provider_context_rejection_gets_one_emergency_compression_retry() -> No
         config = _config(root, compression_threshold_tokens=200000)
         memory = MemoryStore(config.memory_dir)
         session_id = memory.create_session("old")
+        memory.record_user(session_id, "older question")
+        memory.record_assistant(session_id, "older answer")
         memory.record_user(session_id, "old question")
         memory.record_assistant(session_id, "old answer")
         provider = _OverflowOnceProvider()
@@ -200,6 +258,8 @@ def test_provider_context_rejection_never_retries_more_than_once() -> None:
         config = _config(root, compression_threshold_tokens=200000)
         memory = MemoryStore(config.memory_dir)
         session_id = memory.create_session("old")
+        memory.record_user(session_id, "older question")
+        memory.record_assistant(session_id, "older answer")
         memory.record_user(session_id, "old question")
         memory.record_assistant(session_id, "old answer")
         provider = _AlwaysOverflowProvider()

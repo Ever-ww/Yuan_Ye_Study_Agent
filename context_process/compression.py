@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import hashlib
+from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -43,6 +44,8 @@ class CompressionResult(BaseModel):
     projected_tool_output_tokens: int = Field(default=0, ge=0)
     compression_model: str | None = None
     compression_fallback_reason: str | None = None
+    boundary: Literal["turn_start", "turn_internal", "manual"] = "manual"
+    continuity_target_record_id: str | None = None
     message: str = ""
 
     def payload(self) -> dict[str, Any]:
@@ -136,12 +139,13 @@ class ContextProcessor:
                 status="error", session_id=session_id, attempts=0, source_file=source_file,
                 message="当前会话没有可压缩内容",
             )
-        compressible, protected = _select_compression_records(
+        selection = _select_compression_records(
             records,
             self.budget.policy,
             current_query=current_query,
             protect_recent=protect_recent,
         )
+        compressible, protected = selection.compressible, selection.protected
         if not any(record.get("role") in {"user", "assistant", "tool"} for record in compressible):
             return CompressionResult(
                 status="error",
@@ -149,6 +153,8 @@ class ContextProcessor:
                 attempts=0,
                 source_file=source_file,
                 protected_tail_messages=len(protected),
+                boundary=selection.boundary,
+                continuity_target_record_id=selection.continuity_target_record_id,
                 message="当前请求只有受保护的近期上下文，没有可安全压缩的完整历史块",
             )
         normalized = _normalize_records(compressible)
@@ -233,6 +239,8 @@ class ContextProcessor:
                                          for _, record in history if record.role == "summary"],
                         ),
                         "compression_reason": reason,
+                        "compression_boundary": selection.boundary,
+                        "continuity_target_record_id": selection.continuity_target_record_id,
                         "protected_tail_refs": self.memory.protected_tail_refs(
                             session_id, protected,
                         ),
@@ -262,6 +270,8 @@ class ContextProcessor:
                         protected_tail_messages=len(protected),
                         compression_model=selected_model,
                         compression_fallback_reason=provider_fallback_reason,
+                        boundary=selection.boundary,
+                        continuity_target_record_id=selection.continuity_target_record_id,
                         message=(
                             f"上下文压缩完成：{len(compressible)} 条记录 → {segment.name}；"
                             f"保留近期 {len(protected)} 条"
@@ -279,6 +289,8 @@ class ContextProcessor:
             protected_tail_messages=len(protected),
             compression_model=selected_model,
             compression_fallback_reason=provider_fallback_reason or validation_error,
+            boundary=selection.boundary,
+            continuity_target_record_id=selection.continuity_target_record_id,
             message=f"压缩连续失败 3 次，已启用内存上下文裁剪：{validation_error}",
         )
 
@@ -292,6 +304,7 @@ class ContextProcessor:
         ephemeral_preview: str | None = None,
         current_query: str | None = None,
         reason: str | None = None,
+        before_reload: Callable[[CompressionResult], None] | None = None,
     ) -> CompressionResult | None:
         """在真实请求前估算完整上下文，超限时压缩并替换当前内存消息。"""
         estimate = self.forecast(
@@ -310,6 +323,8 @@ class ContextProcessor:
             reason=reason or estimate.reason,
         )
         if result.status == "compressed" and reload_messages is not None:
+            if before_reload is not None:
+                before_reload(result)
             messages[:] = reload_messages()
             return result.model_copy(update={"messages_reloaded": True})
         if result.status == "fallback":
@@ -381,15 +396,18 @@ class ContextProcessor:
         *,
         current_query: str,
         reload_messages: Callable[[], list[dict[str, Any]]] | None,
+        before_reload: Callable[[CompressionResult], None] | None = None,
     ) -> CompressionResult:
         """Perform the single emergency compression allowed for an explicit provider rejection."""
         result = await self.compress_with_policy(
             session_id,
             current_query=current_query,
             reason="provider_context_rejection",
-            protect_recent=False,
+            protect_recent=True,
         )
         if result.status == "compressed" and reload_messages is not None:
+            if before_reload is not None:
+                before_reload(result)
             messages[:] = reload_messages()
             result = result.model_copy(update={"messages_reloaded": True})
         else:
@@ -558,56 +576,76 @@ def _conversation_blocks(messages: list[dict[str, Any]]) -> list[list[dict[str, 
     return blocks
 
 
+@dataclass(frozen=True)
+class _CompressionSelection:
+    compressible: list[dict[str, Any]]
+    protected: list[dict[str, Any]]
+    boundary: Literal["turn_start", "turn_internal", "manual"]
+    continuity_target_record_id: str | None = None
+
+
 def _select_compression_records(
     records: list[dict[str, Any]],
     policy: ContextCompressionPolicy,
     *,
     current_query: str | None,
     protect_recent: bool,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> _CompressionSelection:
     summaries = [record for record in records if record.get("role") == "summary"]
     conversational = [record for record in records if record.get("role") in {"user", "assistant", "tool"}]
     blocks = _conversation_blocks(conversational)
-    protected_blocks: list[list[dict[str, Any]]] = []
-    protected_count = 0
-    tail_budget = max(0, int(policy.trigger_limit_tokens * policy.target_ratio))
-    used_tokens = 0
-    mandatory_records: list[dict[str, Any]] = []
-    if current_query is not None and blocks:
-        first_user = next((item for item in blocks[-1] if item.get("role") == "user"), None)
-        if first_user is not None and first_user.get("content") == current_query:
-            # The current query is immutable provider input. A completed
-            # assistant/tool suffix may be summarized, but the query itself is
-            # always carried into the new segment by canonical record reference.
-            mandatory_records = [first_user]
+    # The policy argument is retained for private API compatibility. Automatic
+    # protection is now defined by complete Turn boundaries, never by a raw
+    # message count or an approximate token ratio.
+    del policy
     if not protect_recent:
-        mandatory_ids = {id(record) for record in mandatory_records}
-        return (
-            [*summaries, *(record for record in conversational if id(record) not in mandatory_ids)],
-            mandatory_records,
+        return _CompressionSelection(
+            compressible=[*summaries, *conversational],
+            protected=[],
+            boundary="manual",
         )
-    protected_count = len(mandatory_records)
-    for block in reversed(blocks):
-        if mandatory_records and block is blocks[-1]:
-            continue
-        block_count = len(block)
-        block_tokens = _message_tokens(block)
-        if (
-            protected_count + block_count > policy.protect_last_n
-            or used_tokens + block_tokens > tail_budget
-        ):
-            break
-        if block_tokens + used_tokens <= tail_budget:
-            protected_blocks.append(block)
-            protected_count += block_count
-            used_tokens += block_tokens
+
+    boundary: Literal["turn_start", "turn_internal"] = "turn_start"
+    protected_blocks: list[list[dict[str, Any]]] = []
+    continuity_target_record_id: str | None = None
+    if blocks:
+        latest_user = next((item for item in blocks[-1] if item.get("role") == "user"), None)
+        inside_turn = bool(
+            current_query is not None
+            and latest_user is not None
+            and latest_user.get("content") == current_query
+        )
+        if inside_turn:
+            boundary = "turn_internal"
+            # Preserve the entire current block, including all assistant Tool
+            # requests and Tool observations already committed in this Turn.
+            # Preserve the previous full Turn as the stable summary anchor.
+            protected_blocks = blocks[-2:]
+            if len(blocks) >= 2:
+                anchor = next(
+                    (item for item in blocks[-2] if item.get("role") == "user"),
+                    None,
+                )
+                if anchor is not None and isinstance(anchor.get("record_id"), str):
+                    continuity_target_record_id = str(anchor["record_id"])
+        else:
+            # The current query has not been durably appended yet.  Keep the
+            # immediately preceding Turn intact and attach the new summary to
+            # the incoming user query after rollover.
+            protected_blocks = blocks[-1:]
+
     protected_ids = {
         id(record)
-        for record in [*mandatory_records, *(item for block in protected_blocks for item in block)]
+        for record in (item for block in protected_blocks for item in block)
     }
     protected = [record for record in conversational if id(record) in protected_ids]
     compressible = [*summaries, *(record for record in conversational if id(record) not in protected_ids)]
-    return compressible, protected
+    return _CompressionSelection(
+        compressible=compressible,
+        protected=protected,
+        boundary=boundary,
+        continuity_target_record_id=continuity_target_record_id,
+    )
 
 
 def _message_tokens(messages: list[dict[str, Any]]) -> int:

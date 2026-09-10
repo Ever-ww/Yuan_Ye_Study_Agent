@@ -223,6 +223,8 @@ def test_emergency_compression_amendment_replays_and_does_not_leak(tmp_path):
     config = config_for(tmp_path)
     memory = MemoryStore(config.memory_dir)
     sid = memory.create_session("start")
+    memory.record_user(sid, "older request")
+    memory.record_assistant(sid, "older answer")
     memory.record_user(sid, "old request")
     memory.record_assistant(sid, "old answer")
 
@@ -243,10 +245,15 @@ def test_emergency_compression_amendment_replays_and_does_not_leak(tmp_path):
                     compression_provider_factory=lambda: compressor)
     assert asyncio.run(agent.run("current", sid)).completed
     assert len(provider.calls) == 2
-    assert "compacted detail" in provider.calls[1][-1]["content"]
+    previous_user = next(
+        message for message in provider.calls[1]
+        if message.get("role") == "user" and "old request" in str(message.get("content"))
+    )
+    assert "compacted detail" in previous_user["content"]
+    assert "compacted detail" not in provider.calls[1][-1]["content"]
     all_records = memory.sessions.read_all_records_strict(sid)
     amendments = [r for _, r in all_records if r.role == "provider_context"]
-    assert len(amendments) == 1
+    assert len(amendments) == 2
     assert len([r for _, r in all_records if r.role == "user" and r.content == "current"]) == 1
     recovered = MemoryStore(config.memory_dir)
     assert recovered.restore_messages(sid, provider_context=True)[-2] == provider.calls[1][-1]
@@ -257,7 +264,8 @@ def test_emergency_compression_amendment_replays_and_does_not_leak(tmp_path):
     next_provider = Capture()
     next_agent = runtime(config, recovered, next_provider, tools=AsyncToolRegistry())
     assert asyncio.run(next_agent.run("next", sid)).completed
-    assert next_provider.calls[0][-1]["content"] == "next"
+    assert next_provider.calls[0][-1]["content"].startswith("<user_query>\nnext\n</user_query>")
+    assert "compacted detail" in next_provider.calls[0][-1]["content"]
     assert next_provider.calls[0][:-2] == provider.calls[1]
     # A later compaction drops the old baseline and supplies the new summary.
     result = asyncio.run(ContextProcessor(config, recovered, provider_factory=lambda: compressor).compress(sid))

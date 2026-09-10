@@ -57,6 +57,8 @@ class RuntimeConfig(BaseModel):
     model_context_window_tokens: StrictInt = Field(default=262144, ge=1024)
     compression_output_reserve_tokens: StrictInt = Field(default=16384, ge=0)
     compression_safety_margin_tokens: StrictInt = Field(default=8192, ge=0)
+    # Kept for settings compatibility. Automatic compression now protects
+    # complete Turn boundaries deterministically instead of a message count.
     compression_protect_last_n: StrictInt = Field(default=20, ge=0, le=1000)
     compression_target_ratio: float = Field(default=0.20, gt=0.0, lt=1.0)
     compression_hygiene_message_limit: StrictInt = Field(default=5000, ge=1)

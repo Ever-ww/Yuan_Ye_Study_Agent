@@ -691,6 +691,8 @@ class CoreTests(unittest.TestCase):
             config = load_runtime_config(root, compression_threshold_tokens=300)
             memory = MemoryStore(config.memory_dir)
             session_id = memory.create_session("历史问题")
+            memory.record_user(session_id, "更早问题" * 300)
+            memory.record_assistant(session_id, "更早回答" * 300)
             memory.record_user(session_id, "历史问题" * 300)
             memory.record_assistant(session_id, "历史回答" * 300)
             compressor = CompressionProvider()
@@ -756,7 +758,7 @@ class CoreTests(unittest.TestCase):
                     (summaries[0].memory_id,),
                 ).fetchone()[0], 2)
 
-    def test_tool_chain_is_compressed_before_the_followup_model_call(self) -> None:
+    def test_current_tool_chain_is_preserved_before_the_followup_model_call(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             config = load_runtime_config(root, compression_threshold_tokens=80)
@@ -773,16 +775,13 @@ class CoreTests(unittest.TestCase):
             result = asyncio.run(runtime.run("计算 2 + 2"))
             self.assertTrue(result.completed)
             self.assertEqual(provider.calls, 2)
-            self.assertEqual(compressor.calls, 1)
-            self.assertTrue(memory.active_filename(result.session_id).endswith("_002.jsonl"))
-            payload = json.loads(compressor.messages[-1]["content"])
-            roles = [record["role"] for record in payload["session_records"]]
-            self.assertEqual(roles, ["assistant", "tool"])
-            self.assertIn("tool_calls", payload["session_records"][0])
+            self.assertEqual(compressor.calls, 0)
+            self.assertTrue(memory.active_filename(result.session_id).endswith("_001.jsonl"))
             self.assertEqual(
                 [message["role"] for message in provider.second_messages],
-                ["system", "user"],
+                ["system", "user", "assistant", "tool"],
             )
+            self.assertIn("tool_calls", provider.second_messages[-2])
 
     def test_manual_compress_is_not_recorded_and_only_returns_status(self) -> None:
         with tempfile.TemporaryDirectory() as value:

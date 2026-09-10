@@ -1,6 +1,8 @@
 # Session Summary 与原文回查
 
-最新滚动 Summary 是会话连续性上下文。Memory Hook 在每次模型请求前准备当前分段的摘要，通过 `continuity_fragment` 放入 Provider 用户消息投影，后续 Turn 和 Runtime 恢复仍会注入。原始用户输入和稳定 System Prompt 保持原样；临时 Envelope 不写入 Session。
+最新滚动 Summary 是会话连续性上下文。Memory Hook 通过 `continuity_fragment` 把它放进 Provider 用户消息投影，后续 Turn 和 Runtime 恢复仍能重建。原始用户输入和稳定 System Prompt 保持原样；动态投影以独立 `provider_context` 字段持久化，不混入用户原文。
+
+自动压缩存在两个明确边界：Turn 开始时保留上一轮完整 Turn，Summary 放到当前新 user prompt；Turn 内触发时保留上一轮完整 Turn和当前 Turn 已产生的全部 Tool Call trace，Summary 挂到上一轮 user prompt。两种情况都只压缩更早的完整对话块，不拆散 assistant/tool 调用链。手动 `/compress` 仍表示用户要求立即重建整个历史窗口，不采用自动边界保护规则。
 
 压缩输入包含当前 Session 索引中的全部历史 Summary，以及本轮待压缩的原始对话。旧摘要按历史顺序传入，提示模型合并、去重，并根据新证据处理已撤销的结论。所有摘要超出压缩模型窗口时走现有压缩失败/预算保护路径，不能静默删掉部分摘要后宣称完成。摘要仍是有损压缩，不保证所有细节保存。
 

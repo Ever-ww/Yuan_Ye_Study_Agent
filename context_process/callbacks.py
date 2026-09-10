@@ -35,6 +35,19 @@ def register_context_callbacks(registry: HookRegistry, processor: ContextProcess
             processor.finalize_request(event.session_id, selected_messages, selected_tools)
         )
         trim_tool_outputs = event.data.get("trim_historical_tool_outputs")
+        place_continuity = event.data.get("place_compressed_continuity")
+
+        def place_compressed_continuity(result) -> None:
+            summary = processor.memory.latest_summary(event.session_id)
+            if not summary:
+                return
+            if callable(place_continuity):
+                place_continuity(summary, result.continuity_target_record_id)
+                return
+            register = event.data.get("set_continuity_fragment")
+            if callable(register):
+                register(summary)
+
         emergency_reload = event.data.get("reload_messages_after_emergency_compression")
         def reload_and_trim_after_emergency():
             if not callable(emergency_reload):
@@ -50,6 +63,7 @@ def register_context_callbacks(registry: HookRegistry, processor: ContextProcess
                 selected_tools,
                 current_query=str(event.data.get("task", "")),
                 reload_messages=reload_and_trim_after_emergency if callable(emergency_reload) else None,
+                before_reload=place_compressed_continuity,
             )
             if callable(trim_tool_outputs):
                 trim_tool_outputs(selected_messages)
@@ -73,12 +87,8 @@ def register_context_callbacks(registry: HookRegistry, processor: ContextProcess
                 ephemeral_preview=preview,
                 current_query=str(event.data.get("task", "")),
                 reason=estimate.reason,
+                before_reload=place_compressed_continuity,
             )
-            if result is not None and result.status == "compressed":
-                register = event.data.get("set_continuity_fragment")
-                summary = processor.memory.latest_summary(event.session_id)
-                if callable(register) and summary:
-                    register(summary)
             if callable(trim_tool_outputs):
                 trim_tool_outputs(messages)
             return result
