@@ -36,6 +36,24 @@ class SessionArchiveReader:
         *,
         excluded_session_ids: set[str] | None = None,
     ) -> DreamDayArchive:
+        return self.iter_range(
+            selected_date,
+            selected_date,
+            timezone_name,
+            excluded_session_ids=excluded_session_ids,
+        )
+
+    def iter_range(
+        self,
+        start_date: date,
+        end_date: date,
+        timezone_name: str,
+        *,
+        excluded_session_ids: set[str] | None = None,
+    ) -> DreamDayArchive:
+        """Read one immutable date range in a single pass over Session JSONL."""
+        if end_date < start_date:
+            raise ValueError("Dream archive end date cannot precede start date")
         zone_name = get_localzone_name() if timezone_name == "local" else timezone_name
         zone = ZoneInfo(zone_name)
         excluded = excluded_session_ids or set()
@@ -78,7 +96,7 @@ class SessionArchiveReader:
                             timestamp = _timestamp_in_zone(record.timestamp, zone)
                         except ValueError:
                             continue
-                        if timestamp.date() != selected_date:
+                        if not start_date <= timestamp.date() <= end_date:
                             continue
                         if record.role not in {"user", "assistant"}:
                             continue
@@ -120,7 +138,7 @@ class SessionArchiveReader:
         records.sort(key=lambda item: (item.timestamp, item.workspace_key, item.session_id, item.source_file, item.line_number))
         evidence.sort(key=lambda item: (item.timestamp, item.workspace_key, item.session_id, item.source_file, item.line_number))
         return DreamDayArchive(
-            date=selected_date.isoformat(),
+            date=end_date.isoformat(),
             timezone=zone_name,
             records=tuple(records),
             evidence=tuple(evidence),

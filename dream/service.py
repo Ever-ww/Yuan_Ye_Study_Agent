@@ -24,6 +24,7 @@ from memory.retrieval import project_identity
 from memory.structured import MemoryProfileProjector, MemoryWriter, StructuredMemoryStore
 
 from .archive import SessionArchiveReader, contains_secret
+from .execution import DreamExecutionJournal
 from .models import (
     DreamCandidate,
     DreamCandidateList,
@@ -85,6 +86,7 @@ class DreamService:
         self.state_path = self.root / "state.json"
         self.memories_path = self.root / "memories.json"
         self.runs_root = self.root / "runs"
+        self.executions_root = self.root / "executions"
         self.backups_root = self.root / "backups"
         self.transactions_root = self.root / "transactions"
         self.archive = SessionArchiveReader(config.memory_dir / "session")
@@ -106,9 +108,62 @@ class DreamService:
             async with self.file_locks.write(self.state_path):
                 self._running = True
                 try:
-                    return await self._process_day(selected_date, run_id=run_id)
+                    return await self._process_range(
+                        selected_date, selected_date, run_id=run_id,
+                    )
                 finally:
                     self._running = False
+
+    async def process_pending(
+        self, cutoff_date: date, *, run_id: str | None = None,
+    ) -> DreamRunResult:
+        """Consume every unprocessed user Evidence through one frozen cutoff."""
+        async with self._lock:
+            async with self.file_locks.write(self.state_path):
+                self._running = True
+                try:
+                    return await self._process_range(
+                        date.min, cutoff_date, run_id=run_id,
+                    )
+                finally:
+                    self._running = False
+
+    async def advance_if_no_pending(self, cutoff_date: date) -> DreamRunResult | None:
+        """Advance the scan cursor without creating a Dream Run when there is no work."""
+        async with self._lock:
+            async with self.file_locks.write(self.state_path):
+                state = self._state()
+                archive = self.archive.iter_range(
+                    date.min,
+                    cutoff_date,
+                    self.config.dream_timezone,
+                    excluded_session_ids=self.excluded_sessions(),
+                )
+                fresh_by_day = _fresh_evidence_by_day(
+                    archive.evidence, state, self.config.dream_timezone,
+                )
+                if any(fresh_by_day.values()):
+                    return None
+                state.last_completed_date = _max_date(
+                    state.last_completed_date, cutoff_date.isoformat(),
+                )
+                state.last_status, state.last_error = "noop", None
+                self._write_state(state)
+                return DreamRunResult(
+                    run_id="scan_" + hashlib.sha256(
+                        cutoff_date.isoformat().encode("utf-8"),
+                    ).hexdigest()[:24],
+                    date=cutoff_date.isoformat(),
+                    range_start=cutoff_date.isoformat(),
+                    range_end=cutoff_date.isoformat(),
+                    status="noop",
+                    message="No unprocessed user evidence; scan cursor advanced",
+                    sessions_processed=archive.session_count,
+                    source_files_processed=archive.source_file_count,
+                    records_processed=len(archive.records),
+                    model=self.config.dream_model or self.config.model,
+                    created_at=_now(),
+                )
 
     async def backfill(self, start: date, end: date) -> tuple[DreamRunResult, ...]:
         if end < start:
@@ -160,22 +215,33 @@ class DreamService:
             next_run_at=next_run_at,
         )
 
-    async def _process_day(self, selected_date: date, *, run_id: str | None = None) -> DreamRunResult:
+    async def _process_range(
+        self,
+        start_date: date,
+        selected_date: date,
+        *,
+        run_id: str | None = None,
+    ) -> DreamRunResult:
         self._input_tokens = 0
         self._output_tokens = 0
         run_id = run_id or uuid4().hex
         created_at = _now()
-        archive = self.archive.iter_day(
+        archive = self.archive.iter_range(
+            start_date,
             selected_date,
             self.config.dream_timezone,
             excluded_session_ids=self.excluded_sessions(),
         )
         state = self._state()
-        already = set(state.processed_evidence.get(selected_date.isoformat(), []))
-        fresh = {item.evidence_id for item in archive.evidence if item.evidence_id not in already}
+        fresh_by_day = _fresh_evidence_by_day(
+            archive.evidence, state, self.config.dream_timezone,
+        )
+        fresh = {item for values in fresh_by_day.values() for item in values}
+        effective_start = min(fresh_by_day) if fresh_by_day else selected_date.isoformat()
         if not fresh:
             result = DreamRunResult(
                 run_id=run_id, date=selected_date.isoformat(), status="noop",
+                range_start=effective_start, range_end=selected_date.isoformat(),
                 message="该日期没有未处理的用户证据", sessions_processed=archive.session_count,
                 source_files_processed=archive.source_file_count,
                 records_processed=len(archive.records), created_at=created_at,
@@ -189,15 +255,28 @@ class DreamService:
 
         profiles = self._profiles()
         records = _records_with_fresh_evidence(archive.records, fresh)
+        execution = DreamExecutionJournal(self.executions_root, run_id)
+        execution.append_once("session", "execution_started", {
+            "range_start": effective_start,
+            "range_end": selected_date.isoformat(),
+            "evidence": [_evidence_reference(item) for item in archive.evidence
+                         if item.evidence_id in fresh],
+            "model": self.config.dream_model or self.config.model,
+            "memoryless": True,
+        })
         attempts = 0
         extracted: list[DreamCandidate] = []
         rejected: list[dict[str, str]] = []
         try:
-            for batch in _batch_records(records, self.config.dream_batch_tokens):
+            for batch_number, batch in enumerate(
+                _batch_records(records, self.config.dream_batch_tokens), 1,
+            ):
                 output, used = await self._validated_call(
                     lambda error: compose_dream_extraction_messages(
                         [item.model_dump(mode="json") for item in batch], profiles, error,
                     ),
+                    phase=f"extraction:{batch_number}",
+                    execution=execution,
                 )
                 attempts += used
                 extracted.extend(output.candidates)
@@ -215,6 +294,8 @@ class DreamService:
                         profiles,
                         error,
                     ),
+                    phase="consolidation",
+                    execution=execution,
                 )
                 attempts += used
                 consolidated, invalid = _validate_candidates(
@@ -224,12 +305,16 @@ class DreamService:
                 rejected.extend(invalid)
             memories = self._memories()
             changed = _apply_candidates(memories, consolidated, selected_date, run_id)
-            state.processed_evidence[selected_date.isoformat()] = sorted(already | fresh)
+            for day, evidence_ids in fresh_by_day.items():
+                already = set(state.processed_evidence.get(day, []))
+                state.processed_evidence[day] = sorted(already | evidence_ids)
             state.last_completed_date = _max_date(state.last_completed_date, selected_date.isoformat())
             state.last_run_id, state.last_status, state.last_error = run_id, "completed", None
             state.successful_runs.append(run_id)
             result = DreamRunResult(
                 run_id=run_id, date=selected_date.isoformat(), status="completed",
+                range_start=effective_start, range_end=selected_date.isoformat(),
+                execution_session_id=execution.execution_session_id,
                 message=f"Dream 完成：处理 {len(fresh)} 条用户证据，更新 {changed} 条长期记忆",
                 sessions_processed=archive.session_count,
                 source_files_processed=archive.source_file_count,
@@ -240,11 +325,19 @@ class DreamService:
                 created_at=created_at,
             )
             self._commit(run_id, state, memories, profiles, result, consolidated, rejected)
+            execution.append_once("result", "execution_completed", {
+                "status": result.status,
+                "evidence_processed": result.evidence_processed,
+                "memories_changed": result.memories_changed,
+                "candidate_count": len(consolidated),
+            })
             return result
         except Exception as exc:
             error = str(exc) or type(exc).__name__
             failed = DreamRunResult(
                 run_id=run_id, date=selected_date.isoformat(), status="failed",
+                range_start=effective_start, range_end=selected_date.isoformat(),
+                execution_session_id=execution.execution_session_id,
                 message=f"Dream 失败：{error}", sessions_processed=archive.session_count,
                 source_files_processed=archive.source_file_count,
                 records_processed=len(records), evidence_processed=len(fresh),
@@ -255,19 +348,50 @@ class DreamService:
             state.last_run_id, state.last_status, state.last_error = run_id, "failed", error
             self._write_state(state)
             self._write_run(failed, candidates=extracted, rejected=rejected)
+            execution.append_once("result", "execution_failed", {
+                "error_type": type(exc).__name__,
+                "error": error[:1000],
+                "attempts": attempts,
+            })
             return failed
 
     async def _validated_call(
         self,
         messages_factory: Callable[[str], list[dict[str, str]]],
+        *,
+        phase: str,
+        execution: DreamExecutionJournal,
     ) -> tuple[DreamCandidateList, int]:
         error = ""
         for attempt in range(1, 4):
             try:
-                raw = await self._run_model(messages_factory(error))
-                return DreamCandidateList.model_validate_json(_json_text(raw)), attempt
+                messages = messages_factory(error)
+                input_hash = hashlib.sha256(json.dumps(
+                    messages, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
+                execution.append_once(
+                    f"{phase}:attempt:{attempt}:started", "model_attempt_started",
+                    {"phase": phase, "attempt": attempt, "input_hash": input_hash,
+                     "message_count": len(messages)},
+                )
+                raw = await self._run_model(messages)
+                parsed = DreamCandidateList.model_validate_json(_json_text(raw))
+                execution.append_once(
+                    f"{phase}:attempt:{attempt}:completed", "model_attempt_completed",
+                    {"phase": phase, "attempt": attempt,
+                     "output_hash": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                     "candidates": [item.model_dump(mode="json")
+                                    for item in parsed.candidates]},
+                )
+                return parsed, attempt
             except Exception as exc:
                 error = str(exc) or type(exc).__name__
+                execution.append_once(
+                    f"{phase}:attempt:{attempt}:failed", "model_attempt_failed",
+                    {"phase": phase, "attempt": attempt,
+                     "error_type": type(exc).__name__, "error": error[:1000]},
+                )
         raise RuntimeError(f"Dream 模型连续三次未返回合法结构：{error}")
 
     async def _run_model(self, messages: list[dict[str, str]]) -> str:
@@ -472,7 +596,13 @@ class DreamService:
                 destination.unlink(missing_ok=True)
 
     def _ensure(self) -> None:
-        for path in (self.root, self.runs_root, self.backups_root, self.transactions_root):
+        for path in (
+            self.root,
+            self.runs_root,
+            self.executions_root,
+            self.backups_root,
+            self.transactions_root,
+        ):
             path.mkdir(parents=True, exist_ok=True)
         if not self.state_path.exists():
             _write_model_atomic(self.state_path, DreamState(initialized_at=_now()))
@@ -497,6 +627,35 @@ def _records_with_fresh_evidence(
         elif blocks:
             blocks[-1].append(record)
     return [item for block in blocks if any(item.evidence_id in fresh for item in block) for item in block]
+
+
+def _fresh_evidence_by_day(
+    evidence: tuple[Any, ...],
+    state: DreamState,
+    timezone_name: str,
+) -> dict[str, set[str]]:
+    """Group only unconsumed Evidence by its already-normalized local day."""
+    del timezone_name  # Archive timestamps are already normalized to the configured zone.
+    grouped: dict[str, set[str]] = {}
+    for item in evidence:
+        day = datetime.fromisoformat(item.timestamp.replace("Z", "+00:00")).date().isoformat()
+        if item.evidence_id in set(state.processed_evidence.get(day, ())):
+            continue
+        grouped.setdefault(day, set()).add(item.evidence_id)
+    return grouped
+
+
+def _evidence_reference(item: Any) -> dict[str, Any]:
+    """Return a replay locator without copying private transcript content."""
+    return {
+        "evidence_id": item.evidence_id,
+        "workspace_key": item.workspace_key,
+        "session_id": item.session_id,
+        "source_file": item.source_file,
+        "line_number": item.line_number,
+        "timestamp": item.timestamp,
+        "content_hash": hashlib.sha256(item.content.encode("utf-8")).hexdigest(),
+    }
 
 
 def _batch_records(records: list[DreamTranscriptRecord], max_tokens: int) -> list[list[DreamTranscriptRecord]]:

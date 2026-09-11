@@ -121,6 +121,9 @@ class DreamRunResult(BaseModel):
 
     run_id: str = Field(min_length=1)
     date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    range_start: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    range_end: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    execution_session_id: str | None = None
     status: DreamRunStatus
     message: str
     sessions_processed: int = Field(default=0, ge=0)

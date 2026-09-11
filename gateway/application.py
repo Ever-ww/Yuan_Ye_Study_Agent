@@ -607,6 +607,14 @@ class GatewayApplication:
             result_summary=str(payload.get("path", "Backup completed")) if target is TerminalTarget.SUCCEEDED else None,
         ))
         await self._finalize_control_plane(run_id)
+        if status == "backup_completed":
+            # Successful automatic maintenance is audit history, not an unread
+            # user notification.  It also supersedes older backup warnings.
+            self.store.coalesce_project_inbox("backup")
+        else:
+            # Keep exactly the latest actionable backup result unread.  Older
+            # failures remain queryable in Inbox history.
+            self.store.coalesce_project_inbox("backup", keep_run_id=run_id)
         self.outbox.wake()
 
     async def close(self) -> None:
@@ -1594,6 +1602,8 @@ class GatewayApplication:
         )
         if not is_runnable(state, None, now=datetime.now().astimezone()):
             raise RuntimeError(f"Dream workload 不可调度：{state.task_state.value}")
+        if automatic:
+            return await self.dream_service.process_pending(selected, run_id=run_id)
         return await self.dream_service.process_day(selected, run_id=run_id)
 
     def _begin_workload_run(
@@ -1705,11 +1715,14 @@ class GatewayApplication:
         )).state
         await self._finalize_control_plane(state.run_id)
         state = self.state_controller.state(state.run_id)
-        if automatic and result.status == "noop":
-            # A scheduled scan with no new evidence is a healthy heartbeat, not
-            # a user-facing background result.  Keep its durable Run/Inbox row
-            # for audit, but do not grow the unread counter with empty work.
-            self.store.mark_run_inbox_read(state.run_id)
+        if automatic:
+            if result.status == "failed":
+                # One current actionable failure is enough.  Preserve older
+                # rows as read audit history instead of growing the counter.
+                self.store.coalesce_project_inbox("dream", keep_run_id=state.run_id)
+            else:
+                # Automatic success/no-op is deliberately silent in chat.
+                self.store.coalesce_project_inbox("dream")
         self.outbox.wake()
         run = self.store.run(state.run_id)
         if result.status == "completed":

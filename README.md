@@ -407,7 +407,7 @@ uv run python run.py backup recover
 uv run python run.py backup rollback
 ```
 
-手动命令使用隐藏输入读取口令；`backup create` 还会要求二次输入。口令不会进入 argv、RuntimeConfig、ToolContext、Harness 或普通子进程。自动备份默认每天本地时间 04:00 运行，只从受信任 Backup Secret Provider（源码运行可用 `YY_BACKUP_PASSPHRASE`）取得口令；Gateway 读取后立即从全局环境移除。缺少口令时记录 `backup_skipped` 并进入 Inbox，绝不生成明文备份。
+手动命令使用隐藏输入读取口令；`backup create` 还会要求二次输入。口令不会进入 argv、RuntimeConfig、ToolContext、Harness 或普通子进程。自动备份默认每天本地时间 04:00 运行，只从受信任 Backup Secret Provider（源码运行可用 `YY_BACKUP_PASSPHRASE`）取得口令；Gateway 读取后立即从全局环境移除。缺少口令时记录 `backup_skipped`，绝不生成明文备份。自动成功只保留已读审计；连续失败只保留最新一条未读通知，普通聊天启动时仅提示待处理数量，详情由 `/inbox` 显式查看。
 
 归档格式使用流式 ZIP64 与 AES-256-GCM，明文 Header 作为 AAD；程序会先限制 Header 与 scrypt 资源参数，再执行 KDF。正常创建过程不生成完整明文 ZIP，也不把整个归档读入内存。正式文件先以 `.partial` 写入，完成认证、校验和 fsync 后原子发布为 `.yybackup`。SQLite 使用 Backup API 生成干净快照，不归档 WAL/SHM。
 
@@ -795,7 +795,9 @@ Dream 使用独立、非流式且无 Tool/Skill/Memory/Sandbox/Extension 的临�
 <!-- dream:managed:end -->
 ```
 
-结构化记忆保存在 `~/.yy/dream/memories.json`，运行报告、模型错误、输入/输出 Token、证据计数与备份位于 `~/.yy/dream/runs/` 和 `~/.yy/dream/backups/`。原始 Session 永不修改或删除；冲突记忆只标为 `superseded`，不做不可恢复删除。同一天没有新证据时返回 `noop`，不会调用合并模型或重写 Profile。成功后，当前正在执行的 Turn 继续使用原 System Prompt，下一次用户输入才重建 Profile 上下文。
+结构化记忆保存在 `~/.yy/dream/memories.json`，运行报告、模型错误、输入/输出 Token、证据计数与备份位于 `~/.yy/dream/runs/` 和 `~/.yy/dream/backups/`。每次真正执行还会在 `~/.yy/dream/executions/` 写入隐藏、append-only 的无记忆执行记录：它保存来源 Session/文件/行号、内容 Hash、模型输入输出 Hash和结构化候选，不复制完整私密对话或完整 Prompt，也不会出现在普通 Session 列表中。原始 Session 永不修改或删除；冲突记忆只标为 `superseded`，不做不可恢复删除。
+
+自动 Dream 在调度时冻结最新截止日期，把截止日前所有尚未处理的用户 Evidence 合成一个增量 changeset，只启动一次无记忆 Runtime；不再按漏掉的自然日逐日创建 Run。若没有新 Evidence，只推进扫描游标，不创建 Gateway Run、Operation、Inbox、worktree或模型 Runtime。自动成功和 no-op 保持静默，失败只保留最新一条未读通知；普通聊天仅提示待处理数量。成功后，当前正在执行的 Turn 继续使用原 System Prompt，下一次用户输入才重建 Profile 上下文。
 
 ```text
 /dream status
@@ -804,7 +806,7 @@ Dream 使用独立、非流式且无 Tool/Skill/Memory/Sandbox/Extension 的临�
 /dream rollback [run-id]
 ```
 
-`run` 默认处理昨天；`backfill` 按日期从旧到新执行，单次最多 31 天；`rollback` 只能依次回滚最近一次成功运行，以免跳过后续依赖状态。Gateway 离线错过计划时间后会按日期补跑，但首次启用只处理昨天，不自动消费全部旧历史。普通 Agent Run 尚未结束时 Dream 会等待；自动运行结果会进入 Inbox。
+`run` 默认显式处理昨天；`backfill` 仍按日期从旧到新执行，单次最多 31 天；`rollback` 只能依次回滚最近一次成功运行，以免跳过后续依赖状态。自动 Scheduler 与显式 backfill 语义分离：Gateway 离线期间积累的未处理 Evidence 会在下一次到期时合并为一个增量执行。普通 Agent Run 尚未结束时 Dream 会等待。
 
 ## 配置、状态与安全
 

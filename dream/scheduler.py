@@ -96,14 +96,22 @@ class DreamScheduler:
             now = self._local_now()
             profile_retry_blocked = self._retry_after is not None and now < self._retry_after
             due = self._due_date(now) if profile_enabled and not profile_retry_blocked else None
+            profile_cycle_due = due is not None
             scheduled_day = self._latest_scheduled_day(now)
             if due is None and not harness_enabled:
                 return None
             result: DreamRunResult | None = None
             if due is not None:
                 try:
-                    result = await self.run_day(due)
-                    await self.on_result(result, True)
+                    preflight = getattr(self.service, "advance_if_no_pending", None)
+                    no_work = await preflight(due) if callable(preflight) else None
+                    if no_work is not None:
+                        # Cursor-only scans are deliberately invisible: no Run,
+                        # Operation, Inbox row or model Runtime is created.
+                        result = no_work
+                    else:
+                        result = await self.run_day(due)
+                        await self.on_result(result, True)
                 except Exception as exc:
                     self.last_error = str(exc) or type(exc).__name__
                     self._retry_after = now + timedelta(seconds=max(300, self.heartbeat_seconds))
@@ -119,7 +127,7 @@ class DreamScheduler:
             # 代码类Dream阶段拥有独立持久状态；Profile失败不能阻止同一tick中的独立阶段。
             if (
                 checkpoint_enabled and self.run_checkpoint_day is not None
-                and scheduled_day is not None and due is not None
+                and scheduled_day is not None and profile_cycle_due
             ):
                 try:
                     await self.run_checkpoint_day(scheduled_day)
@@ -162,8 +170,10 @@ class DreamScheduler:
         previous = croniter(self.service.config.dream_schedule, now).get_prev(datetime)
         due = previous.date() - timedelta(days=1)
         last = date.fromisoformat(state.last_completed_date)
-        candidate = last + timedelta(days=1)
-        return candidate if candidate <= due else None
+        # Automatic Dream is one incremental changeset, not one Run per missed
+        # calendar day.  All unconsumed Evidence through this cutoff is handled
+        # by one memoryless execution.  Explicit backfill remains date-based.
+        return due if last < due else None
 
     def _next_run_at(self) -> str:
         now = self._local_now()

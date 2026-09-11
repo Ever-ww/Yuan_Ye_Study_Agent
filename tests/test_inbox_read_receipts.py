@@ -136,10 +136,10 @@ def test_restore_acknowledges_only_after_rendering(monkeypatch):
     assert client.acknowledge_session_history.await_count == 1
 
 
-def test_chat_startup_displays_then_acknowledges_exact_unread_rows(monkeypatch):
-    displayed = []
+def test_chat_startup_silently_acknowledges_completed_background_rows(monkeypatch):
     marked = []
-    items = [inbox_item("background-1"), inbox_item("background-2")]
+    items = [inbox_item("background-1", status="completed"),
+             inbox_item("background-2", status="completed")]
 
     class Client:
         async def inbox(self, unread_only=False):
@@ -147,33 +147,33 @@ def test_chat_startup_displays_then_acknowledges_exact_unread_rows(monkeypatch):
             return items
 
         async def mark_inbox_read(self, item_id):
-            assert displayed == items
             marked.append(item_id)
             return {"item_id": item_id, "read": True}
 
-    monkeypatch.setattr(
-        cli,
-        "_render_inbox_table",
-        lambda rows, *, unread_only: displayed.extend(rows),
-    )
-    asyncio.run(cli._display_and_acknowledge_unread_inbox(Client()))
+    output = io.StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=output, width=120))
+    asyncio.run(cli._notify_actionable_inbox(Client()))
     assert marked == ["item-background-1", "item-background-2"]
+    assert output.getvalue() == ""
 
 
-def test_chat_startup_receipt_failure_does_not_block_chat(monkeypatch):
-    displayed = []
+def test_chat_startup_only_reports_actionable_count(monkeypatch):
+    marked = []
 
     class Client:
         async def inbox(self, unread_only=False):
-            return [inbox_item("background")]
+            return [
+                inbox_item("success", status="completed"),
+                inbox_item("failed", status="failed"),
+            ]
 
         async def mark_inbox_read(self, item_id):
-            raise ConnectionError(item_id)
+            marked.append(item_id)
+            return {"item_id": item_id, "read": True}
 
-    monkeypatch.setattr(
-        cli,
-        "_render_inbox_table",
-        lambda rows, *, unread_only: displayed.extend(rows),
-    )
-    asyncio.run(cli._display_and_acknowledge_unread_inbox(Client()))
-    assert displayed == [inbox_item("background")]
+    output = io.StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=output, width=120))
+    asyncio.run(cli._notify_actionable_inbox(Client()))
+    assert marked == ["item-success"]
+    assert "后台有 1 条需要处理的通知" in output.getvalue()
+    assert "failed" not in output.getvalue()

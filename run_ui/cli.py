@@ -410,7 +410,7 @@ async def _chat_gateway(
         _render_restored_history(records)
         await _acknowledge_displayed_history(client, project_id, session_id, records)
     interrupt_controller.bind(asyncio.get_running_loop())
-    await _display_and_acknowledge_unread_inbox(client)
+    await _notify_actionable_inbox(client)
     while True:
         try:
             task = console.input("[bold blue]你 > [/]").strip()
@@ -662,35 +662,35 @@ async def _handle_inbox_command(client: GatewayClient, task: str) -> None:
     )
 
 
-async def _display_and_acknowledge_unread_inbox(client: GatewayClient) -> None:
-    """Display pending background notifications once, then acknowledge exactly those rows.
+async def _notify_actionable_inbox(client: GatewayClient) -> None:
+    """Silence routine maintenance and report only an actionable count.
 
-    Fetching an Inbox list is not normally a read receipt.  Chat startup is a
-    deliberate exception because the rows are rendered to the user before they
-    are marked.  Items created concurrently after the fetch remain unread.
+    Successful/no-op background results remain in ``/inbox all`` as audit
+    history but are silently acknowledged.  Failures remain unread, while chat
+    startup shows only one compact hint instead of expanding maintenance rows.
     """
     unread = await client.inbox(unread_only=True)
     if not unread:
         return
-    _render_inbox_table(unread, unread_only=True)
-    acknowledged = 0
+    actionable: list[dict[str, object]] = []
     for item in unread:
+        status = str(item.get("status", "")).casefold()
+        if status not in {"completed", "succeeded", "success"}:
+            actionable.append(item)
+            continue
         item_id = item.get("item_id")
         if not isinstance(item_id, str) or not item_id:
             continue
         try:
             await client.mark_inbox_read(item_id)
         except Exception:
-            # A read-receipt outage must not prevent chat from starting.  The
-            # same notification will be shown again on the next connection.
+            # A receipt outage must not prevent an interactive chat from
+            # starting. The completed row may be acknowledged next time.
             continue
-        acknowledged += 1
-    if acknowledged:
-        console.print(f"[dim]以上 {acknowledged} 条 Inbox 通知已显示并标记为已读。[/]")
-    if acknowledged != len(unread):
+    if actionable:
         console.print(
-            f"[yellow]有 {len(unread) - acknowledged} 条 Inbox 已读确认失败，"
-            "下次连接会再次显示。[/]"
+            f"[yellow]后台有 {len(actionable)} 条需要处理的通知；"
+            "使用 /inbox 查看详情。[/]"
         )
 
 

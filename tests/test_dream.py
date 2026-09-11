@@ -241,6 +241,92 @@ class DreamTests(unittest.TestCase):
             )
             self.assertEqual(after._due_date(after._local_now()), date(2026, 8, 3))
 
+    def test_scheduler_collapses_missed_days_into_latest_cutoff(self) -> None:
+        service = type("Service", (), {
+            "config": type("Config", (), {
+                "dream_enabled": True,
+                "harness_dream_enabled": False,
+                "dream_schedule": "0 3 * * *",
+                "dream_timezone": "Asia/Shanghai",
+            })(),
+            "status": lambda self, **kwargs: DreamStatus(
+                enabled=True, running=False, schedule="0 3 * * *",
+                timezone="Asia/Shanghai", initialized_at="2026-08-01T00:00:00+08:00",
+                last_completed_date="2026-08-01",
+            ),
+        })()
+        scheduler = DreamScheduler(
+            service, lambda: True, lambda result, automatic: asyncio.sleep(0),
+            clock=lambda: datetime(2026, 8, 10, 4, tzinfo=ZoneInfo("Asia/Shanghai")),
+            run_day=lambda selected: asyncio.sleep(0),
+        )
+        self.assertEqual(scheduler._due_date(scheduler._local_now()), date(2026, 8, 9))
+
+    def test_automatic_no_work_advances_cursor_without_run_or_callback(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(
+                root, dream_enabled=True, dream_timezone="Asia/Shanghai",
+                dream_schedule="0 3 * * *",
+            )
+            service = DreamService(config, model_runner=_DreamModel())
+            run_calls = []
+            callbacks = []
+
+            async def run_day(selected):
+                run_calls.append(selected)
+                raise AssertionError("no-work scan must not create a Dream run")
+
+            async def callback(result, automatic):
+                callbacks.append((result, automatic))
+
+            scheduler = DreamScheduler(
+                service, lambda: True, callback,
+                clock=lambda: datetime(2026, 8, 4, 4, tzinfo=ZoneInfo("Asia/Shanghai")),
+                run_day=run_day,
+            )
+            result = asyncio.run(scheduler.tick())
+            self.assertEqual(result.status, "noop")
+            self.assertEqual(service.status().last_completed_date, "2026-08-03")
+            self.assertEqual(run_calls, [])
+            self.assertEqual(callbacks, [])
+            self.assertEqual(
+                list((root / ".yy" / "dream" / "executions").glob("*.jsonl")),
+                [],
+            )
+
+    def test_pending_range_uses_one_hidden_memoryless_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(root, dream_enabled=False, dream_timezone="Asia/Shanghai")
+            memory = MemoryStore(config.memory_dir, workspace_root=root / "workspace", agent_root=root)
+            session_id = "7" * 16
+            memory.create_session("first", session_id)
+            first_text = "first private preference"
+            second_text = "second private preference"
+            _append(memory, session_id, "user", first_text, "2026-08-02 09:00:00")
+            _append(memory, session_id, "assistant", "ack one", "2026-08-02 09:00:01")
+            _append(memory, session_id, "user", second_text, "2026-08-03 09:00:00")
+            model = _DreamModel()
+            service = DreamService(config, model_runner=model)
+
+            result = asyncio.run(service.process_pending(date(2026, 8, 3), run_id="range-run"))
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.range_start, "2026-08-02")
+            self.assertEqual(result.range_end, "2026-08-03")
+            self.assertEqual(result.execution_session_id, "dream-exec-range-run")
+            journal = root / ".yy" / "dream" / "executions" / "range-run.jsonl"
+            journal_text = journal.read_text(encoding="utf-8")
+            self.assertIn('"memoryless":true', journal_text)
+            self.assertIn('"source_file"', journal_text)
+            self.assertIn('"content_hash"', journal_text)
+            self.assertNotIn(first_text, journal_text)
+            self.assertNotIn(second_text, journal_text)
+            self.assertNotIn("dream-exec-range-run", {
+                str(item["session_id"]) for item in memory.list_sessions()
+            })
+
     def test_gateway_dream_api(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)

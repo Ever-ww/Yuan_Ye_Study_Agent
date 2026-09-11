@@ -23,9 +23,34 @@ from backup.control import ExternalControlLock
 from backup.archive import ArchiveHeader, ArchiveSource, MAGIC, build_sources
 from backup.models import BackupManifest, RestoreFence
 from Agent import load_runtime_config
+from gateway.application import GatewayApplication
 
 
 class BackupTests(unittest.TestCase):
+    def test_automatic_backup_inbox_is_silent_on_success_and_coalesces_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            config = load_runtime_config(Path(value), dream_enabled=False)
+            application = GatewayApplication(config)
+
+            async def scenario() -> None:
+                await application._record_backup_result(
+                    "backup_skipped", {"message": "missing passphrase"},
+                )
+                await application._record_backup_result(
+                    "backup_failed", {"message": "storage unavailable"},
+                )
+                unread = application.store.list_inbox(unread_only=True)
+                self.assertEqual(len(unread), 1)
+                self.assertEqual(unread[0].summary, "storage unavailable")
+
+                await application._record_backup_result(
+                    "backup_completed", {"path": "backup.yybackup"},
+                )
+                self.assertEqual(application.store.list_inbox(unread_only=True), [])
+                self.assertEqual(len(application.store.list_inbox()), 3)
+
+            asyncio.run(scenario())
+
     def test_streaming_archive_round_trip_and_wrong_password(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)

@@ -174,6 +174,32 @@ class GatewayStore:
             row = connection.execute("SELECT * FROM inbox WHERE run_id=?", (run_id,)).fetchone()
         return _inbox_item(row) if row is not None else None
 
+    @lifecycle_mutation
+    def coalesce_project_inbox(
+        self,
+        project_id: str,
+        *,
+        keep_run_id: str | None = None,
+    ) -> int:
+        """Acknowledge superseded background notices without deleting history.
+
+        ``keep_run_id`` remains unread so one current actionable failure can be
+        surfaced.  Passing no run acknowledges every notice for the project,
+        which is used for successful/no-op automatic maintenance.
+        """
+        with self._connect() as connection:
+            if keep_run_id is None:
+                cursor = connection.execute(
+                    "UPDATE inbox SET is_read=1 WHERE project_id=? AND is_read=0",
+                    (project_id,),
+                )
+            else:
+                cursor = connection.execute(
+                    "UPDATE inbox SET is_read=1 WHERE project_id=? AND run_id<>? AND is_read=0",
+                    (project_id, keep_run_id),
+                )
+        return max(0, cursor.rowcount)
+
     def client_connected(self, client_id: str) -> None:
         timestamp = now_iso()
         with self._connect() as connection:
