@@ -19,7 +19,7 @@ import time
 from uuid import uuid4
 
 from .policy import NativePolicy, is_link
-from .session import CommandResult, SandboxRecoveryRequired
+from .session import CommandResult, SandboxRecoveryRequired, SandboxUnavailableError
 
 
 class SECURITY_ATTRIBUTES(C.Structure):
@@ -142,6 +142,26 @@ class WinAPI:
             self.kernel.LocalFree(updated)
             self.kernel.LocalFree(descriptor)
 
+    def check_acl_access(self, path: Path) -> None:
+        """Read-only access probe before any profile/permission side effects.
+
+        MODIFY alone does not include WRITE_DAC, notably for virtualenvs created
+        by a different Windows account. Do not take ownership or elevate here.
+        """
+        if is_link(path):
+            raise SandboxUnavailableError(f"ACL target is a reparse point: {path}", reason_code="unsafe_workspace_entry")
+        handle = self.kernel.CreateFileW(
+            str(path), 0x60000, 7, None, 3, 0x02200000, None,
+        )  # READ_CONTROL | WRITE_DAC; directory + open-reparse-point, no writes
+        if handle == C.c_void_p(-1).value:
+            code = C.get_last_error()
+            raise SandboxUnavailableError(
+                f"Windows AppContainer needs READ_CONTROL/WRITE_DAC on {path} (WinError {code}). "
+                "Use a workspace/toolchain owned by the current user; no automatic ownership or permission override.",
+                reason_code="windows_acl_permission_denied",
+            )
+        self.kernel.CloseHandle(handle)
+
     def stop_job(self, job) -> None:
         try:
             self.check(self.kernel.TerminateJobObject(job, 124))
@@ -250,6 +270,12 @@ class AppContainerRunner:
         # System binaries already have AppContainer execute permission. Do not edit System32 ACLs.
         system = Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve()
         paths = [p for p in paths if not p.is_relative_to(system)]
+        try:
+            for path in paths:
+                api.check_acl_access(path)
+        except BaseException:
+            api.advapi.FreeSid(sid)
+            raise
         record = {"name": name, "paths": [str(p) for p in paths]}
         lease = self.leases / (name + ".json")
         file = lease.open("x+b")

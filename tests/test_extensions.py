@@ -309,7 +309,7 @@ class HookExecutorReliabilityTests(unittest.TestCase):
         core_registry.register(
             HookPoint.TURN_START, slow, timeout_seconds=0.001,
         )
-        with self.assertRaisesRegex(RuntimeError, "failed"):
+        with self.assertRaisesRegex(RuntimeError, "timed out after 0.001 seconds"):
             asyncio.run(core_registry.emit(HookEvent(
                 point=HookPoint.TURN_START, session_id="session", data={},
             )))

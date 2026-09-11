@@ -549,5 +549,17 @@ class GatewayClient:
             response = await client.request(method, f"{self.base_url}{path}", **kwargs)
             if response.status_code == 409:
                 raise RuntimeError(response.json().get("detail", "Gateway 状态冲突"))
+            if response.status_code == 503:
+                # A live control-only Gateway is not ready for chat. Surface the
+                # exact durable resume identity, never silently unfreeze it.
+                lifecycle = await client.get(f"{self.base_url}/api/v1/maintenance")
+                if lifecycle.status_code == 200:
+                    state = lifecycle.json()
+                    if state.get("state") in {"quiesced", "failed"}:
+                        raise RuntimeError(
+                            f"Gateway 处于 {state['state']} 维护状态，未接收新任务。"
+                            f"请先检查 gateway status；确认可恢复后执行 gateway resume "
+                            f"--epoch {state['maintenance_epoch']} --revision {state['revision']}。"
+                        )
             response.raise_for_status()
             return response.json()

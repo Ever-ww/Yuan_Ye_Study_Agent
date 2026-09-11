@@ -36,6 +36,7 @@ def register_context_callbacks(registry: HookRegistry, processor: ContextProcess
         )
         trim_tool_outputs = event.data.get("trim_historical_tool_outputs")
         place_continuity = event.data.get("place_compressed_continuity")
+        current_record = event.data.get("current_user_record_id")
 
         def place_compressed_continuity(result) -> None:
             summary = processor.memory.latest_summary(event.session_id)
@@ -62,6 +63,7 @@ def register_context_callbacks(registry: HookRegistry, processor: ContextProcess
                 selected_messages,
                 selected_tools,
                 current_query=str(event.data.get("task", "")),
+                current_user_record_id=current_record() if callable(current_record) else None,
                 reload_messages=reload_and_trim_after_emergency if callable(emergency_reload) else None,
                 before_reload=place_compressed_continuity,
             )
@@ -86,6 +88,7 @@ def register_context_callbacks(registry: HookRegistry, processor: ContextProcess
                 reload_messages=reload_messages if callable(reload_messages) else None,
                 ephemeral_preview=preview,
                 current_query=str(event.data.get("task", "")),
+                current_user_record_id=current_record() if callable(current_record) else None,
                 reason=estimate.reason,
                 before_reload=place_compressed_continuity,
             )

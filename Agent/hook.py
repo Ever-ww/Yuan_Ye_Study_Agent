@@ -75,6 +75,13 @@ class HookExecutor:
     """Apply timeout and isolation consistently to every Hook callback."""
 
     @staticmethod
+    def _error_message(error: BaseException, timeout_seconds: float) -> str:
+        """Never surface an empty Hook failure such as ``TimeoutError()``."""
+        if isinstance(error, asyncio.TimeoutError):
+            return f"timed out after {timeout_seconds:g} seconds"
+        return str(error).strip() or type(error).__name__
+
+    @staticmethod
     async def _await_in_current_task(
         awaitable: Awaitable[Any], timeout_seconds: float,
     ) -> Any:
@@ -138,8 +145,9 @@ class HookExecutor:
                 return
         if error is None or registration.failure_mode is HookFailureMode.ISOLATE:
             return
+        message = self._error_message(error, registration.timeout_seconds)
         raise RuntimeError(
-            f"Hook {event.point.value}/{registration.identity} failed: {error}"
+            f"Hook {event.point.value}/{registration.identity} failed: {message}"
         ) from error
 
 

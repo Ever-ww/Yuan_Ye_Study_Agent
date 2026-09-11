@@ -825,10 +825,12 @@ class CoreTests(unittest.TestCase):
                 {"role": "system", "content": "规则"},
                 {"role": "user", "content": "旧问题" * 60},
                 {"role": "assistant", "content": "旧回答" * 60},
+                {"role": "user", "content": "上一轮"},
+                {"role": "assistant", "content": "上一答"},
                 {"role": "user", "content": "新问题"},
             ]
             self.assertTrue(processor.trim_messages_if_needed(session_id, messages))
-            self.assertEqual([item["role"] for item in messages], ["system", "user"])
+            self.assertEqual([item["role"] for item in messages], ["system", "user", "assistant", "user"])
             self.assertEqual(messages[-1]["content"], "新问题")
             self.assertEqual(memory.session_records(session_id), original)
 
@@ -1444,6 +1446,7 @@ class CoreTests(unittest.TestCase):
             memory.record_tool_result(session_id, tool_call_id="call_x", name="demo", content=raw, status="success", arguments={})
             # Canonical restore never trims; MODEL_BEFORE owns the projection.
             self.assertEqual(memory.restore_messages(session_id)[1]["content"], raw)
+            memory.record_user(session_id, "上一轮")
             memory.record_model_tool_calls(
                 session_id, content=None,
                 tool_calls=[{"id": "recent", "type": "function", "function": {"name": "demo", "arguments": "{}"}}],

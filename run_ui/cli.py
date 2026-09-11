@@ -410,9 +410,7 @@ async def _chat_gateway(
         _render_restored_history(records)
         await _acknowledge_displayed_history(client, project_id, session_id, records)
     interrupt_controller.bind(asyncio.get_running_loop())
-    unread = await client.inbox(unread_only=True)
-    if unread:
-        console.print(f"[yellow]Inbox 有 {len(unread)} 条未读后台结果。[/]")
+    await _display_and_acknowledge_unread_inbox(client)
     while True:
         try:
             task = console.input("[bold blue]你 > [/]").strip()
@@ -662,6 +660,38 @@ async def _handle_inbox_command(client: GatewayClient, task: str) -> None:
         "[yellow]用法：/inbox；/inbox all；/inbox show <ID>；"
         "/inbox read <ID>；/inbox read-all[/]"
     )
+
+
+async def _display_and_acknowledge_unread_inbox(client: GatewayClient) -> None:
+    """Display pending background notifications once, then acknowledge exactly those rows.
+
+    Fetching an Inbox list is not normally a read receipt.  Chat startup is a
+    deliberate exception because the rows are rendered to the user before they
+    are marked.  Items created concurrently after the fetch remain unread.
+    """
+    unread = await client.inbox(unread_only=True)
+    if not unread:
+        return
+    _render_inbox_table(unread, unread_only=True)
+    acknowledged = 0
+    for item in unread:
+        item_id = item.get("item_id")
+        if not isinstance(item_id, str) or not item_id:
+            continue
+        try:
+            await client.mark_inbox_read(item_id)
+        except Exception:
+            # A read-receipt outage must not prevent chat from starting.  The
+            # same notification will be shown again on the next connection.
+            continue
+        acknowledged += 1
+    if acknowledged:
+        console.print(f"[dim]以上 {acknowledged} 条 Inbox 通知已显示并标记为已读。[/]")
+    if acknowledged != len(unread):
+        console.print(
+            f"[yellow]有 {len(unread) - acknowledged} 条 Inbox 已读确认失败，"
+            "下次连接会再次显示。[/]"
+        )
 
 
 async def _resolve_inbox_item(
@@ -1367,11 +1397,16 @@ def gateway_start(port: int | None = typer.Option(None, "--port")) -> None:
 
 
 @gateway_app.command("stop")
-def gateway_stop(port: int | None = typer.Option(None, "--port")) -> None:
+def gateway_stop(port: int | None = typer.Option(None, "--port"),
+                 timeout: float = typer.Option(30, "--timeout", min=1, max=3600)) -> None:
     """停止当前 Agent Home 的 Gateway。"""
     config = load_runtime_config()
     manager = GatewayProcessManager(config.agent_root, port or config.gateway_port)
-    stopped = manager.stop()
+    try:
+        stopped = manager.stop(timeout_seconds=timeout)
+    except RuntimeError as exc:
+        console.print(f"[yellow]{exc}[/]")
+        raise typer.Exit(code=1) from exc
     console.print("[green]Gateway 已停止[/]" if stopped else "[yellow]Gateway 当前未运行[/]")
 
 

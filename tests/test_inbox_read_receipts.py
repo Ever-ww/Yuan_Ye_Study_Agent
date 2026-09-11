@@ -134,3 +134,46 @@ def test_restore_acknowledges_only_after_rendering(monkeypatch):
     monkeypatch.setattr(cli, "_gateway_project", AsyncMock(return_value={"project_id": "project"}))
     asyncio.run(cli._chat_gateway("session", interrupt_controller=cli.ChatInterruptController()))
     assert client.acknowledge_session_history.await_count == 1
+
+
+def test_chat_startup_displays_then_acknowledges_exact_unread_rows(monkeypatch):
+    displayed = []
+    marked = []
+    items = [inbox_item("background-1"), inbox_item("background-2")]
+
+    class Client:
+        async def inbox(self, unread_only=False):
+            assert unread_only
+            return items
+
+        async def mark_inbox_read(self, item_id):
+            assert displayed == items
+            marked.append(item_id)
+            return {"item_id": item_id, "read": True}
+
+    monkeypatch.setattr(
+        cli,
+        "_render_inbox_table",
+        lambda rows, *, unread_only: displayed.extend(rows),
+    )
+    asyncio.run(cli._display_and_acknowledge_unread_inbox(Client()))
+    assert marked == ["item-background-1", "item-background-2"]
+
+
+def test_chat_startup_receipt_failure_does_not_block_chat(monkeypatch):
+    displayed = []
+
+    class Client:
+        async def inbox(self, unread_only=False):
+            return [inbox_item("background")]
+
+        async def mark_inbox_read(self, item_id):
+            raise ConnectionError(item_id)
+
+    monkeypatch.setattr(
+        cli,
+        "_render_inbox_table",
+        lambda rows, *, unread_only: displayed.extend(rows),
+    )
+    asyncio.run(cli._display_and_acknowledge_unread_inbox(Client()))
+    assert displayed == [inbox_item("background")]

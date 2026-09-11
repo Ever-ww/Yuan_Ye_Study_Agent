@@ -125,7 +125,12 @@ def test_tool_iterations_keep_committed_user_projection(tmp_path):
     assert "new notice" in provider.calls[2][-1]["content"]
 
 
-def test_fragment_withdrawal_summary_dedup_and_provenance(tmp_path):
+def test_fragment_withdrawal_summary_dedup_and_provenance(tmp_path, monkeypatch):
+    class Clock(datetime):
+        @classmethod
+        def now(cls):
+            return datetime(2026, 9, 11, 12).astimezone()
+    monkeypatch.setattr("prompt.runtime_context.datetime", Clock)
     config = config_for(tmp_path)
     memory = MemoryStore(config.memory_dir)
     sid = memory.create_session("start")
@@ -148,6 +153,34 @@ def test_fragment_withdrawal_summary_dedup_and_provenance(tmp_path):
     assert builder.prepare("q3", sid).fragments == {}
     builder.fragments.set(sid, "continuity", summary.replace("summary", "updated summary"))
     assert list(builder.prepare("q3", sid).fragments) == ["continuity"]
+
+
+def test_repeated_query_at_turn_start_places_summary_on_incoming_user(tmp_path):
+    config = config_for(tmp_path).model_copy(update={"compression_threshold_tokens": 100})
+    memory = MemoryStore(config.memory_dir)
+    sid = memory.create_session("start")
+    memory.record_user(sid, "older " * 200)
+    memory.record_assistant(sid, "older answer " * 200)
+    previous_id = memory.record_user(sid, "continue")
+    memory.record_assistant(sid, "previous answer")
+
+    class Compressor(Capture):
+        async def complete(self, messages, tools):
+            self.calls.append(copy.deepcopy(messages))
+            return ModelReply(text=json.dumps({"context_summary_markdown": "older summary"}))
+
+    provider, compressor = Capture(), Compressor()
+    agent = runtime(config, memory, provider, tools=AsyncToolRegistry(),
+                    compression_provider_factory=lambda: compressor)
+    assert asyncio.run(agent.run("continue", sid)).completed
+    assert len(compressor.calls) == 1
+    summary = memory.session_records(sid)[0]
+    assert summary["compression_boundary"] == "turn_start"
+    assert summary["continuity_target_record_id"] is None
+    assert any(ref["record_id"] == previous_id for ref in summary["protected_tail_refs"])
+    users = [m for m in provider.calls[0] if m["role"] == "user"]
+    assert users[0]["content"] == "continue"
+    assert "older summary" in users[-1]["content"]
 
 
 def test_withdrawal_does_not_reset_two_hour_clock_each_turn(tmp_path, monkeypatch):

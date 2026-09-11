@@ -4,11 +4,11 @@
 
 ## 默认行为
 
-- 当前 Turn（最近一次用户消息之后）新产生的工具结果全部保留。
+- 当前 Turn 及上一完整 Turn 的工具结果全部保留。
 - 缺少结果、调用 ID 非法、孤立 Tool 消息或来源不唯一时不猜测、不裁剪。
-- 最近一次用户消息之后产生的 Tool 结果保持完整；更早的完整 Tool Call 组才可裁剪。
+- 裁剪、自动压缩与压缩失败兜底共用 Turn 保护边界；只有更早的完整 Tool Call 组才可裁剪。
 - 中文阈值为 1000 个中日韩统一表意字符，英文阈值为 1000 个单词；另有默认 10000 字符的防御性硬阈值用于代码、Base64和标点密集输出。
-- 正文默认保留前 427、后 427 个 Python 字符，不是单词或 Token；中间只放确定性的 `session_read` 调用参数。
+- 中文阈值触发时正文默认保留头尾各 427 个 Python 字符；英文阈值触发时保留头尾各 427 个完整英文单词，并保留选中范围内的原始标点和空白。两种阈值同时触发时优先字符规则，仅硬字符上限触发也按字符处理。中间放确定性的 `session_read` 调用参数。头尾重叠或预览无法缩短正文时保持原文。
 - 三个阈值均为 0 时关闭裁剪。旧 ratio/protect/diagnostic 配置只为兼容旧配置读取，不参与新规则。
 
 ```json
@@ -17,7 +17,9 @@
   "tool_output_english_threshold_words": 1000,
   "tool_output_max_chars": 10000,
   "tool_output_preview_head_chars": 427,
-  "tool_output_preview_tail_chars": 427
+  "tool_output_preview_tail_chars": 427,
+  "tool_output_preview_head_words": 427,
+  "tool_output_preview_tail_words": 427
 }
 ```
 

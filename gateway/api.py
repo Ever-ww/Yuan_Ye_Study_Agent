@@ -2,7 +2,7 @@
 
 import asyncio
 import secrets
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -571,14 +571,17 @@ def create_gateway_api(
                     await socket.send_text(event.model_dump_json())
                     acknowledge_if_origin(event)
                     last_sent = max(last_sent, event.sequence)
-            while True:
-                event = await queue.get()
-                if event.run_id == run_id and event.sequence <= last_sent:
-                    continue
-                await socket.send_text(event.model_dump_json())
-                acknowledge_if_origin(event)
-                if event.run_id == run_id:
-                    last_sent = event.sequence
+            # An idle subscription must also receive disconnects. Waiting only
+            # on queue.get() strands ASGI tasks when clients leave or Uvicorn
+            # closes sockets during graceful shutdown.
+            async with aclosing(_subscription_events(socket, queue)) as delivery:
+                async for event in delivery:
+                    if event.run_id == run_id and event.sequence <= last_sent:
+                        continue
+                    await socket.send_text(event.model_dump_json())
+                    acknowledge_if_origin(event)
+                    if event.run_id == run_id:
+                        last_sent = event.sequence
         except (WebSocketDisconnect, asyncio.CancelledError):
             pass
         finally:
@@ -617,6 +620,31 @@ def create_gateway_api(
     app.state.access_token = token
     app.state.csrf_token = csrf_token
     return app
+
+
+async def _subscription_events(socket, queue):
+    """Race delivery with peer disconnect; always reap both helper tasks."""
+    async def disconnected():
+        while True:
+            if (await socket.receive())["type"] == "websocket.disconnect":
+                return
+
+    receiver = asyncio.create_task(disconnected())
+    pending = None
+    try:
+        while True:
+            pending = asyncio.create_task(queue.get())
+            done, _ = await asyncio.wait((receiver, pending), return_when=asyncio.FIRST_COMPLETED)
+            if receiver in done:
+                await receiver
+                return
+            yield pending.result()
+    finally:
+        tasks = [receiver] + ([pending] if pending is not None else [])
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _json_response(value: dict[str, Any], status_code: int):

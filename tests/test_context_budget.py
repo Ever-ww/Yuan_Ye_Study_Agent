@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import tempfile
 from pathlib import Path
@@ -162,7 +163,7 @@ def test_mid_turn_compression_protects_previous_turn_and_current_tool_trace() ->
         memory.record_assistant(session_id, "older answer")
         memory.record_user(session_id, "previous question")
         memory.record_assistant(session_id, "previous answer")
-        memory.record_user(session_id, "current question")
+        current_id = memory.record_user(session_id, "current question")
         memory.record_model_tool_calls(
             session_id,
             content=None,
@@ -186,7 +187,7 @@ def test_mid_turn_compression_protects_previous_turn_and_current_tool_trace() ->
 
         result = asyncio.run(ContextProcessor(
             config, memory, provider_factory=lambda: compressor,
-        ).compress_with_policy(session_id, current_query="current question"))
+        ).compress_with_policy(session_id, current_query="current question", current_user_record_id=current_id))
 
         assert result.status == "compressed"
         assert result.boundary == "turn_internal"
@@ -306,3 +307,48 @@ def test_unavailable_auxiliary_compressor_falls_back_to_main() -> None:
 
 async def _collect(runtime: AgentRuntime, task: str, session_id: str):
     return [event async for event in runtime.run_task(task, session_id)]
+
+
+@pytest.mark.parametrize("with_tool_trace", [False, True])
+def test_fallback_keeps_previous_and_current_turn_even_over_hard_limit(tmp_path, with_tool_trace):
+    config = _config(tmp_path, compression_threshold_tokens=800,
+                     model_context_window_tokens=1024,
+                     compression_safety_margin_tokens=100, compression_output_reserve_tokens=0)
+    memory = MemoryStore(config.memory_dir)
+    sid = memory.create_session("task")
+    processor = ContextProcessor(config, memory)
+    protected = [
+        {"role": "user", "content": "previous"},
+        {"role": "assistant", "content": "large previous answer " * 1000},
+        {"role": "user", "content": "current task"},
+    ]
+    if with_tool_trace:
+        protected.extend([
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call", "type": "function",
+                "function": {"name": "demo", "arguments": "{}"},
+            }]},
+            {"role": "tool", "name": "demo", "tool_call_id": "call", "content": "result " * 1000},
+        ])
+    messages = [{"role": "system", "content": "rules"},
+                {"role": "user", "content": "older"},
+                {"role": "assistant", "content": "older answer " * 1000}, *copy.deepcopy(protected)]
+    assert processor.trim_messages_if_needed(sid, messages, force=True)
+    assert messages[1:] == protected
+    assert not processor.trim_messages_if_needed(sid, messages, force=True)
+    with pytest.raises(ContextBudgetExceeded):
+        processor.finalize_request(sid, messages, [])
+
+
+def test_compression_rejects_wrong_current_record_identity(tmp_path):
+    config = _config(tmp_path)
+    memory = MemoryStore(config.memory_dir)
+    sid = memory.create_session("task")
+    previous_id = memory.record_user(sid, "same")
+    memory.record_assistant(sid, "done")
+    memory.record_user(sid, "same")
+    compressor = _CompressionProvider()
+    processor = ContextProcessor(config, memory, provider_factory=lambda: compressor)
+    with pytest.raises(ValueError, match="record identity"):
+        asyncio.run(processor.compress_with_policy(sid, current_query="same", current_user_record_id=previous_id))
+    assert compressor.calls == 0

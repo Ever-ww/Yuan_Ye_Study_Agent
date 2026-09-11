@@ -50,6 +50,8 @@ def register_tool_output_trimming_callbacks(
             "english_threshold_words": projector.policy.english_threshold_words,
             "head_chars": projector.policy.head_chars,
             "tail_chars": projector.policy.tail_chars,
+            "head_words": projector.policy.head_words,
+            "tail_words": projector.policy.tail_words,
         }
 
     # Memory reconstructs the canonical message projection at -100.  Trimming

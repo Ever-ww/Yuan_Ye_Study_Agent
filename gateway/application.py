@@ -1705,6 +1705,11 @@ class GatewayApplication:
         )).state
         await self._finalize_control_plane(state.run_id)
         state = self.state_controller.state(state.run_id)
+        if automatic and result.status == "noop":
+            # A scheduled scan with no new evidence is a healthy heartbeat, not
+            # a user-facing background result.  Keep its durable Run/Inbox row
+            # for audit, but do not grow the unread counter with empty work.
+            self.store.mark_run_inbox_read(state.run_id)
         self.outbox.wake()
         run = self.store.run(state.run_id)
         if result.status == "completed":

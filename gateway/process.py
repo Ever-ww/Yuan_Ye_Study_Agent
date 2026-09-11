@@ -37,6 +37,7 @@ class GatewayProcessManager:
         self.log_path = self.directory / "gateway.log"
         self.stop_request_path = self.directory / "stop.request"
         self.stop_ack_path = self.directory / "stop.ack"
+        self.stopped_path = self.directory / "stopped.json"
         self.restart_request_path = self.directory / "restart.request"
         # This is the external control plane, never the replaceable `.yy` tree.
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -135,7 +136,7 @@ class GatewayProcessManager:
             time.sleep(0.15)
         raise RuntimeError(f"Gateway 启动超时；请查看日志：{self.log_path}")
 
-    def stop(self, timeout_seconds: float = 10.0) -> bool:
+    def stop(self, timeout_seconds: float = 30.0, *, shutdown_grace_seconds: float = 10.0) -> bool:
         startup_lock = InstanceLock(self.startup_lock_path, timeout_seconds=timeout_seconds)
         startup_lock.acquire()
         try:
@@ -158,13 +159,30 @@ class GatewayProcessManager:
                 requested_by="gateway-process-manager", timeout_seconds=timeout_seconds,
             )
             _atomic_json(self.stop_request_path, request.model_dump_json())
-            deadline = time.monotonic() + timeout_seconds
+            # Drain and ASGI/socket teardown are separate phases. Giving both
+            # the same deadline falsely reports failure at the drain boundary.
+            deadline = time.monotonic() + timeout_seconds + shutdown_grace_seconds
+            request_hash = hashlib.sha256(self.stop_request_path.read_bytes()).hexdigest()
+            ack = {}
             while time.monotonic() < deadline:
-                if not _pid_alive(pid) or not self._instance_lock_held():
+                # Lock release precedes Python's final process/stdio teardown.
+                # Wait for both, otherwise Windows still holds gateway.log open.
+                if not _pid_alive(pid) and not self._instance_lock_held():
                     self._cleanup_stopped_instance()
                     return True
+                ack = _read_control_json(self.stop_ack_path)
+                if ack.get("request_hash") == request_hash and ack.get("instance_id") == request.instance_id:
+                    if ack.get("status") == "failed":
+                        raise RuntimeError(
+                            f"Gateway drain 失败（{ack.get('error_type')}）；未强杀任务。"
+                            f"状态={ack.get('state')}。运行 gateway status 查看详情；"
+                            "工作结束后重试 stop，或按 epoch/revision 执行 gateway resume。"
+                        )
                 time.sleep(0.1)
-            raise RuntimeError(f"Gateway drain 超过 {timeout_seconds:g} 秒；未强杀任务，请检查 stop.ack 与 maintenance 状态")
+            phase = "已 quiesced，但连接/进程退出超时" if (
+                ack.get("request_hash") == request_hash and ack.get("status") == "completed"
+            ) else f"drain 超过 {timeout_seconds:g} 秒"
+            raise RuntimeError(f"Gateway {phase}；未强杀任务，请检查 gateway status、stop.ack 与 maintenance 状态")
         finally:
             startup_lock.close()
 
@@ -310,6 +328,7 @@ def run_gateway(agent_root: Path, port: int) -> None:
     import uvicorn
     from Agent import load_runtime_config
     from gateway.api import create_gateway_api
+    from gateway.application import GatewayApplication
     from gateway.models import now_iso
 
     root = agent_root.resolve()
@@ -344,12 +363,15 @@ def run_gateway(agent_root: Path, port: int) -> None:
         temporary.replace(manager.instance_path)
         try:
             config = load_runtime_config(root, gateway_port=port)
-            api = create_gateway_api(access_token=token)
+            api = create_gateway_api(GatewayApplication(config), access_token=token)
             server = uvicorn.Server(uvicorn.Config(
                 api,
                 host="127.0.0.1",
                 port=port,
                 log_config=None,
+                # User work has already crossed the durable quiesce boundary
+                # for a stop request. Bound leftover HTTP/WebSocket teardown.
+                timeout_graceful_shutdown=5,
             ))
 
             async def serve_until_stopped() -> None:
@@ -368,7 +390,9 @@ def run_gateway(agent_root: Path, port: int) -> None:
                         current_loop.default_exception_handler(context)
 
                 loop.set_exception_handler(handle_loop_exception)
+                await resume_completed_operator_stop(manager, api.state.gateway)
                 serving = asyncio.create_task(server.serve())
+                stopped_by_request = False
                 try:
                     while not serving.done():
                         if not server.started:
@@ -385,6 +409,7 @@ def run_gateway(agent_root: Path, port: int) -> None:
                                 # shut down/cancel active user work.
                                 logging.getLogger(__name__).error("Gateway control request failed: %s", type(exc).__name__)
                         if stop_ready:
+                            stopped_by_request = True
                             server.should_exit = True
                             break
                         if manager.restart_request_path.exists():
@@ -392,6 +417,15 @@ def run_gateway(agent_root: Path, port: int) -> None:
                             break
                         await asyncio.sleep(0.2)
                     await serving
+                    if stopped_by_request:
+                        snapshot = api.state.gateway.maintenance.snapshot
+                        if snapshot.state == MaintenanceState.QUIESCED and snapshot.reason == "operator stop":
+                            _atomic_json(manager.stopped_path, json.dumps({
+                                "instance_id": instance_id,
+                                "maintenance_epoch": snapshot.maintenance_epoch,
+                                "revision": snapshot.revision,
+                                "operation_id": snapshot.operation_id,
+                            }, sort_keys=True))
                 finally:
                     try:
                         if not serving.done():
@@ -439,10 +473,37 @@ async def process_control_request(manager, gateway, instance_id: str) -> bool:
                       state=gateway.write_gate.state.value)
     except Exception as exc:
         result.update(status="failed", error_type=type(exc).__name__,
-                      state=gateway.write_gate.state.value)
+                      state=gateway.write_gate.state.value,
+                      lifecycle_revision=gateway.maintenance.snapshot.revision)
     result["completed_at"] = datetime.now().astimezone().isoformat()
     _atomic_json(manager.stop_ack_path, json.dumps(result, sort_keys=True))
     return result.get("status") == "completed" and result.get("action") == "stop"
+
+
+def _read_control_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+async def resume_completed_operator_stop(manager, gateway) -> bool:
+    """A clean operator stop can restart; crash/backup/FAILED stays control-only.
+
+    The marker is only evidence of completed ASGI teardown, not lifecycle
+    authority. Resume still validates the canonical epoch/revision, restore
+    fence, participants and database health through the maintenance controller.
+    """
+    marker = _read_control_json(manager.stopped_path)
+    snapshot = gateway.maintenance.snapshot
+    if not marker or snapshot.state != MaintenanceState.QUIESCED or snapshot.reason != "operator stop":
+        return False
+    if any(marker.get(key) != getattr(snapshot, key) for key in ("maintenance_epoch", "revision", "operation_id")):
+        return False
+    await gateway.resume(snapshot.maintenance_epoch, expected_revision=snapshot.revision)
+    manager.stopped_path.unlink(missing_ok=True)
+    return True
 
 
 class _GatewayProtocolNoiseFilter(logging.Filter):

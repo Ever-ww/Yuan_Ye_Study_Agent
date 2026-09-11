@@ -10,6 +10,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any
+from memory.turn_boundary import protected_turn_start
 
 
 MARKER = "[如想查看全部tool call输出内容，请调用工具session_read："
@@ -34,6 +35,8 @@ class ToolOutputProjectionPolicy:
     max_chars: int = 10000
     head_chars: int = 427
     tail_chars: int = 427
+    head_words: int = 427
+    tail_words: int = 427
 
     @classmethod
     def from_config(cls, config: Any) -> "ToolOutputProjectionPolicy":
@@ -43,6 +46,8 @@ class ToolOutputProjectionPolicy:
             max_chars=config.tool_output_max_chars,
             head_chars=config.tool_output_preview_head_chars,
             tail_chars=config.tool_output_preview_tail_chars,
+            head_words=config.tool_output_preview_head_words,
+            tail_words=config.tool_output_preview_tail_words,
         )
 
     def should_trim(self, content: str) -> bool:
@@ -98,8 +103,7 @@ class ToolOutputProjector:
     ) -> int:
         """Trim old complete Tool groups while preserving the latest conversation.
 
-        The latest conversation starts at the last user message.  Tool calls
-        produced after it remain byte-for-byte intact on every model iteration.
+        The current and previous user blocks remain byte-for-byte intact.
         Incomplete/orphan results and records without an exact durable selector
         also remain intact.
         """
@@ -107,15 +111,10 @@ class ToolOutputProjector:
                     self.policy.max_chars)):
             return 0
         groups = self._complete_groups(messages)
-        last_user = max(
-            (index for index, value in enumerate(messages) if value.get("role") == "user"),
-            default=-1,
-        )
-        if last_user < 0:
-            return 0
-        eligible = {index for group in groups for index in group if index < last_user}
-        if protect_current_turn:
-            eligible = {i for i in eligible if i < last_user}
+        boundary = protected_turn_start(messages)
+        # Keep the argument for compatibility; protection cannot be disabled.
+        del protect_current_turn
+        eligible = {index for group in groups for index in group if index < boundary}
         saved = 0
         for index in sorted(eligible):
             message = messages[index]
@@ -136,6 +135,8 @@ class ToolOutputProjector:
                 # would discard information the model cannot retrieve again.
                 continue
             preview = self.render(record)
+            if len(preview) >= len(body):
+                continue
             message["content"] = preview
             saved += max(0, len(body) - len(preview))
         return saved
@@ -148,8 +149,20 @@ class ToolOutputProjector:
             "offset": 0,
             "limited": 1,
         }
-        head = body[:self.policy.head_chars]
-        tail = body[-self.policy.tail_chars:] if self.policy.tail_chars else ""
+        # Mixed output crossing the CJK threshold uses character boundaries;
+        # otherwise English threshold crossings preserve whole words.
+        if (not _exceeds_matches(_CJK, body, self.policy.cjk_threshold_chars)
+                and _exceeds_matches(_ENGLISH_WORD, body, self.policy.english_threshold_words)):
+            words = list(_ENGLISH_WORD.finditer(body))
+            if len(words) <= self.policy.head_words + self.policy.tail_words:
+                return body
+            head = body[:words[self.policy.head_words - 1].end()] if self.policy.head_words else ""
+            tail = body[words[-self.policy.tail_words].start():] if self.policy.tail_words else ""
+        else:
+            if len(body) <= self.policy.head_chars + self.policy.tail_chars:
+                return body
+            head = body[:self.policy.head_chars]
+            tail = body[-self.policy.tail_chars:] if self.policy.tail_chars else ""
         instruction = (
             MARKER
             + json.dumps(selector, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

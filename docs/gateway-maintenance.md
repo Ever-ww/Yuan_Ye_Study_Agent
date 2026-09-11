@@ -127,6 +127,18 @@ ACK 含请求 hash、状态、revision、完成时间和结构化错误。同请
 官方 stop 不再 SIGTERM 回退；失败时保留现场。Harness 自动重启仅能自动恢复自己 request_id 对应的
 QUIESCED 维护，不会解锁管理员发起的维护。
 
+普通 `gateway stop --timeout 30` 将任务 drain 与连接退出分开等待：默认 drain
+30 秒，再给 ASGI 退出 10 秒。WebSocket 同时等待事件和客户端断开，空闲连接
+不会把停机永远挂住；Uvicorn 的连接收尾最多等待 5 秒。没有成功 quiesce 时
+不会通过超时强杀 Run。失败 ACK 会立即反馈 CLI，不再展示内部 traceback。
+
+正常 operator stop 完成整个 ASGI/lifespan 退出后才写 `stopped.json`。
+下一进程只有当它与 Canonical lifecycle 的 epoch、revision、operation_id
+全部匹配，且状态为 `QUIESCED / operator stop` 时，才通过现有健康检查与 CAS
+resume 恢复准入。崩溃、FAILED、Backup/Restore 或不匹配证据仍是 control-only。
+旧版本遗留的 QUIESCED 实例没有该完成证据，需要检查后显式 `gateway resume`；
+不删状态库、instance lock、stop.ack 或恢复证据来伪造“已恢复”。
+
 ## 6. 运维入口
 
 ```text

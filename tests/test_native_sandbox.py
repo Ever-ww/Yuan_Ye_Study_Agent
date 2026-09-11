@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 from pathlib import Path
 import socket
 import sys
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from Agent.config import RuntimeConfig
 from sandbox import create_sandbox_session, NativeSandboxSession, DockerSandboxSession, SandboxStatus
@@ -52,6 +53,38 @@ class NativeSandboxTests(unittest.TestCase):
             self.assertIsInstance(create_sandbox_session(config.model_copy(update={"sandbox_backend": "docker"})), DockerSandboxSession)
             with self.assertRaises(ValueError):
                 RuntimeConfig(agent_root=root, workspace_root=root, sandbox_backend="host")
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows permission preflight")
+    def test_acl_preflight_reports_target_without_mutating_acl(self):
+        import ctypes
+        from sandbox.windows import WinAPI
+        with tempfile.TemporaryDirectory() as value:
+            api = object.__new__(WinAPI)
+            api.kernel = MagicMock()
+            api.advapi = MagicMock()
+            api.kernel.CreateFileW.return_value = ctypes.c_void_p(-1).value
+            with self.assertRaisesRegex(SandboxUnavailableError, "READ_CONTROL/WRITE_DAC") as failure:
+                api.check_acl_access(Path(value))
+            self.assertEqual(failure.exception.reason_code, "windows_acl_permission_denied")
+            api.advapi.SetNamedSecurityInfoW.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows permission preflight")
+    def test_acl_denied_before_profile_and_lease_does_not_create_unknown_side_effect(self):
+        import threading
+        from sandbox.windows import AppContainerRunner
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value) / "workspace"
+            root.mkdir()
+            api = MagicMock()
+            api.userenv.DeriveAppContainerSidFromAppContainerName.return_value = 0
+            api.check_acl_access.side_effect = SandboxUnavailableError("no WRITE_DAC", reason_code="windows_acl_permission_denied")
+            runner = AppContainerRunner(NativePolicy(root), Path(value))
+            with patch("sandbox.windows.WinAPI", return_value=api):
+                with self.assertRaises(SandboxUnavailableError):
+                    runner._run([r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"], 30, threading.Event())
+            api.userenv.CreateAppContainerProfile.assert_not_called()
+            api.acl.assert_not_called()
+            self.assertEqual(list(runner.leases.iterdir()), [])
 
     def test_shell_argument_is_not_reparsed_by_host(self):
         command = 'echo "a b"; echo $TOKEN'
@@ -100,6 +133,38 @@ class NativeSandboxTests(unittest.TestCase):
             os.link(root / "a", root / "b")
             with self.assertRaises(SandboxUnavailableError):
                 NativePolicy(root).protected_paths()
+
+    def test_uv_cache_hardlinks_are_hidden_not_granted_as_source(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            cache = root / ".uv-cache"
+            cache.mkdir()
+            venv = root / ".venv"
+            venv.mkdir()
+            (cache / "package.py").write_text("cached dependency")
+            os.link(cache / "package.py", venv / "package.py")
+            policy = NativePolicy(root)
+            self.assertEqual(dict(policy.protected_paths()), {cache: True, venv: False})
+            args = linux_arguments(policy, "bwrap", ["/bin/bash", "-c", "pwd"])
+            self.assertIn(["--tmpfs", str(cache)], [args[i:i+2] for i in range(len(args))])
+            profile = seatbelt_profile(policy, root / "temp")
+            self.assertIn(f'(deny file-read* (subpath {json.dumps(str(cache))}))', profile)
+            # A link to that same cache in writable source still fails closed.
+            os.link(cache / "package.py", root / "unsafe.py")
+            with self.assertRaisesRegex(SandboxUnavailableError, "unsafe.py"):
+                policy.protected_paths()
+
+    def test_cargo_build_hardlinks_are_readonly_but_arbitrary_target_is_not_exempt(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            target = root / "target"
+            target.mkdir()
+            (target / "build-script").write_text("artifact")
+            os.link(target / "build-script", target / "build-script-abc")
+            with self.assertRaises(SandboxUnavailableError):
+                NativePolicy(root).protected_paths()
+            (root / "Cargo.toml").write_text("[package]")
+            self.assertEqual(dict(NativePolicy(root).protected_paths()), {target: False})
 
     def test_unavailable_os_never_launches_docker_or_host(self):
         async def check(root):

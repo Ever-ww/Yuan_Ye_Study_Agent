@@ -23,7 +23,7 @@ def group(ids, *, body=None, name="demo", status="success"):
 
 def test_preview_427_characters_and_current_conversation_protection():
     body = "甲" * 427 + "中" * 12000 + "乙" * 427
-    original = group(["old"], body=body) + [{"role": "user", "content": "now"}] + group(["a", "b", "c", "d"])
+    original = group(["old"], body=body) + [{"role": "user", "content": "previous"}] + group(["previous"], body=body) + [{"role": "user", "content": "now"}] + group(["a", "b", "c", "d"])
     messages = copy.deepcopy(original)
     projector = ToolOutputProjector(ToolOutputProjectionPolicy(), original)
     assert projector.project(messages) > 0
@@ -40,7 +40,7 @@ def test_preview_427_characters_and_current_conversation_protection():
 
 
 def test_incomplete_orphan_and_current_groups_never_trimmed():
-    old = group(["old"]) + group(["protected"])
+    old = group(["old"]) + [{"role": "user", "content": "previous"}] + group(["protected"])
     current = [{"role": "user", "content": "continue"}] + group(["current1"]) + group(["current2"])
     incomplete = group(["pending1", "pending2"])[:-1]
     orphan = [{"role": "tool", "name": "demo", "tool_call_id": "orphan", "content": "X" * 12000}]
@@ -49,12 +49,11 @@ def test_incomplete_orphan_and_current_groups_never_trimmed():
     projector = ToolOutputProjector(ToolOutputProjectionPolicy(), old)
     projector.project(messages, protect_current_turn=True)
     assert MARKER in messages[1]["content"]
-    assert MARKER in messages[3]["content"]
-    assert messages[4:] == original[4:]
+    assert messages[2:] == original[2:]
 
 
 def test_recovered_current_run_is_not_mistaken_for_historical_output():
-    old = group(["old"]) + group(["recent"])
+    old = group(["old"]) + [{"role": "user", "content": "previous"}] + group(["recent"])
     current = group(["current1"]) + group(["current2"])
     for record in current:
         record["run_id"] = "recovering-run"
@@ -62,25 +61,24 @@ def test_recovered_current_run_is_not_mistaken_for_historical_output():
     messages = copy.deepcopy(original)
     ToolOutputProjector(ToolOutputProjectionPolicy(), original, current_run_id="recovering-run").project(messages)
     assert MARKER in messages[1]["content"]
-    assert MARKER in messages[3]["content"]
-    assert messages[5:] == original[5:]
+    assert messages[2:] == original[2:]
 
 
 def test_chinese_and_english_thresholds_are_independent_and_strict():
-    policy = ToolOutputProjectionPolicy(max_chars=0, head_chars=3, tail_chars=3)
+    policy = ToolOutputProjectionPolicy(max_chars=0, head_chars=3, tail_chars=3, head_words=3, tail_words=3)
     assert not policy.should_trim("中" * 1000)
     assert policy.should_trim("中" * 1001)
     assert not policy.should_trim("word " * 1000)
     assert policy.should_trim("word " * 1001)
-    records = group(["log"], body="word " * 1001) + [{"role": "user", "content": "now"}]
+    records = group(["log"], body="word " * 1001) + [{"role": "user", "content": "previous"}, {"role": "assistant", "content": "done"}, {"role": "user", "content": "now"}]
     messages = copy.deepcopy(records)
     ToolOutputProjector(policy, records).project(messages)
-    assert messages[1]["content"].startswith("wor\n" + MARKER)
-    assert messages[1]["content"].endswith("rd ")
+    assert messages[1]["content"].startswith("word word word\n" + MARKER)
+    assert messages[1]["content"].endswith("word word word ")
 
 
 def test_unproven_ambiguous_and_small_observations_are_preserved():
-    records = group(["old"]) + [{"role": "user", "content": "now"}]
+    records = group(["old"]) + [{"role": "user", "content": "previous"}, {"role": "assistant", "content": "done"}, {"role": "user", "content": "now"}]
     for evidence in ([], [*records, records[1]]):
         messages = copy.deepcopy(records)
         assert ToolOutputProjector(ToolOutputProjectionPolicy(), evidence).project(messages) == 0
@@ -181,6 +179,11 @@ def test_preview_policy_config_defaults_and_validation(tmp_path):
     policy = ToolOutputProjectionPolicy.from_config(config)
     assert (policy.cjk_threshold_chars, policy.english_threshold_words) == (1000, 1000)
     assert (policy.head_chars, policy.tail_chars) == (427, 427)
+    assert (policy.head_words, policy.tail_words) == (427, 427)
+    custom = ToolOutputProjectionPolicy.from_config(load_runtime_config(
+        tmp_path, tool_output_preview_head_words=100, tool_output_preview_tail_words=200,
+    ))
+    assert (custom.head_words, custom.tail_words) == (100, 200)
     with pytest.raises(ValueError):
         load_runtime_config(tmp_path, tool_output_protect_recent_groups=0)
 
@@ -279,11 +282,11 @@ def test_runtime_hook_preview_requires_history_tool_and_keeps_prefix(tmp_path, h
             assert (await runtime.run(question, sid)).completed
         await runtime.close()
     asyncio.run(check())
-    for request in provider.requests:
+    for index, request in enumerate(provider.requests):
         old = next(m for m in request if m.get("tool_call_id") == "old")["content"]
         assert (MARKER in old) is history_available
         recent = next(m for m in request if m.get("tool_call_id") == "recent")["content"]
-        assert (MARKER in recent) is history_available
+        assert (MARKER in recent) is (history_available and index > 0)
     assert provider.requests[0][0] == provider.requests[1][0]
     assert all(MARKER not in str(record.get("content")) for record in memory.session_records(sid))
 
@@ -302,3 +305,26 @@ def test_budget_recheck_does_not_own_tool_output_trimming(tmp_path):
     assert estimate.projected_tool_output_tokens == 0
     assert messages == first
     assert all(MARKER not in str(m.get("content")) for m in messages)
+
+
+def test_english_preview_keeps_427_whole_words_and_never_expands_output():
+    body = "alpha-beta " * 1100
+    record = group(["english"], body=body)[1]
+    projector = ToolOutputProjector(ToolOutputProjectionPolicy(), [record])
+    preview = projector.render(record)
+    head, instruction, tail = preview.split("\n")
+    assert head.split() == ["alpha-beta"] * 427
+    assert tail.split() == ["alpha-beta"] * 427
+    assert MARKER in instruction
+    assert len(preview) < len(body)
+    assert record["content"] == body
+    # Oversized configured edges must not duplicate overlapping content.
+    oversized = ToolOutputProjectionPolicy(head_words=1000, tail_words=1000)
+    assert ToolOutputProjector(oversized, [record]).render(record) == body
+
+
+def test_one_current_turn_without_previous_is_never_trimmed():
+    messages = [{"role": "user", "content": "current"}, *group(["current"])]
+    original = copy.deepcopy(messages)
+    assert ToolOutputProjector(ToolOutputProjectionPolicy(), messages).project(messages) == 0
+    assert messages == original

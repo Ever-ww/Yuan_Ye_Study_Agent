@@ -72,6 +72,9 @@ def register_memory_callbacks(
         dynamic = getattr(prompts, "dynamic_context", None)
         fragments = getattr(dynamic, "fragments", None)
         turn = provider_turns.setdefault(event.session_id, {})
+        # A getter observes persistence later in this same MODEL_BEFORE pass,
+        # including a Provider rejection on the first model call.
+        event.data["current_user_record_id"] = lambda: turn.get("record_id")
         if fragments is not None:
             event.data["register_provider_context_fragment"] = lambda name, content: fragments.set(
                 event.session_id, name, content,

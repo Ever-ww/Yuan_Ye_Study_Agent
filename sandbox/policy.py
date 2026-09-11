@@ -8,7 +8,9 @@ from pathlib import Path
 
 from .session import SandboxUnavailableError
 
-PROTECTED = frozenset({".git", ".yy", ".yy-backups", ".agents", ".codex"})
+# uv installs use hardlinks into this cache. Hide the cache entirely rather than
+# treating its package objects as writable source (or allowing arbitrary aliases).
+PROTECTED = frozenset({".git", ".yy", ".yy-backups", ".agents", ".codex", ".uv-cache"})
 READ_ONLY = frozenset({".venv"})
 
 
@@ -48,12 +50,15 @@ class NativePolicy:
                     found.append((path, True))
                     if name in dirs:
                         dirs.remove(name)
-                elif name in READ_ONLY:
+                elif name in READ_ONLY or (name == "target" and (base / "Cargo.toml").is_file()):
                     if is_link(path):
                         raise SandboxUnavailableError("Read-only toolchain must not be a link", reason_code="unsafe_toolchain")
                     found.append((path, False))
                     if name in dirs:
                         dirs.remove(name)
                 elif is_link(path) or (path.is_file() and path.stat().st_nlink > 1) or not (path.is_file() or path.is_dir()):
-                    raise SandboxUnavailableError("Workspace links, hardlinks and special files require review", reason_code="unsafe_workspace_entry")
+                    raise SandboxUnavailableError(
+                        f"Workspace links, hardlinks and special files require review: {path.relative_to(self.workspace)}",
+                        reason_code="unsafe_workspace_entry",
+                    )
         return tuple(sorted(found, key=lambda item: str(item[0])))

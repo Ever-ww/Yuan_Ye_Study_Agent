@@ -360,6 +360,25 @@ class SandboxTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             asyncio.run(check(Path(value)))
 
+    def test_sandbox_trace_start_has_room_for_native_probe_and_checkpoint(self) -> None:
+        from sandbox.callbacks import (
+            SANDBOX_START_HOOK_TIMEOUT_SECONDS,
+            register_sandbox_callbacks,
+        )
+
+        class Registry:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def register(self, point, callback, **kwargs):
+                self.calls.append((point, callback, kwargs))
+
+        registry = Registry()
+        register_sandbox_callbacks(registry, object())
+        start = next(call for call in registry.calls if call[0] is HookPoint.TRACE_START)
+        self.assertEqual(start[2]["timeout_seconds"], SANDBOX_START_HOOK_TIMEOUT_SECONDS)
+        self.assertGreater(SANDBOX_START_HOOK_TIMEOUT_SECONDS, 30)
+
     def test_missing_cli_uses_checkpoint_only_without_subprocess(self) -> None:
         async def check(root: Path) -> None:
             sandbox = DockerSandboxSession(root)

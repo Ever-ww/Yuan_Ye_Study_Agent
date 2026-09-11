@@ -73,6 +73,20 @@ Query Context 中获得 shell/backend 信息，不重建稳定 System Prompt。
 
 ## 文件与进程边界
 
+依赖缓存不视为可写源码：`.uv-cache` 完全隐藏；`.venv` 和
+紧邻 `Cargo.toml` 的 `target` 目录只读。uv/Cargo 在这些目录内部生成的硬链接
+不再导致整个 Workspace 禁用 Shell；可写源码里的硬链接、symlink、reparse point
+仍拒绝执行，并在错误中显示具体相对路径。不会修改、删除缓存或全局放行硬链接。
+如需重新构建 Rust，请显式将 `CARGO_TARGET_DIR` 指向 Workspace 内新的普通输出目录。
+隔离自检必须真实通过；Docker 仍仅是显式备用选项，不回退到无隔离 Shell。
+
+Windows 在创建 AppContainer 和写 ACL 前检查所有授权路径的
+`READ_CONTROL/WRITE_DAC`。由其他账户（如 CodexSandboxOffline）创建的 `.venv`
+可能只有普通 Modify 权限，不允许当前用户修改 DACL；这时会明确报告
+`windows_acl_permission_denied` 及路径，不先写权限再误报未知清理状态。
+应由用户在停止相关进程后，以自己的账户重建工具链，或由管理员明确修复目录
+权限；Runtime 不自动接管所有权、不改全局 ACL，也不要求以管理员身份运行 Agent。
+
 Linux 只挂载系统运行库、明确只读根与 workspace；不映射用户 Home 和主机 socket。
 `.git`、`.yy`、`.yy-backups`、`.agents`、`.codex`、已有 `.env*` 等保护路径被遮蔽。
 macOS 通过 Seatbelt 限定读写范围并显式拒绝网络和保护路径。

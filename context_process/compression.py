@@ -14,6 +14,7 @@ from Agent.config import RuntimeConfig
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models import build_provider
 from memory import MemoryStore
+from memory.turn_boundary import protected_turn_start
 from prompt import compose_compression_messages
 from tool import AsyncToolRegistry
 from .budget import (
@@ -126,6 +127,7 @@ class ContextProcessor:
         session_id: str,
         *,
         current_query: str | None = None,
+        current_user_record_id: str | None = None,
         summary_metadata: dict[str, object] | None = None,
         skill_catalog: dict[str, object] | None = None,
         reason: str = "projected_total",
@@ -143,6 +145,7 @@ class ContextProcessor:
             records,
             self.budget.policy,
             current_query=current_query,
+            current_user_record_id=current_user_record_id,
             protect_recent=protect_recent,
         )
         compressible, protected = selection.compressible, selection.protected
@@ -229,7 +232,7 @@ class ContextProcessor:
                     metadata = dict(summary_metadata or {})
                     current_query_record = next((
                         record for record in protected
-                        if record.get("role") == "user" and record.get("content") == current_query
+                        if record.get("role") == "user" and record.get("record_id") == current_user_record_id
                     ), None)
                     metadata.update({
                         "summary_original_segments": sorted(original_segments),
@@ -303,6 +306,7 @@ class ContextProcessor:
         reload_messages: Callable[[], list[dict[str, Any]]] | None = None,
         ephemeral_preview: str | None = None,
         current_query: str | None = None,
+        current_user_record_id: str | None = None,
         reason: str | None = None,
         before_reload: Callable[[CompressionResult], None] | None = None,
     ) -> CompressionResult | None:
@@ -320,6 +324,7 @@ class ContextProcessor:
         result = await self.compress_with_policy(
             session_id,
             current_query=current_query,
+            current_user_record_id=current_user_record_id,
             reason=reason or estimate.reason,
         )
         if result.status == "compressed" and reload_messages is not None:
@@ -395,6 +400,7 @@ class ContextProcessor:
         tools: list[dict[str, Any]],
         *,
         current_query: str,
+        current_user_record_id: str | None = None,
         reload_messages: Callable[[], list[dict[str, Any]]] | None,
         before_reload: Callable[[CompressionResult], None] | None = None,
     ) -> CompressionResult:
@@ -402,6 +408,7 @@ class ContextProcessor:
         result = await self.compress_with_policy(
             session_id,
             current_query=current_query,
+            current_user_record_id=current_user_record_id,
             reason="provider_context_rejection",
             protect_recent=True,
         )
@@ -450,13 +457,14 @@ class ContextProcessor:
         rest = list(messages)
         while rest and rest[0].get("role") == "system":
             systems.append(rest.pop(0))
-        current = rest.pop() if rest and rest[-1].get("role") == "user" else None
-        blocks = _conversation_blocks(rest)
+        boundary = protected_turn_start(rest)
+        protected = rest[boundary:]
+        blocks = _conversation_blocks(rest[:boundary])
         changed = False
-        while blocks and _message_tokens([*systems, *(item for block in blocks for item in block), *([current] if current else [])]) > threshold:
+        while blocks and _message_tokens([*systems, *(item for block in blocks for item in block), *protected]) > threshold:
             blocks.pop(0)
             changed = True
-        messages[:] = [*systems, *(item for block in blocks for item in block), *([current] if current else [])]
+        messages[:] = [*systems, *(item for block in blocks for item in block), *protected]
         return changed
 
     async def _run_compression_agent(self, messages: list[dict[str, str]], provider: Any) -> str:
@@ -590,6 +598,7 @@ def _select_compression_records(
     *,
     current_query: str | None,
     protect_recent: bool,
+    current_user_record_id: str | None = None,
 ) -> _CompressionSelection:
     summaries = [record for record in records if record.get("role") == "summary"]
     conversational = [record for record in records if record.get("role") in {"user", "assistant", "tool"}]
@@ -597,7 +606,7 @@ def _select_compression_records(
     # The policy argument is retained for private API compatibility. Automatic
     # protection is now defined by complete Turn boundaries, never by a raw
     # message count or an approximate token ratio.
-    del policy
+    del policy, current_query
     if not protect_recent:
         return _CompressionSelection(
             compressible=[*summaries, *conversational],
@@ -606,21 +615,19 @@ def _select_compression_records(
         )
 
     boundary: Literal["turn_start", "turn_internal"] = "turn_start"
-    protected_blocks: list[list[dict[str, Any]]] = []
     continuity_target_record_id: str | None = None
+    if current_user_record_id is not None and not blocks:
+        raise ValueError("Current Turn record identity is missing from canonical history")
     if blocks:
         latest_user = next((item for item in blocks[-1] if item.get("role") == "user"), None)
-        inside_turn = bool(
-            current_query is not None
-            and latest_user is not None
-            and latest_user.get("content") == current_query
-        )
+        inside_turn = current_user_record_id is not None
+        if inside_turn and (latest_user is None or latest_user.get("record_id") != current_user_record_id):
+            raise ValueError("Current Turn record identity does not match the latest canonical user")
         if inside_turn:
             boundary = "turn_internal"
             # Preserve the entire current block, including all assistant Tool
             # requests and Tool observations already committed in this Turn.
             # Preserve the previous full Turn as the stable summary anchor.
-            protected_blocks = blocks[-2:]
             if len(blocks) >= 2:
                 anchor = next(
                     (item for item in blocks[-2] if item.get("role") == "user"),
@@ -628,16 +635,9 @@ def _select_compression_records(
                 )
                 if anchor is not None and isinstance(anchor.get("record_id"), str):
                     continuity_target_record_id = str(anchor["record_id"])
-        else:
-            # The current query has not been durably appended yet.  Keep the
-            # immediately preceding Turn intact and attach the new summary to
-            # the incoming user query after rollover.
-            protected_blocks = blocks[-1:]
 
-    protected_ids = {
-        id(record)
-        for record in (item for block in protected_blocks for item in block)
-    }
+    start = protected_turn_start(conversational, current_turn_present=current_user_record_id is not None)
+    protected_ids = {id(record) for record in conversational[start:]}
     protected = [record for record in conversational if id(record) in protected_ids]
     compressible = [*summaries, *(record for record in conversational if id(record) not in protected_ids)]
     return _CompressionSelection(

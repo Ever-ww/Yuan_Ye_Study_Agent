@@ -7,6 +7,12 @@ from Agent.hook import HookEvent, HookPoint, HookRegistry
 from .docker import SandboxSessionProtocol, sandbox_status_of
 
 
+# Native Windows sandbox startup performs a real AppContainer launch plus
+# checkpoint initialization.  Its inner command timeout is 30 seconds, so the
+# enclosing Core Hook must leave room for ACL setup/cleanup and checkpoint I/O.
+SANDBOX_START_HOOK_TIMEOUT_SECONDS = 60.0
+
+
 def register_sandbox_callbacks(
     registry: HookRegistry,
     sandbox: SandboxSessionProtocol,
@@ -21,5 +27,10 @@ def register_sandbox_callbacks(
     async def close_sandbox(event: HookEvent) -> None:
         await sandbox.close()
 
-    registry.register(HookPoint.TRACE_START, start_sandbox, priority=-300)
+    registry.register(
+        HookPoint.TRACE_START,
+        start_sandbox,
+        priority=-300,
+        timeout_seconds=SANDBOX_START_HOOK_TIMEOUT_SECONDS,
+    )
     registry.register(HookPoint.TRACE_END, close_sandbox, priority=300)
