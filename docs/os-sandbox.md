@@ -58,13 +58,15 @@ OS 后端失败不会自动启动 Docker，也不会自动改成无隔离宿主�
 
 ## 生命周期与失败
 
-`TRACE_START` 在所选隔离后端内执行一次受控启动探测，然后创建 Checkpoint 基线。
+`TRACE_START` 只验证静态 Policy、打开或复用 Checkpoint 基线，并把 OS 后端标记为
+`os_lazy`；普通问答不会创建 AppContainer、ACL 或隔离进程。第一次真正调用 Bash
+时才复用或重建 Workspace 安全扫描缓存、建立短期 Sandbox Lease 并执行受控探测。
 启动能力不足时进入 `checkpoint_only`；Registry 移除 Bash Schema，也拒绝伪造调用。
 读取、编辑、写入和 Checkpoint 仍可用。Checkpoint 本身失败仍向上传播。
 
-`/api/v1/status` 对 OS 后端只报告发现结果 `pending` 与 `trace_probe_required`。
+`/api/v1/status` 对 OS 后端只报告发现结果 `pending` 与 `first_bash_probe_required`。
 它不为了健康查询创建 Runtime、AppContainer、ACL、worktree 或 Checkpoint；
-实际 `bash_available` 由每个 Trace 的隔离自检确定。主 Agent 和 Harness 在临时
+实际 Bash 执行能力由每个 Trace 的首次 Bash 隔离自检确定。主 Agent 和 Harness 在临时
 Query Context 中获得 shell/backend 信息，不重建稳定 System Prompt。
 
 命令失败或超时，在停止执行后沿用 Checkpoint 恢复；取消向上层传播。
@@ -93,7 +95,9 @@ macOS 通过 Seatbelt 限定读写范围并显式拒绝网络和保护路径。
 POSIX 启动使用独立进程组，超时、取消与普通完成后清理该进程组；
 Linux 的 PID namespace 进一步约束后代进程。
 
-Windows 每次物理执行创建新的 package SID。目录授权按保护路径分割：
+Windows 每个 Trace 创建一个 package SID，并在该 Trace 内复用 AppContainer/ACL
+Lease；Workspace 或授权范围变化后，下一次 Bash 会回收旧 Lease 并建立新版本。
+目录授权按保护路径分割：
 含保护子项的祖先不获得整树继承写权限；保护项不进入 package allowlist；
 安全子树获得局部授权。AppContainer 本身另有系统允许的运行库/注册表权限，
 其访问仍受当前机器 ACL 约束；它不提供 Linux mount namespace 那样的全盘视图。
@@ -105,6 +109,15 @@ Windows 授权前在 `.yy/sandbox/native-leases/` 持久化精确 SID 与路径�
 清理只移除该 SID 的 ACE，不用旧 DACL 覆盖用户修改。每份 lease 持有 OS 文件锁，
 新执行只回收已经失去所有者锁的 lease。源码工作区可能临时出现 package SID ACL；
 这是原生 Windows 后端的权限装配，不是项目 Git 内容变更。
+
+Workspace 安全扫描和 Shell 权限是两层不同事实。扫描结果缓存在 Agent Home 的
+`.yy/sandbox/scan-cache/`，以 Workspace identity、Git HEAD/dirty/untracked、目录
+边界、Policy 和 backend version 校验；命中时只执行 quick check，变化时才重新扫描。
+该缓存不是授权。Bash 可用 `writable_paths` 声明本次所需的现有相对目录；Linux 使用
+只读 Workspace 加局部 bind，macOS 只为这些目录生成 write rule，Windows 只把这些
+目录加入 package 写 ACL。省略该字段时为兼容旧调用保留整个 Workspace 写权限。
+`.venv`、`node_modules`、`target`、`build` 等可继承的安全子树按目录边界处理，
+不逐文件重复装配权限；保护路径仍会强制切断继承。
 
 第一版拒绝 workspace 中可写区域的 symlink/reparse point、hardlink 和特殊文件，
 防止别名绕过路径边界；只读 `.venv` 不作可写区域遍历。

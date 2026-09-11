@@ -373,13 +373,24 @@ def run(task: str, session_id: str | None = typer.Option(None, "--session", "-s"
 
 
 @app.command()
-def chat(session_id: str | None = typer.Option(None, "--session", "-s", help="恢复指定会话哈希")) -> None:
+def chat(
+    session_id: str | None = typer.Option(None, "--session", "-s", help="恢复指定会话哈希"),
+    continue_last: bool = typer.Option(
+        False, "--continue", help="恢复当前 workspace 最近使用的 Session",
+    ),
+) -> None:
     """连接 Gateway 并启动连续交互会话。"""
+    if session_id and continue_last:
+        raise typer.BadParameter("--session 与 --continue 不能同时使用")
     interrupts = ChatInterruptController()
     previous_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, interrupts.handle_sigint)
     try:
-        asyncio.run(_chat_gateway(session_id, interrupt_controller=interrupts))
+        asyncio.run(_chat_gateway(
+            session_id,
+            continue_last=continue_last,
+            interrupt_controller=interrupts,
+        ))
     except KeyboardInterrupt:
         console.print("\n[dim]已退出会话。[/]")
     except Exception as exc:
@@ -392,6 +403,7 @@ def chat(session_id: str | None = typer.Option(None, "--session", "-s", help="�
 async def _chat_gateway(
     session_id: str | None,
     *,
+    continue_last: bool = False,
     interrupt_controller: ChatInterruptController,
 ) -> None:
     console.print(
@@ -401,6 +413,12 @@ async def _chat_gateway(
     client = _gateway_client()
     project = await _gateway_project(client)
     project_id = str(project["project_id"])
+    if continue_last:
+        sessions = await client.sessions(project_id)
+        if not sessions:
+            console.print("[dim]当前 workspace 还没有可恢复的 Session，将创建新会话。[/]")
+        else:
+            session_id = str(sessions[0]["session_id"])
     if session_id:
         sessions = await client.sessions(project_id)
         if not any(item.get("session_id") == session_id for item in sessions):

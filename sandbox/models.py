@@ -18,7 +18,7 @@ class SandboxStatus(BaseModel):
 
     model_config = ConfigDict(frozen=True, strict=True)
 
-    mode: Literal["pending", "os", "docker", "checkpoint_only", "closed"]
+    mode: Literal["pending", "os_lazy", "os", "docker", "checkpoint_only", "closed"]
     bash_available: bool
     reason_code: str | None = None
     message: str = Field(min_length=1)
@@ -27,8 +27,8 @@ class SandboxStatus(BaseModel):
 
     @model_validator(mode="after")
     def validate_capabilities(self) -> "SandboxStatus":
-        if self.bash_available != (self.mode in {"os", "docker"}):
-            raise ValueError("只有 os/docker 模式可以声明 Bash 可用")
+        if self.bash_available != (self.mode in {"os_lazy", "os", "docker"}):
+            raise ValueError("只有 os_lazy/os/docker 模式可以声明 Bash 可用")
         return self
 
 

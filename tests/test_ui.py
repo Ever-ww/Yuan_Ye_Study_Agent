@@ -3,6 +3,7 @@
 import unittest
 import asyncio
 import io
+import os
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -35,6 +36,18 @@ class UiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             app = create_app("test-token", agent_root=Path(value))
             self.assertEqual(app.state.access_token, "test-token")
+
+    def test_sessions_are_ordered_by_latest_durable_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            memory = MemoryStore(Path(value) / ".yy" / "memory")
+            active = memory.create_session("first")
+            newer = memory.create_session("second")
+            memory.record_user(newer, "newer activity")
+            os.utime(
+                memory.sessions.active_path(active),
+                (2_000_000_000, 2_000_000_000),
+            )
+            self.assertEqual(memory.list_sessions()[0]["session_id"], active)
 
     def test_restored_history_is_rendered_without_reasoning(self) -> None:
         output = io.StringIO()
@@ -139,16 +152,23 @@ class UiTests(unittest.TestCase):
                     del unread_only
                     return []
 
+                async def acknowledge_session_history(self, project_id, selected_session, records):
+                    del project_id, selected_session, records
+                    return {"acknowledged": 0}
+
             runner = CliRunner()
             with patch("run_ui.cli._gateway_client", return_value=FakeGatewayClient()):
                 listed = runner.invoke(app, ["session", "list"])
                 shown = runner.invoke(app, ["session", "show", session_id])
                 missing = runner.invoke(app, ["chat", "--session", "missing-session"])
+                continued = runner.invoke(app, ["chat", "--continue"], input="/exit\n")
             self.assertEqual(listed.exit_code, 0)
             self.assertIn(session_id, listed.stdout)
             self.assertEqual(shown.exit_code, 0)
             self.assertIn("第一答", shown.stdout)
             self.assertNotEqual(missing.exit_code, 0)
+            self.assertEqual(continued.exit_code, 0)
+            self.assertIn(session_id, continued.stdout)
 
     def test_web_client_handles_compression_events(self) -> None:
         script = (Path(__file__).parents[1] / "run_ui" / "static" / "app.js").read_text(encoding="utf-8")

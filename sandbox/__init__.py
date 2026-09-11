@@ -20,6 +20,7 @@ from .docker import (
 from .locks import WorkspaceLockManager
 from .factory import create_sandbox_session, probe_sandbox_status
 from .native import NativeSandboxSession
+from .scan_cache import WorkspaceScanCache
 from .models import (
     BashResult,
     CheckpointAuditEvent,
@@ -66,6 +67,7 @@ __all__ = [
     "SandboxSessionProtocol",
     "SandboxStatus",
     "WorkspaceLockManager",
+    "WorkspaceScanCache",
     "register_sandbox_callbacks",
     "probe_docker_status",
     "sandbox_status_of",

@@ -7,9 +7,8 @@ from Agent.hook import HookEvent, HookPoint, HookRegistry
 from .docker import SandboxSessionProtocol, sandbox_status_of
 
 
-# Native Windows sandbox startup performs a real AppContainer launch plus
-# checkpoint initialization.  Its inner command timeout is 30 seconds, so the
-# enclosing Core Hook must leave room for ACL setup/cleanup and checkpoint I/O.
+# TRACE_START is intentionally lightweight: it loads policy and opens/reuses a
+# checkpoint baseline. Native process isolation and ACL work wait for Bash.
 SANDBOX_START_HOOK_TIMEOUT_SECONDS = 60.0
 
 

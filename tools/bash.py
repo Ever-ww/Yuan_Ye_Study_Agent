@@ -15,6 +15,13 @@ class BashTool:
         "properties": {
             "command": {"type": "string"},
             "timeout_seconds": {"type": "integer"},
+            "writable_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 16,
+                "description": "Workspace-relative directories this command may modify; omit for whole workspace compatibility.",
+            },
         },
         "required": ["command"],
     }
@@ -24,10 +31,16 @@ class BashTool:
         if context.sandbox is None:
             raise RuntimeError("当前 Runtime 未启用安全沙箱，禁止执行 Bash/Shell")
         timeout = arguments.get("timeout_seconds")
-        result = await context.sandbox.run_bash(
-            arguments["command"],
-            30 if timeout is None else timeout,
-        )
+        timeout_seconds = 30 if timeout is None else timeout
+        if "writable_paths" in arguments:
+            result = await context.sandbox.run_bash(
+                arguments["command"], timeout_seconds,
+                writable_paths=tuple(arguments["writable_paths"]),
+            )
+        else:
+            # Preserve the small injected Sandbox protocol used by existing
+            # runtimes and third-party tests until they opt into path scoping.
+            result = await context.sandbox.run_bash(arguments["command"], timeout_seconds)
         checkpoint = (
             f"\ncheckpoint: {result.checkpoint.commit_sha}"
             if result.checkpoint is not None

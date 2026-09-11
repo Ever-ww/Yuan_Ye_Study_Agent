@@ -60,7 +60,7 @@ class RuntimePool:
         store: GatewayStore,
         events: GatewayEventBus,
         max_concurrent_runs: int = 4,
-        idle_timeout_seconds: int = 900,
+        idle_timeout_seconds: int = 3600,
         approval_timeout_seconds: int = 30,
         runtime_factory: RuntimeFactory | None = None,
         extensions: ExtensionCatalog | None = None,

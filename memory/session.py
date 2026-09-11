@@ -287,8 +287,24 @@ class SessionStore:
         for session_id, metadata in self._read_index()["sessions"].items():
             path = self.directory / metadata["latest_file"]
             message_count = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip()) if path.exists() else 0
-            sessions.append({"session_id": session_id, "created_at": metadata["created_at"], "latest_file": metadata["latest_file"], "message_count": message_count})
-        return sorted(sessions, key=lambda item: str(item["created_at"]), reverse=True)
+            updated_at = (
+                datetime.fromtimestamp(path.stat().st_mtime).astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")
+                if path.exists() else metadata["created_at"]
+            )
+            sessions.append({
+                "session_id": session_id,
+                "created_at": metadata["created_at"],
+                "updated_at": updated_at,
+                "latest_file": metadata["latest_file"],
+                "message_count": message_count,
+            })
+        return sorted(
+            sessions,
+            key=lambda item: (
+                str(item["updated_at"]), str(item["created_at"]), str(item["session_id"]),
+            ),
+            reverse=True,
+        )
 
     def start_new_segment(self, session_id: str) -> Path:
         """为未来上下文压缩创建同哈希的新 JSONL 分段并更新最新索引。"""

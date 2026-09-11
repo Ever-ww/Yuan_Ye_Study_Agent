@@ -23,10 +23,10 @@ def create_sandbox_session(config, *, project_root: Path | None = None, file_loc
 
 
 async def probe_sandbox_status(config) -> SandboxStatus:
-    """Health is discovery only; TRACE_START performs the actual confined self-test.
+    """Health is discovery only; the first Bash performs the confined self-test.
 
     A health request must not create checkpoints, containers, ACL grants or native
-    processes. Until tested by a Trace, report pending rather than claim isolation.
+    processes. Until tested by Bash, report pending rather than claim isolation.
     """
     if config.sandbox_backend == "docker":
         return await probe_docker_status()
@@ -43,4 +43,5 @@ async def probe_sandbox_status(config) -> SandboxStatus:
                              reason_code=exc.reason_code, message=str(exc))
     return SandboxStatus(mode="pending", bash_available=False, shell=Path(shell).name,
                          backend={"linux": "bubblewrap", "darwin": "seatbelt", "win32": "appcontainer"}[sys.platform],
-                         reason_code="trace_probe_required", message="OS backend located; each Trace must pass the sandbox self-test")
+                         reason_code="first_bash_probe_required",
+                         message="OS backend located; the first Bash in each Trace must pass the sandbox self-test")

@@ -16,11 +16,54 @@ from Agent.config import RuntimeConfig
 from sandbox import create_sandbox_session, NativeSandboxSession, DockerSandboxSession, SandboxStatus
 from sandbox.native import linux_arguments, seatbelt_profile, shell_argv
 from sandbox.policy import NativePolicy
+from sandbox.scan_cache import WorkspaceScanCache
 from sandbox.session import BashUnavailableError, CommandResult, SandboxUnavailableError, SandboxRecoveryRequired
 from tool import ToolContext, default_tools
 
 
 class NativeSandboxTests(unittest.TestCase):
+    def test_native_backend_is_lazy_until_first_bash(self):
+        async def check(root):
+            session = NativeSandboxSession(root, state_root=root)
+            execute = AsyncMock(return_value=CommandResult(
+                returncode=0, stdout="yy-sandbox-ready\n",
+            ))
+            with patch.object(session, "_execute_shell", execute):
+                await session.start("lazy")
+                self.assertEqual(session.status.mode, "os_lazy")
+                execute.assert_not_called()
+                await session.run_bash("echo actual")
+                self.assertEqual(session.status.mode, "os")
+                self.assertEqual(execute.await_count, 2)  # first-use probe + command
+                await session.close()
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(check(Path(value)))
+
+    def test_workspace_scan_cache_reuses_and_invalidates_on_entry_change(self):
+        with tempfile.TemporaryDirectory() as value:
+            parent = Path(value)
+            root = parent / "workspace"
+            root.mkdir()
+            policy = NativePolicy(root)
+            cache = WorkspaceScanCache(root, parent, backend="test")
+            original = NativePolicy.protected_paths
+            with patch.object(
+                NativePolicy,
+                "protected_paths",
+                autospec=True,
+                side_effect=lambda selected: original(selected),
+            ) as scan:
+                self.assertEqual(cache.protected_paths(policy), ())
+                self.assertFalse(cache.last_cache_hit)
+                self.assertEqual(cache.protected_paths(policy), ())
+                self.assertTrue(cache.last_cache_hit)
+                self.assertEqual(scan.call_count, 1)
+                (root / "new.py").write_text("pass", encoding="utf-8")
+                self.assertEqual(cache.protected_paths(policy), ())
+                self.assertFalse(cache.last_cache_hit)
+                self.assertEqual(scan.call_count, 2)
+
     def test_unknown_cleanup_preserves_evidence_instead_of_restore(self):
         async def check(root):
             session = NativeSandboxSession(root)
@@ -86,6 +129,32 @@ class NativeSandboxTests(unittest.TestCase):
             api.acl.assert_not_called()
             self.assertEqual(list(runner.leases.iterdir()), [])
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows trace lease")
+    def test_appcontainer_permission_lease_is_reused_until_close(self):
+        from sandbox.windows import AppContainerRunner
+
+        with tempfile.TemporaryDirectory() as value:
+            parent = Path(value)
+            root = parent / "workspace"
+            root.mkdir()
+            api = MagicMock()
+            api.userenv.DeriveAppContainerSidFromAppContainerName.return_value = 0
+            api.userenv.CreateAppContainerProfile.return_value = 0
+            api.userenv.DeleteAppContainerProfile.return_value = 0
+            runner = AppContainerRunner(NativePolicy(root), parent)
+            argv = [r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"]
+            first, first_sid, _ = runner._ensure_lease(api, argv, (), (root,))
+            second, second_sid, _ = runner._ensure_lease(api, argv, (), (root,))
+            self.assertEqual(first["name"], second["name"])
+            self.assertEqual(api.userenv.CreateAppContainerProfile.call_count, 1)
+            self.assertEqual(len(list(runner.leases.glob("*.json"))), 1)
+            api.advapi.FreeSid(first_sid)
+            api.advapi.FreeSid(second_sid)
+            with patch("sandbox.windows.WinAPI", return_value=api):
+                runner._close()
+            self.assertEqual(api.userenv.DeleteAppContainerProfile.call_count, 1)
+            self.assertEqual(list(runner.leases.glob("*.json")), [])
+
     def test_shell_argument_is_not_reparsed_by_host(self):
         command = 'echo "a b"; echo $TOKEN'
         self.assertEqual(shell_argv(command, "/bin/bash", "linux")[-1], command)
@@ -114,6 +183,33 @@ class NativeSandboxTests(unittest.TestCase):
             self.assertNotIn(str(Path.home()), args)
             self.assertIn(["--ro-bind", "/dev/null", str(root / ".env")], [args[i:i+3] for i in range(len(args))])
             self.assertIn(["--chmod", "000", str(root / ".git")], [args[i:i+3] for i in range(len(args))])
+
+    def test_write_roots_narrow_native_permissions_without_new_approval(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            source = root / "src"
+            tests = root / "tests"
+            source.mkdir()
+            tests.mkdir()
+            (root / ".git").mkdir()
+            policy = NativePolicy(root)
+            selected = policy.writable_roots(("src",))
+            self.assertEqual(selected, (source,))
+            args = linux_arguments(
+                policy, "bwrap", ["/bin/bash", "-c", "pwd"],
+                writable_roots=selected,
+            )
+            triples = [args[index:index + 3] for index in range(len(args))]
+            self.assertIn(["--ro-bind", str(root), str(root)], triples)
+            self.assertIn(["--bind", str(source), str(source)], triples)
+            self.assertNotIn(["--bind", str(tests), str(tests)], triples)
+            profile = seatbelt_profile(
+                policy, root / "temp", writable_roots=selected,
+            )
+            self.assertIn(f'(allow file-write* (subpath {json.dumps(str(source))}))', profile)
+            self.assertNotIn(f'(allow file-write* (subpath {json.dumps(str(root))}))', profile)
+            with self.assertRaises(ValueError):
+                policy.writable_roots((".git",))
 
     def test_seatbelt_profile_is_deny_by_default_and_escapes_paths(self):
         with tempfile.TemporaryDirectory() as value:

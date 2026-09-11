@@ -44,7 +44,7 @@
   "sandbox_checkpoint_merged_branch_retention_days": 30,
   "gateway_port": 8765,
   "gateway_max_concurrent_runs": 4,
-  "gateway_runtime_idle_seconds": 900,
+  "gateway_runtime_idle_seconds": 3600,
   "approval_timeout_seconds": 30,
   "model_retry_max_attempts": 3,
   "model_retry_base_seconds": 2.0,

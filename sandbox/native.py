@@ -11,8 +11,15 @@ import tempfile
 
 from .models import SandboxStatus
 from .policy import NativePolicy
+from .scan_cache import WorkspaceScanCache
 from .process import run_isolated
-from .session import CheckpointSandboxSession, CommandResult, SandboxUnavailableError, SandboxRecoveryRequired
+from .session import (
+    BashUnavailableError,
+    CheckpointSandboxSession,
+    CommandResult,
+    SandboxRecoveryRequired,
+    SandboxUnavailableError,
+)
 
 
 def find_bubblewrap() -> str | None:
@@ -42,7 +49,14 @@ def discover_shell(platform: str, configured: str | None = None) -> str:
     return str(Path(shell).resolve())
 
 
-def linux_arguments(policy: NativePolicy, executable: str, command: list[str]) -> list[str]:
+def linux_arguments(
+    policy: NativePolicy,
+    executable: str,
+    command: list[str],
+    *,
+    protected_paths: tuple[tuple[Path, bool], ...] | None = None,
+    writable_roots: tuple[Path, ...] | None = None,
+) -> list[str]:
     args = [executable, "--unshare-all", "--unshare-user", "--unshare-pid", "--unshare-net",
             "--die-with-parent", "--new-session", "--cap-drop", "ALL",
             "--disable-userns", "--assert-userns-disabled"]
@@ -53,8 +67,14 @@ def linux_arguments(policy: NativePolicy, executable: str, command: list[str]) -
     args += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/tmp/home"]
     for path in policy.readable_roots:
         args += ["--ro-bind", str(path), str(path)]
-    args += ["--bind", str(policy.workspace), str(policy.workspace)]
-    for path, hidden in policy.protected_paths():
+    selected = writable_roots or (policy.workspace,)
+    if selected == (policy.workspace,):
+        args += ["--bind", str(policy.workspace), str(policy.workspace)]
+    else:
+        args += ["--ro-bind", str(policy.workspace), str(policy.workspace)]
+        for path in selected:
+            args += ["--bind", str(path), str(path)]
+    for path, hidden in protected_paths if protected_paths is not None else policy.protected_paths():
         if hidden and path.is_dir():
             args += ["--tmpfs", str(path), "--chmod", "000", str(path)]
         elif hidden:
@@ -64,7 +84,13 @@ def linux_arguments(policy: NativePolicy, executable: str, command: list[str]) -
     return args + ["--chdir", str(policy.workspace), "--", *command]
 
 
-def seatbelt_profile(policy: NativePolicy, temporary: Path) -> str:
+def seatbelt_profile(
+    policy: NativePolicy,
+    temporary: Path,
+    *,
+    protected_paths: tuple[tuple[Path, bool], ...] | None = None,
+    writable_roots: tuple[Path, ...] | None = None,
+) -> str:
     literal = lambda path: json.dumps(str(path), ensure_ascii=False)
     rows = ["(version 1)", "(deny default)", "(allow process-exec)", "(allow process-fork)",
             "(allow signal (target same-sandbox))", "(allow process-info* (target same-sandbox))",
@@ -74,9 +100,9 @@ def seatbelt_profile(policy: NativePolicy, temporary: Path) -> str:
                  Path("/private/etc/paths"), Path("/private/etc/localtime"),
                  *policy.readable_roots, policy.workspace, temporary):
         rows.append(f"(allow file-read* (subpath {literal(path)}))")
-    for path in (policy.workspace, temporary):
+    for path in (*(writable_roots or (policy.workspace,)), temporary):
         rows.append(f"(allow file-write* (subpath {literal(path)}))")
-    for path, hidden in policy.protected_paths():
+    for path, hidden in protected_paths if protected_paths is not None else policy.protected_paths():
         rows.append(f"(deny file-write* (subpath {literal(path)}))")
         if hidden:
             rows.append(f"(deny file-read* (subpath {literal(path)}))")
@@ -94,22 +120,99 @@ class NativeSandboxSession(CheckpointSandboxSession):
         self.shell = ""
         self._temporary = None
         self._windows = None
+        self._protected_snapshot: tuple[tuple[Path, bool], ...] | None = None
+        self._backend_ready = False
+        self._backend_dirty = False
+        self._current_writable_roots: tuple[Path, ...] = (self.project_root,)
+        self._lease_writable_roots: tuple[Path, ...] = ()
+        backend = {"linux": "bubblewrap", "darwin": "seatbelt", "win32": "appcontainer"}.get(
+            self.platform, self.platform,
+        )
+        self.scan_cache = WorkspaceScanCache(
+            self.project_root, self.state_root, backend=backend,
+        )
 
     async def _start_backend(self, session_id: str) -> SandboxStatus:
         del session_id
         self.policy.validate()
-        self.policy.protected_paths()
         self.shell = discover_shell(self.platform, self.configured_shell)
         if self.platform not in {"linux", "darwin", "win32"}:
             raise SandboxUnavailableError("Unsupported OS", reason_code="unsupported_platform")
         self._temporary = tempfile.TemporaryDirectory(prefix="yy-shell-")
+        if self.platform == "win32":
+            from .windows import AppContainerRunner
+            self._windows = AppContainerRunner(self.policy, self.state_root)
+        backend = {"linux": "bubblewrap", "darwin": "seatbelt", "win32": "appcontainer"}[self.platform]
+        return SandboxStatus(
+            mode="os_lazy", bash_available=True, backend=backend,
+            shell=Path(self.shell).name,
+            reason_code="sandbox_lazy_start",
+            message=f"OS sandbox ready on first Shell use: {backend}; network disabled",
+        )
+
+    async def _ensure_backend_ready(self) -> None:
+        if self._backend_ready and not self._backend_dirty:
+            # Editors and build tools may mutate the workspace outside this
+            # Runtime. Revalidate the durable workspace fingerprint before
+            # reusing permissions; a cache hit only stats directories and Git.
+            try:
+                current = self.scan_cache.protected_paths(self.policy)
+            except Exception as exc:
+                await self._close_backend()
+                reason = exc.reason_code if isinstance(exc, SandboxUnavailableError) else "workspace_revalidation_failed"
+                self._status = SandboxStatus(
+                    mode="checkpoint_only", bash_available=False,
+                    reason_code=reason,
+                    message=f"Workspace safety revalidation failed: {str(exc) or type(exc).__name__}",
+                )
+                raise BashUnavailableError(self._status.message) from exc
+            if self._temporary is None and self._windows is None:
+                # Test/injected native backends declare themselves ready and
+                # own no permission lease that needs rebuilding.
+                self._protected_snapshot = current
+                return
+            if self._protected_snapshot is None and self.scan_cache.last_cache_hit:
+                self._protected_snapshot = current
+                return
+            if self.scan_cache.last_cache_hit and current == self._protected_snapshot:
+                return
+            if self._windows is not None:
+                await self._windows.close()
+            self._backend_ready = False
+            self._protected_snapshot = current
+            self._status = self._status.model_copy(update={
+                "mode": "os_lazy",
+                "reason_code": "workspace_changed_externally",
+                "message": "Workspace safety projection changed; refreshing OS sandbox permissions",
+            })
+        if self._backend_dirty:
+            if self._windows is not None:
+                await self._windows.close()
+            self._backend_ready = False
+            self._backend_dirty = False
+            self._protected_snapshot = None
+            self._status = self._status.model_copy(update={
+                "mode": "os_lazy",
+                "reason_code": "workspace_changed",
+                "message": "Workspace changed; OS sandbox permissions will be refreshed on use",
+            })
+        # Injected/test backends may declare themselves fully active at
+        # TRACE_START. Only the native ``os_lazy`` state needs the first-use
+        # probe below.
+        if self._status.mode == "os":
+            if self._protected_snapshot is None:
+                self._protected_snapshot = self.scan_cache.protected_paths(self.policy)
+            self._backend_ready = True
+            return
+        if self._status.mode != "os_lazy":
+            return
         try:
-            if self.platform == "win32":
-                from .windows import AppContainerRunner
-                self._windows = AppContainerRunner(self.policy, self.state_root)
+            self._protected_snapshot = self.scan_cache.protected_paths(self.policy)
             result = await self._execute_shell("echo yy-sandbox-ready", 30)
             if result.returncode or "yy-sandbox-ready" not in result.stdout:
-                raise SandboxUnavailableError("OS sandbox self-test failed", reason_code="os_sandbox_probe_failed")
+                raise SandboxUnavailableError(
+                    "OS sandbox self-test failed", reason_code="os_sandbox_probe_failed",
+                )
         except asyncio.CancelledError:
             await self._close_backend()
             raise
@@ -118,16 +221,26 @@ class NativeSandboxSession(CheckpointSandboxSession):
             raise
         except Exception as exc:
             await self._close_backend()
-            if isinstance(exc, SandboxUnavailableError):
-                raise
-            raise SandboxUnavailableError(f"OS sandbox unavailable: {type(exc).__name__}", reason_code="os_sandbox_probe_failed") from exc
-        backend = {"linux": "bubblewrap", "darwin": "seatbelt", "win32": "appcontainer"}[self.platform]
-        return SandboxStatus(mode="os", bash_available=True, backend=backend,
-                             shell=Path(self.shell).name, message=f"OS sandbox: {backend}; shell: {Path(self.shell).name}; network disabled")
+            reason = exc.reason_code if isinstance(exc, SandboxUnavailableError) else "os_sandbox_probe_failed"
+            self._status = SandboxStatus(
+                mode="checkpoint_only", bash_available=False, reason_code=reason,
+                message=f"OS sandbox unavailable: {str(exc) or type(exc).__name__}；Bash/Shell 已禁用",
+            )
+            raise BashUnavailableError(self._status.message) from exc
+        self._backend_ready = True
+        self._status = SandboxStatus(
+            mode="os", bash_available=True,
+            backend={"linux": "bubblewrap", "darwin": "seatbelt", "win32": "appcontainer"}[self.platform],
+            shell=Path(self.shell).name,
+            message=f"OS sandbox active; shell: {Path(self.shell).name}; network disabled",
+        )
 
     async def _execute_shell(self, command: str, timeout_seconds: int) -> CommandResult:
         self.policy.validate()
-        self.policy.protected_paths()
+        protected = self._protected_snapshot
+        if protected is None:
+            protected = self.scan_cache.protected_paths(self.policy)
+            self._protected_snapshot = protected
         if self.platform == "win32" and Path(self.shell).name.lower() in {"powershell.exe", "pwsh.exe"}:
             # PowerShell's provider location can differ from CreateProcess' cwd
             # when starting in AppContainer. Set it explicitly, failing closed.
@@ -138,19 +251,32 @@ class NativeSandboxSession(CheckpointSandboxSession):
                        "Set-Location YYWorkspace: -ErrorAction Stop } catch { Write-Error $_; exit 125 }; " + command)
         argv = shell_argv(command, self.shell, self.platform)
         if self.platform == "win32":
-            return await self._windows.run(argv, timeout_seconds)
+            return await self._windows.run(
+                argv, timeout_seconds, protected_paths=protected,
+                writable_roots=self._lease_writable_roots or (self.project_root,),
+            )
         temporary = Path(self._temporary.name).resolve()
         if self.platform == "linux":
             executable = find_bubblewrap()
             if not executable:
                 raise SandboxUnavailableError("Install bubblewrap with user namespaces enabled", reason_code="bubblewrap_missing")
-            argv = linux_arguments(self.policy, executable, argv)
+            argv = linux_arguments(
+                self.policy, executable, argv, protected_paths=protected,
+                writable_roots=self._current_writable_roots,
+            )
             temp = "/tmp"
         else:
             executable = "/usr/bin/sandbox-exec"
             if not Path(executable).is_file():
                 raise SandboxUnavailableError("Seatbelt sandbox-exec unavailable", reason_code="seatbelt_missing")
-            argv = [executable, "-p", seatbelt_profile(self.policy, temporary), "--", *argv]
+            argv = [
+                executable, "-p",
+                seatbelt_profile(
+                    self.policy, temporary, protected_paths=protected,
+                    writable_roots=self._current_writable_roots,
+                ),
+                "--", *argv,
+            ]
             temp = str(temporary)
         # Explicit environment: no Provider keys, proxy, BASH_ENV, PYTHONPATH or startup hooks.
         env = {"PATH": os.defpath, "HOME": temp, "TMPDIR": temp, "TMP": temp, "TEMP": temp,
@@ -161,8 +287,37 @@ class NativeSandboxSession(CheckpointSandboxSession):
         env["PATH"] = os.pathsep.join([*tool_dirs, str(Path(self.shell).parent), os.defpath])
         return await run_isolated(argv, cwd=str(self.project_root), env=env, timeout=timeout_seconds)
 
+    def _configure_bash_access(self, writable_paths: tuple[str, ...] | None) -> None:
+        selected = self.policy.writable_roots(writable_paths)
+        self._current_writable_roots = selected
+        if self.platform != "win32":
+            return
+        combined = [*self._lease_writable_roots, *selected]
+        expanded: list[Path] = []
+        for path in sorted(set(combined), key=lambda item: (len(item.parts), str(item))):
+            if not any(path == parent or path.is_relative_to(parent) for parent in expanded):
+                expanded.append(path)
+        value = tuple(expanded)
+        if value != self._lease_writable_roots and self._backend_ready:
+            self._backend_dirty = True
+        self._lease_writable_roots = value
+
     async def _close_backend(self) -> None:
+        self._backend_ready = False
+        self._backend_dirty = False
+        self._protected_snapshot = None
+        if self._windows is not None:
+            await self._windows.close()
         self._windows = None
         if self._temporary is not None:
             self._temporary.cleanup()
             self._temporary = None
+
+    def _workspace_changed(self) -> None:
+        self._protected_snapshot = None
+        self.scan_cache.invalidate()
+        # A Windows AppContainer lease contains temporary ACL grants based on
+        # the exact scanned tree. Keep it through read-only commands, but
+        # rebuild it before the next command after any durable tree mutation.
+        if self._windows is not None:
+            self._backend_dirty = True

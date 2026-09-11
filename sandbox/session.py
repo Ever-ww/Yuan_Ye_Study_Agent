@@ -48,7 +48,10 @@ class SandboxSessionProtocol(Protocol):
 
     async def start(self, session_id: str) -> CheckpointRecord: ...
     async def close(self) -> None: ...
-    async def run_bash(self, command: str, timeout_seconds: int = 30) -> BashResult: ...
+    async def run_bash(
+        self, command: str, timeout_seconds: int = 30,
+        *, writable_paths: tuple[str, ...] | None = None,
+    ) -> BashResult: ...
     async def checkpoint_write(self, path: str) -> CheckpointRecord | None: ...
     async def checkpoint_edit(self, path: str) -> CheckpointRecord | None: ...
     async def restore_current(self) -> CheckpointRecord: ...
@@ -95,7 +98,7 @@ class CheckpointSandboxSession:
 
     @property
     def active(self) -> bool:
-        return self._status.mode in {"os", "docker", "checkpoint_only"}
+        return self._status.mode in {"os_lazy", "os", "docker", "checkpoint_only"}
 
     @property
     def status(self) -> SandboxStatus:
@@ -146,13 +149,27 @@ class CheckpointSandboxSession:
     async def _execute_shell(self, command: str, timeout_seconds: int) -> CommandResult:
         raise NotImplementedError
 
-    async def run_bash(self, command: str, timeout_seconds: int = 30) -> BashResult:
+    async def _ensure_backend_ready(self) -> None:
+        """Allow a backend to defer expensive process isolation until first use."""
+
+    def _workspace_changed(self) -> None:
+        """Invalidate backend-local safety projections after a durable mutation."""
+
+    def _configure_bash_access(self, writable_paths: tuple[str, ...] | None) -> None:
+        """Allow native backends to narrow temporary write permissions."""
+
+    async def run_bash(
+        self, command: str, timeout_seconds: int = 30,
+        *, writable_paths: tuple[str, ...] | None = None,
+    ) -> BashResult:
         if not isinstance(command, str) or not command.strip():
             raise ValueError("Bash command 不能为空")
         if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 120:
             raise ValueError("Bash timeout_seconds 必须位于 1 到 120 之间")
         async with self.file_locks.workspace_exclusive():
             async with self._operation_lock:
+                self._configure_bash_access(writable_paths)
+                await self._ensure_backend_ready()
                 if not self.bash_available:
                     raise BashUnavailableError("未运行安全沙箱；禁止回退到无隔离的宿主机 Shell")
                 try:
@@ -165,6 +182,8 @@ class CheckpointSandboxSession:
                         self.checkpoints.create, "bash",
                         {"command": command[:1000], "timeout_seconds": timeout_seconds},
                     )
+                    if checkpoint is not None:
+                        self._workspace_changed()
                 except SandboxRecoveryRequired:
                     self._status = SandboxStatus(
                         mode="checkpoint_only", bash_available=False,
@@ -176,6 +195,7 @@ class CheckpointSandboxSession:
                     # Backends must stop the entire process tree before returning/cancelling.
                     # Only then can the shared checkpoint safely restore the workspace.
                     await asyncio.to_thread(self.checkpoints.restore_current)
+                    self._workspace_changed()
                     raise
                 return BashResult(exit_code=0, output=output, checkpoint=checkpoint)
 
@@ -183,26 +203,34 @@ class CheckpointSandboxSession:
         """为宿主机 write 已完成的实际修改创建一次 checkpoint。"""
         async with self._operation_lock:
             self._require_checkpoint_session()
-            return await asyncio.to_thread(
+            checkpoint = await asyncio.to_thread(
                 self.checkpoints.create,
                 "write",
                 {"path": path},
             )
+            if checkpoint is not None:
+                self._workspace_changed()
+            return checkpoint
 
     async def checkpoint_edit(self, path: str) -> CheckpointRecord | None:
         """为宿主机 edit 已完成的实际修改创建一次独立审计 checkpoint。"""
         async with self._operation_lock:
             self._require_checkpoint_session()
-            return await asyncio.to_thread(
+            checkpoint = await asyncio.to_thread(
                 self.checkpoints.create,
                 "edit",
                 {"path": path},
             )
+            if checkpoint is not None:
+                self._workspace_changed()
+            return checkpoint
 
     async def restore_current(self) -> CheckpointRecord:
         async with self._operation_lock:
             self._require_checkpoint_session()
-            return await asyncio.to_thread(self.checkpoints.restore_current)
+            restored = await asyncio.to_thread(self.checkpoints.restore_current)
+            self._workspace_changed()
+            return restored
 
     async def rollback(
         self,
@@ -221,15 +249,18 @@ class CheckpointSandboxSession:
                     and merge_eligible and archive_reason == "user_rollback"
                 ):
                     # 保持旧测试替身和第三方Sandbox适配器的单参数调用兼容性。
-                    return await asyncio.to_thread(self.checkpoints.rollback, steps)
-                return await asyncio.to_thread(
-                    self.checkpoints.rollback,
-                    steps,
-                    sequence=sequence,
-                    checkpoint_sha=checkpoint_sha,
-                    merge_eligible=merge_eligible,
-                    archive_reason=archive_reason,
-                )
+                    result = await asyncio.to_thread(self.checkpoints.rollback, steps)
+                else:
+                    result = await asyncio.to_thread(
+                        self.checkpoints.rollback,
+                        steps,
+                        sequence=sequence,
+                        checkpoint_sha=checkpoint_sha,
+                        merge_eligible=merge_eligible,
+                        archive_reason=archive_reason,
+                    )
+                self._workspace_changed()
+                return result
 
     def list_checkpoints(self) -> tuple[CheckpointRecord, ...]:
         return self.checkpoints.list()
@@ -264,11 +295,14 @@ class CheckpointSandboxSession:
             self.checkpoints.create,
             "trace_start",
             {"kind": "baseline"},
-            force=True,
+            force=False,
         )
-        if baseline is None:
+        if baseline is not None:
+            return baseline
+        existing = self.checkpoints.list()
+        if not existing:
             raise RuntimeError("创建 Trace 基线 checkpoint 失败")
-        return baseline
+        return existing[-1]
 
     def _require_checkpoint_session(self) -> None:
         if not self.active:

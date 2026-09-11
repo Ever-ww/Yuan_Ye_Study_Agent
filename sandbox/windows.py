@@ -1,6 +1,6 @@
 """Native Windows AppContainer + Job Object launcher (no network capabilities).
 
-ACL entries use a fresh package SID per physical invocation. A durable lease is
+ACL entries use a fresh package SID per sandbox trace. A durable lease is
 written BEFORE touching ACLs; recovery removes only that SID, never restores an
 old DACL over a user's edits. Job handles are non-inheritable and kill descendants
 on cancellation, timeout, normal completion, or Gateway process death.
@@ -183,10 +183,24 @@ class AppContainerRunner:
         self.policy = policy
         self.leases = state_root / ".yy/sandbox/native-leases"
         self.leases.mkdir(parents=True, exist_ok=True)
+        self._lease_file = None
+        self._lease_path: Path | None = None
+        self._lease_record: dict | None = None
+        self._recovered = False
+        self._lease_recovery_required = False
 
-    async def run(self, argv: list[str], timeout: float) -> CommandResult:
+    async def run(
+        self,
+        argv: list[str],
+        timeout: float,
+        *,
+        protected_paths: tuple[tuple[Path, bool], ...] | None = None,
+        writable_roots: tuple[Path, ...] | None = None,
+    ) -> CommandResult:
         cancelled = threading.Event()
-        task = asyncio.create_task(asyncio.to_thread(self._run, argv, timeout, cancelled))
+        task = asyncio.create_task(asyncio.to_thread(
+            self._run, argv, timeout, cancelled, protected_paths, writable_roots,
+        ))
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -194,6 +208,10 @@ class AppContainerRunner:
             # Do not restore a checkpoint until the OS confirms the job was terminated.
             await asyncio.shield(task)
             raise
+
+    async def close(self) -> None:
+        """Release the trace-scoped AppContainer profile and temporary ACLs."""
+        await asyncio.to_thread(self._close)
 
     def recover(self, api: WinAPI) -> None:
         import msvcrt
@@ -232,77 +250,21 @@ class AppContainerRunner:
         if code < 0 and code != -2147024894:  # profile absent is idempotent
             raise OSError(f"AppContainer profile cleanup failed: {code}")
 
-    def _run(self, argv, timeout, cancelled):
-        import msvcrt
+    def _run(self, argv, timeout, cancelled, protected_paths=None, writable_roots=None):
         api = WinAPI()
-        try:
-            self.recover(api)
-        except Exception as exc:
-            raise SandboxRecoveryRequired("Previous sandbox permission lease requires recovery") from exc
         self.policy.validate()
-        protected = self.policy.protected_paths()
-        name = "yy-" + uuid4().hex
-        sid = C.c_void_p()
-        if api.userenv.DeriveAppContainerSidFromAppContainerName(name, C.byref(sid)) < 0:
-            raise OSError("Cannot derive AppContainer SID")
-        excluded = {path for path, _ in protected}
-        # No broad inherited workspace grant: inherited carveout DENYs cannot be
-        # relied on for AppContainer's package access check. Grant ordinary entries
-        # individually, leaving protected paths entirely outside the package allowlist.
-        writable = [(self.policy.workspace, False)]
-        for directory, dirs, files in os.walk(self.policy.workspace):
-            base = Path(directory)
-            dirs[:] = [name for name in dirs if base / name not in excluded]
-            for child in list(dirs):
-                path = base / child
-                can_inherit = not any(p.is_relative_to(path) for p in excluded)
-                writable.append((path, can_inherit))
-                if can_inherit:
-                    dirs.remove(child)
-            writable.extend((base / name, False) for name in files if base / name not in excluded)
-        readable = list(dict.fromkeys([*self.policy.readable_roots, Path(argv[0]).parent,
-                                      *(p for p, hidden in protected if not hidden)]))
-        shell_root = Path(argv[0]).parent
-        if self.policy.workspace.is_relative_to(shell_root) or shell_root.is_relative_to(self.policy.workspace):
-            api.advapi.FreeSid(sid)
-            raise OSError("Windows shell installation must be outside the mutable workspace")
-        paths = list(dict.fromkeys([*(p for p, _ in writable), *readable]))
-        # System binaries already have AppContainer execute permission. Do not edit System32 ACLs.
-        system = Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve()
-        paths = [p for p in paths if not p.is_relative_to(system)]
-        try:
-            for path in paths:
-                api.check_acl_access(path)
-        except BaseException:
-            api.advapi.FreeSid(sid)
-            raise
-        record = {"name": name, "paths": [str(p) for p in paths]}
-        lease = self.leases / (name + ".json")
-        file = lease.open("x+b")
+        protected = protected_paths or self.policy.protected_paths()
+        record, sid, system = self._ensure_lease(
+            api, argv, protected, writable_roots or (self.policy.workspace,),
+        )
+        name = str(record["name"])
         handles = []
         readers = []
         output = [bytearray(), bytearray()]
         attributes = None
         job = None
         process = PROCESS_INFORMATION()
-        cleaned = False
         try:
-            msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
-            file.write(json.dumps(record, ensure_ascii=False).encode("utf-8"))
-            file.flush()
-            os.fsync(file.fileno())
-            created_sid = C.c_void_p()
-            code = api.userenv.CreateAppContainerProfile(name, name, "Yuan Ye isolated shell", None, 0, C.byref(created_sid))
-            if code < 0:
-                raise OSError(f"CreateAppContainerProfile failed: {code}")
-            api.advapi.FreeSid(created_sid)
-            for path in readable:
-                if path in paths:
-                    api.acl(path, sid, mode=1, permissions=0x1200A9)
-            for path, inherit in writable:
-                api.acl(path, sid, mode=1, permissions=0x1301BF, inherit=inherit)
-                api.acl(path, sid, mode=3, permissions=0xC0040, inherit=inherit)
-
             sa = SECURITY_ATTRIBUTES(C.sizeof(SECURITY_ATTRIBUTES), None, True)
             writes = []
             for index in range(2):
@@ -406,22 +368,175 @@ class AppContainerRunner:
                     api.stop_job(job)
                 except SandboxRecoveryRequired as exc:
                     termination_error = exc
+                    self._lease_recovery_required = True
                 finally:
                     api.kernel.CloseHandle(job)
             if attributes is not None:
                 api.kernel.DeleteProcThreadAttributeList(attributes)
             for handle in handles:
                 api.kernel.CloseHandle(handle)
+            api.advapi.FreeSid(sid)
+            if termination_error is not None:
+                raise termination_error
+
+    def _ensure_lease(self, api: WinAPI, argv, protected, writable_roots):
+        """Create ACL grants once and reuse them for this sandbox trace."""
+        import msvcrt
+
+        if not self._recovered:
             try:
-                if termination_error is not None:
-                    raise termination_error
-                try:
-                    self._cleanup(api, record, sid)
-                except Exception as exc:
-                    raise SandboxRecoveryRequired("Sandbox ACL cleanup failed; lease preserved") from exc
+                self.recover(api)
+            except Exception as exc:
+                raise SandboxRecoveryRequired(
+                    "Previous sandbox permission lease requires recovery",
+                ) from exc
+            self._recovered = True
+        if self._lease_record is not None:
+            expected = [str(path) for path in writable_roots]
+            if self._lease_record.get("writable_roots") != expected:
+                raise SandboxRecoveryRequired(
+                    "Active sandbox lease does not match requested write roots",
+                )
+            sid = C.c_void_p()
+            code = api.userenv.DeriveAppContainerSidFromAppContainerName(
+                str(self._lease_record["name"]), C.byref(sid),
+            )
+            if code < 0:
+                raise SandboxRecoveryRequired("Cannot recover active sandbox SID")
+            system = Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve()
+            return self._lease_record, sid, system
+
+        name = "yy-" + uuid4().hex
+        sid = C.c_void_p()
+        if api.userenv.DeriveAppContainerSidFromAppContainerName(name, C.byref(sid)) < 0:
+            raise OSError("Cannot derive AppContainer SID")
+        excluded = {path for path, _ in protected}
+
+        def access_entries(root: Path) -> list[tuple[Path, bool]]:
+            entries = [(root, not any(path.is_relative_to(root) for path in excluded))]
+            if entries[0][1]:
+                return entries
+            for directory, dirs, files in os.walk(root):
+                base = Path(directory)
+                dirs[:] = [child for child in dirs if base / child not in excluded]
+                for child in list(dirs):
+                    path = base / child
+                    can_inherit = not any(item.is_relative_to(path) for item in excluded)
+                    entries.append((path, can_inherit))
+                    if can_inherit:
+                        dirs.remove(child)
+                entries.extend(
+                    (base / child, False)
+                    for child in files if base / child not in excluded
+                )
+            return entries
+
+        # Read access covers the repository, while write access is the explicit
+        # per-command/trace subset. Protected paths never receive either ACL.
+        workspace_readable = access_entries(self.policy.workspace)
+        writable: list[tuple[Path, bool]] = []
+        for root in writable_roots:
+            writable.extend(access_entries(root))
+        external_readable = list(dict.fromkeys([
+            *self.policy.readable_roots, Path(argv[0]).parent,
+            *(path for path, hidden in protected if not hidden),
+        ]))
+        shell_root = Path(argv[0]).parent
+        if self.policy.workspace.is_relative_to(shell_root) or shell_root.is_relative_to(self.policy.workspace):
+            api.advapi.FreeSid(sid)
+            raise OSError("Windows shell installation must be outside the mutable workspace")
+        paths = list(dict.fromkeys([
+            *(path for path, _ in workspace_readable),
+            *(path for path, _ in writable),
+            *external_readable,
+        ]))
+        # System binaries already have AppContainer execute permission. Do not edit System32 ACLs.
+        system = Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve()
+        paths = [p for p in paths if not p.is_relative_to(system)]
+        try:
+            for path in paths:
+                api.check_acl_access(path)
+        except BaseException:
+            api.advapi.FreeSid(sid)
+            raise
+        record = {
+            "name": name,
+            "paths": [str(path) for path in paths],
+            "writable_roots": [str(path) for path in writable_roots],
+        }
+        lease = self.leases / (name + ".json")
+        file = lease.open("x+b")
+        cleaned = False
+        try:
+            msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+            file.write(json.dumps(record, ensure_ascii=False).encode("utf-8"))
+            file.flush()
+            os.fsync(file.fileno())
+            created_sid = C.c_void_p()
+            code = api.userenv.CreateAppContainerProfile(name, name, "Yuan Ye isolated shell", None, 0, C.byref(created_sid))
+            if code < 0:
+                raise OSError(f"CreateAppContainerProfile failed: {code}")
+            api.advapi.FreeSid(created_sid)
+            for path, inherit in workspace_readable:
+                if path in paths:
+                    api.acl(path, sid, mode=1, permissions=0x1200A9, inherit=inherit)
+            for path in external_readable:
+                if path in paths:
+                    api.acl(path, sid, mode=1, permissions=0x1200A9)
+            for path, inherit in writable:
+                api.acl(path, sid, mode=1, permissions=0x1301BF, inherit=inherit)
+                api.acl(path, sid, mode=3, permissions=0xC0040, inherit=inherit)
+            self._lease_file = file
+            self._lease_path = lease
+            self._lease_record = record
+            return record, sid, system
+        except BaseException:
+            try:
+                self._cleanup(api, record, sid)
                 cleaned = True
             finally:
                 api.advapi.FreeSid(sid)
                 file.close()
                 if cleaned:
-                    lease.unlink()
+                    lease.unlink(missing_ok=True)
+            raise
+
+    def _close(self) -> None:
+        import msvcrt
+
+        file = self._lease_file
+        lease = self._lease_path
+        record = self._lease_record
+        if file is None or lease is None or record is None:
+            return
+        self._lease_file = None
+        self._lease_path = None
+        self._lease_record = None
+        try:
+            if self._lease_recovery_required:
+                raise SandboxRecoveryRequired(
+                    "Sandbox process cleanup is unconfirmed; ACL lease preserved",
+                )
+            api = WinAPI()
+            sid = C.c_void_p()
+            code = api.userenv.DeriveAppContainerSidFromAppContainerName(
+                str(record["name"]), C.byref(sid),
+            )
+            if code < 0:
+                raise OSError(f"Cannot derive sandbox SID: {code}")
+            try:
+                self._cleanup(api, record, sid)
+            finally:
+                api.advapi.FreeSid(sid)
+            file.seek(0)
+            msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+            file.close()
+            lease.unlink(missing_ok=True)
+        except SandboxRecoveryRequired:
+            file.close()
+            raise
+        except Exception as exc:
+            file.close()
+            raise SandboxRecoveryRequired(
+                "Sandbox ACL cleanup failed; lease preserved",
+            ) from exc

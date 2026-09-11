@@ -62,3 +62,47 @@ class NativePolicy:
                         reason_code="unsafe_workspace_entry",
                     )
         return tuple(sorted(found, key=lambda item: str(item[0])))
+
+    def writable_roots(self, requested: tuple[str, ...] | None) -> tuple[Path, ...]:
+        """Resolve model-declared write roots without treating them as grants.
+
+        The Runtime already authorizes Bash.  These roots only narrow the OS
+        backend's temporary filesystem permissions for that invocation/lease.
+        Missing roots fall back to the workspace for backward compatibility.
+        """
+        if requested is None:
+            return (self.workspace,)
+        if not requested or len(requested) > 16:
+            raise ValueError("writable_paths must contain between 1 and 16 directories")
+        selected: list[Path] = []
+        for raw in requested:
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError("writable_paths entries must be non-empty strings")
+            relative = Path(raw)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"Writable path must be workspace-relative: {raw}")
+            path = (self.workspace / relative).resolve()
+            if not path.is_relative_to(self.workspace) or not path.is_dir():
+                raise ValueError(f"Writable path must be an existing workspace directory: {raw}")
+            cursor = self.workspace
+            for part in path.relative_to(self.workspace).parts:
+                cursor = cursor / part
+                if is_link(cursor):
+                    raise SandboxUnavailableError(
+                        f"Writable path crosses a link/reparse point: {raw}",
+                        reason_code="unsafe_workspace_entry",
+                    )
+            if any(
+                part in PROTECTED or part in READ_ONLY or part == ".env"
+                or part.startswith(".env.")
+                or part in {"settings.local.json", "credentials.json"}
+                for part in path.relative_to(self.workspace).parts
+            ):
+                raise ValueError(f"Writable path is protected or read-only: {raw}")
+            selected.append(path)
+        # Keep a deterministic minimal set: a parent grant subsumes descendants.
+        roots: list[Path] = []
+        for path in sorted(set(selected), key=lambda item: (len(item.parts), str(item))):
+            if not any(path == parent or path.is_relative_to(parent) for parent in roots):
+                roots.append(path)
+        return tuple(roots)

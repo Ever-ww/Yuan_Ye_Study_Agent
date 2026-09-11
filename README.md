@@ -246,7 +246,7 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
   "sandbox_checkpoint_merged_branch_retention_days": 30,
   "gateway_port": 8765,
   "gateway_max_concurrent_runs": 4,
-  "gateway_runtime_idle_seconds": 900,
+  "gateway_runtime_idle_seconds": 3600,
   "approval_timeout_seconds": 30,
   "cron_heartbeat_seconds": 60,
   "dream_enabled": true,
@@ -359,7 +359,7 @@ Google Scholar 仍只是候选链接来源；工具不会绕过验证码、登�
 
 `sandbox_checkpoint_limit` 默认是 `17`，必须是大于等于 1 的整数。它只限制每个 Session 中可供用户精确回退的恢复点数量，基线也计入上限；超过后淘汰最老恢复点引用，但归档分支仍需要的提交继续由 branch ref 保护，不改写项目主仓库。
 
-Gateway 默认监听 `127.0.0.1:8765`，不同 Session 最多同时运行 4 个任务，同一 Session 同时只允许一个任务。`gateway_runtime_idle_seconds=900` 表示 Session Runtime 空闲 15 分钟后关闭 Trace 与沙箱后端；Session JSONL 不会删除，下一次请求仍可恢复。
+Gateway 默认监听 `127.0.0.1:8765`，不同 Session 最多同时运行 4 个任务，同一 Session 同时只允许一个任务。`gateway_runtime_idle_seconds=3600` 表示 Session Runtime 默认空闲 60 分钟后关闭 Trace 与沙箱后端；Session JSONL 不会删除，下一次请求仍可冷恢复。`chat --continue` 会选择当前 workspace 最近的 Session：Runtime 尚在时热复用，已经回收时从 Session 记录恢复。
 
 Durable 重试参数分为 `model_retry_*`、`tool_retry_*` 和 `outbox_retry_*`。策略会在
 Logical Operation 创建时固化，后续修改配置只影响新 Operation。Outbox 默认最多尝试
@@ -687,7 +687,7 @@ tool_before  tool_during  tool_after
 
 时序固定为 `trace_start → turn_start → (model_* → tool_* …)* → turn_end → … → trace_end`。第二个用户问题同样会触发新的 `turn_start`，并且发生在该问题进入上下文前。`model_before` 可修改 `event.data["messages"]` 和 `event.data["tools"]`；`tool_before` 可修改工具名称和参数，修改后的参数仍会重新执行 JSON Schema 校验。`during` 在进入真实 Provider 或工具函数前通知一次，不会按流式文本片段重复触发；`after` 同时覆盖成功与失败，并通过 `result/reply/error` 暴露结果。
 
-默认 Runtime 在 `trace_start` 通过同一 Hook 注册器启动 OS 沙箱并创建基线 checkpoint；`trace_end` 释放后端资源并保留快照。显式 `sandbox_backend=docker` 使用 Docker。安全后端不可用时进入 checkpoint-only。Subagent 复用父 Runtime 的安全上下文；压缩 Runtime 不需要危险工具，显式禁用沙箱。Harness Coding Runtime 使用同一工厂与生命周期，但 workspace 和 checkpoint 始终绑定自己的隔离 Git worktree。
+默认 Runtime 在 `trace_start` 通过同一 Hook 注册器加载 Sandbox Policy、打开或复用 checkpoint 基线，但不会启动 OS 隔离进程。第一次真正调用 `bash` 时才扫描或复用 Workspace 安全缓存并创建 OS Sandbox；`trace_end` 释放短期权限 Lease，长期扫描缓存继续保留。显式 `sandbox_backend=docker` 使用 Docker。安全后端不可用时进入 checkpoint-only。Subagent 复用父 Runtime 的安全上下文；压缩 Runtime 不需要危险工具，显式禁用沙箱。Harness Coding Runtime 使用同一工厂与生命周期，但 workspace 和 checkpoint 始终绑定自己的隔离 Git worktree。
 
 Checkpoint 不写入 workspace 自身的 `.git`。当 workspace 就是 Agent 根目录时，每个 Session 在 `.yy/sandbox/checkpoints/<session-id>/` 使用独立 Git 对象库；外部 workspace 则保存到 `.yy/sandbox/checkpoints/<workspace-hash>/<session-id>/`。对象库用无父 commit 保存 workspace 快照，因此 workspace 的 `git status`、当前分支和 `git push` 都不会包含这些 commit。回溯采用 hard-reset 语义恢复非忽略文件，workspace 中的 `.git`、`.yy`、`.env*` 等敏感或运行期路径不会进入快照。
 
