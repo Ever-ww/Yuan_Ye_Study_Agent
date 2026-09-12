@@ -17,7 +17,15 @@ from uuid import uuid4
 from backup.maintenance import lifecycle_work, lifecycle_mutation, validate_home_databases, MaintenanceBlockedError
 from backup.models import MaintenanceState
 
-from Agent import ExtensionCapability, ExtensionLoader, RuntimeConfig
+from Agent import (
+    ExtensionCapability,
+    ExtensionLoader,
+    RuntimeConfig,
+    RuntimePluginManager,
+    RuntimePluginWatcher,
+    RuntimeProfile,
+    load_generation_tool_module,
+)
 from Agent.state import (
     CompleteOperationAttemptCommand,
     CreateOperationWithAttemptCommand,
@@ -156,7 +164,20 @@ class GatewayApplication:
         source_root = config.coding_source_root or Path(__file__).resolve().parents[1]
         if self.write_gate.state == MaintenanceState.RUNNING:
             self._reconcile_extension_grant_intents(source_root)
-        self.extensions = ExtensionLoader(source_root).scan()
+        self.runtime_plugins = RuntimePluginManager(
+            source_root=source_root,
+            agent_root=config.agent_root,
+            state_controller=self.state_controller,
+        )
+        self.runtime_plugins.ensure_initial_generation()
+        interactive_resources = self.runtime_plugins.snapshot(RuntimeProfile.INTERACTIVE)
+        self.extensions = ExtensionLoader(interactive_resources.source_root).scan()
+        self.runtime_plugin_watcher = RuntimePluginWatcher(
+            self.runtime_plugins,
+            poll_seconds=config.runtime_plugin_watch_poll_seconds,
+            debounce_seconds=config.runtime_plugin_watch_debounce_seconds,
+            write_gate=self.write_gate,
+        )
         self.cron_store = CronStore(
             config.agent_root,
             database_path=self.store.database_path,
@@ -193,6 +214,7 @@ class GatewayApplication:
             config,
             store=self.store,
             state_controller=self.state_controller,
+            runtime_resource_manager=self.runtime_plugins,
         )
         self._harness_dream_tick_lock = asyncio.Lock()
 
@@ -216,6 +238,7 @@ class GatewayApplication:
             harness_evolution_service=self.harness_evolution,
             cron_tool_authorizer=self.cron_service.tool_preapproved,
             cron_terminal_callback=self._settle_cron_terminal,
+            runtime_resource_manager=self.runtime_plugins,
         )
         self.recovery = RecoveryCoordinator(
             self.state_controller,
@@ -255,7 +278,9 @@ class GatewayApplication:
         )
         self._browser_codes: dict[str, float] = {}
         self.code_sessions = CodeSessionManager(
-            config, grant_backend=self.state_controller,
+            config,
+            grant_backend=self.state_controller,
+            runtime_resource_manager=self.runtime_plugins,
         )
         from tools import HarnessDreamTool, HarnessErrorTool, HarnessManualTool
         self.harness_manual_tool = HarnessManualTool(lambda: self.code_sessions)
@@ -269,6 +294,7 @@ class GatewayApplication:
         if self.memory_embedding_worker is not None:
             self.maintenance.register("memory_embedding", self.memory_embedding_worker)
         self.maintenance.register("harness", self.code_sessions)
+        self.maintenance.register("runtime_plugins", self.runtime_plugin_watcher)
         self.restart_coordinator = GatewayRestartCoordinator(
             agent_root=config.agent_root, source_root=source_root,
             port=config.gateway_port, gateway_epoch=self.gateway_epoch,
@@ -311,7 +337,8 @@ class GatewayApplication:
         """Merge existing Gateway diagnostics with canonical Memory health."""
         return {**self.state_controller.health(), **self.memory_store.memory_health(),
                 "maintenance": self.maintenance.snapshot.model_dump(mode="json"),
-                "accepting_work": self.write_gate.state == MaintenanceState.RUNNING}
+                "accepting_work": self.write_gate.state == MaintenanceState.RUNNING,
+                "runtime_plugins": self.runtime_plugin_status()}
 
     async def quiesce(self, timeout: float = 30, reason: str = "maintenance"):
         return await self.maintenance.quiesce(reason, timeout)
@@ -370,7 +397,14 @@ class GatewayApplication:
             self.memory_store.structured.watermark()
 
     def skills_for_maintenance(self):
-        return SkillService(self.config.agent_root, self.config.workspace_root, self.config.coding_source_root)
+        snapshot = self.runtime_plugins.snapshot(RuntimeProfile.MAINTENANCE)
+        return SkillService(
+            self.config.agent_root,
+            self.config.workspace_root,
+            snapshot.source_root,
+            allowed_names=(),
+            read_only=True,
+        )
 
     def _reconcile_extension_grant_intents(self, source_root: Path) -> None:
         for row in self.state_controller.pending_extension_grant_intents():
@@ -421,6 +455,10 @@ class GatewayApplication:
             # Only explicit resume after health checks can launch recovery/workers.
             return
         self.state_controller.prune_retention()
+        await asyncio.to_thread(
+            self.runtime_plugins.collect_garbage,
+            retention_days=self.config.runtime_plugin_generation_retention_days,
+        )
         # Delivery and archive evidence are reconciled before any runtime recovery
         # may append new events.  The dispatcher itself starts only after recovery.
         self.outbox.reconcile_startup()
@@ -430,6 +468,8 @@ class GatewayApplication:
             await self.memory_embedding_worker.start()
         try:
             await self.pool.start()
+            if self.config.runtime_plugin_watch_enabled:
+                await self.runtime_plugin_watcher.start()
             await self.cron_store.ensure()
             await self._reconcile_cron_dispatches()
             await self.recovery.recover()
@@ -619,6 +659,7 @@ class GatewayApplication:
 
     async def close(self) -> None:
         try:
+            await self.runtime_plugin_watcher.close()
             await self.event_archive_scheduler.close()
             await self.restart_coordinator.close()
             await self.backup_scheduler.close()
@@ -666,6 +707,7 @@ class GatewayApplication:
         )
 
     def extension_status(self, hook_id: str | None = None) -> dict[str, object]:
+        self.extensions = self._active_extension_catalog()
         modules = [
             module for selected in self.extensions.modules.values() for module in selected
             if hook_id is None or module.hook_id == hook_id
@@ -693,7 +735,37 @@ class GatewayApplication:
             "loader_rejections": list(self.extensions.rejections),
         }
 
+    def runtime_plugin_status(self) -> dict[str, object]:
+        return {
+            **self.state_controller.runtime_resource_status(),
+            "watcher": self.runtime_plugin_watcher.status(),
+        }
+
+    def reload_runtime_plugins(
+        self, *, actor: str, approved_plan_hash: str | None = None,
+    ) -> dict[str, object]:
+        result = self.runtime_plugins.reload(
+            actor=actor, approved_plan_hash=approved_plan_hash,
+        )
+        if result.status == "activated":
+            self.extensions = self._active_extension_catalog()
+        return result.model_dump(mode="json")
+
+    def rollback_runtime_plugin(
+        self, plugin_id: str, *, from_generation_id: str, actor: str,
+    ) -> dict[str, object]:
+        result = self.runtime_plugins.rollback_member(
+            plugin_id, from_generation_id=from_generation_id, actor=actor,
+        )
+        self.extensions = self._active_extension_catalog()
+        return result.model_dump(mode="json")
+
+    def _active_extension_catalog(self):
+        snapshot = self.runtime_plugins.snapshot(RuntimeProfile.INTERACTIVE)
+        return ExtensionLoader(snapshot.source_root).scan()
+
     def grant_extension(self, request: ExtensionGrantRequest, *, revoke: bool = False):
+        self.extensions = self._active_extension_catalog()
         module = self._extension_module(
             request.hook_id, request.stage, request.source_hash, request.manifest_hash,
         )
@@ -743,6 +815,7 @@ class GatewayApplication:
         self, hook_id: str, stage: str, source_hash: str,
         manifest_hash: str | None,
     ):
+        self.extensions = self._active_extension_catalog()
         for module in self.extensions.modules.get(stage, ()):
             if (
                 module.hook_id == hook_id and module.source_hash == source_hash
@@ -761,12 +834,14 @@ class GatewayApplication:
         raise KeyError(hook_id)
 
     def _interactive_tool_registry(self):
-        # Build the same default interactive registry contract used by Runtime.
+        # Build from the active immutable Generation, never from editable files.
         from tool import default_tools
+        snapshot = self.runtime_plugins.snapshot(RuntimeProfile.INTERACTIVE)
         return default_tools(
             self.config.workspace_root,
             agent_root=self.config.agent_root,
             runtime_profile="interactive",
+            tool_module=load_generation_tool_module(snapshot),
         )
 
     @lifecycle_work("request")
@@ -1735,6 +1810,8 @@ class GatewayApplication:
     @lifecycle_work("request")
     async def start_run(self, request: RunCreateRequest) -> RunRecord:
         self.store.project(request.project_id)
+        run_id = uuid4().hex
+        resource_snapshot = self.runtime_plugins.snapshot(RuntimeProfile.INTERACTIVE)
         request_body = json.dumps(
             {
                 "project_id": request.project_id,
@@ -1749,7 +1826,7 @@ class GatewayApplication:
         )
         request_hash = hashlib.sha256(request_body.encode("utf-8")).hexdigest()
         state, duplicate = self.state_controller.create_run(
-            run_id=uuid4().hex,
+            run_id=run_id,
             workload_kind=WorkloadKind.CHAT,
             project_id=request.project_id,
             client_id=request.client_id,
@@ -1758,6 +1835,7 @@ class GatewayApplication:
             idempotency_key=request.idempotency_key or uuid4().hex,
             request_hash=request_hash,
             deadline_at=request.deadline_at,
+            runtime_generation_id=resource_snapshot.generation_id,
         )
         run = self.store.run(state.run_id)
         if duplicate:
@@ -1803,6 +1881,16 @@ class GatewayApplication:
     @lifecycle_work("request")
     async def _submit_cron_dispatch(self, dispatch: CronDispatch) -> None:
         job = await self.cron_service.get(dispatch.job_id)
+        cron_generation_id = self.runtime_plugins.referenced_generation(
+            owner_kind="cron", owner_id=dispatch.dispatch_id,
+        )
+        if cron_generation_id is None:
+            cron_snapshot = self.runtime_plugins.snapshot(RuntimeProfile.CRON)
+            cron_generation_id = cron_snapshot.generation_id
+            self.runtime_plugins.acquire_reference(
+                cron_generation_id,
+                owner_kind="cron", owner_id=dispatch.dispatch_id,
+            )
         run_id = hashlib.sha256(f"cron-run:{dispatch.dispatch_id}".encode()).hexdigest()[:32]
         session_id = hashlib.sha256(f"cron-session:{dispatch.dispatch_id}".encode()).hexdigest()[:16]
         project = self.store.project(job.project_id)
@@ -1829,6 +1917,13 @@ class GatewayApplication:
             request_hash=dispatch.request_hash,
             persistence_contract=PersistenceContract.SESSION_BACKED_WORKLOAD,
             session_id=session_id,
+            runtime_generation_id=cron_generation_id,
+        )
+        # The Run and its Cron scheduling fact independently reference the
+        # same immutable Generation. RuntimePool recovery therefore cannot
+        # silently switch a crash-resumed dispatch to today's active head.
+        self.runtime_plugins.acquire_reference(
+            cron_generation_id, owner_kind="run", owner_id=run_id,
         )
         operation_id = hashlib.sha256(f"cron-operation:{dispatch.dispatch_id}".encode()).hexdigest()[:32]
         attempt_id = hashlib.sha256(f"cron-attempt:{dispatch.dispatch_id}".encode()).hexdigest()[:32]
@@ -1898,6 +1993,15 @@ class GatewayApplication:
             status=status,
             result=run.answer if status == "succeeded" else None,
             error=run.error if status == "failed" else None,
+        )
+        self.runtime_plugins.release_reference(
+            owner_kind="cron", owner_id=row.dispatch_id,
+        )
+        # Normal Runtime finalization already releases this reference.  The
+        # explicit release also covers recovery that finds a terminal Run
+        # after binding but before RuntimePool.submit().
+        self.runtime_plugins.release_reference(
+            owner_kind="run", owner_id=run.run_id,
         )
 
     async def cancel_run(self, run_id: str) -> bool:

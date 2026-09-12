@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict
 
 from tool.contracts import ToolContext
 from tool.path_guard import safe_workspace_path
-from tools.web_fetch import (
+from .web_fetch import (
     HostResolver,
     WebFetchNetworkError,
     WebFetchSecurityError,

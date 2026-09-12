@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
@@ -22,12 +22,24 @@ from Agent.hook import (
     HookEvent,
     HookPoint,
     HookRegistry,
+    build_core_hooks,
     build_default_hooks,
     register_sandbox_callbacks,
+)
+from Agent.resource_adapters import (
+    build_runtime_contribution_adapters,
+    install_runtime_contribution_adapters,
 )
 from Agent.models import build_provider
 from Agent.react import ReactLoop
 from Agent.retry import ModelRetryPolicy
+from Agent.resources import (
+    RuntimeContributionKind,
+    RuntimeResourceBundle,
+    RuntimeResourceSnapshot,
+    load_generation_tool_module,
+    register_runtime_resource_callbacks,
+)
 from context_process import ContextProcessor
 from memory import MemoryStore
 from paper_library import PaperLibraryService
@@ -97,11 +109,34 @@ class AgentRuntime:
         paper_library: PaperLibraryService | None = None,
         enable_paper_library: bool = True,
         session_origin: Literal["interactive", "cron", "maintenance"] = "interactive",
-        runtime_profile: Literal["interactive", "cron", "harness", "maintenance"] | None = None,
+        runtime_profile: Literal[
+            "interactive", "cron", "subagent", "compression", "harness", "maintenance"
+        ] | None = None,
         extension_state: Any | None = None,
         extension_runtime_policy: ExtensionRuntimePolicy | None = None,
+        resource_snapshot: RuntimeResourceSnapshot | None = None,
+        auxiliary_resource_snapshots: Mapping[str, RuntimeResourceSnapshot] | None = None,
     ) -> None:
         self.config = config or load_runtime_config()
+        self.resource_snapshot = resource_snapshot
+        self.resource_generation_id = (
+            resource_snapshot.generation_id if resource_snapshot is not None else None
+        )
+        self.auxiliary_resource_snapshots = dict(auxiliary_resource_snapshots or {})
+        resource_source_root = (
+            resource_snapshot.source_root
+            if resource_snapshot is not None
+            else (self.config.coding_source_root or self.config.agent_root)
+        )
+        resource_agent_root = (
+            resource_snapshot.agent_root
+            if resource_snapshot is not None else self.config.agent_root
+        )
+        generation_tools = (
+            load_generation_tool_module(resource_snapshot)
+            if resource_snapshot is not None else None
+        )
+        self.generation_tools = generation_tools
         self.provider = provider or build_provider(
             self.config.provider,
             self.config.model,
@@ -175,6 +210,7 @@ class AgentRuntime:
             self.memory = memory
         if hasattr(self.memory, "configure_long_term_retrieval"):
             self.memory.configure_long_term_retrieval(self.config)
+        self.skill_management = None
         if enable_skills:
             if skills is not None:
                 if skills.agent_root != self.config.agent_root:
@@ -182,13 +218,23 @@ class AgentRuntime:
                 if skills.workspace_root != self.config.workspace_root:
                     raise ValueError("SkillService.workspace_root 必须与 RuntimeConfig.workspace_root 一致")
                 self.skills = skills
+                self.skill_management = skills
             else:
                 self.skills = SkillService(
                     self.config.agent_root,
                     self.config.workspace_root,
-                    self.config.coding_source_root,
+                    resource_source_root,
                     approval=self.approval,
                 )
+                if resource_snapshot is not None:
+                    self.skill_management = SkillService(
+                        self.config.agent_root,
+                        self.config.workspace_root,
+                        self.config.coding_source_root,
+                        approval=self.approval,
+                    )
+                else:
+                    self.skill_management = self.skills
         else:
             self.skills = None
         if enable_references:
@@ -204,8 +250,11 @@ class AgentRuntime:
         if tools is not None:
             self.tools = tools
         else:
+            web_search_type = getattr(generation_tools, "WebSearchTool", WebSearchTool)
+            web_fetch_type = getattr(generation_tools, "WebFetchTool", WebFetchTool)
+            paper_download_type = getattr(generation_tools, "PaperDownloadTool", PaperDownloadTool)
             web_search = (
-                WebSearchTool(
+                web_search_type(
                     self.config.web_search_api_key,
                     timeout_seconds=self.config.web_search_timeout_seconds,
                     use_system_proxy=self.config.use_system_proxy,
@@ -214,14 +263,14 @@ class AgentRuntime:
                 if self.config.web_search_api_key
                 else None
             )
-            web_fetch = WebFetchTool(
+            web_fetch = web_fetch_type(
                 timeout_seconds=self.config.web_fetch_timeout_seconds,
                 max_bytes=self.config.web_fetch_max_bytes,
                 max_chars=self.config.web_fetch_max_chars,
                 use_system_proxy=self.config.use_system_proxy,
                 proxy_url=self.config.proxy_url,
             )
-            paper_download = PaperDownloadTool(
+            paper_download = paper_download_type(
                 timeout_seconds=self.config.paper_download_timeout_seconds,
                 max_bytes=self.config.paper_download_max_bytes,
                 use_system_proxy=self.config.use_system_proxy,
@@ -248,18 +297,28 @@ class AgentRuntime:
                 reference_search_mode=self.config.reference_search_mode,
                 paper_library_service=self.paper_library,
                 runtime_profile=runtime_profile or session_origin,
+                tool_module=generation_tools,
+                skill_install_service=self.skill_management,
             )
             if enable_subagent:
-                runner = subagent_runner or RuntimeSubagentRunner(self.config, base_tools)
-                register_subagent(base_tools, runner)
+                runner = subagent_runner or RuntimeSubagentRunner(
+                    self.config,
+                    base_tools,
+                    resource_snapshot=self.auxiliary_resource_snapshots.get("subagent"),
+                )
+                register_subagent(base_tools, runner, tool_module=generation_tools)
             self.tools = base_tools
         if (
             tools is None and hooks is None
             and (runtime_profile or session_origin) in {"interactive", "harness"}
             and hasattr(self.memory, "sessions")
         ):
-            from tools.session_history import SessionHistoryTool
-            from tools.session_read import SessionReadTool
+            if generation_tools is None:
+                from tools.session_history import SessionHistoryTool
+                from tools.session_read import SessionReadTool
+            else:
+                SessionHistoryTool = generation_tools.SessionHistoryTool
+                SessionReadTool = generation_tools.SessionReadTool
 
             self.tools.register(SessionHistoryTool(self.memory))
             self.tools.register(SessionReadTool(self.memory))
@@ -270,27 +329,55 @@ class AgentRuntime:
                 self.memory,
                 provider_factory=compression_provider_factory,
             )
+            self.context_processor.runtime_resource_snapshot = (
+                self.auxiliary_resource_snapshots.get("compression")
+            )
         self.prompts = prompt_composer or PromptComposer(
             self.config,
             self.memory,
             self.skills,
             sandbox_enabled=self.sandbox is not None,
+            resource_agent_root=resource_agent_root,
+            prefer_current_skill_catalog=resource_snapshot is not None,
         )
-        self.hooks = hooks or build_default_hooks(
-            self.config.memory_dir, self.memory, self.context_processor, self.prompts,
-            session_origin=session_origin,
-            runtime_profile=runtime_profile,
-            session_read_available="session_read" in self.tools.names(),
-            runtime_config=self.config,
-        )
-        if self._owns_sandbox and self.sandbox is not None:
+        if hooks is not None:
+            self.hooks = hooks
+        elif resource_snapshot is not None:
+            self.hooks = build_core_hooks()
+        else:
+            self.hooks = build_default_hooks(
+                self.config.memory_dir, self.memory, self.context_processor, self.prompts,
+                session_origin=session_origin,
+                runtime_profile=runtime_profile,
+                session_read_available="session_read" in self.tools.names(),
+                runtime_config=self.config,
+            )
+        self.resource_adapters = ()
+        if resource_snapshot is not None:
+            self.resource_adapters = build_runtime_contribution_adapters(
+                resource_snapshot,
+                memory=self.memory,
+                prompts=self.prompts,
+                context_processor=self.context_processor,
+                sandbox=self.sandbox if self._owns_sandbox else None,
+                runtime_config=self.config,
+                session_origin=session_origin,
+                runtime_profile=runtime_profile or session_origin,
+                session_read_available="session_read" in self.tools.names(),
+            )
+            install_runtime_contribution_adapters(self.hooks, self.resource_adapters)
+        elif self._owns_sandbox and self.sandbox is not None:
             register_sandbox_callbacks(self.hooks, self.sandbox)
         self.extensions = extensions
         self._extension_binding = ExtensionRuntimeBinding(trace_id=uuid4().hex)
         self._extension_services: ExtensionServices | None = None
         if enable_extensions:
-            source_root = self.config.coding_source_root or self.config.agent_root
-            self.extensions = self.extensions or ExtensionLoader(source_root).scan()
+            source_root = resource_source_root
+            self.extensions = (
+                ExtensionLoader(source_root).scan()
+                if resource_snapshot is not None
+                else self.extensions or ExtensionLoader(source_root).scan()
+            )
             self._extension_services = ExtensionServices(
                 workspace_root=self.config.workspace_root,
                 memory=self.memory,
@@ -307,6 +394,46 @@ class AgentRuntime:
                 binding=self._extension_binding,
                 runtime_policy=extension_runtime_policy,
             )
+        self.resource_bundle = (
+            RuntimeResourceBundle(
+                snapshot=resource_snapshot,
+                tools=self.tools,
+                skills=self.skills,
+                prompts=self.prompts,
+                hooks=self.hooks,
+                extensions=self.extensions,
+                contributions=resource_snapshot.contributions,
+                contribution_instances={
+                    RuntimeContributionKind.TOOL: (self.tools,),
+                    RuntimeContributionKind.SKILL: (
+                        (self.skills,) if self.skills is not None else ()
+                    ),
+                    RuntimeContributionKind.STABLE_PROMPT: (self.prompts,),
+                    RuntimeContributionKind.HOOK: tuple(
+                        adapter for adapter in self.resource_adapters
+                        if any(
+                            item.plugin_id == adapter.plugin_id
+                            and item.kind is RuntimeContributionKind.HOOK
+                            for item in resource_snapshot.contributions
+                        )
+                    ),
+                    RuntimeContributionKind.EXTENSION: (
+                        (self.extensions,) if self.extensions is not None else ()
+                    ),
+                    RuntimeContributionKind.DYNAMIC_CONTEXT: tuple(
+                        adapter for adapter in self.resource_adapters
+                        if any(
+                            item.plugin_id == adapter.plugin_id
+                            and item.kind is RuntimeContributionKind.DYNAMIC_CONTEXT
+                            for item in resource_snapshot.contributions
+                        )
+                    ),
+                },
+            )
+            if resource_snapshot is not None else None
+        )
+        self._active_resource_bundle: RuntimeResourceBundle | None = None
+        self._resource_mount_registered = False
         self._session_id: str | None = None
         self._session_open = False
         self._sandbox_fallback_notified: set[str] = set()
@@ -315,6 +442,88 @@ class AgentRuntime:
     def active_session_id(self) -> str | None:
         """返回当前打开的 Session，供 CLI 在失败后保存复现现场。"""
         return self._session_id
+
+    def mount_runtime_resources(
+        self, bundle: RuntimeResourceBundle, event: HookEvent,
+    ) -> None:
+        """Bind an immutable resource Bundle at TRACE_START.
+
+        Hook is the assembly bus only: concrete Tool/Skill/Prompt/Extension
+        implementations continue to execute in their own registries/services.
+        """
+        if bundle.snapshot.generation_id != self.resource_generation_id:
+            raise RuntimeError("Runtime resource Generation does not match this Runtime")
+        if (
+            self._active_resource_bundle is not None
+            and self._active_resource_bundle is not bundle
+        ):
+            raise RuntimeError("A Runtime Trace cannot switch resource Generation")
+        if (
+            self.tools is not bundle.tools
+            or self.skills is not bundle.skills
+            or self.prompts is not bundle.prompts
+            or self.hooks is not bundle.hooks
+            or self.extensions is not bundle.extensions
+        ):
+            raise RuntimeError("Runtime resource Bundle identity changed before TRACE_START")
+        self.tools.freeze()
+        self._active_resource_bundle = bundle
+        event.data["resource_generation_id"] = bundle.snapshot.generation_id
+        event.data["runtime_profile"] = bundle.snapshot.profile.value
+        event.data["runtime_contributions"] = tuple(
+            f"{item.plugin_id}:{item.kind.value}:{item.name}"
+            for item in bundle.contributions
+        )
+
+    def unmount_runtime_resources(
+        self, bundle: RuntimeResourceBundle, event: HookEvent,
+    ) -> None:
+        """Release the Trace binding without mutating the immutable Bundle."""
+        del event
+        if self._active_resource_bundle is bundle:
+            self._active_resource_bundle = None
+
+    def _register_resource_mount(self) -> None:
+        """Freeze the final pre-Trace assembly into the lifecycle mount hook."""
+        if self.resource_snapshot is None or self._resource_mount_registered:
+            return
+        self.resource_bundle = RuntimeResourceBundle(
+            snapshot=self.resource_snapshot,
+            tools=self.tools,
+            skills=self.skills,
+            prompts=self.prompts,
+            hooks=self.hooks,
+            extensions=self.extensions,
+            contributions=self.resource_snapshot.contributions,
+            contribution_instances={
+                RuntimeContributionKind.TOOL: (self.tools,),
+                RuntimeContributionKind.SKILL: (
+                    (self.skills,) if self.skills is not None else ()
+                ),
+                RuntimeContributionKind.STABLE_PROMPT: (self.prompts,),
+                RuntimeContributionKind.HOOK: tuple(
+                    adapter for adapter in self.resource_adapters
+                    if any(
+                        item.plugin_id == adapter.plugin_id
+                        and item.kind is RuntimeContributionKind.HOOK
+                        for item in self.resource_snapshot.contributions
+                    )
+                ),
+                RuntimeContributionKind.EXTENSION: (
+                    (self.extensions,) if self.extensions is not None else ()
+                ),
+                RuntimeContributionKind.DYNAMIC_CONTEXT: tuple(
+                    adapter for adapter in self.resource_adapters
+                    if any(
+                        item.plugin_id == adapter.plugin_id
+                        and item.kind is RuntimeContributionKind.DYNAMIC_CONTEXT
+                        for item in self.resource_snapshot.contributions
+                    )
+                ),
+            },
+        )
+        register_runtime_resource_callbacks(self.hooks, self.resource_bundle, self)
+        self._resource_mount_registered = True
 
     def invalidate_context_cache(self) -> None:
         """让下一次模型调用重新读取长期 Profile，不影响正在运行的消息列表。"""
@@ -347,7 +556,10 @@ class AgentRuntime:
             return
         sandbox_status = sandbox_status_of(self.sandbox)
         self.prompts.set_sandbox_status(sandbox_status)
-        yield RunEvent(type=EventType.STARTED, payload={"session_id": active_id})
+        yield RunEvent(type=EventType.STARTED, payload={
+            "session_id": active_id,
+            "resource_generation_id": self.resource_generation_id,
+        })
         if (
             sandbox_status.mode == "checkpoint_only"
             and active_id not in self._sandbox_fallback_notified
@@ -621,8 +833,20 @@ class AgentRuntime:
             if requested_session_id and requested_session_id != self._session_id:
                 raise ValueError("同一个 AgentRuntime 不能在未关闭时切换 Session")
             return str(self._session_id)
+        # Tool and Hook contracts are immutable for the complete Trace.  A
+        # resource reload creates a replacement Runtime at the next Turn.
+        self._register_resource_mount()
+        if self.resource_bundle is None:
+            self.tools.freeze()
         session_id = requested_session_id or uuid4().hex[:16]
-        event = HookEvent(point=HookPoint.TRACE_START, session_id=session_id, data={"task": task, "new_session": requested_session_id is None})
+        event = HookEvent(point=HookPoint.TRACE_START, session_id=session_id, data={
+            "task": task,
+            "new_session": requested_session_id is None,
+            "resource_generation_id": self.resource_generation_id,
+            "runtime_profile": (
+                self.resource_snapshot.profile.value if self.resource_snapshot is not None else None
+            ),
+        })
         try:
             await self.hooks.emit(event)
         except Exception:

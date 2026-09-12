@@ -18,7 +18,8 @@ from backup.security import SensitiveEnvSanitizer
 
 from Agent import (
     AgentRuntime, EventType, ExtensionLoader, ModelRetryPolicy, RuntimeConfig,
-    RuntimeFailure, build_extension_grant_plan,
+    RuntimeFailure, RuntimeProfile, RuntimeResourceSnapshot,
+    build_extension_grant_plan,
 )
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models import build_provider
@@ -300,6 +301,7 @@ class CodeSessionRecord(BaseModel):
     audit_path: Path
     origin: HarnessOriginContext | None = None
     grant_plan: dict[str, Any] = Field(default_factory=dict)
+    resource_generation_id: str | None = None
 
 
 class CodeTurnResult(BaseModel):
@@ -391,6 +393,7 @@ class CodeSessionController:
         runtime_factory: Callable[[RuntimeConfig, Path], AgentRuntime] | None = None,
         memory_provider_factory: Callable[[RuntimeConfig], Any] | None = None,
         grant_backend: Any | None = None,
+        runtime_resource_manager: Any | None = None,
     ) -> None:
         self.config = config
         self.runtime_factory = runtime_factory
@@ -400,6 +403,7 @@ class CodeSessionController:
         self.runtime: AgentRuntime | None = None
         self._requirements: list[str] = []
         self.grant_backend = grant_backend
+        self.runtime_resource_manager = runtime_resource_manager
         self._latest_grant_plan: dict[str, Any] = {}
 
     async def start(
@@ -434,6 +438,12 @@ class CodeSessionController:
         worktree_parent.mkdir(parents=True, exist_ok=True)
         branch = f"harness-code/{code_id}"
         await self._git(root, "worktree", "add", "-b", branch, str(worktree), base)
+        resource_snapshot = self._resource_snapshot("manual")
+        if self.runtime_resource_manager is not None and resource_snapshot is not None:
+            self.runtime_resource_manager.acquire_reference(
+                resource_snapshot.generation_id,
+                owner_kind="harness", owner_id=code_id,
+            )
         try:
             factory = self.runtime_factory or create_coding_runtime
             runtime = _create_profiled_runtime(
@@ -443,6 +453,7 @@ class CodeSessionController:
                 trigger="manual",
                 target="extension",
                 invocation_id=code_id,
+                resource_snapshot=resource_snapshot,
             )
             if not _runtime_targets_worktree(runtime, worktree):
                 await runtime.close()
@@ -468,12 +479,30 @@ class CodeSessionController:
                 last_verified_commit=base,
                 audit_path=audit_path,
                 origin=origin,
+                resource_generation_id=(
+                    resource_snapshot.generation_id if resource_snapshot is not None else None
+                ),
             )
             return self.record
         except Exception:
+            if self.runtime_resource_manager is not None:
+                self.runtime_resource_manager.release_reference(
+                    owner_kind="harness", owner_id=code_id,
+                )
             await self._git(root, "worktree", "remove", "--force", str(worktree), check=False)
             await self._git(root, "branch", "-D", branch, check=False)
             raise
+
+    def _resource_snapshot(self, trigger: str) -> RuntimeResourceSnapshot | None:
+        if self.runtime_resource_manager is None:
+            return None
+        profile = {
+            "manual": RuntimeProfile.HARNESS_MANUAL,
+            "error": RuntimeProfile.HARNESS_ERROR,
+            "capability": RuntimeProfile.HARNESS_CAPABILITY,
+            "dream": RuntimeProfile.HARNESS_DREAM,
+        }[trigger]
+        return self.runtime_resource_manager.snapshot(profile)
 
     async def _run_turn_legacy(self, task: str) -> CodeTurnResult:
         """Compatibility alias; the single Evolution Engine owns the execution pipeline."""
@@ -481,11 +510,59 @@ class CodeSessionController:
 
     async def run_turn(self, task: str) -> CodeTurnResult:
         """Thin MANUAL adapter: the shared engine owns generation, repair and validation."""
+        await self._refresh_runtime_generation()
         return await HarnessEvolutionEngine.for_config(
             self.config,
             runtime_factory=self.runtime_factory or create_coding_runtime,
             memory_provider_factory=self.memory_provider_factory,
+            runtime_resource_manager=self.runtime_resource_manager,
         ).run_manual_turn(self, task)
+
+    async def _refresh_runtime_generation(self) -> None:
+        """Switch /code resources only at a Turn boundary, preserving Memory."""
+        if self.runtime_resource_manager is None or self.record is None:
+            return
+        snapshot = self.runtime_resource_manager.snapshot(RuntimeProfile.HARNESS_MANUAL)
+        if self.runtime is not None and self.record.resource_generation_id == snapshot.generation_id:
+            return
+        record = self.record
+        if self.runtime is not None:
+            await self.runtime.close()
+            self.runtime = None
+        referenced = self.runtime_resource_manager.referenced_generation(
+            owner_kind="harness", owner_id=record.code_session_id,
+        )
+        if referenced != snapshot.generation_id:
+            if referenced is not None:
+                self.runtime_resource_manager.release_reference(
+                    owner_kind="harness", owner_id=record.code_session_id,
+                )
+            self.runtime_resource_manager.acquire_reference(
+                snapshot.generation_id,
+                owner_kind="harness", owner_id=record.code_session_id,
+            )
+        runtime = _create_profiled_runtime(
+            self.runtime_factory or create_coding_runtime,
+            self.config,
+            record.worktree_path,
+            trigger="manual",
+            target="extension",
+            invocation_id=record.code_session_id,
+            resource_snapshot=snapshot,
+            coding_session_id=record.coding_memory_session_id,
+        )
+        if not _runtime_targets_worktree(runtime, record.worktree_path):
+            await runtime.close()
+            raise RuntimeError("Reloaded Coding Runtime escaped its isolated worktree")
+        self.runtime = runtime
+        self.record = record.model_copy(update={
+            "resource_generation_id": snapshot.generation_id,
+        })
+        self.audit.append_event(
+            record.audit_path,
+            "runtime_generation_switched",
+            generation_id=snapshot.generation_id,
+        )
 
     async def finalize(
         self, *, approved_plan_hash: str | None = None,
@@ -495,6 +572,7 @@ class CodeSessionController:
             self.config,
             runtime_factory=self.runtime_factory or create_coding_runtime,
             memory_provider_factory=self.memory_provider_factory,
+            runtime_resource_manager=self.runtime_resource_manager,
         ).finalize_manual(
             self, approved_plan_hash=approved_plan_hash,
             decision_actor=decision_actor, run_id=run_id,
@@ -507,6 +585,10 @@ class CodeSessionController:
         await self._cleanup(record, keep_branch=False)
         self.audit.append_event(record.audit_path, "code_session_aborted")
         self.record = None
+        if self.runtime_resource_manager is not None:
+            self.runtime_resource_manager.release_reference(
+                owner_kind="harness", owner_id=record.code_session_id,
+            )
         return CodeFinalizeResult(
             code_session_id=record.code_session_id,
             status="aborted",
@@ -716,6 +798,8 @@ def create_coding_runtime(
     profile: HarnessRuntimeProfile | None = None,
     trace_context: HarnessTraceContext | None = None,
     prefix_cache: HarnessPromptPrefixCache | None = None,
+    resource_snapshot: RuntimeResourceSnapshot | None = None,
+    coding_session_id: str | None = None,
 ) -> AgentRuntime:
     """复用正式 AgentRuntime 装配具备完整工作区能力的 Coding Agent。"""
     isolated = config.model_copy(update={
@@ -723,7 +807,11 @@ def create_coding_runtime(
         "stream": False,
         "compression_threshold_tokens": config.compression_threshold_tokens or 200000,
     })
-    resource_loader = HarnessRuntimeResourceLoader(Path(__file__).resolve().parent / "runtime")
+    resource_loader = HarnessRuntimeResourceLoader(
+        resource_snapshot.source_root
+        if resource_snapshot is not None
+        else Path(__file__).resolve().parent / "runtime"
+    )
     selected_profile = profile or resource_loader.profile(HarnessRuntimeTrigger.MANUAL)
     skills = resource_loader.build_skills(
         selected_profile,
@@ -747,8 +835,9 @@ def create_coding_runtime(
     )
     # Harness recall is shared by source repository identity, never by the
     # disposable worktree path of one invocation.
-    session_id = uuid4().hex[:16]
-    memory.create_session("Harness Coding Agent 本次更新", session_id=session_id)
+    session_id = coding_session_id or uuid4().hex[:16]
+    if not memory.has_session(session_id):
+        memory.create_session("Harness Coding Agent 本次更新", session_id=session_id)
     tools = resource_loader.build_tools(selected_profile, isolated, skills)
     from tools.session_history import SessionHistoryTool
     from tools.session_read import SessionReadTool
@@ -800,6 +889,7 @@ def create_coding_runtime(
         enable_cron=False,
         enable_references=False,
         runtime_profile="harness",
+        resource_snapshot=resource_snapshot,
     )
     register_harness_context_callbacks(runtime.hooks, dynamic_context, sandbox=runtime.sandbox)
     runtime.coding_session_id = session_id
@@ -818,8 +908,14 @@ def _runtime_profile_and_trace(
     trigger: str,
     target: str,
     invocation_id: str,
+    resource_snapshot: RuntimeResourceSnapshot | None = None,
+    coding_session_id: str | None = None,
 ) -> tuple[HarnessRuntimeProfile, HarnessTraceContext]:
-    resource_loader = HarnessRuntimeResourceLoader(Path(__file__).resolve().parent / "runtime")
+    resource_loader = HarnessRuntimeResourceLoader(
+        resource_snapshot.source_root
+        if resource_snapshot is not None
+        else Path(__file__).resolve().parent / "runtime"
+    )
     profile = resource_loader.profile(HarnessRuntimeTrigger(trigger))
     isolated = config.model_copy(update={"workspace_root": worktree.resolve(), "stream": False})
     skills = resource_loader.build_skills(
@@ -859,6 +955,7 @@ def _create_profiled_runtime(
     trigger: str,
     target: str,
     invocation_id: str,
+    resource_snapshot: RuntimeResourceSnapshot | None = None,
 ) -> AgentRuntime:
     signature = inspect.signature(factory)
     supports_profile = (
@@ -876,13 +973,22 @@ def _create_profiled_runtime(
         trigger=trigger,
         target=target,
         invocation_id=invocation_id,
+        resource_snapshot=resource_snapshot,
     )
-    return factory(
-        config,
-        worktree,
-        profile=profile,
-        trace_context=trace,
-    )
+    keyword = {"profile": profile, "trace_context": trace}
+    if "resource_snapshot" in signature.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        keyword["resource_snapshot"] = resource_snapshot
+    if coding_session_id is not None and (
+        "coding_session_id" in signature.parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+    ):
+        keyword["coding_session_id"] = coding_session_id
+    return factory(config, worktree, **keyword)
 
 
 class HarnessEvolutionRunner:
@@ -894,10 +1000,12 @@ class HarnessEvolutionRunner:
         *,
         runtime_factory: Callable[[RuntimeConfig, Path], AgentRuntime] = create_coding_runtime,
         memory_provider_factory: Callable[[RuntimeConfig], Any] | None = None,
+        runtime_resource_manager: Any | None = None,
     ) -> None:
         self.writer = writer
         self.runtime_factory = runtime_factory
         self.memory_provider_factory = memory_provider_factory
+        self.runtime_resource_manager = runtime_resource_manager
 
     async def _run_legacy(self, request: HarnessEvolutionRequest) -> HarnessEvolutionResult:
         """Compatibility alias; ERROR execution is owned by HarnessEvolutionEngine."""
@@ -905,6 +1013,7 @@ class HarnessEvolutionRunner:
             request.config,
             runtime_factory=self.runtime_factory,
             memory_provider_factory=self.memory_provider_factory,
+            runtime_resource_manager=self.runtime_resource_manager,
         ).run_error(self, request)
 
     async def run(self, request: HarnessEvolutionRequest) -> HarnessEvolutionResult:
@@ -913,6 +1022,7 @@ class HarnessEvolutionRunner:
             request.config,
             runtime_factory=self.runtime_factory,
             memory_provider_factory=self.memory_provider_factory,
+            runtime_resource_manager=self.runtime_resource_manager,
         ).run_error(self, request)
 
     async def _update_long_term_memory(
@@ -1180,12 +1290,25 @@ class HarnessEvolutionEngine:
         *,
         runtime_factory: Callable[[RuntimeConfig, Path], AgentRuntime] = create_coding_runtime,
         memory_provider_factory: Callable[[RuntimeConfig], Any] | None = None,
+        runtime_resource_manager: Any | None = None,
     ) -> None:
         self.config = config
         self.runtime_factory = runtime_factory
         self.memory_provider_factory = memory_provider_factory
+        self.runtime_resource_manager = runtime_resource_manager
         self.audit = HarnessInvocationAudit(config.agent_root)
         self._tool_registry_baselines: dict[str, dict[str, Any]] = {}
+
+    def _resource_snapshot(self, trigger: str) -> RuntimeResourceSnapshot | None:
+        if self.runtime_resource_manager is None:
+            return None
+        profile = {
+            "manual": RuntimeProfile.HARNESS_MANUAL,
+            "error": RuntimeProfile.HARNESS_ERROR,
+            "capability": RuntimeProfile.HARNESS_CAPABILITY,
+            "dream": RuntimeProfile.HARNESS_DREAM,
+        }[trigger]
+        return self.runtime_resource_manager.snapshot(profile)
 
     @classmethod
     def for_config(cls, config: RuntimeConfig, **kwargs: Any) -> "HarnessEvolutionEngine":
@@ -1329,6 +1452,10 @@ class HarnessEvolutionEngine:
         if record.last_verified_commit == record.base_commit:
             await controller._cleanup(record, keep_branch=False)
             controller.record = None
+            if controller.runtime_resource_manager is not None:
+                controller.runtime_resource_manager.release_reference(
+                    owner_kind="harness", owner_id=record.code_session_id,
+                )
             return CodeFinalizeResult(
                 code_session_id=record.code_session_id, status="no_changes",
                 message="本次 Coding Session 没有已验证改动，已清理并返回普通聊天。",
@@ -1364,6 +1491,10 @@ class HarnessEvolutionEngine:
         await controller._update_long_term(record, changed)
         await controller._cleanup(record, keep_branch=False)
         controller.record = None
+        if controller.runtime_resource_manager is not None:
+            controller.runtime_resource_manager.release_reference(
+                owner_kind="harness", owner_id=record.code_session_id,
+            )
         return CodeFinalizeResult(
             code_session_id=record.code_session_id, status="merged",
             message="已由统一 Harness Engine fast-forward 合并验证通过的 Hook。",
@@ -1451,6 +1582,12 @@ class HarnessEvolutionEngine:
             record_event("finished", status="unknown", reason=added.stderr[-2048:])
             return HarnessEvolutionResult(status="unknown", message="Could not create isolated Harness worktree")
         keep = True
+        resource_snapshot = self._resource_snapshot(request.trigger)
+        if self.runtime_resource_manager is not None and resource_snapshot is not None:
+            self.runtime_resource_manager.acquire_reference(
+                resource_snapshot.generation_id,
+                owner_kind="harness", owner_id=invocation_id,
+            )
         try:
             record_event("worktree_created", base_commit=base, branch=branch, worktree=str(worktree))
             runtime = _create_profiled_runtime(
@@ -1460,6 +1597,7 @@ class HarnessEvolutionEngine:
                 trigger=request.trigger,
                 target=request.target,
                 invocation_id=invocation_id,
+                resource_snapshot=resource_snapshot,
             )
             if not _runtime_targets_worktree(runtime, worktree):
                 await runtime.close()
@@ -1554,6 +1692,10 @@ class HarnessEvolutionEngine:
                     "cleanup", status="cleanup", former_worktree_path=str(worktree),
                     branch=branch, branch_preserved=False,
                 )
+                if self.runtime_resource_manager is not None:
+                    self.runtime_resource_manager.release_reference(
+                        owner_kind="harness", owner_id=invocation_id,
+                    )
 
     async def _repair_loop(
         self, *, runtime: Any, request: HarnessEvolutionRequest, worktree: Path,

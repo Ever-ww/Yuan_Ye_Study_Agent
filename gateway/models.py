@@ -296,6 +296,21 @@ class ExtensionReenableRequest(BaseModel):
     reason: str = Field(min_length=1)
 
 
+class RuntimeReloadRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    actor: str = Field(min_length=1)
+    approved_plan_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class RuntimePluginRollbackRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    plugin_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
+    from_generation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    actor: str = Field(min_length=1)
+
+
 def now_iso() -> str:
     """生成带时区、秒级稳定格式的协议时间。"""
     return datetime.now().astimezone().isoformat(timespec="seconds")

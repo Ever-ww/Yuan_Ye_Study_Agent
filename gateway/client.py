@@ -50,6 +50,8 @@ from gateway.models import (
     RunRecord,
     ExtensionGrantRequest,
     ExtensionReenableRequest,
+    RuntimeReloadRequest,
+    RuntimePluginRollbackRequest,
 )
 from gateway.process import GatewayProcessManager
 
@@ -432,6 +434,33 @@ class GatewayClient:
         return dict(await self._request(
             "POST", "/api/v1/extensions/reenable",
             json=request.model_dump(mode="json"),
+        ))
+
+    async def runtime_plugin_status(self) -> dict[str, Any]:
+        return dict(await self._request("GET", "/api/v1/runtime/plugins/status"))
+
+    async def reload_runtime_plugins(
+        self, *, actor: str, approved_plan_hash: str | None = None,
+    ) -> dict[str, Any]:
+        payload = RuntimeReloadRequest(
+            actor=actor, approved_plan_hash=approved_plan_hash,
+        )
+        return dict(await self._request(
+            "POST", "/api/v1/runtime/plugins/reload",
+            json=payload.model_dump(mode="json"), timeout=300,
+        ))
+
+    async def rollback_runtime_plugin(
+        self, plugin_id: str, from_generation_id: str, *, actor: str,
+    ) -> dict[str, Any]:
+        payload = RuntimePluginRollbackRequest(
+            plugin_id=plugin_id,
+            from_generation_id=from_generation_id,
+            actor=actor,
+        )
+        return dict(await self._request(
+            "POST", "/api/v1/runtime/plugins/rollback",
+            json=payload.model_dump(mode="json"), timeout=300,
         ))
 
     async def code_session_events(

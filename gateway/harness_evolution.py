@@ -43,10 +43,14 @@ def _load_harness(source_root: Path) -> ModuleType:
 class GatewayHarnessEvolutionService:
     """The only Gateway bridge for ERROR and CAPABILITY Harness invocations."""
 
-    def __init__(self, config: RuntimeConfig, *, store=None, state_controller=None) -> None:
+    def __init__(
+        self, config: RuntimeConfig, *, store=None, state_controller=None,
+        runtime_resource_manager=None,
+    ) -> None:
         self.config = config
         self.store = store
         self.state_controller = state_controller
+        self.runtime_resource_manager = runtime_resource_manager
         self.write_gate = getattr(state_controller, "write_gate", None)
         self.source_root = (config.coding_source_root or Path(__file__).resolve().parents[1]).resolve()
         self.module = _load_harness(self.source_root)
@@ -81,7 +85,9 @@ class GatewayHarnessEvolutionService:
             max_attempts=4,
             merge_policy="immediate",
         )
-        result = await self.module.HarnessEvolutionEngine.for_config(self.config).run(request)
+        result = await self.module.HarnessEvolutionEngine.for_config(
+            self.config, runtime_resource_manager=self.runtime_resource_manager,
+        ).run(request)
         return result.model_dump(mode="json")
 
     def _origin_for_operation(
@@ -206,7 +212,9 @@ class GatewayHarnessEvolutionService:
             max_attempts=4,
             merge_policy="immediate",
         )
-        result = await self.module.HarnessEvolutionEngine.for_config(self.config).run(request)
+        result = await self.module.HarnessEvolutionEngine.for_config(
+            self.config, runtime_resource_manager=self.runtime_resource_manager,
+        ).run(request)
         return result.model_dump(mode="json")
 
     async def reconcile_dream(
@@ -341,7 +349,9 @@ class GatewayHarnessEvolutionService:
             origin=self.module.HarnessOriginContext.model_validate(origin, strict=True),
             max_attempts=4, merge_policy="immediate",
         )
-        runner = self.module.HarnessEvolutionRunner(writer)
+        runner = self.module.HarnessEvolutionRunner(
+            writer, runtime_resource_manager=self.runtime_resource_manager,
+        )
         result = await runner.run(request)
         proposal.update({"status": result.status, "result": result.model_dump(mode="json")})
         self._write_proposal(proposal)

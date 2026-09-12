@@ -5,6 +5,7 @@ from __future__ import annotations
 from Agent.config import RuntimeConfig
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models import build_provider
+from Agent.resources import RuntimeResourceSnapshot
 from prompt import compose_subagent_messages
 from tool import AsyncToolRegistry, ToolContext
 from .ephemeral import EphemeralMemory
@@ -13,9 +14,16 @@ from .ephemeral import EphemeralMemory
 class RuntimeSubagentRunner:
     """使用父 Agent 的模型配置和显式工具子集执行临时任务。"""
 
-    def __init__(self, config: RuntimeConfig, available_tools: AsyncToolRegistry) -> None:
+    def __init__(
+        self,
+        config: RuntimeConfig,
+        available_tools: AsyncToolRegistry,
+        *,
+        resource_snapshot: RuntimeResourceSnapshot | None = None,
+    ) -> None:
         self.config = config
         self.available_tools = available_tools
+        self.resource_snapshot = resource_snapshot
 
     async def __call__(
         self,
@@ -58,6 +66,8 @@ class RuntimeSubagentRunner:
             enable_sandbox=False,
             enable_extensions=False,
             enable_references=False,
+            runtime_profile="subagent",
+            resource_snapshot=self.resource_snapshot,
         )
         result = await runtime.run(task)
         if not result.completed:

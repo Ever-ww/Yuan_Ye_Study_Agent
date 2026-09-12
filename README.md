@@ -656,7 +656,7 @@ Skill 遵循 [Agent Skills 规范](https://agentskills.io/specification)。一�
 
 也可以用自然语言让主 Agent 安装 Skill。此时模型调用高风险 `skill_install`，先确认下载意图；如果审核还发现可接受风险，再进行第二次确认。Subagent 不能获得 `skill_install`。
 
-`/skill install|update` 会先把来源下载到 `~/.yy/skills/review/`，完成安全审核和必要的人工确认后，再原子发布到源码仓库 `skills/<name>/`。发布不会修改当前 Runtime 的 Skill 缓存。只有显式执行 `/skill refresh` 成功后，Gateway 才刷新当前 Session：目录发生变化时先压缩旧上下文，再创建相同 Session 哈希的下一 JSONL 分段并加载新 Skill；目录未变化时不创建空分段。即使该 Session 的 Runtime 已被空闲回收，Gateway 也会根据持久化 Session 自动恢复它，不需要先发送一条聊天消息。System Prompt 只加入如下发现信息，不加载正文：
+`/skill install|update` 会先把来源下载到 `~/.yy/skills/review/`，完成安全审核和必要的人工确认后，再原子发布到源码仓库 `skills/<name>/`。发布不会修改当前 Runtime。文件监听器会在资源树稳定后构建新的不可变 Runtime Generation；也可以显式执行 `/skill refresh` 或 `/reload`。已经开始的 Turn 继续使用旧 Generation，同一 Session 的下一 Turn 自动创建或切换到新 Runtime，并从原 Session 恢复上下文。目录语义未变化时不会创建空 Generation 或切换 Runtime。System Prompt 只加入如下发现信息，不加载正文：
 
 ```xml
 <available_skills>
@@ -674,8 +674,7 @@ Skill 遵循 [Agent Skills 规范](https://agentskills.io/specification)。一�
 
 本项目把 Session 视为逻辑上的完整 Trace，不额外创建 Trace 数据模型。概念上，每次真实模型 API 调用对应一个模型 Turn；该响应请求的一个或多个工具在下一次模型调用前完成。Hook 中的 `TURN_START/TURN_END` 则刻意定义为一次完整用户任务的外层边界，任务内可以出现多次 `MODEL_*` 与 `TOOL_*`。两者都不创建实体、不编号，也不向事件或 Session JSONL 写入编号。
 
-核心注册入口是 `Agent/hook.py`。全局源码扩展由 `Agent/extensions.py` 在 Gateway
-启动时扫描 `extension/hook/`，以下十个阶段各自拥有目录，每个目录可包含任意数量、
+核心注册入口是 `Agent/hook.py`。Tool、Skill、稳定 Prompt 和 Extension 由 `Agent/resources.py` 统一发现、验证并发布到 `.yy/runtime-plugins/generations/`；Runtime 只读取当前 Profile 的不可变 Snapshot。Bundle 在 `TRACE_START` 经 Hook 生命周期总线挂载并冻结，但 Tool 查找和执行仍由 Tool Registry 负责。完整边界、Reload、Rollback 和 Profile 隔离见 [`docs/runtime-hot-reload.md`](docs/runtime-hot-reload.md)。全局源码扩展由 `Agent/extensions.py` 从当前 Generation 的 `extension/hook/` 扫描，以下十个阶段各自拥有目录，每个目录可包含任意数量、
 名称不同的 Python 能力文件：
 
 ```text

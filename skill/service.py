@@ -110,11 +110,17 @@ class SkillService:
         source_root: Path | None = None,
         *,
         approval: Approval | None = None,
+        allowed_names: tuple[str, ...] | None = None,
+        read_only: bool = False,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.workspace_root = workspace_root.resolve()
         self.source_root = (source_root or workspace_root).resolve()
         self.approval = approval
+        self._allowed_names = (
+            frozenset(allowed_names) if allowed_names is not None else None
+        )
+        self.read_only = read_only
         self.state_root = self.agent_root / ".yy" / "skills"
         self.skills_root = self.source_root / "skills"
         self.review_root = self.state_root / "review"
@@ -123,7 +129,8 @@ class SkillService:
         self.index_path = self.state_root / "index.json"
         self._locks = WorkspaceLockManager(self.source_root, state_root=self.agent_root)
         self._session_snapshots: dict[str, SkillCatalogSnapshot] = {}
-        self.initialize()
+        if not read_only:
+            self.initialize()
 
     def initialize(self) -> None:
         """创建本机 Skill 目录，并清理超过一天的中断审核副本。"""
@@ -272,13 +279,30 @@ class SkillService:
     def catalog(self) -> tuple[SkillMetadata, ...]:
         """扫描源码仓库 skills，并只返回结构与路径合法的 Skill。"""
         values: list[SkillMetadata] = []
+        if not self.skills_root.is_dir():
+            return ()
         for root in sorted(self.skills_root.iterdir(), key=lambda item: item.name):
             if root.name.startswith(".") or not root.is_dir():
+                continue
+            if self._allowed_names is not None and root.name not in self._allowed_names:
                 continue
             if root.is_symlink():
                 raise ValueError(f"正式 Skill 目录不允许符号链接：{root.name}")
             values.append(parse_skill(root))
         return tuple(values)
+
+    def restrict_to(self, allowed_names: tuple[str, ...]) -> None:
+        """Narrow an unbound Runtime catalog before TRACE_START.
+
+        This is intentionally one-way.  A Cron dispatch cannot use a mutable
+        job edit to expand the immutable allowlist captured in its snapshot.
+        """
+        selected = frozenset(allowed_names)
+        if self._session_snapshots:
+            raise RuntimeError("Skill allowlist is frozen after Session binding")
+        if self._allowed_names is not None and not selected.issubset(self._allowed_names):
+            raise PermissionError("Skill allowlist cannot be expanded at Runtime")
+        self._allowed_names = selected
 
     def catalog_snapshot(self) -> SkillCatalogSnapshot:
         """生成可绑定到单个 Session 的不可变目录快照。"""

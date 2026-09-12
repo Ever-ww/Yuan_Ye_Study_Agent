@@ -12,7 +12,15 @@ from pathlib import Path
 from time import monotonic
 from uuid import uuid4
 
-from Agent import AgentRuntime, EventType, ExtensionCatalog, ModelRetryPolicy, RuntimeFailure, load_runtime_config
+from Agent import (
+    AgentRuntime,
+    EventType,
+    ExtensionCatalog,
+    ModelRetryPolicy,
+    RuntimeFailure,
+    RuntimeProfile,
+    load_runtime_config,
+)
 from Agent.runtime.ephemeral import DurableIsolatedMemory
 from Agent.state import (
     BindSessionCommand,
@@ -48,6 +56,8 @@ CronTerminalCallback = Callable[[RunRecord], Awaitable[None]]
 class RuntimeEntry:
     runtime: AgentRuntime
     last_used: float
+    generation_id: str | None = None
+    reference_owner_id: str | None = None
 
 
 class RuntimePool:
@@ -77,6 +87,7 @@ class RuntimePool:
         harness_evolution_service=None,
         cron_tool_authorizer=None,
         cron_terminal_callback: CronTerminalCallback | None = None,
+        runtime_resource_manager=None,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.store = store
@@ -115,6 +126,7 @@ class RuntimePool:
         )
         self.harness_evolution_service = harness_evolution_service
         self.cron_terminal_callback = cron_terminal_callback
+        self.runtime_resource_manager = runtime_resource_manager
         self._pending_profile_refresh: set[tuple[str, str]] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._submitting: set[str] = set()
@@ -125,6 +137,11 @@ class RuntimePool:
 
     async def start(self) -> None:
         if self._reaper is None:
+            if self.runtime_resource_manager is not None:
+                # Runtime instances are process-local. Run/Harness/Recovery
+                # references remain durable, but a reference owned by an old
+                # process cache cannot represent a live Runtime after restart.
+                self.state_controller.reconcile_runtime_generation_references()
             self._reaper = asyncio.create_task(self._reap_idle(), name="gateway-runtime-reaper")
 
     @lifecycle_work(continuation=True)
@@ -144,6 +161,10 @@ class RuntimePool:
                 TaskState.SUCCEEDED, TaskState.FAILED,
                 TaskState.CANCELLED, TaskState.INTERRUPTED,
             }:
+                if self.runtime_resource_manager is not None:
+                    self.runtime_resource_manager.release_reference(
+                        owner_kind="run", owner_id=run.run_id,
+                    )
                 return
             if state.task_state is TaskState.RECOVERY_REQUIRED:
                 raise RuntimeError("RECOVERY_REQUIRED Run must be handled by RecoveryCoordinator")
@@ -156,6 +177,23 @@ class RuntimePool:
                 raise RuntimeError("Run fencing token 不属于当前 Gateway epoch")
             if not is_runnable(state, operation, attempt, now=datetime.now().astimezone()):
                 raise RuntimeError(f"Run 当前不可调度：{state.task_state.value}")
+            # Fence the accepted Run to a Generation before scheduling any
+            # Provider or Tool work. Recovery reuses this exact binding.
+            if self.runtime_resource_manager is not None:
+                bound = self.runtime_resource_manager.referenced_generation(
+                    owner_kind="run", owner_id=run.run_id,
+                )
+                if bound is None:
+                    profile = (
+                        RuntimeProfile.CRON
+                        if run.client_id.startswith("cron:")
+                        else RuntimeProfile.INTERACTIVE
+                    )
+                    selected = self.runtime_resource_manager.snapshot(profile)
+                    self.runtime_resource_manager.acquire_reference(
+                        selected.generation_id,
+                        owner_kind="run", owner_id=run.run_id,
+                    )
             if run.session_id:
                 await self.session_reservations.acquire(
                     run.project_id, run.session_id, owner_id=run.run_id, wait=False,
@@ -225,6 +263,7 @@ class RuntimePool:
         self._runtimes.clear()
         for entry in entries:
             await entry.runtime.close()
+            self._release_runtime_reference(entry)
 
     @lifecycle_work()
     async def refresh_skills(self, project_id: str, session_id: str):
@@ -238,6 +277,48 @@ class RuntimePool:
         )
         created = False
         try:
+            if self.runtime_resource_manager is not None:
+                from skill import SkillRefreshResult, SkillService
+
+                before = self.runtime_resource_manager.snapshot(RuntimeProfile.INTERACTIVE)
+                result = await asyncio.to_thread(
+                    self.runtime_resource_manager.reload,
+                    actor=f"gateway:skill-refresh:{session_id}",
+                )
+                if result.status == "awaiting_approval":
+                    return SkillRefreshResult(
+                        status="error",
+                        message=(
+                            "Resource reload also contains privileged changes; approve plan "
+                            f"{result.plan_hash} before refreshing"
+                        ),
+                        session_id=session_id,
+                        old_digest=before.skill_catalog_hash,
+                        new_digest=before.skill_catalog_hash,
+                    )
+                after = self.runtime_resource_manager.snapshot(RuntimeProfile.INTERACTIVE)
+                entry = self._runtimes.pop(key, None)
+                if entry is not None:
+                    await entry.runtime.close()
+                    self._release_runtime_reference(entry)
+                service = SkillService(
+                    self.agent_root,
+                    Path(self.store.project(project_id).path),
+                    after.source_root,
+                )
+                count = len(service.catalog())
+                changed = before.skill_catalog_hash != after.skill_catalog_hash
+                return SkillRefreshResult(
+                    status="refreshed" if changed else "unchanged",
+                    message=(
+                        "Skill resources activated; this Session will use the new Generation on its next Turn"
+                        if changed else "Skill resources are unchanged"
+                    ),
+                    session_id=session_id,
+                    count=count,
+                    old_digest=before.skill_catalog_hash,
+                    new_digest=after.skill_catalog_hash,
+                )
             entry = self._runtimes.get(key)
             if entry is None:
                 project = self.store.project(project_id)
@@ -259,7 +340,10 @@ class RuntimePool:
                     created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
                 )
                 runtime = await self._runtime_for(placeholder, workspace)
-                entry = RuntimeEntry(runtime, monotonic())
+                entry = RuntimeEntry(
+                    runtime, monotonic(), getattr(runtime, "resource_generation_id", None),
+                    getattr(runtime, "runtime_generation_reference_owner", None),
+                )
                 self._runtimes[key] = entry
                 created = True
             entry.last_used = monotonic()
@@ -269,6 +353,7 @@ class RuntimePool:
                 selected = self._runtimes.pop(key, None)
                 if selected is not None:
                     await selected.runtime.close()
+                    self._release_runtime_reference(selected)
             raise
         finally:
             await self.session_reservations.release_owner(reservation_owner)
@@ -318,6 +403,7 @@ class RuntimePool:
             self._runtimes.clear()
         for entry in entries:
             await entry.runtime.close()
+            self._release_runtime_reference(entry)
 
     async def invalidate_profile_context(self, after_active_turn: bool = True) -> None:
         """Profile 更新后刷新空闲 Runtime；活动 Turn 在结束后再刷新。"""
@@ -390,7 +476,22 @@ class RuntimePool:
                                     owner_id=current.run_id, wait=False,
                                 )
                                 session_key = new_key
-                            self._runtimes[new_key] = RuntimeEntry(runtime, monotonic())
+                            if (
+                                self.runtime_resource_manager is not None
+                                and getattr(runtime, "resource_generation_id", None)
+                                and not getattr(runtime, "runtime_generation_reference_owner", None)
+                            ):
+                                owner_id = f"{current.project_id}:{session_id}"
+                                self.runtime_resource_manager.acquire_reference(
+                                    runtime.resource_generation_id,
+                                    owner_kind="runtime", owner_id=owner_id,
+                                )
+                                runtime.runtime_generation_reference_owner = owner_id
+                            self._runtimes[new_key] = RuntimeEntry(
+                                runtime, monotonic(),
+                                getattr(runtime, "resource_generation_id", None),
+                                getattr(runtime, "runtime_generation_reference_owner", None),
+                            )
                         if event.type is EventType.FINAL:
                             answer = str(event.payload.get("answer", ""))
                         await self._emit(
@@ -463,6 +564,12 @@ class RuntimePool:
                     entry.last_used = monotonic()
             if runtime is not None and isolated_cron:
                 await runtime.close()
+                owner_id = getattr(runtime, "runtime_generation_reference_owner", None)
+                if owner_id and self.runtime_resource_manager is not None:
+                    self.runtime_resource_manager.release_reference(
+                        owner_kind="runtime", owner_id=str(owner_id),
+                    )
+                    runtime.runtime_generation_reference_owner = None
             if session_key is not None:
                 await self.session_reservations.release_owner(original.run_id)
                 async with self._lock:
@@ -534,6 +641,10 @@ class RuntimePool:
             result_summary=reason if outcome is ExecutionOutcome.SUCCESS else None,
         )
         await self.finalizer.finalize(run_id)
+        if self.runtime_resource_manager is not None:
+            self.runtime_resource_manager.release_reference(
+                owner_kind="run", owner_id=run_id,
+            )
         if self.cron_terminal_callback is not None:
             final_run = self.store.run(run_id)
             if final_run.client_id.startswith("cron:"):
@@ -542,16 +653,46 @@ class RuntimePool:
             self.outbox.wake()
 
     async def _runtime_for(self, run: RunRecord, workspace: Path) -> AgentRuntime:
+        scheduled = run.client_id.startswith("cron:")
+        resource_snapshot = None
+        if self.runtime_resource_manager is not None:
+            bound_generation = self.runtime_resource_manager.referenced_generation(
+                owner_kind="run", owner_id=run.run_id,
+            )
+            resource_snapshot = self.runtime_resource_manager.snapshot(
+                RuntimeProfile.CRON if scheduled else RuntimeProfile.INTERACTIVE,
+                generation_id=bound_generation,
+            )
+            if bound_generation is None:
+                self.runtime_resource_manager.acquire_reference(
+                    resource_snapshot.generation_id,
+                    owner_kind="run", owner_id=run.run_id,
+                )
         if run.session_id:
-            entry = self._runtimes.get((run.project_id, run.session_id))
+            key = (run.project_id, run.session_id)
+            entry = self._runtimes.get(key)
             if entry is not None:
-                entry.last_used = monotonic()
-                return entry.runtime
+                if (
+                    resource_snapshot is None
+                    or entry.generation_id == resource_snapshot.generation_id
+                ):
+                    entry.last_used = monotonic()
+                    return entry.runtime
+                # A reload never mutates a live Runtime.  Session reservation
+                # fencing guarantees this replacement occurs between Turns.
+                self._runtimes.pop(key, None)
+                await entry.runtime.close()
+                self._release_runtime_reference(entry)
         if self.runtime_factory is not None:
             runtime = self.runtime_factory(workspace, self.approvals)
+            if resource_snapshot is not None:
+                setattr(runtime, "resource_snapshot", resource_snapshot)
+                setattr(runtime, "resource_generation_id", resource_snapshot.generation_id)
         else:
-            runtime = self._default_runtime(workspace, self.approvals, run)
-        if run.client_id.startswith("cron:") and self.cron_service is not None:
+            runtime = self._default_runtime(
+                workspace, self.approvals, run, resource_snapshot=resource_snapshot,
+            )
+        if scheduled and self.cron_service is not None:
             # The dispatch snapshot, not today's editable CronJob, is the
             # authority for an already materialized unattended run.
             dispatch = await self.cron_service.store.dispatch_by_run_id(run.run_id)
@@ -561,6 +702,11 @@ class RuntimePool:
             # Cron starts from a deny-all surface. A durable snapshot selects tools.
             runtime.tools = runtime.tools.select(allowed_tools)
             if isinstance(profile, dict):
+                allowed_skills = profile.get("allowed_skills", ())
+                if getattr(runtime, "skills", None) is not None:
+                    runtime.skills.restrict_to(
+                        tuple(allowed_skills) if isinstance(allowed_skills, (list, tuple)) else ()
+                    )
                 requested_parallelism = profile.get("max_parallel_tool_calls", 4)
                 if isinstance(requested_parallelism, int) and not isinstance(
                     requested_parallelism, bool,
@@ -586,7 +732,10 @@ class RuntimePool:
             and hasattr(runtime, "tools")
             and "harness_capability" not in runtime.tools.names()
         ):
-            from tools import HarnessCapabilityTool
+            if getattr(runtime, "generation_tools", None) is None:
+                from tools import HarnessCapabilityTool
+            else:
+                HarnessCapabilityTool = runtime.generation_tools.HarnessCapabilityTool
             runtime.tools.register(HarnessCapabilityTool(self.harness_evolution_service))
         if (
             self.tool_operations is not None
@@ -614,20 +763,46 @@ class RuntimePool:
             ).register(runtime.hooks)
         if hasattr(runtime, "bind_gateway_run"):
             runtime.bind_gateway_run(run.run_id)
+        if run.session_id and resource_snapshot is not None:
+            owner_id = f"{run.project_id}:{run.session_id}"
+            self.runtime_resource_manager.acquire_reference(
+                resource_snapshot.generation_id,
+                owner_kind="runtime", owner_id=owner_id,
+            )
+            runtime.runtime_generation_reference_owner = owner_id
         return runtime
+
+    def _release_runtime_reference(self, entry: RuntimeEntry) -> None:
+        owner_id = entry.reference_owner_id or getattr(
+            entry.runtime, "runtime_generation_reference_owner", None,
+        )
+        if owner_id and self.runtime_resource_manager is not None:
+            self.runtime_resource_manager.release_reference(
+                owner_kind="runtime", owner_id=str(owner_id),
+            )
 
     def _default_runtime(
         self,
         workspace: Path,
         approvals: GatewayApprovalBroker,
         run: RunRecord,
+        *,
+        resource_snapshot=None,
     ) -> AgentRuntime:
         config = load_runtime_config(self.agent_root, workspace_root=workspace)
         scheduled = run.client_id.startswith("cron:")
+        auxiliary_snapshots = {}
+        if self.runtime_resource_manager is not None and resource_snapshot is not None:
+            for name, profile in (
+                ("subagent", RuntimeProfile.SUBAGENT),
+                ("compression", RuntimeProfile.COMPRESSION),
+                ("maintenance", RuntimeProfile.MAINTENANCE),
+            ):
+                auxiliary_snapshots[name] = self.runtime_resource_manager.snapshot(
+                    profile, generation_id=resource_snapshot.generation_id,
+                )
         if scheduled:
-            from skill import SkillService
             config = config.model_copy(update={"stream": False, "compression_threshold_tokens": 0})
-            skills = SkillService(config.agent_root, workspace, config.coding_source_root)
             # A Cron dispatch has a fresh durable Session but never restores another Session.
             memory = DurableIsolatedMemory(
                 config.memory_dir,
@@ -639,7 +814,6 @@ class RuntimePool:
             return AgentRuntime(
                 config,
                 memory=memory,
-                skills=skills,
                 approval=approvals,
                 enable_context_processing=False,
                 enable_subagent=False,
@@ -655,6 +829,8 @@ class RuntimePool:
                 references=self.reference_service,
                 enable_references=self.reference_service is not None,
                 runtime_profile="cron",
+                resource_snapshot=resource_snapshot,
+                auxiliary_resource_snapshots=auxiliary_snapshots,
             )
         runtime = AgentRuntime(
             config,
@@ -673,6 +849,8 @@ class RuntimePool:
             enable_references=self.reference_service is not None,
             runtime_profile="interactive",
             extension_state=self.state_controller,
+            resource_snapshot=resource_snapshot,
+            auxiliary_resource_snapshots=auxiliary_snapshots,
         )
         return runtime
 
@@ -716,3 +894,4 @@ class RuntimePool:
                     self._runtimes.pop(key, None)
         for entry in selected:
             await entry.runtime.close()
+            self._release_runtime_reference(entry)

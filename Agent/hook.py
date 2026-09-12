@@ -8,6 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal
 
@@ -69,6 +70,14 @@ class HookRegistration:
     failure_mode: HookFailureMode
     timeout_seconds: float
     outcome_reporter: HookOutcomeReporter | None = None
+
+
+@dataclass(frozen=True)
+class HookPlan:
+    """Immutable callback ordering used by one Runtime Trace."""
+
+    callbacks: Any
+    tool_observation_publishers: tuple[HookRegistration, ...]
 
 
 class HookExecutor:
@@ -159,6 +168,24 @@ class HookRegistry:
         self._tool_observation_publishers: list[HookRegistration] = []
         self._order = 0
         self._executor = executor or HookExecutor()
+        self._plan: HookPlan | None = None
+
+    @property
+    def frozen(self) -> bool:
+        return self._plan is not None
+
+    def freeze(self) -> HookPlan:
+        if self._plan is None:
+            callbacks = MappingProxyType({
+                point: tuple(sorted(values, key=lambda item: (item.priority, item.order)))
+                for point, values in self._callbacks.items()
+            })
+            publishers = tuple(sorted(
+                self._tool_observation_publishers,
+                key=lambda item: (item.priority, item.order),
+            ))
+            self._plan = HookPlan(callbacks, publishers)
+        return self._plan
 
     def register(
         self,
@@ -173,6 +200,8 @@ class HookRegistry:
         outcome_reporter: HookOutcomeReporter | None = None,
     ) -> HookCallback:
         """注册同步或异步回调；优先级数值越小越先执行。"""
+        if self.frozen:
+            raise RuntimeError("HookRegistry is frozen for the active Runtime Trace")
         if timeout_seconds <= 0:
             raise ValueError("Hook timeout_seconds must be positive")
         mode = failure_mode or (
@@ -200,10 +229,7 @@ class HookRegistry:
         return decorator
 
     async def emit(self, event: HookEvent) -> HookEvent:
-        registrations = sorted(
-            self._callbacks.get(event.point, ()),
-            key=lambda item: (item.priority, item.order),
-        )
+        registrations = self.freeze().callbacks.get(event.point, ())
         for registration in registrations:
             await self._executor.execute(registration, event)
         return event
@@ -212,6 +238,8 @@ class HookRegistry:
         self, callback: HookCallback, *, priority: int = 0,
     ) -> HookCallback:
         """Register an internal ordered persistence callback, not an Extension Hook point."""
+        if self.frozen:
+            raise RuntimeError("HookRegistry is frozen for the active Runtime Trace")
         registration = HookRegistration(
             priority=priority,
             order=self._order,
@@ -226,10 +254,7 @@ class HookRegistry:
         return callback
 
     async def publish_tool_observation(self, event: HookEvent) -> HookEvent:
-        for registration in sorted(
-            self._tool_observation_publishers,
-            key=lambda item: (item.priority, item.order),
-        ):
+        for registration in self.freeze().tool_observation_publishers:
             await self._executor.execute(registration, event)
         return event
 
@@ -302,7 +327,7 @@ def build_default_hooks(
     from memory.callbacks import register_memory_callbacks
     from memory.store import MemoryStore
 
-    registry = HookRegistry()
+    registry = build_core_hooks()
     selected_memory = memory or MemoryStore(memory_dir)
     register_memory_callbacks(
         registry,
@@ -322,8 +347,23 @@ def build_default_hooks(
     if context_processor is not None:
         from context_process import register_context_callbacks
         register_context_callbacks(registry, context_processor)
+    return registry
+
+
+def build_core_hooks() -> HookRegistry:
+    """Create only the immutable lifecycle bus and project Core callbacks.
+
+    Resource adapters are installed separately from a Generation Snapshot.
+    This keeps HookExecutor/dispatch stable while allowing capability-layer
+    callbacks to be selected and versioned by the resource system.
+    """
+    registry = HookRegistry()
     for point, callback in _PROJECT_CALLBACKS.items():
-        registry.register(point, callback, priority=-200 if point is HookPoint.TRACE_START else 0)
+        registry.register(
+            point, callback,
+            priority=-200 if point is HookPoint.TRACE_START else 0,
+            identity=f"core:{point.value}",
+        )
     return registry
 
 

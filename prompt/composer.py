@@ -37,11 +37,15 @@ class SystemPromptComposer:
         memory: "MemoryStore",
         skills: "SkillService | None" = None,
         sandbox_enabled: bool = False,
+        resource_agent_root: Path | None = None,
+        prefer_current_skill_catalog: bool = False,
     ) -> None:
         self.config = config
         self.memory = memory
         self.skills = skills
         self.sandbox_mode = "pending" if sandbox_enabled else "closed"
+        self.resource_agent_root = (resource_agent_root or config.agent_root).resolve()
+        self.prefer_current_skill_catalog = prefer_current_skill_catalog
         self._snapshots: dict[str, SystemPromptSnapshot] = {}
         self.rebuild_count = 0
 
@@ -68,6 +72,12 @@ class SystemPromptComposer:
             else None
         )
         selected_catalog = skill_catalog
+        if (
+            selected_catalog is None
+            and self.prefer_current_skill_catalog
+            and self.skills is not None
+        ):
+            selected_catalog = self.skills.catalog_snapshot()
         if selected_catalog is None and persisted_catalog is not None:
             selected_catalog = SkillCatalogSnapshot.model_validate(
                 persisted_catalog,
@@ -79,8 +89,8 @@ class SystemPromptComposer:
             if self.skills is not None and selected_catalog is not None
             else "<available_skills></available_skills>"
         )
-        soul = _read(self.config.agent_root / ".yy" / "agents" / "SOUL.md")
-        agent = _read(self.config.agent_root / ".yy" / "agents" / "AGENT.md")
+        soul = _read(self.resource_agent_root / ".yy" / "agents" / "SOUL.md")
+        agent = _read(self.resource_agent_root / ".yy" / "agents" / "AGENT.md")
         sections = [
             skill_xml,
             (
@@ -151,7 +161,7 @@ class TaskPromptComposer:
 class PromptComposer:
     """兼容 Runtime 使用的 Prompt 门面，System Prompt 始终是一个字符串。"""
 
-    def __init__(self, config: "RuntimeConfig | Path", memory: "MemoryStore | SkillService | None" = None, skills: "SkillService | None" = None, sandbox_enabled: bool = False) -> None:
+    def __init__(self, config: "RuntimeConfig | Path", memory: "MemoryStore | SkillService | None" = None, skills: "SkillService | None" = None, sandbox_enabled: bool = False, *, resource_agent_root: Path | None = None, prefer_current_skill_catalog: bool = False) -> None:
         # 兼容独立 Prompt 测试：PromptComposer(project_root, skill_service)。
         if isinstance(config, Path):
             from Agent.config import load_runtime_config
@@ -164,7 +174,11 @@ class PromptComposer:
             memory = memory if isinstance(memory, MemoryStore) else MemoryStore(config.memory_dir)
         if memory is None:
             raise ValueError("PromptComposer 需要 MemoryStore")
-        self.system = SystemPromptComposer(config, memory, skills, sandbox_enabled=sandbox_enabled)
+        self.system = SystemPromptComposer(
+            config, memory, skills, sandbox_enabled=sandbox_enabled,
+            resource_agent_root=resource_agent_root,
+            prefer_current_skill_catalog=prefer_current_skill_catalog,
+        )
         self.task = TaskPromptComposer()
         self.dynamic_context = AgentDynamicContextBuilder(config, memory)
 

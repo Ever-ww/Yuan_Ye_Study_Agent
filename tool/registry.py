@@ -53,11 +53,14 @@ class AsyncToolRegistry:
     def __init__(self, tools: Iterable[AsyncTool] = ()) -> None:
         self._tools: dict[str, AsyncTool] = {}
         self._argument_models: dict[str, type[BaseModel]] = {}
+        self._frozen = False
         for tool in tools:
             self.register(tool)
 
     def register(self, tool: AsyncTool) -> None:
         """注册一个工具，并拒绝名称冲突。"""
+        if self._frozen:
+            raise RuntimeError("Tool Registry is frozen for the active Runtime Trace")
         if tool.name in self._tools:
             raise ValueError(f"工具名称重复：{tool.name}")
         if tool.risk not in _ALL_RISKS:
@@ -66,6 +69,15 @@ class AsyncToolRegistry:
             raise ValueError(f"动态风险工具 {tool.name} 必须实现 risk_for(arguments)")
         self._tools[tool.name] = tool
         self._argument_models[tool.name] = _build_argument_model(tool.name, tool.schema)
+
+    def freeze(self) -> "AsyncToolRegistry":
+        """Prevent Tool contract drift after a Runtime Trace starts."""
+        self._frozen = True
+        return self
+
+    @property
+    def frozen(self) -> bool:
+        return self._frozen
 
     def schemas(self, context: ToolContext | None = None) -> list[dict[str, Any]]:
         """返回供模型调用的 OpenAI function Schema 列表。"""

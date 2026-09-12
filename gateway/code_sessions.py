@@ -38,13 +38,17 @@ def _load_harness(source_root: Path) -> ModuleType:
 class CodeSessionManager:
     """确保每个 Yuan Ye 源码仓库同时只有一个可变 Coding Session。"""
 
-    def __init__(self, config: RuntimeConfig, *, grant_backend=None) -> None:
+    def __init__(
+        self, config: RuntimeConfig, *, grant_backend=None,
+        runtime_resource_manager=None,
+    ) -> None:
         self.config = config
         self.source_root = (
             config.coding_source_root or Path(__file__).resolve().parents[1]
         ).resolve()
         self.module = _load_harness(self.source_root)
         self.grant_backend = grant_backend
+        self.runtime_resource_manager = runtime_resource_manager
         self.write_gate = getattr(grant_backend, "write_gate", None)
         self._sessions: dict[str, object] = {}
         self._sources: dict[Path, str] = {}
@@ -65,12 +69,22 @@ class CodeSessionManager:
                 raise RuntimeError("这个 Yuan Ye 源码仓库已经有活动的 Coding Session")
             try:
                 controller = self.module.CodeSessionController(
-                    self.config, grant_backend=self.grant_backend,
+                    self.config,
+                    grant_backend=self.grant_backend,
+                    runtime_resource_manager=self.runtime_resource_manager,
                 )
             except TypeError as exc:
-                if "grant_backend" not in str(exc):
+                if not any(
+                    name in str(exc)
+                    for name in ("grant_backend", "runtime_resource_manager")
+                ):
                     raise
-                controller = self.module.CodeSessionController(self.config)
+                try:
+                    controller = self.module.CodeSessionController(
+                        self.config, grant_backend=self.grant_backend,
+                    )
+                except TypeError:
+                    controller = self.module.CodeSessionController(self.config)
             origin = self.module.HarnessOriginContext.model_validate(
                 origin_context or {
                     "origin_project_id": project_id,

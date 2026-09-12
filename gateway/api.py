@@ -32,6 +32,8 @@ from gateway.models import (
     SkillManageRequest,
     ExtensionGrantRequest,
     ExtensionReenableRequest,
+    RuntimeReloadRequest,
+    RuntimePluginRollbackRequest,
 )
 from gateway.security import GatewayCredentials, bearer_value
 from sandbox import probe_sandbox_status
@@ -237,6 +239,24 @@ def create_gateway_api(
     @app.post("/api/v1/extensions/reenable", dependencies=[Depends(authorize_write)])
     async def extension_reenable(payload: ExtensionReenableRequest):
         return gateway.reenable_extension(payload)
+
+    @app.get("/api/v1/runtime/plugins/status", dependencies=[Depends(authorize)])
+    async def runtime_plugin_status():
+        return gateway.runtime_plugin_status()
+
+    @app.post("/api/v1/runtime/plugins/reload", dependencies=[Depends(authorize_write)])
+    async def reload_runtime_plugins(payload: RuntimeReloadRequest):
+        return gateway.reload_runtime_plugins(
+            actor=payload.actor, approved_plan_hash=payload.approved_plan_hash,
+        )
+
+    @app.post("/api/v1/runtime/plugins/rollback", dependencies=[Depends(authorize_write)])
+    async def rollback_runtime_plugin(payload: RuntimePluginRollbackRequest):
+        return gateway.rollback_runtime_plugin(
+            payload.plugin_id,
+            from_generation_id=payload.from_generation_id,
+            actor=payload.actor,
+        )
 
     @app.get("/api/v1/bootstrap", dependencies=[Depends(authorize)])
     async def bootstrap():

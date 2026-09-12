@@ -36,6 +36,7 @@ from .harness_error import HarnessErrorTool
 from .harness_dream import HarnessDreamTool
 from .skill_read import SkillReadTool
 from .session_read import SessionReadTool
+from .session_history import SessionHistoryTool
 from .sandbox_checkpoint_branch import SandboxCheckpointBranchTool
 from .sandbox_checkpoint_history import SandboxCheckpointHistoryTool
 from .sandbox_rollback import SandboxRollbackTool
@@ -92,6 +93,7 @@ __all__ = [
     "HarnessDreamTool",
     "SkillReadTool",
     "SessionReadTool",
+    "SessionHistoryTool",
     "SandboxCheckpointBranchTool",
     "SandboxCheckpointHistoryTool",
     "SandboxRollbackTool",

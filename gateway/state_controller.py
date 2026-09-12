@@ -107,7 +107,7 @@ class StateInvariantError(RuntimeError):
 class StateController:
     """以 SQLite 事务实现 command 幂等、CAS、FSM guard 和 Outbox。"""
 
-    SCHEMA_VERSION = 10
+    SCHEMA_VERSION = 12
 
     def __init__(
         self,
@@ -429,6 +429,91 @@ class StateController:
                     audit_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS runtime_resource_generations (
+                    generation_id TEXT PRIMARY KEY,
+                    parent_generation_id TEXT,
+                    core_api_version INTEGER NOT NULL CHECK(core_api_version >= 1),
+                    semantic_hash TEXT NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN
+                        ('preparing','active','retired','rejected','quarantined')),
+                    generation_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    activated_at TEXT,
+                    retired_at TEXT,
+                    FOREIGN KEY(parent_generation_id)
+                        REFERENCES runtime_resource_generations(generation_id) ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS runtime_resource_profile_heads (
+                    profile TEXT PRIMARY KEY,
+                    generation_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(generation_id)
+                        REFERENCES runtime_resource_generations(generation_id) ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS runtime_reload_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    plan_hash TEXT,
+                    generation_id TEXT,
+                    actor TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN
+                        ('activated','unchanged','awaiting_approval','rejected','failed','rollback')),
+                    plan_json TEXT,
+                    error_type TEXT,
+                    error_summary TEXT,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    FOREIGN KEY(generation_id)
+                        REFERENCES runtime_resource_generations(generation_id) ON DELETE RESTRICT
+                );
+                CREATE INDEX IF NOT EXISTS runtime_reload_attempts_generation_idx
+                    ON runtime_reload_attempts(generation_id,created_at);
+                CREATE TABLE IF NOT EXISTS runtime_generation_references (
+                    reference_id TEXT PRIMARY KEY,
+                    generation_id TEXT NOT NULL,
+                    owner_kind TEXT NOT NULL CHECK(owner_kind IN
+                        ('run','runtime','operation','cron','harness','recovery')),
+                    owner_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('active','released')),
+                    created_at TEXT NOT NULL,
+                    released_at TEXT,
+                    FOREIGN KEY(generation_id)
+                        REFERENCES runtime_resource_generations(generation_id) ON DELETE RESTRICT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS one_active_runtime_generation_reference
+                    ON runtime_generation_references(owner_kind,owner_id)
+                    WHERE status='active';
+                CREATE INDEX IF NOT EXISTS runtime_generation_reference_generation_idx
+                    ON runtime_generation_references(generation_id,status);
+                CREATE TABLE IF NOT EXISTS runtime_plugin_health (
+                    generation_id TEXT NOT NULL,
+                    plugin_id TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    failure_count INTEGER NOT NULL DEFAULT 0,
+                    failure_streak INTEGER NOT NULL DEFAULT 0,
+                    ignored_failure_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'healthy'
+                        CHECK(status IN ('healthy','quarantined')),
+                    last_failure_kind TEXT,
+                    last_error TEXT,
+                    quarantined_at TEXT,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(generation_id,plugin_id,profile),
+                    FOREIGN KEY(generation_id)
+                        REFERENCES runtime_resource_generations(generation_id) ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS runtime_reload_approvals (
+                    plan_hash TEXT PRIMARY KEY,
+                    generation_id TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('approved','revoked')),
+                    approved_at TEXT NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    FOREIGN KEY(generation_id)
+                        REFERENCES runtime_resource_generations(generation_id) ON DELETE RESTRICT
+                );
                 """
             )
             self._ensure_column(connection, "operation_ledger", "stable_key", "TEXT")
@@ -447,6 +532,9 @@ class StateController:
             self._ensure_column(connection, "extension_grant_intents", "run_id", "TEXT")
             self._ensure_column(
                 connection, "agent_states", "snapshot_stream_sequence", "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                connection, "runtime_resource_generations", "artifact_deleted_at", "TEXT",
             )
             self._migrate_gateway_event_v10(connection)
             self._migrate_legacy_gateway_jsonl(connection)
@@ -1014,8 +1102,9 @@ class StateController:
         session_id: str | None = None,
         parent_run_id: str | None = None,
         deadline_at: str | None = None,
+        runtime_generation_id: str | None = None,
     ) -> tuple[AgentState, bool]:
-        """原子建立 Run 投影、幂等记录、AgentState、Event 与 Outbox。"""
+        """原子建立 Run、Event、Outbox及其可选Runtime Generation绑定。"""
         timestamp = now_iso()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1065,6 +1154,22 @@ class StateController:
                 (client_id, workload_kind.value, idempotency_key, request_hash,
                  run_id, None, timestamp, timestamp),
             )
+            if runtime_generation_id is not None:
+                generation = connection.execute(
+                    "SELECT artifact_deleted_at FROM runtime_resource_generations "
+                    "WHERE generation_id=?",
+                    (runtime_generation_id,),
+                ).fetchone()
+                if generation is None or generation["artifact_deleted_at"] is not None:
+                    raise StateInvariantError("Run Runtime generation is unavailable")
+                reference_id = hashlib.sha256(
+                    f"runtime-generation-ref:run:{run_id}:{runtime_generation_id}".encode("utf-8")
+                ).hexdigest()
+                connection.execute(
+                    "INSERT INTO runtime_generation_references(reference_id,generation_id,"
+                    "owner_kind,owner_id,status,created_at) VALUES(?,?,'run',?,'active',?)",
+                    (reference_id, runtime_generation_id, run_id, timestamp),
+                )
             self._update_run_projection(connection, state)
             self._write_event(
                 connection, state, "state_created", {"task_state": state.task_state.value},
@@ -4009,6 +4114,515 @@ class StateController:
                 (payload["attempt_id"], json.dumps(payload, ensure_ascii=False), row["approval_id"]),
             )
             self._save_operation(connection, operation)
+
+    # Runtime resource generations are control-plane facts.  They deliberately
+    # share this SQLite authority, but are not a second Run/Operation FSM.
+    def active_runtime_generation(self, profile: str = "global") -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT g.*,h.revision AS head_revision,h.profile FROM "
+                "runtime_resource_profile_heads h JOIN runtime_resource_generations g "
+                "ON g.generation_id=h.generation_id WHERE h.profile=?",
+                (profile,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def runtime_generation(self, generation_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM runtime_resource_generations WHERE generation_id=?",
+                (generation_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def runtime_resource_status(self) -> dict[str, Any]:
+        with self._connection() as connection:
+            heads = [dict(row) for row in connection.execute(
+                "SELECT h.profile,h.generation_id,h.revision,h.updated_at,g.semantic_hash,"
+                "g.source_hash,g.status FROM runtime_resource_profile_heads h "
+                "JOIN runtime_resource_generations g ON g.generation_id=h.generation_id "
+                "ORDER BY h.profile",
+            ).fetchall()]
+            attempts = [dict(row) for row in connection.execute(
+                "SELECT attempt_id,plan_hash,generation_id,actor,status,error_type,error_summary,"
+                "plan_json,created_at,completed_at FROM runtime_reload_attempts "
+                "ORDER BY created_at DESC LIMIT 50",
+            ).fetchall()]
+            for attempt in attempts:
+                raw = attempt.pop("plan_json", None)
+                attempt["plan"] = json.loads(raw) if raw else None
+            references = [dict(row) for row in connection.execute(
+                "SELECT reference_id,generation_id,owner_kind,owner_id,status,created_at,"
+                "released_at FROM runtime_generation_references WHERE status='active' "
+                "ORDER BY created_at",
+            ).fetchall()]
+            quarantined = [dict(row) for row in connection.execute(
+                "SELECT generation_id,plugin_id,profile,failure_count,failure_streak,"
+                "ignored_failure_count,last_failure_kind,last_error,quarantined_at "
+                "FROM runtime_plugin_health WHERE status='quarantined' "
+                "ORDER BY quarantined_at DESC",
+            ).fetchall()]
+            approvals = [dict(row) for row in connection.execute(
+                "SELECT plan_hash,generation_id,actor,status,approved_at "
+                "FROM runtime_reload_approvals ORDER BY approved_at DESC LIMIT 50",
+            ).fetchall()]
+            return {
+                "heads": heads,
+                "recent_attempts": attempts,
+                "active_references": references,
+                "quarantined_plugins": quarantined,
+                "approvals": approvals,
+            }
+
+    def record_runtime_reload_attempt(
+        self, plan: Any, *, actor: str, status: str, error: BaseException | None,
+    ) -> dict[str, Any]:
+        now = now_iso()
+        attempt_id = hashlib.sha256(
+            f"runtime-reload:{plan.plan_hash}:{actor}:{uuid4().hex}".encode("utf-8")
+        ).hexdigest()
+        with self._connection() as connection:
+            generation = plan.generation
+            existing = connection.execute(
+                "SELECT generation_json FROM runtime_resource_generations WHERE generation_id=?",
+                (generation.generation_id,),
+            ).fetchone()
+            generation_json = generation.model_dump_json()
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO runtime_resource_generations(generation_id,parent_generation_id,"
+                    "core_api_version,semantic_hash,source_hash,status,generation_json,created_at) "
+                    "VALUES(?,?,?,?,?,'preparing',?,?)",
+                    (
+                        generation.generation_id, generation.parent_generation_id,
+                        generation.core_api_version, generation.semantic_hash,
+                        generation.source_hash, generation_json, now,
+                    ),
+                )
+            elif str(existing["generation_json"]) != generation_json and status != "unchanged":
+                raise StateInvariantError("Runtime reload plan conflicts with stored generation")
+            connection.execute(
+                "INSERT INTO runtime_reload_attempts(attempt_id,plan_hash,generation_id,actor,"
+                "status,plan_json,error_type,error_summary,created_at,completed_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    attempt_id, plan.plan_hash, plan.generation.generation_id, actor, status,
+                    plan.model_dump_json(), type(error).__name__ if error else None,
+                    str(AuditSanitizer.sanitize(str(error))) if error else None, now, now,
+                ),
+            )
+        return {"attempt_id": attempt_id, "status": status}
+
+    def record_runtime_reload_failure(self, *, actor: str, error: BaseException) -> None:
+        now = now_iso()
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO runtime_reload_attempts(attempt_id,actor,status,error_type,"
+                "error_summary,created_at,completed_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    uuid4().hex, actor, "failed", type(error).__name__,
+                    str(AuditSanitizer.sanitize(str(error))), now, now,
+                ),
+            )
+
+    def approve_runtime_reload_plan(self, plan: Any, *, actor: str) -> None:
+        """Persist an exact, content-addressed approval before activation work."""
+        now = now_iso()
+        with self._connection() as connection:
+            generation = connection.execute(
+                "SELECT generation_id FROM runtime_resource_generations WHERE generation_id=?",
+                (plan.generation.generation_id,),
+            ).fetchone()
+            if generation is None:
+                # Awaiting-approval recording normally creates this row. Keep
+                # the method correct for an explicit approve after migration.
+                connection.execute(
+                    "INSERT INTO runtime_resource_generations(generation_id,parent_generation_id,"
+                    "core_api_version,semantic_hash,source_hash,status,generation_json,created_at) "
+                    "VALUES(?,?,?,?,?,'preparing',?,?)",
+                    (
+                        plan.generation.generation_id,
+                        plan.generation.parent_generation_id,
+                        plan.generation.core_api_version,
+                        plan.generation.semantic_hash,
+                        plan.generation.source_hash,
+                        plan.generation.model_dump_json(),
+                        now,
+                    ),
+                )
+            connection.execute(
+                "INSERT INTO runtime_reload_approvals(plan_hash,generation_id,actor,status,"
+                "approved_at,plan_json) VALUES(?,?,?,'approved',?,?) "
+                "ON CONFLICT(plan_hash) DO UPDATE SET actor=excluded.actor,status='approved',"
+                "approved_at=excluded.approved_at",
+                (
+                    plan.plan_hash, plan.generation.generation_id,
+                    actor, now, plan.model_dump_json(),
+                ),
+            )
+
+    def runtime_reload_plan_is_approved(
+        self, *, plan_hash: str, generation_id: str,
+    ) -> bool:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM runtime_reload_approvals WHERE plan_hash=? AND generation_id=? "
+                "AND status='approved'",
+                (plan_hash, generation_id),
+            ).fetchone()
+            return row is not None
+
+    def activate_runtime_generation(self, plan: Any, *, actor: str) -> dict[str, Any]:
+        generation = plan.generation
+        now = now_iso()
+        with self._connection() as connection:
+            head = connection.execute(
+                "SELECT generation_id,revision FROM runtime_resource_profile_heads "
+                "WHERE profile='global'",
+            ).fetchone()
+            current_id = str(head["generation_id"]) if head is not None else None
+            if generation.parent_generation_id != current_id:
+                raise StateConflictError(
+                    "Runtime resource head changed while the reload plan was being built"
+                )
+            existing = connection.execute(
+                "SELECT generation_json FROM runtime_resource_generations WHERE generation_id=?",
+                (generation.generation_id,),
+            ).fetchone()
+            payload = generation.model_dump_json()
+            if existing is not None and str(existing["generation_json"]) != payload:
+                raise StateInvariantError("Runtime generation identity has conflicting content")
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO runtime_resource_generations(generation_id,parent_generation_id,"
+                    "core_api_version,semantic_hash,source_hash,status,generation_json,created_at,"
+                    "activated_at) VALUES(?,?,?,?,?,'active',?,?,?)",
+                    (
+                        generation.generation_id, generation.parent_generation_id,
+                        generation.core_api_version, generation.semantic_hash,
+                        generation.source_hash, payload, now, now,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "UPDATE runtime_resource_generations SET status='active',activated_at=?,"
+                    "retired_at=NULL WHERE generation_id=?",
+                    (now, generation.generation_id),
+                )
+            if current_id and current_id != generation.generation_id:
+                connection.execute(
+                    "UPDATE runtime_resource_generations SET status='retired',retired_at=? "
+                    "WHERE generation_id=? AND status='active'",
+                    (now, current_id),
+                )
+            if head is None:
+                connection.execute(
+                    "INSERT INTO runtime_resource_profile_heads(profile,generation_id,revision,"
+                    "updated_at) VALUES('global',?,0,?)",
+                    (generation.generation_id, now),
+                )
+            else:
+                updated = connection.execute(
+                    "UPDATE runtime_resource_profile_heads SET generation_id=?,revision=revision+1,"
+                    "updated_at=? WHERE profile='global' AND revision=?",
+                    (generation.generation_id, now, int(head["revision"])),
+                )
+                if updated.rowcount != 1:
+                    raise StateConflictError("Runtime resource generation CAS failed")
+            attempt_status = "rollback" if any(
+                str(reason).startswith("rollback:") for reason in plan.reasons
+            ) else "activated"
+            connection.execute(
+                "INSERT INTO runtime_reload_attempts(attempt_id,plan_hash,generation_id,actor,"
+                "status,plan_json,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    uuid4().hex, plan.plan_hash, generation.generation_id, actor,
+                    attempt_status, plan.model_dump_json(), now, now,
+                ),
+            )
+        return {"generation_id": generation.generation_id, "status": "active"}
+
+    def acquire_runtime_generation_reference(
+        self, *, generation_id: str, owner_kind: str, owner_id: str,
+    ) -> dict[str, Any]:
+        """Bind a resumable owner to exactly one immutable Generation."""
+        now = now_iso()
+        reference_id = hashlib.sha256(
+            f"runtime-generation-ref:{owner_kind}:{owner_id}:{generation_id}".encode("utf-8")
+        ).hexdigest()
+        with self._connection() as connection:
+            generation = connection.execute(
+                "SELECT generation_id,artifact_deleted_at FROM runtime_resource_generations "
+                "WHERE generation_id=?",
+                (generation_id,),
+            ).fetchone()
+            if generation is None or generation["artifact_deleted_at"] is not None:
+                raise StateInvariantError("Referenced Runtime generation is unavailable")
+            active = connection.execute(
+                "SELECT * FROM runtime_generation_references WHERE owner_kind=? AND owner_id=? "
+                "AND status='active'",
+                (owner_kind, owner_id),
+            ).fetchone()
+            if active is not None:
+                if str(active["generation_id"]) != generation_id:
+                    raise StateConflictError(
+                        "Runtime owner is already fenced to a different Generation"
+                    )
+                return dict(active)
+            connection.execute(
+                "INSERT INTO runtime_generation_references(reference_id,generation_id,owner_kind,"
+                "owner_id,status,created_at) VALUES(?,?,?,?, 'active',?) "
+                "ON CONFLICT(reference_id) DO UPDATE SET status='active',released_at=NULL",
+                (reference_id, generation_id, owner_kind, owner_id, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM runtime_generation_references WHERE reference_id=?",
+                (reference_id,),
+            ).fetchone()
+            assert row is not None
+            return dict(row)
+
+    def release_runtime_generation_reference(
+        self, *, owner_kind: str, owner_id: str,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE runtime_generation_references SET status='released',released_at=? "
+                "WHERE owner_kind=? AND owner_id=? AND status='active'",
+                (now_iso(), owner_kind, owner_id),
+            )
+
+    def release_runtime_generation_references_by_kind(self, owner_kind: str) -> int:
+        """Release process-owned references which cannot survive Gateway restart.
+
+        Durable owners such as Runs, Harness invocations and Recovery decisions
+        are released by their own terminal transactions.  A cached Runtime
+        object is process-local, so every active ``runtime`` reference is stale
+        when a newly constructed RuntimePool starts.
+        """
+        if owner_kind != "runtime":
+            raise ValueError("Bulk release is only valid for process-local Runtime references")
+        with self._connection() as connection:
+            updated = connection.execute(
+                "UPDATE runtime_generation_references SET status='released',released_at=? "
+                "WHERE owner_kind=? AND status='active'",
+                (now_iso(), owner_kind),
+            )
+            return int(updated.rowcount)
+
+    def reconcile_runtime_generation_references(self) -> dict[str, int]:
+        """Release references whose durable owner can no longer resume work."""
+        now = now_iso()
+        with self._connection() as connection:
+            runtime_refs = connection.execute(
+                "UPDATE runtime_generation_references SET status='released',released_at=? "
+                "WHERE owner_kind='runtime' AND status='active'",
+                (now,),
+            ).rowcount
+            terminal_run_refs = connection.execute(
+                "UPDATE runtime_generation_references SET status='released',released_at=? "
+                "WHERE owner_kind='run' AND status='active' AND EXISTS("
+                "SELECT 1 FROM agent_states s WHERE s.run_id=runtime_generation_references.owner_id "
+                "AND s.task_state IN ('succeeded','failed','cancelled','interrupted'))",
+                (now,),
+            ).rowcount
+            cron_refs = 0
+            has_cron_dispatches = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cron_dispatches'",
+            ).fetchone()
+            if has_cron_dispatches is not None:
+                cron_refs = connection.execute(
+                    "UPDATE runtime_generation_references SET status='released',released_at=? "
+                    "WHERE owner_kind='cron' AND status='active' AND EXISTS("
+                    "SELECT 1 FROM cron_dispatches d "
+                    "WHERE d.dispatch_id=runtime_generation_references.owner_id "
+                    "AND d.status IN ('succeeded','failed','cancelled','skipped'))",
+                    (now,),
+                ).rowcount
+            return {
+                "runtime": int(runtime_refs),
+                "terminal_run": int(terminal_run_refs),
+                "terminal_cron": int(cron_refs),
+            }
+
+    def runtime_generation_reference(
+        self, *, owner_kind: str, owner_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM runtime_generation_references WHERE owner_kind=? AND owner_id=? "
+                "AND status='active'",
+                (owner_kind, owner_id),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def record_runtime_plugin_failure(
+        self,
+        *,
+        generation_id: str,
+        plugin_id: str,
+        profile: str,
+        failure_kind: str,
+        error: BaseException | str,
+        counts_toward_quarantine: bool,
+        threshold: int,
+    ) -> dict[str, Any]:
+        now = now_iso()
+        summary = str(AuditSanitizer.sanitize(str(error)))[:2000]
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM runtime_plugin_health WHERE generation_id=? AND plugin_id=? "
+                "AND profile=?",
+                (generation_id, plugin_id, profile),
+            ).fetchone()
+            previous_status = str(row["status"]) if row is not None else "healthy"
+            failures = int(row["failure_count"]) if row is not None else 0
+            streak = int(row["failure_streak"]) if row is not None else 0
+            ignored = int(row["ignored_failure_count"]) if row is not None else 0
+            if counts_toward_quarantine:
+                failures += 1
+                streak += 1
+            else:
+                ignored += 1
+            status = "quarantined" if streak >= max(1, threshold) else previous_status
+            quarantined_at = (
+                now if status == "quarantined" and previous_status != "quarantined"
+                else (str(row["quarantined_at"]) if row is not None and row["quarantined_at"] else None)
+            )
+            connection.execute(
+                "INSERT INTO runtime_plugin_health(generation_id,plugin_id,profile,failure_count,"
+                "failure_streak,ignored_failure_count,status,last_failure_kind,last_error,"
+                "quarantined_at,revision,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,0,?) "
+                "ON CONFLICT(generation_id,plugin_id,profile) DO UPDATE SET "
+                "failure_count=excluded.failure_count,failure_streak=excluded.failure_streak,"
+                "ignored_failure_count=excluded.ignored_failure_count,status=excluded.status,"
+                "last_failure_kind=excluded.last_failure_kind,last_error=excluded.last_error,"
+                "quarantined_at=excluded.quarantined_at,revision=runtime_plugin_health.revision+1,"
+                "updated_at=excluded.updated_at",
+                (
+                    generation_id, plugin_id, profile, failures, streak, ignored,
+                    status, failure_kind, summary, quarantined_at, now,
+                ),
+            )
+            if status == "quarantined":
+                connection.execute(
+                    "UPDATE runtime_resource_generations SET status='quarantined' "
+                    "WHERE generation_id=? AND status='retired'",
+                    (generation_id,),
+                )
+            return {
+                "status": status,
+                "failure_count": failures,
+                "failure_streak": streak,
+                "ignored_failure_count": ignored,
+                "quarantined_now": status == "quarantined" and previous_status != "quarantined",
+            }
+
+    def record_runtime_plugin_success(
+        self, *, generation_id: str, plugin_id: str, profile: str,
+    ) -> None:
+        """A successful callback clears its streak without erasing evidence."""
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE runtime_plugin_health SET failure_streak=0,revision=revision+1,"
+                "updated_at=? WHERE generation_id=? AND plugin_id=? AND profile=? "
+                "AND status='healthy'",
+                (now_iso(), generation_id, plugin_id, profile),
+            )
+
+    def mark_runtime_generation_quarantined(self, generation_id: str) -> None:
+        """Mark a displaced bad Generation without mutating its contents."""
+        with self._connection() as connection:
+            head = connection.execute(
+                "SELECT 1 FROM runtime_resource_profile_heads WHERE generation_id=?",
+                (generation_id,),
+            ).fetchone()
+            if head is not None:
+                raise StateConflictError("Cannot quarantine the active Runtime generation head")
+            connection.execute(
+                "UPDATE runtime_resource_generations SET status='quarantined' "
+                "WHERE generation_id=? AND status='retired'",
+                (generation_id,),
+            )
+
+    def last_healthy_runtime_plugin_generation(
+        self, *, plugin_id: str, excluding_generation_id: str,
+    ) -> str | None:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT generation_id,generation_json FROM runtime_resource_generations "
+                "WHERE generation_id!=? AND artifact_deleted_at IS NULL "
+                "AND status IN ('active','retired') AND activated_at IS NOT NULL "
+                "ORDER BY COALESCE(activated_at,created_at) DESC",
+                (excluding_generation_id,),
+            ).fetchall()
+            quarantined = {
+                str(row["generation_id"])
+                for row in connection.execute(
+                    "SELECT generation_id FROM runtime_plugin_health WHERE plugin_id=? "
+                    "AND status='quarantined'",
+                    (plugin_id,),
+                ).fetchall()
+            }
+            for row in rows:
+                generation_id = str(row["generation_id"])
+                if generation_id in quarantined:
+                    continue
+                try:
+                    payload = json.loads(str(row["generation_json"]))
+                except json.JSONDecodeError:
+                    continue
+                if any(
+                    item.get("plugin_id") == plugin_id
+                    for item in payload.get("descriptors", [])
+                    if isinstance(item, dict)
+                ):
+                    return generation_id
+        return None
+
+    def runtime_generation_gc_candidates(self, *, retention_days: int) -> list[dict[str, Any]]:
+        cutoff = (datetime.now().astimezone() - timedelta(days=retention_days)).isoformat()
+        with self._connection() as connection:
+            return [dict(row) for row in connection.execute(
+                "SELECT g.* FROM runtime_resource_generations g "
+                "WHERE g.status IN ('retired','quarantined','rejected') "
+                "AND g.artifact_deleted_at IS NULL "
+                "AND COALESCE(g.retired_at,g.created_at)<? "
+                "AND NOT EXISTS(SELECT 1 FROM runtime_generation_references r "
+                "WHERE r.generation_id=g.generation_id AND r.status='active') "
+                "AND NOT EXISTS(SELECT 1 FROM runtime_resource_profile_heads h "
+                "WHERE h.generation_id=g.generation_id)",
+                (cutoff,),
+            ).fetchall()]
+
+    def runtime_generation_pending_artifact_cleanup(self) -> list[dict[str, Any]]:
+        """Return fenced GC intents left across a process crash."""
+        with self._connection() as connection:
+            return [dict(row) for row in connection.execute(
+                "SELECT * FROM runtime_resource_generations "
+                "WHERE artifact_deleted_at IS NOT NULL ORDER BY artifact_deleted_at,generation_id",
+            ).fetchall()]
+
+    def delete_runtime_generation_if_unreferenced(self, generation_id: str) -> bool:
+        """Fence artifact GC while retaining immutable generation metadata."""
+        with self._connection() as connection:
+            active = connection.execute(
+                "SELECT 1 FROM runtime_generation_references WHERE generation_id=? "
+                "AND status='active'",
+                (generation_id,),
+            ).fetchone()
+            head = connection.execute(
+                "SELECT 1 FROM runtime_resource_profile_heads WHERE generation_id=?",
+                (generation_id,),
+            ).fetchone()
+            if active is not None or head is not None:
+                return False
+            updated = connection.execute(
+                "UPDATE runtime_resource_generations SET artifact_deleted_at=? "
+                "WHERE generation_id=? AND status!='active' AND artifact_deleted_at IS NULL",
+                (now_iso(), generation_id),
+            )
+            return updated.rowcount == 1
 
     @contextmanager
     def _connection(self):

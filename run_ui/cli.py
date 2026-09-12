@@ -444,6 +444,7 @@ async def _chat_gateway(
                 "/inbox [all|show <ID>|read <ID>|read-all]；"
                 "/tool-result <record_id|tool_call_id> [字符偏移]；"
                 "/extension status|grant|revoke|reenable（管理员 override）；"
+                "/reload [status|approve <plan_hash>|rollback <plugin> <generation>]；"
                 "/cron list|status|add|at|preview|edit|pause|resume|run|remove；"
                 "/dream status|run|backfill|rollback；"
                 "运行中 Ctrl+C 取消当前 Run，空闲时 Ctrl+C 退出客户端。"
@@ -472,6 +473,9 @@ async def _chat_gateway(
             continue
         if task == "/extension" or task.startswith("/extension "):
             await _handle_extension_command(client, task)
+            continue
+        if task == "/reload" or task.startswith("/reload "):
+            await _handle_runtime_reload_command(client, task)
             continue
         if not task:
             continue
@@ -512,6 +516,34 @@ async def _handle_extension_command(client: GatewayClient, task: str) -> None:
     else:
         result = await client.extension_grant(
             ExtensionGrantRequest.model_validate(payload), revoke=action == "revoke",
+        )
+    console.print_json(data=result)
+
+
+async def _handle_runtime_reload_command(client: GatewayClient, task: str) -> None:
+    """Build or inspect immutable Runtime resource generations."""
+    parts = shlex.split(task)
+    action = parts[1].lower() if len(parts) > 1 else "reload"
+    if action == "status":
+        console.print_json(data=await client.runtime_plugin_status())
+        return
+    if action == "approve":
+        if len(parts) != 3:
+            raise ValueError("Usage: /reload approve <plan_hash>")
+        result = await client.reload_runtime_plugins(
+            actor=client.client_id, approved_plan_hash=parts[2],
+        )
+    elif action == "rollback":
+        if len(parts) != 4:
+            raise ValueError("Usage: /reload rollback <plugin_id> <generation_id>")
+        result = await client.rollback_runtime_plugin(
+            parts[2], parts[3], actor=client.client_id,
+        )
+    elif action == "reload" and len(parts) in {1, 2}:
+        result = await client.reload_runtime_plugins(actor=client.client_id)
+    else:
+        raise ValueError(
+            "Usage: /reload [status|approve <plan_hash>|rollback <plugin_id> <generation_id>]"
         )
     console.print_json(data=result)
 

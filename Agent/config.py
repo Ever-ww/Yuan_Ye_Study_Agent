@@ -89,6 +89,10 @@ class RuntimeConfig(BaseModel):
     gateway_port: StrictInt = Field(default=8765, ge=1024, le=65535)
     gateway_max_concurrent_runs: StrictInt = Field(default=4, ge=1, le=32)
     gateway_runtime_idle_seconds: StrictInt = Field(default=3600, ge=30)
+    runtime_plugin_watch_enabled: StrictBool = True
+    runtime_plugin_watch_poll_seconds: float = Field(default=1.0, ge=0.1, le=60.0)
+    runtime_plugin_watch_debounce_seconds: float = Field(default=1.5, ge=0.1, le=300.0)
+    runtime_plugin_generation_retention_days: StrictInt = Field(default=30, ge=1, le=3650)
     approval_timeout_seconds: StrictInt = Field(default=30, ge=5, le=3600)
     model_retry_max_attempts: StrictInt = Field(default=3, ge=1, le=20)
     model_retry_base_seconds: float = Field(default=2.0, ge=0.0, le=300.0)
