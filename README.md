@@ -710,6 +710,11 @@ PDF 使用布局文本模式，尽量保留多栏论文的水平位置和页面�
 
 `subagent` 的风险等级是 `dynamic`：无工具或只读子集解析为 `read`，包含写入能力时解析为 `write`，由同一个工具 Registry 决定是否审批。委派写能力和实际执行写入分别需要一次批准。临时子 Agent 复用父级完整 `ToolContext`，工作区必须与父 Runtime 一致；它使用空 Memory，不创建独立会话记录，最终输出只作为父 Agent 的普通 `tool` 结果保存。
 
+Runtime Observer 作为热插拔 `OBSERVER` Contribution 随 Generation 发布，但状态、事件可见性、
+offset、恢复和审批由 Gateway Core 管理。它只能消费用户可见 Event 投影，不能读取 reasoning、
+隐藏上下文、Tool 参数或结果，也不能调用 Tool 或修改 Prompt。CLI 与 Web 展示同一份持久化
+Progress，详细数据流见 [`docs/runtime-observer.md`](docs/runtime-observer.md)。
+
 Hook 注册方式参考 [PI Agent Extensions](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md) 的事件订阅模式：单一入口、可变事件上下文、按注册顺序执行。为保持本项目的安全边界，工具参数被 Hook 修改后仍会重新校验 Schema，这一点比 PI Agent 当前默认行为更严格。
 
 每个扩展文件导出唯一 `EXTENSION_NAME`、`-50..50` 的 `PRIORITY`，以及

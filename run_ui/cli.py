@@ -13,6 +13,7 @@ from types import FrameType
 
 import typer
 from rich.console import Console
+from rich.columns import Columns
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
@@ -173,9 +174,44 @@ async def _render_gateway(
     streaming_text = ""
     active_session_id = session_id or ""
     terminal_error = ""
+    observer_progress = "等待可见运行进度…"
+    handled_observer_proposals: set[str] = set()
     approval_selector = InteractiveApproval(console)
     with Live(Panel("正在排队…", title="Yuan Ye Gateway"), console=console, refresh_per_second=10) as live:
         token = _active_live.set(live)
+
+        async def decide_observer_proposal(proposal: dict[str, object]) -> None:
+            proposal_id = str(proposal.get("proposal_id") or "")
+            if not proposal_id or proposal_id in handled_observer_proposals:
+                return
+            handled_observer_proposals.add(proposal_id)
+            live.stop()
+            try:
+                action = typer.prompt(
+                    "Observer 检测到意图偏移（adopt/edit/reject）",
+                    default="reject",
+                ).strip().lower()
+                if action not in {"adopt", "edit", "reject"}:
+                    action = "reject"
+                edited_prompt = None
+                if action == "edit":
+                    edited_prompt = typer.prompt(
+                        "编辑纠偏提示词",
+                        default=str(proposal.get("proposed_prompt") or ""),
+                    )
+                await client.decide_observer_correction(
+                    proposal_id,
+                    expected_revision=int(proposal.get("revision", 0)),
+                    action=action,
+                    edited_prompt=edited_prompt,
+                    reason=f"cli_user_{action}",
+                )
+                lines.append(
+                    f"[yellow]Observer 纠偏建议：{proposal.get('proposed_prompt') or ''}[/]"
+                )
+            finally:
+                live.start(refresh=True)
+
         try:
             # 保证正常结束、Ctrl+C 与异常退出都在 asyncio.run 关闭事件循环前
             # 完成订阅器及其底层 WebSocket 的单次、有序 aclose。
@@ -212,6 +248,12 @@ async def _render_gateway(
                         if isinstance(reference, str) and reference:
                             from rich.markup import escape
                             lines.append(f"[dim]详情：/tool-result {escape(shlex.quote(reference))}[/]")
+                    elif event.type == "observer_progress":
+                        observer_progress = str(
+                            event.payload.get("progress_markdown") or observer_progress
+                        )
+                    elif event.type == "observer_correction_proposed":
+                        await decide_observer_proposal(dict(event.payload))
                     elif event.type == EventType.GATEWAY_RESTART_REQUIRED.value:
                         lines.append(f"[bold yellow]{event.payload.get('message', '需要重启 Gateway')}[/]")
                     elif event.type == "approval_requested":
@@ -258,8 +300,32 @@ async def _render_gateway(
                             lines.append(f"[bold green]{answer}[/]")
                     display = lines[-12:] + ([streaming_text] if streaming_text else [])
                     terminal = event.type in {"run_completed", "run_failed", "run_cancelled", "run_interrupted"}
-                    live.update(Panel("\n".join(display) or "正在运行…", title="Yuan Ye Gateway"), refresh=terminal)
+                    observer_columns = Columns((
+                        Panel("\n".join(display) or "正在运行…", title="Yuan Ye Gateway"),
+                        Panel(observer_progress, title="Observer Progress"),
+                    ), expand=True, equal=True)
+                    # Keep the primary visible content available to legacy Live
+                    # adapters/read-receipt tests while Rich renders both columns.
+                    observer_columns.renderable = "\n".join(display) or "正在运行…"
+                    live.update(observer_columns, refresh=terminal)
                     if terminal:
+                        # A correction proposal is created from the terminal
+                        # Observer state, so it can be sequenced after the Run's
+                        # terminal event. Querying the durable projection avoids
+                        # losing it when a client closes its live subscription.
+                        try:
+                            status = await client.observer_status(run.run_id)
+                            observer_progress = str(
+                                status.get("progress_markdown") or observer_progress
+                            )
+                            proposal = status.get("correction_proposal")
+                            if isinstance(proposal, dict):
+                                if proposal.get("status") == "pending":
+                                    await decide_observer_proposal(proposal)
+                        except Exception:
+                            # Observer status is an isolated enhancement. It must
+                            # not prevent display/acknowledgement of the Run result.
+                            pass
                         try:
                             await client.acknowledge_run_result(event.run_id)
                         except Exception:

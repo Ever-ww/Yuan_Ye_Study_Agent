@@ -176,6 +176,7 @@ def test_harness_providers_are_common_plus_exact_trigger() -> None:
         "runtime.adapter.memory",
         "runtime.adapter.sandbox",
         "runtime.adapter.dynamic-context",
+        "builtin.observer",
     }
     assert all("capability" not in item and "dream" not in item for item in manual)
 
@@ -239,6 +240,9 @@ def test_profiles_expose_only_their_authorized_resource_surface() -> None:
         }
 
     assert "builtin.extensions" not in visible(RuntimeProfile.CRON)
+    assert "builtin.observer" in visible(RuntimeProfile.INTERACTIVE)
+    assert "builtin.observer" in visible(RuntimeProfile.CRON)
+    assert "builtin.observer" not in visible(RuntimeProfile.SUBAGENT)
     assert not any(item.startswith("harness.") for item in visible(RuntimeProfile.CRON))
     assert visible(RuntimeProfile.COMPRESSION) == set()
     assert visible(RuntimeProfile.MAINTENANCE) == {

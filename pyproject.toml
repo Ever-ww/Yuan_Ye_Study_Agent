@@ -18,7 +18,7 @@ yy-agent = "run_ui.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["Agent*", "backup*", "bootstrap*", "context_process*", "cron*", "dream*", "gateway*", "harness_runtime*", "memory*", "paper_library*", "prompt*", "reference*", "sandbox*", "skill*", "tool*", "tools*", "run_ui*"]
+include = ["Agent*", "backup*", "bootstrap*", "context_process*", "cron*", "dream*", "gateway*", "harness_runtime*", "memory*", "observer_plugins*", "paper_library*", "prompt*", "reference*", "sandbox*", "skill*", "tool*", "tools*", "run_ui*"]
 
 [tool.setuptools.package-data]
 bootstrap = ["templates/*.example"]

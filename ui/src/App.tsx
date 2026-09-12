@@ -5,6 +5,12 @@ import type { GatewayEvent, GatewayStatus, InboxItem, Project, Session, SessionR
 import "./styles.css";
 
 const terminalEvents = new Set(["run_completed", "run_failed", "run_cancelled", "run_interrupted"]);
+type ObserverCorrection = {
+  proposal_id: string;
+  proposed_prompt: string;
+  revision: number;
+  status?: string;
+};
 
 export default function App() {
   const api = useMemo(() => new GatewayApi(), []);
@@ -20,6 +26,8 @@ export default function App() {
   const [runId, setRunId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [handledApprovals, setHandledApprovals] = useState<Set<string>>(new Set());
+  const [observerProgress, setObserverProgress] = useState("");
+  const [observerCorrection, setObserverCorrection] = useState<ObserverCorrection | null>(null);
 
   async function refresh() {
     const [nextStatus, nextProjects, nextInbox] = await Promise.all([
@@ -79,6 +87,8 @@ export default function App() {
     if (!project || !task.trim() || runId) return;
     setError("");
     setEvents([]);
+    setObserverProgress("");
+    setObserverCorrection(null);
     setHandledApprovals(new Set());
     const submitted = task.trim();
     setHistory((current) => [
@@ -95,9 +105,29 @@ export default function App() {
         if (event.sequence <= lastSequence) return;
         lastSequence = event.sequence;
         setEvents((current) => mergeGatewayEvents(current, event));
+        if (event.type === "observer_progress") {
+          setObserverProgress(String(event.payload.progress_markdown || ""));
+        }
+        if (event.type === "observer_correction_proposed") {
+          setObserverCorrection({
+            proposal_id: String(event.payload.proposal_id || ""),
+            proposed_prompt: String(event.payload.proposed_prompt || ""),
+            revision: Number(event.payload.revision || 0),
+            status: "pending"
+          });
+        }
         if (event.session_id) setSessionId(event.session_id);
         if (terminalEvents.has(event.type)) {
           terminal = true;
+          try {
+            const observer = await api.observerStatus(created.run_id);
+            setObserverProgress(String(observer.progress_markdown || ""));
+            const proposal = observer.correction_proposal as ObserverCorrection | null;
+            if (proposal?.status === "pending") setObserverCorrection(proposal);
+          } catch {
+            // Observer is isolated and may be disabled or degraded.  The Run
+            // result remains authoritative and is still displayed normally.
+          }
           socket.close();
           setRunId(null);
           await notifyDesktop(
@@ -125,6 +155,29 @@ export default function App() {
     try {
       await api.respondApproval(approvalId, approved);
       setHandledApprovals((current) => new Set(current).add(approvalId));
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function decideObserverCorrection(action: "adopt" | "edit" | "reject") {
+    if (!observerCorrection) return;
+    let edited: string | undefined;
+    if (action === "edit") {
+      edited = prompt(
+        "编辑纠偏提示词",
+        observerCorrection.proposed_prompt
+      ) || undefined;
+      if (!edited) return;
+    }
+    try {
+      await api.decideObserverCorrection(
+        observerCorrection.proposal_id,
+        observerCorrection.revision,
+        action,
+        edited
+      );
+      setObserverCorrection(null);
     } catch (reason) {
       setError(String(reason));
     }
@@ -224,6 +277,14 @@ export default function App() {
             <button className="allow" onClick={() => void decideApproval(String(approval.payload.approval_id), true)}>允许</button>
           </div>
         )}
+        {observerCorrection && (
+          <div className="approval observer-correction">
+            <div><b>Observer 检测到意图偏移</b><p>{observerCorrection.proposed_prompt}</p></div>
+            <button onClick={() => void decideObserverCorrection("reject")}>拒绝</button>
+            <button onClick={() => void decideObserverCorrection("edit")}>编辑后采用</button>
+            <button className="allow" onClick={() => void decideObserverCorrection("adopt")}>采用</button>
+          </div>
+        )}
         {error && <div className="error">{error}</div>}
         <div className="composer">
           <textarea value={task} onChange={(event) => setTask(event.target.value)}
@@ -234,6 +295,10 @@ export default function App() {
             : <button onClick={send} disabled={!project || !task.trim()}>↑</button>}
         </div>
       </section>
+      <aside className="observer-panel">
+        <h2>Observer Progress</h2>
+        <pre>{observerProgress || "等待可见运行进度…"}</pre>
+      </aside>
     </main>
   );
 }
@@ -252,6 +317,7 @@ async function notifyDesktop(title: string, body: string) {
 }
 
 function EventCard({ event }: { event: GatewayEvent }) {
+  if (event.type === "observer_progress" || event.type === "observer_correction_proposed") return null;
   if (event.type === "text") return <article className="answer">{String(event.payload.content || "")}</article>;
   if (event.type === "approval_requested") return null;
   const labels: Record<string, string> = {

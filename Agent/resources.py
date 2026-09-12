@@ -38,6 +38,7 @@ def _sha256(value: bytes | str) -> str:
 class RuntimeProfile(str, Enum):
     INTERACTIVE = "interactive"
     CRON = "cron"
+    DREAM = "dream"
     SUBAGENT = "subagent"
     COMPRESSION = "compression"
     MAINTENANCE = "maintenance"
@@ -54,6 +55,7 @@ class RuntimeContributionKind(str, Enum):
     HOOK = "hook"
     EXTENSION = "extension"
     DYNAMIC_CONTEXT = "dynamic_context"
+    OBSERVER = "observer"
 
 
 class RuntimePluginFailureKind(str, Enum):
@@ -245,6 +247,7 @@ class RuntimeResourceBundle:
             RuntimeContributionKind.HOOK: self.hooks,
             RuntimeContributionKind.EXTENSION: self.extensions,
             RuntimeContributionKind.DYNAMIC_CONTEXT: None,
+            RuntimeContributionKind.OBSERVER: None,
         }.get(kind)
         if instance is None:
             return ()
@@ -487,6 +490,16 @@ def default_runtime_resource_providers(
             ),),
         ),
         FileTreeRuntimeResourceProvider(
+            "builtin.observer", source / "observer_plugins", root_kind="source",
+            contribution_kind=RuntimeContributionKind.OBSERVER,
+            profiles=(
+                RuntimeProfile.INTERACTIVE, RuntimeProfile.CRON, RuntimeProfile.DREAM,
+                RuntimeProfile.HARNESS_MANUAL, RuntimeProfile.HARNESS_ERROR,
+                RuntimeProfile.HARNESS_CAPABILITY, RuntimeProfile.HARNESS_DREAM,
+            ),
+            relative_to=source,
+        ),
+        FileTreeRuntimeResourceProvider(
             "builtin.tools", source / "tools", root_kind="source",
             contribution_kind=RuntimeContributionKind.TOOL, profiles=interactive,
             relative_to=source,
@@ -495,6 +508,24 @@ def default_runtime_resource_providers(
             "builtin.skills", source / "skills", root_kind="source",
             contribution_kind=RuntimeContributionKind.SKILL,
             profiles=(RuntimeProfile.INTERACTIVE, RuntimeProfile.CRON), relative_to=source,
+        ),
+        FileTreeRuntimeResourceProvider(
+            "runtime.skills.interactive",
+            source / "runtime-resources" / "interactive" / "skills",
+            root_kind="source", contribution_kind=RuntimeContributionKind.SKILL,
+            profiles=(RuntimeProfile.INTERACTIVE,), relative_to=source,
+            requires_plugins=("builtin.skills",),
+        ),
+        FileTreeRuntimeResourceProvider(
+            "runtime.skills.cron", source / "runtime-resources" / "cron" / "skills",
+            root_kind="source", contribution_kind=RuntimeContributionKind.SKILL,
+            profiles=(RuntimeProfile.CRON,), relative_to=source,
+            requires_plugins=("builtin.skills",),
+        ),
+        FileTreeRuntimeResourceProvider(
+            "runtime.skills.dream", source / "runtime-resources" / "dream" / "skills",
+            root_kind="source", contribution_kind=RuntimeContributionKind.SKILL,
+            profiles=(RuntimeProfile.DREAM,), relative_to=source,
         ),
         FileTreeRuntimeResourceProvider(
             "builtin.prompts", agent / ".yy" / "agents", root_kind="agent",
@@ -629,7 +660,8 @@ class RuntimePluginManager:
                 )
             return
         allowed = bool(parts) and parts[0] in {
-            "tools", "skills", "extension", "runtime-plugins",
+            "tools", "skills", "extension", "observer_plugins", "runtime-plugins",
+            "runtime-resources",
         }
         harness_runtime = parts[:2] == ("harness-evolution", "runtime")
         if not (allowed or harness_runtime):
@@ -734,6 +766,7 @@ class RuntimePluginManager:
                     RuntimeContributionKind.TOOL,
                     RuntimeContributionKind.EXTENSION,
                     RuntimeContributionKind.HOOK,
+                    RuntimeContributionKind.OBSERVER,
                 }
                 for contribution in item.contributions
             )
@@ -981,6 +1014,7 @@ class RuntimePluginManager:
                 kinds[RuntimeContributionKind.HOOK]
                 + kinds[RuntimeContributionKind.EXTENSION]
                 + kinds[RuntimeContributionKind.DYNAMIC_CONTEXT]
+                + kinds[RuntimeContributionKind.OBSERVER]
             ))),
         )
 
@@ -1171,6 +1205,12 @@ class RuntimePluginManager:
     ) -> str:
         if profile.value.startswith("harness:"):
             prefix = "harness-evolution/runtime/"
+            if member.root == "source" and member.path.startswith(prefix):
+                return member.path[len(prefix):]
+        if profile in {
+            RuntimeProfile.INTERACTIVE, RuntimeProfile.CRON, RuntimeProfile.DREAM,
+        }:
+            prefix = f"runtime-resources/{profile.value}/"
             if member.root == "source" and member.path.startswith(prefix):
                 return member.path[len(prefix):]
         return member.path

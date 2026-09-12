@@ -67,6 +67,7 @@ from gateway.outbox import OutboxDispatcher
 from gateway.event_store import EventStore, GatewayEventArchiveScheduler, GatewayEventArchiveService
 from gateway.recovery import RecoveryCoordinator
 from gateway.state_controller import StateController
+from gateway.observer import GatewayObserverService, ObserverStateStore
 from gateway.models import (
     ApprovalDecision,
     CodeSessionCreateRequest,
@@ -94,6 +95,7 @@ from reference import (
     build_embedding_provider,
 )
 from skill import SkillInstallRequest, SkillService
+from skill.parser import parse_skill
 from dream import DreamRunResult, DreamScheduler, DreamService
 from gateway.harness_dream import (
     HarnessDreamChangeSet,
@@ -170,6 +172,13 @@ class GatewayApplication:
             state_controller=self.state_controller,
         )
         self.runtime_plugins.ensure_initial_generation()
+        self.observer = GatewayObserverService(
+            event_store=self.event_store,
+            state_store=ObserverStateStore(self.store.database_path),
+            gateway_store=self.store,
+            resource_manager=self.runtime_plugins,
+            timeout_seconds=config.observer_correction_timeout_seconds,
+        ) if config.observer_enabled else None
         interactive_resources = self.runtime_plugins.snapshot(RuntimeProfile.INTERACTIVE)
         self.extensions = ExtensionLoader(interactive_resources.source_root).scan()
         self.runtime_plugin_watcher = RuntimePluginWatcher(
@@ -239,6 +248,7 @@ class GatewayApplication:
             cron_tool_authorizer=self.cron_service.tool_preapproved,
             cron_terminal_callback=self._settle_cron_terminal,
             runtime_resource_manager=self.runtime_plugins,
+            observer_service=self.observer,
         )
         self.recovery = RecoveryCoordinator(
             self.state_controller,
@@ -336,6 +346,7 @@ class GatewayApplication:
     def health(self) -> dict[str, object]:
         """Merge existing Gateway diagnostics with canonical Memory health."""
         return {**self.state_controller.health(), **self.memory_store.memory_health(),
+                **(self.observer.state_store.health() if self.observer is not None else {}),
                 "maintenance": self.maintenance.snapshot.model_dump(mode="json"),
                 "accepting_work": self.write_gate.state == MaintenanceState.RUNNING,
                 "runtime_plugins": self.runtime_plugin_status()}
@@ -468,6 +479,12 @@ class GatewayApplication:
             await self.memory_embedding_worker.start()
         try:
             await self.pool.start()
+            if self.observer is not None:
+                # Reconsume only canonical events after each durable offset.
+                # Progress is queryable from StateStore even if a prior crash
+                # occurred before its transient projection was delivered.
+                await asyncio.to_thread(self.observer.recover)
+                await self.observer.start()
             if self.config.runtime_plugin_watch_enabled:
                 await self.runtime_plugin_watcher.start()
             await self.cron_store.ensure()
@@ -659,6 +676,8 @@ class GatewayApplication:
 
     async def close(self) -> None:
         try:
+            if self.observer is not None:
+                await self.observer.close()
             await self.runtime_plugin_watcher.close()
             await self.event_archive_scheduler.close()
             await self.restart_coordinator.close()
@@ -739,6 +758,113 @@ class GatewayApplication:
         return {
             **self.state_controller.runtime_resource_status(),
             "watcher": self.runtime_plugin_watcher.status(),
+        }
+
+    def observer_status(self, run_id: str) -> dict[str, object]:
+        if self.observer is None:
+            raise RuntimeError("Runtime Observer is disabled")
+        return self.observer.state_store.status(run_id)
+
+    def decide_observer_correction(
+        self, proposal_id: str, *, expected_revision: int, action: str,
+        actor: str, edited_prompt: str | None = None, reason: str = "",
+    ) -> dict[str, object]:
+        if self.observer is None:
+            raise RuntimeError("Runtime Observer is disabled")
+        evidence = self.observer.decide_correction(
+            proposal_id, expected_revision=expected_revision, action=action,
+            actor=actor, edited_prompt=edited_prompt, reason=reason,
+        )
+        try:
+            state = self.state_controller.state(evidence.run_id)
+            self.state_controller.apply(RecordRuntimeEventCommand(
+                command_id=hashlib.sha256(
+                    f"observer-correction-decided:{proposal_id}:{expected_revision}".encode("utf-8")
+                ).hexdigest(),
+                run_id=evidence.run_id, expected_revision=state.revision,
+                gateway_epoch=self.gateway_epoch,
+                event_type="observer_correction_decided",
+                payload={
+                    "proposal_id": proposal_id, "action": action,
+                    "evidence_id": evidence.evidence_id,
+                },
+            ))
+            self.outbox.wake()
+        except Exception:
+            # The decision and finalized Evidence are authoritative; UI delivery
+            # remains a retryable projection and must not reverse the decision.
+            pass
+        return evidence.model_dump(mode="json")
+
+    def observer_skill_candidates(self) -> tuple[dict[str, object], ...]:
+        if self.observer is None:
+            return ()
+        return self.observer.state_store.skill_candidates()
+
+    def decide_observer_skill_candidate(
+        self, candidate_id: str, *, expected_revision: int,
+        approved: bool, actor: str,
+    ) -> dict[str, object]:
+        if self.observer is None:
+            raise RuntimeError("Runtime Observer is disabled")
+        candidate = self.observer.state_store.decide_skill_candidate(
+            candidate_id, expected_revision=expected_revision, approved=approved,
+        )
+        if not approved:
+            return candidate
+        name = str(candidate["name"])
+        profile = str(candidate["runtime_profile"])
+        trigger = str(candidate["trigger"])
+        source_root = self.runtime_plugins.source_root
+        if profile.startswith("harness:"):
+            selected_trigger = profile.split(":", 1)[1]
+            target = (
+                source_root / "harness-evolution" / "runtime" / "skills"
+                / selected_trigger / name
+            )
+        elif profile == "cron":
+            target = source_root / "runtime-resources" / "cron" / "skills" / name
+        elif profile == "dream":
+            target = source_root / "runtime-resources" / "dream" / "skills" / name
+        elif profile == "interactive":
+            target = source_root / "runtime-resources" / "interactive" / "skills" / name
+        else:
+            raise RuntimeError(f"Observer Skill profile cannot be published: {profile}")
+        if target.exists():
+            raise RuntimeError(f"Observer Skill target already exists: {target}")
+        staging = target.parent / f".{name}.{candidate_id[-12:]}.tmp"
+        temporary = staging / name
+        temporary.mkdir(parents=True, exist_ok=False)
+        try:
+            skill_file = temporary / "SKILL.md"
+            with skill_file.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(str(candidate["skill_markdown"]))
+                handle.flush()
+                os.fsync(handle.fileno())
+            parsed = parse_skill(temporary)
+            if parsed.name != name:
+                raise RuntimeError("Observer Skill validation changed its identity")
+            os.replace(temporary, target)
+            staging.rmdir()
+        except Exception:
+            if staging.is_dir():
+                import shutil
+                shutil.rmtree(staging, ignore_errors=True)
+            raise
+        reload_result = self.runtime_plugins.reload(actor=f"{actor}:observer-skill")
+        if reload_result.status not in {"activated", "unchanged"}:
+            raise RuntimeError(
+                "Observer Skill was written but Runtime Generation was not activated: "
+                + reload_result.status
+            )
+        self.observer.state_store.mark_skill_published(candidate_id)
+        return {
+            **candidate,
+            "status": "published",
+            "target": str(target),
+            "generation_id": reload_result.generation_id,
+            "effective_next_turn": True,
+            "trigger": trigger,
         }
 
     def reload_runtime_plugins(
@@ -974,6 +1100,7 @@ class GatewayApplication:
         run_id: str,
     ) -> None:
         await self.pool.finalizer.finalize(run_id)
+        self.runtime_plugins.release_reference(owner_kind="run", owner_id=run_id)
 
     def _code_project(self, session_id: str) -> str:
         owner = getattr(self.code_sessions, "owner", None)
@@ -1691,6 +1818,26 @@ class GatewayApplication:
         task: str,
     ):
         request_hash = hashlib.sha256(task.encode("utf-8")).hexdigest()
+        resource_profile = {
+            WorkloadKind.DREAM: RuntimeProfile.DREAM,
+            WorkloadKind.DREAM_BACKFILL: RuntimeProfile.DREAM,
+            WorkloadKind.DREAM_ROLLBACK: RuntimeProfile.DREAM,
+            WorkloadKind.CODE_SESSION_START: RuntimeProfile.HARNESS_MANUAL,
+            WorkloadKind.CODE_TURN: RuntimeProfile.HARNESS_MANUAL,
+            WorkloadKind.CODE_FINALIZE: RuntimeProfile.HARNESS_MANUAL,
+            WorkloadKind.CODE_ABORT: RuntimeProfile.HARNESS_MANUAL,
+            WorkloadKind.HARNESS_DREAM: RuntimeProfile.HARNESS_DREAM,
+            WorkloadKind.MAINTENANCE: RuntimeProfile.MAINTENANCE,
+        }.get(workload)
+        if workload is WorkloadKind.HARNESS_EVOLUTION:
+            resource_profile = (
+                RuntimeProfile.HARNESS_CAPABILITY
+                if "capability" in task.lower()
+                else RuntimeProfile.HARNESS_ERROR
+            )
+        resource_snapshot = self.runtime_plugins.snapshot(
+            resource_profile or RuntimeProfile.MAINTENANCE,
+        )
         state, duplicate = self.state_controller.create_run(
             run_id=run_id,
             workload_kind=workload,
@@ -1700,6 +1847,7 @@ class GatewayApplication:
             idempotency_key=f"{workload.value}:{run_id}",
             request_hash=request_hash,
             persistence_contract=PersistenceContract.CONTROL_ONLY,
+            runtime_generation_id=resource_snapshot.generation_id,
         )
         if duplicate:
             return state
@@ -1717,6 +1865,16 @@ class GatewayApplication:
                 reason=reason,
             )).state
         self.outbox.wake()
+        if self.observer is not None:
+            try:
+                maximum = self.event_store.max_sequence(state.run_id)
+                latest = self.event_store.read_stream(
+                    state.run_id, after_sequence=max(0, maximum - 1), limit=1,
+                )
+                if latest:
+                    self.observer.observe_event(latest[0].event_id)
+            except Exception as exc:
+                self.observer.record_failure(state.run_id, exc)
         return state
 
     @lifecycle_work("request")
@@ -1768,6 +1926,32 @@ class GatewayApplication:
             "noop": "dream_noop",
             "failed": "dream_failed",
         }[result.status]
+        # Observer Evidence has its own durable consumption cursor. A Profile
+        # Dream may legitimately be a no-op while repeated Harness/Cron
+        # Evidence is ready for Skill evolution, so both successful outcomes
+        # run the same profile-isolated candidate stage.
+        if result.status in {"completed", "noop"} and self.observer is not None:
+            candidates = self.observer.state_store.create_skill_candidates(
+                minimum_evidence=self.config.observer_skill_minimum_evidence,
+            )
+            for candidate in candidates:
+                state = self.state_controller.apply(RecordRuntimeEventCommand(
+                    command_id=hashlib.sha256(
+                        f"observer-skill-candidate:{candidate['candidate_id']}".encode("utf-8")
+                    ).hexdigest(),
+                    run_id=state.run_id,
+                    expected_revision=state.revision,
+                    gateway_epoch=self.gateway_epoch,
+                    event_type="observer_skill_candidate",
+                    payload={
+                        "candidate_id": candidate["candidate_id"],
+                        "name": candidate["name"],
+                        "runtime_profile": candidate["runtime_profile"],
+                        "trigger": candidate["trigger"],
+                        "evidence_count": len(candidate["evidence_ids"]),
+                        "status": "awaiting_approval",
+                    },
+                )).state
         target = TerminalTarget.FAILED if result.status == "failed" else TerminalTarget.SUCCEEDED
         state = self.state_controller.apply(TransitionCommand(
             command_id=uuid4().hex,

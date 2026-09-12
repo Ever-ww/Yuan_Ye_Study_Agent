@@ -450,6 +450,40 @@ class GatewayClient:
             json=payload.model_dump(mode="json"), timeout=300,
         ))
 
+    async def observer_status(self, run_id: str) -> dict[str, Any]:
+        return dict(await self._request("GET", f"/api/v1/observer/runs/{run_id}"))
+
+    async def decide_observer_correction(
+        self, proposal_id: str, *, expected_revision: int, action: str,
+        edited_prompt: str | None = None, reason: str = "",
+    ) -> dict[str, Any]:
+        return dict(await self._request(
+            "POST", f"/api/v1/observer/corrections/{proposal_id}/decision",
+            json={
+                "expected_revision": expected_revision,
+                "action": action,
+                "actor": self.client_id,
+                "edited_prompt": edited_prompt,
+                "reason": reason,
+            },
+        ))
+
+    async def observer_skill_candidates(self) -> list[dict[str, Any]]:
+        return list(await self._request("GET", "/api/v1/observer/skill-candidates"))
+
+    async def decide_observer_skill_candidate(
+        self, candidate_id: str, *, expected_revision: int, approved: bool,
+    ) -> dict[str, Any]:
+        return dict(await self._request(
+            "POST", f"/api/v1/observer/skill-candidates/{candidate_id}/decision",
+            json={
+                "expected_revision": expected_revision,
+                "approved": approved,
+                "actor": self.client_id,
+            },
+            timeout=300,
+        ))
+
     async def rollback_runtime_plugin(
         self, plugin_id: str, from_generation_id: str, *, actor: str,
     ) -> dict[str, Any]:

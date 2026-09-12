@@ -25,7 +25,8 @@ RuntimePluginDescriptor
    ├─ STABLE_PROMPT
    ├─ HOOK
    ├─ EXTENSION
-   └─ DYNAMIC_CONTEXT
+   ├─ DYNAMIC_CONTEXT
+   └─ OBSERVER
 ```
 
 - Generation：持久化、内容寻址、不可修改的完整资源版本。
@@ -52,6 +53,11 @@ Generation → Profile Snapshot → Bundle
 Memory Retrieval/Projection、Sandbox Policy/Context 和 Dynamic Context 都以窄适配器进入
 Bundle。Canonical Memory Store 与 Sandbox Backend 仍属于 Core。Dynamic Context 回调在
 `MODEL_BEFORE` 准备当前请求投影；ReAct Loop 只消费 Hook 产生的确定性请求操作。
+
+Observer reducer 同样是 Generation 成员，但它只消费 Core 生成的 Visible Event Projection。
+Observer StateStore、offset、恢复、审批和传输属于 Core，不能通过 reload 替换。当前 Run 固定
+使用其绑定 Generation 中的 Observer；新 Generation 只影响之后的 Run/Turn。完整隔离与恢复
+语义见 [`runtime-observer.md`](runtime-observer.md)。
 
 Extension Hook 和其他插件 Hook 回调统一通过 `RuntimeHookCallbackContribution` 装入现有
 HookExecutor。默认采用 `ISOLATE`，超时与异常可归因到具体插件版本；插件不能替换

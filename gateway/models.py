@@ -311,6 +311,24 @@ class RuntimePluginRollbackRequest(BaseModel):
     actor: str = Field(min_length=1)
 
 
+class ObserverCorrectionDecisionRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    expected_revision: int = Field(ge=0)
+    action: Literal["adopt", "edit", "reject"]
+    actor: str = Field(min_length=1)
+    edited_prompt: str | None = Field(default=None, max_length=8000)
+    reason: str = Field(default="", max_length=2000)
+
+
+class ObserverSkillCandidateDecisionRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    expected_revision: int = Field(ge=0)
+    approved: bool
+    actor: str = Field(min_length=1)
+
+
 def now_iso() -> str:
     """生成带时区、秒级稳定格式的协议时间。"""
     return datetime.now().astimezone().isoformat(timespec="seconds")

@@ -52,6 +52,11 @@ from .resources import (
     load_generation_tool_module,
     register_runtime_resource_callbacks,
 )
+from .observer import (
+    IntentAlignment, IntentAlignmentStatus, ObserverEvidence, ObserverPlugin,
+    ObserverState, ObserverToolLoop, VisibleObserverEvent,
+    render_observer_progress,
+)
 from .runtime import AgentRuntime, RuntimeFailure, RuntimeResult, RunEvent, EventType
 from .state import (
     AgentState,
@@ -138,6 +143,9 @@ __all__ = [
     "RuntimeResourceGeneration",
     "RuntimeResourceSnapshot",
     "StaticRuntimeResourceProvider",
+    "IntentAlignment", "IntentAlignmentStatus", "ObserverEvidence",
+    "ObserverPlugin", "ObserverState", "ObserverToolLoop",
+    "VisibleObserverEvent", "render_observer_progress",
     "load_generation_tool_module",
     "register_runtime_resource_callbacks",
     "RunEvent",

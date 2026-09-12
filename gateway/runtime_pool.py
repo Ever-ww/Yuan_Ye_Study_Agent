@@ -88,6 +88,7 @@ class RuntimePool:
         cron_tool_authorizer=None,
         cron_terminal_callback: CronTerminalCallback | None = None,
         runtime_resource_manager=None,
+        observer_service=None,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.store = store
@@ -127,6 +128,7 @@ class RuntimePool:
         self.harness_evolution_service = harness_evolution_service
         self.cron_terminal_callback = cron_terminal_callback
         self.runtime_resource_manager = runtime_resource_manager
+        self.observer_service = observer_service
         self._pending_profile_refresh: set[tuple[str, str]] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._submitting: set[str] = set()
@@ -856,7 +858,7 @@ class RuntimePool:
 
     async def _emit(self, run: RunRecord, event_type: str, payload: dict) -> None:
         state = self.state_controller.state(run.run_id)
-        self.state_controller.apply(RecordRuntimeEventCommand(
+        result = self.state_controller.apply(RecordRuntimeEventCommand(
             command_id=uuid4().hex,
             run_id=run.run_id,
             expected_revision=state.revision,
@@ -865,6 +867,33 @@ class RuntimePool:
             payload=payload,
             mark_progress=event_type in {"text", "model_reconnected", "tool_completed"},
         ))
+        if self.observer_service is not None and result.event_id is not None:
+            try:
+                outputs = self.observer_service.observe_event(result.event_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Observer is an isolated enhancement.  Its implementation
+                # failure is attributed/quarantined but never fails Main/Harness.
+                try:
+                    self.observer_service.record_failure(run.run_id, exc)
+                except Exception:
+                    pass
+                outputs = ()
+            for output in outputs:
+                current = self.state_controller.state(run.run_id)
+                self.state_controller.apply(RecordRuntimeEventCommand(
+                    command_id=hashlib.sha256(
+                        f"observer-output:{run.run_id}:{output.event_type}:"
+                        f"{output.payload.get('source_event_id') or output.payload.get('proposal_id') or result.event_id}".encode("utf-8")
+                    ).hexdigest(),
+                    run_id=run.run_id,
+                    expected_revision=current.revision,
+                    gateway_epoch=self.state_controller.gateway_epoch,
+                    event_type=output.event_type,
+                    payload=output.payload,
+                    mark_progress=False,
+                ))
         if self.outbox is not None:
             self.outbox.wake()
             await self.outbox.drain_once()

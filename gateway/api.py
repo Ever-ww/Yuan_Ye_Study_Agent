@@ -34,6 +34,8 @@ from gateway.models import (
     ExtensionReenableRequest,
     RuntimeReloadRequest,
     RuntimePluginRollbackRequest,
+    ObserverCorrectionDecisionRequest,
+    ObserverSkillCandidateDecisionRequest,
 )
 from gateway.security import GatewayCredentials, bearer_value
 from sandbox import probe_sandbox_status
@@ -256,6 +258,39 @@ def create_gateway_api(
             payload.plugin_id,
             from_generation_id=payload.from_generation_id,
             actor=payload.actor,
+        )
+
+    @app.get("/api/v1/observer/runs/{run_id}", dependencies=[Depends(authorize)])
+    async def observer_status(run_id: str):
+        return gateway.observer_status(run_id)
+
+    @app.post(
+        "/api/v1/observer/corrections/{proposal_id}/decision",
+        dependencies=[Depends(authorize_write)],
+    )
+    async def decide_observer_correction(
+        proposal_id: str, payload: ObserverCorrectionDecisionRequest,
+    ):
+        return gateway.decide_observer_correction(
+            proposal_id, expected_revision=payload.expected_revision,
+            action=payload.action, actor=payload.actor,
+            edited_prompt=payload.edited_prompt, reason=payload.reason,
+        )
+
+    @app.get("/api/v1/observer/skill-candidates", dependencies=[Depends(authorize)])
+    async def observer_skill_candidates():
+        return gateway.observer_skill_candidates()
+
+    @app.post(
+        "/api/v1/observer/skill-candidates/{candidate_id}/decision",
+        dependencies=[Depends(authorize_write)],
+    )
+    async def decide_observer_skill_candidate(
+        candidate_id: str, payload: ObserverSkillCandidateDecisionRequest,
+    ):
+        return gateway.decide_observer_skill_candidate(
+            candidate_id, expected_revision=payload.expected_revision,
+            approved=payload.approved, actor=payload.actor,
         )
 
     @app.get("/api/v1/bootstrap", dependencies=[Depends(authorize)])

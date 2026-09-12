@@ -37,7 +37,7 @@ export type InboxItem = {
 };
 
 export type GatewayEvent = {
-  version: 1;
+  version: 1 | 2;
   event_id: string;
   sequence: number;
   timestamp: string;
@@ -46,6 +46,14 @@ export type GatewayEvent = {
   run_id: string;
   type: string;
   payload: Record<string, unknown>;
+};
+
+export type ObserverState = {
+  user_problem: string;
+  completed_tasks: string[];
+  in_progress_task: string;
+  current_agent_action: string;
+  intent_alignment: { status: "aligned" | "uncertain" | "drifted"; reason: string };
 };
 
 export type GatewayStatus = {

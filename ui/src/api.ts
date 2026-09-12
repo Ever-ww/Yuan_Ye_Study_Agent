@@ -87,6 +87,24 @@ export class GatewayApi {
       body: JSON.stringify({ client_id: this.clientId, approved })
     });
   }
+  observerStatus(runId: string): Promise<Record<string, unknown>> {
+    return this.request(`/api/v1/observer/runs/${runId}`);
+  }
+  decideObserverCorrection(
+    proposalId: string, expectedRevision: number, action: "adopt" | "edit" | "reject",
+    editedPrompt?: string
+  ): Promise<Record<string, unknown>> {
+    return this.request(`/api/v1/observer/corrections/${proposalId}/decision`, {
+      method: "POST",
+      body: JSON.stringify({
+        expected_revision: expectedRevision,
+        action,
+        actor: this.clientId,
+        edited_prompt: editedPrompt || null,
+        reason: action === "reject" ? "user_rejected" : "user_approved"
+      })
+    });
+  }
 
   subscribe(runId: string, afterSequence: number, onEvent: (event: GatewayEvent) => void): WebSocket {
     const base = this.connection.baseUrl.replace(/^http/, "ws");

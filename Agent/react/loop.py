@@ -49,6 +49,9 @@ class _ToolOutcome:
     operation_id: str | None = None
     attempt_id: str | None = None
     status: str = "success"
+    execution: str = "serial"
+    tool_batch_id: str | None = None
+    loop: int = 1
 
 
 class ReactLoop:
@@ -367,6 +370,7 @@ class ReactLoop:
                         prepared_calls, messages, context, task, session_id,
                         run_id=run_id,
                         logical_model_call_id=logical_tool_call_parent,
+                        loop_number=successful_steps + 1,
                     ):
                         yield event
                         if event.type is EventType.FINAL:
@@ -402,11 +406,13 @@ class ReactLoop:
         *,
         run_id: str,
         logical_model_call_id: str,
+        loop_number: int = 1,
     ) -> AsyncIterator[RunEvent]:
         async for event in self._execute_tools_streaming(
             calls, messages, context, task, session_id,
             run_id=run_id,
             logical_model_call_id=logical_model_call_id,
+            loop_number=loop_number,
         ):
             yield event
 
@@ -420,6 +426,7 @@ class ReactLoop:
         *,
         run_id: str,
         logical_model_call_id: str,
+        loop_number: int = 1,
     ) -> AsyncIterator[RunEvent]:
         """Stream left-to-right and flush PURE reads at each serial barrier."""
         pending: list[_PreparedCall] = []
@@ -516,6 +523,9 @@ class ReactLoop:
                 "content": content,
                 "status": status,
                 "observation_id": observation_id,
+                "loop": outcome.loop,
+                "execution": outcome.execution,
+                "tool_batch_id": outcome.tool_batch_id,
             }), content
 
         async def execute_one(
@@ -554,6 +564,9 @@ class ReactLoop:
                     result=executed.result,
                     operation_id=executed.operation_id,
                     attempt_id=executed.attempt_id,
+                    execution="parallel" if parallel else "serial",
+                    tool_batch_id=batch_id,
+                    loop=loop_number,
                 )
             except asyncio.CancelledError:
                 raise
@@ -568,6 +581,9 @@ class ReactLoop:
                     operation_id=getattr(exc, "durable_operation_id", None),
                     attempt_id=getattr(exc, "durable_attempt_id", None),
                     status="error",
+                    execution="parallel" if parallel else "serial",
+                    tool_batch_id=batch_id,
+                    loop=loop_number,
                 )
 
         async def flush_group() -> AsyncIterator[tuple[RunEvent, str]]:
@@ -682,6 +698,7 @@ class ReactLoop:
                     risk=failed_risk,
                     error=error,
                     status="error",
+                    loop=loop_number,
                 ))
                 yield event
                 continue
@@ -689,6 +706,13 @@ class ReactLoop:
             yield RunEvent(type=EventType.TOOL_REQUESTED, payload={
                 "name": prepared.name,
                 "arguments": prepared.arguments,
+                "loop": loop_number,
+                "execution": (
+                    "parallel"
+                    if prepared.parallel_safe and self.max_parallel_tool_calls > 1
+                    else "serial"
+                ),
+                "position": position,
             })
             if prepared.parallel_safe and self.max_parallel_tool_calls > 1:
                 pending.append(item)
@@ -715,6 +739,7 @@ class ReactLoop:
                         risk="read",
                         result=skipped,
                         status="skipped",
+                        loop=loop_number,
                     ), run_after=False)
                     yield skipped_event
                 answer = (

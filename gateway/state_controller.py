@@ -107,7 +107,7 @@ class StateInvariantError(RuntimeError):
 class StateController:
     """以 SQLite 事务实现 command 幂等、CAS、FSM guard 和 Outbox。"""
 
-    SCHEMA_VERSION = 12
+    SCHEMA_VERSION = 13
 
     def __init__(
         self,
@@ -513,6 +513,86 @@ class StateController:
                     plan_json TEXT NOT NULL,
                     FOREIGN KEY(generation_id)
                         REFERENCES runtime_resource_generations(generation_id) ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS observer_instances (
+                    run_id TEXT PRIMARY KEY,
+                    session_id TEXT,
+                    generation_id TEXT NOT NULL,
+                    observer_plugin_id TEXT NOT NULL,
+                    observer_plugin_version TEXT NOT NULL,
+                    state_schema_version INTEGER NOT NULL CHECK(state_schema_version >= 1),
+                    runtime_role TEXT NOT NULL,
+                    agent_role TEXT NOT NULL,
+                    runtime_profile TEXT NOT NULL,
+                    trigger_name TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    last_event_offset INTEGER NOT NULL DEFAULT 0 CHECK(last_event_offset >= 0),
+                    status TEXT NOT NULL CHECK(status IN
+                        ('active','finalized','failed')),
+                    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    FOREIGN KEY(generation_id) REFERENCES runtime_resource_generations(generation_id)
+                        ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS observer_visible_events (
+                    event_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    stream_sequence INTEGER NOT NULL CHECK(stream_sequence >= 1),
+                    visible_event_json TEXT,
+                    visible INTEGER NOT NULL CHECK(visible IN (0,1)),
+                    created_at TEXT NOT NULL,
+                    UNIQUE(run_id,stream_sequence),
+                    FOREIGN KEY(event_id) REFERENCES gateway_events(event_id) ON DELETE RESTRICT,
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS observer_tool_loops (
+                    run_id TEXT NOT NULL,
+                    loop INTEGER NOT NULL CHECK(loop >= 1),
+                    execution TEXT NOT NULL CHECK(execution IN ('serial','parallel','mixed')),
+                    tools_json TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(run_id,loop),
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS observer_correction_proposals (
+                    proposal_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL CHECK(status IN
+                        ('pending','adopted','edited','rejected','timed_out')),
+                    proposed_prompt TEXT NOT NULL,
+                    edited_prompt TEXT,
+                    actor TEXT,
+                    reason TEXT,
+                    expires_at TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                    created_at TEXT NOT NULL,
+                    decided_at TEXT,
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS observer_evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL UNIQUE,
+                    runtime_profile TEXT NOT NULL,
+                    trigger_name TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    finalized_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS observer_skill_candidates (
+                    candidate_id TEXT PRIMARY KEY,
+                    runtime_profile TEXT NOT NULL,
+                    trigger_name TEXT NOT NULL,
+                    evidence_ids_json TEXT NOT NULL,
+                    candidate_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN
+                        ('awaiting_approval','approved','rejected','published')),
+                    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                    created_at TEXT NOT NULL,
+                    decided_at TEXT
                 );
                 """
             )

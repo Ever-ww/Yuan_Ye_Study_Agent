@@ -428,6 +428,7 @@ class AgentRuntime:
                             for item in resource_snapshot.contributions
                         )
                     ),
+                    RuntimeContributionKind.OBSERVER: (),
                 },
             )
             if resource_snapshot is not None else None
@@ -520,6 +521,7 @@ class AgentRuntime:
                         for item in self.resource_snapshot.contributions
                     )
                 ),
+                RuntimeContributionKind.OBSERVER: (),
             },
         )
         register_runtime_resource_callbacks(self.hooks, self.resource_bundle, self)

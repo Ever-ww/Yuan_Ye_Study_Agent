@@ -93,6 +93,9 @@ class RuntimeConfig(BaseModel):
     runtime_plugin_watch_poll_seconds: float = Field(default=1.0, ge=0.1, le=60.0)
     runtime_plugin_watch_debounce_seconds: float = Field(default=1.5, ge=0.1, le=300.0)
     runtime_plugin_generation_retention_days: StrictInt = Field(default=30, ge=1, le=3650)
+    observer_enabled: StrictBool = True
+    observer_correction_timeout_seconds: StrictInt = Field(default=60, ge=5, le=3600)
+    observer_skill_minimum_evidence: StrictInt = Field(default=3, ge=2, le=100)
     approval_timeout_seconds: StrictInt = Field(default=30, ge=5, le=3600)
     model_retry_max_attempts: StrictInt = Field(default=3, ge=1, le=20)
     model_retry_base_seconds: float = Field(default=2.0, ge=0.0, le=300.0)
