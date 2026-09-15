@@ -19,7 +19,12 @@ from .maintenance import (
 )
 from .models import *
 from .restore import RestoreConfirmationError, RestoreRecoveryRequired, RestoreService
-from .security import SensitiveEnvSanitizer
+from .security import (
+    BackupSecret,
+    SensitiveEnvSanitizer,
+    SystemManagedBackupKeyStore,
+    SystemManagedKeyUnavailable,
+)
 from .scheduler import BackupScheduler
 from .service import BackupService
 
@@ -28,6 +33,7 @@ __all__ = [
     "AgentHomeMaintenanceCoordinator",
     "AgentHomeWriteGate",
     "ArchiveHeader",
+    "BackupSecret",
     "BackupService",
     "BackupScheduler",
     "EncryptedBackupArchive",
@@ -40,6 +46,8 @@ __all__ = [
     "RestoreRecoveryRequired",
     "RestoreService",
     "SensitiveEnvSanitizer",
+    "SystemManagedBackupKeyStore",
+    "SystemManagedKeyUnavailable",
     "UnsafeArchiveEntryError",
     "WriteScope",
     "assert_restore_inactive",

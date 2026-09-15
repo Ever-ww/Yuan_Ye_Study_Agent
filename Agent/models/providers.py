@@ -107,6 +107,17 @@ def _openai_usage(value: object) -> TokenUsage | None:
     output_tokens = value.get("completion_tokens", value.get("output_tokens"))
     details = value.get("prompt_tokens_details", value.get("input_tokens_details", {}))
     cached_input_tokens = details.get("cached_tokens") if isinstance(details, dict) else None
+    cache_miss_input_tokens = None
+    cache_metrics_source = None
+    if isinstance(value.get("prompt_cache_hit_tokens"), (int, float)):
+        # DeepSeek exposes cache accounting at the top level rather than in
+        # prompt_tokens_details. Keep parsing structural so compatible
+        # providers can use the same adapter without fabricating absent data.
+        cached_input_tokens = value["prompt_cache_hit_tokens"]
+        cache_miss_input_tokens = value.get("prompt_cache_miss_tokens")
+        cache_metrics_source = "deepseek.prompt_cache_tokens"
+    elif isinstance(cached_input_tokens, (int, float)):
+        cache_metrics_source = "openai_compatible.cached_tokens"
     return TokenUsage(
         input_tokens=int(input_tokens) if isinstance(input_tokens, (int, float)) else None,
         cached_input_tokens=(
@@ -114,6 +125,12 @@ def _openai_usage(value: object) -> TokenUsage | None:
             if isinstance(cached_input_tokens, (int, float))
             else None
         ),
+        cache_miss_input_tokens=(
+            int(cache_miss_input_tokens)
+            if isinstance(cache_miss_input_tokens, (int, float))
+            else None
+        ),
+        cache_metrics_source=cache_metrics_source,
         output_tokens=int(output_tokens) if isinstance(output_tokens, (int, float)) else None,
     )
 
@@ -159,19 +176,38 @@ class OpenAICompatibleProvider:
         api_key: str,
         *,
         streaming: bool = False,
+        reasoning_effort: str | None = None,
         use_system_proxy: bool = False,
         proxy_url: str | None = None,
     ) -> None:
         self.base_url, self.model, self.api_key = base_url.rstrip("/"), model, api_key
         self.streaming = streaming
+        self.reasoning_effort = reasoning_effort
         self.use_system_proxy = use_system_proxy
         self.proxy_url = proxy_url
 
-    async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelReply:
-        """请求供应商并转换其标准 tool_calls 响应。"""
-        payload: dict[str, Any] = {"model": self.model, "messages": messages, "temperature": 0}
+    def _payload(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        stream: bool,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"model": self.model, "messages": messages}
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
+        # OpenAI reasoning models reject sampling controls above `none`.
+        if self.reasoning_effort in {None, "none"}:
+            payload["temperature"] = 0
+        if stream:
+            payload.update({"stream": True, "stream_options": {"include_usage": True}})
         if tools:
             payload["tools"] = [{"type": "function", "function": tool} for tool in tools]
+        return payload
+
+    async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelReply:
+        """请求供应商并转换其标准 tool_calls 响应。"""
+        payload = self._payload(messages, tools, stream=False)
         try:
             async with httpx.AsyncClient(**_http_client_options(
                 60,
@@ -195,12 +231,9 @@ class OpenAICompatibleProvider:
 
     async def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> AsyncIterator[ModelReply]:
         """读取 OpenAI-compatible SSE，逐段产出文本并在结束时组装工具调用。"""
-        payload: dict[str, Any] = {"model": self.model, "messages": messages, "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}
-        if tools:
-            payload["tools"] = [{"type": "function", "function": tool} for tool in tools]
+        payload = self._payload(messages, tools, stream=True)
         pending_calls: dict[int, dict[str, str]] = {}
         usage: TokenUsage | None = None
-        reasoning_parts: list[str] = []
         try:
             async with httpx.AsyncClient(**_http_client_options(
                 httpx.Timeout(90, connect=15),
@@ -237,7 +270,7 @@ class OpenAICompatibleProvider:
                             yield ModelReply(text=str(content), finished=False)
                         reasoning = delta.get("reasoning_content", delta.get("reasoning"))
                         if isinstance(reasoning, str) and reasoning:
-                            reasoning_parts.append(reasoning)
+                            yield ModelReply(reasoning=reasoning, finished=False)
                         raw_tool_calls = delta.get("tool_calls", [])
                         if not isinstance(raw_tool_calls, list):
                             raise ModelResponseFormatError("模型 SSE tool_calls 必须是数组", _response_excerpt(packet))
@@ -280,7 +313,7 @@ class OpenAICompatibleProvider:
                     f"模型返回了无效的流式工具参数：{slot['name']}",
                     _response_excerpt(pending_calls),
                 ) from exc
-        yield ModelReply(tool_calls=tuple(calls), finished=True, usage=usage, reasoning="".join(reasoning_parts) or None)
+        yield ModelReply(tool_calls=tuple(calls), finished=True, usage=usage)
 
 
 class AnthropicProvider:
@@ -293,13 +326,33 @@ class AnthropicProvider:
         api_key: str,
         *,
         streaming: bool = False,
+        reasoning_effort: str | None = None,
         use_system_proxy: bool = False,
         proxy_url: str | None = None,
     ) -> None:
         self.base_url, self.model, self.api_key = base_url.rstrip("/"), model, api_key
         self.streaming = streaming
+        self.reasoning_effort = reasoning_effort
         self.use_system_proxy = use_system_proxy
         self.proxy_url = proxy_url
+
+    def _payload(
+        self,
+        system: str,
+        conversation: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": 2048,
+            "system": system,
+            "messages": conversation,
+        }
+        if self.reasoning_effort == "none":
+            payload["thinking"] = {"type": "disabled"}
+        elif self.reasoning_effort is not None:
+            payload["thinking"] = {"type": "adaptive"}
+            payload["output_config"] = {"effort": self.reasoning_effort}
+        return payload
 
     async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelReply:
         """调用 Messages API；首期仅接收其文本最终输出。"""
@@ -311,7 +364,15 @@ class AnthropicProvider:
                 use_system_proxy=self.use_system_proxy,
                 proxy_url=self.proxy_url,
             )) as client:
-                response = await client.post(f"{self.base_url}/messages", headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01"}, json={"model": self.model, "max_tokens": 2048, "system": system, "messages": conversation})
+                payload = self._payload(system, conversation)
+                response = await client.post(
+                    f"{self.base_url}/messages",
+                    headers={
+                        "x-api-key": self.api_key,
+                        "anthropic-version": "2023-06-01",
+                    },
+                    json=payload,
+                )
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise ModelServiceError(
@@ -332,12 +393,38 @@ class AnthropicProvider:
         raw_usage = data.get("usage")
         if not isinstance(raw_usage, dict):
             raw_usage = {}
+        raw_input_tokens = raw_usage.get("input_tokens")
+        cache_read_tokens = raw_usage.get("cache_read_input_tokens")
+        cache_creation_tokens = raw_usage.get("cache_creation_input_tokens")
+        uncached_input_tokens = (
+            int(raw_input_tokens)
+            if isinstance(raw_input_tokens, (int, float)) else None
+        )
+        cached_input_tokens = (
+            int(cache_read_tokens)
+            if isinstance(cache_read_tokens, (int, float)) else None
+        )
+        created_input_tokens = (
+            int(cache_creation_tokens)
+            if isinstance(cache_creation_tokens, (int, float)) else 0
+        )
         usage = TokenUsage(
-            input_tokens=int(raw_usage["input_tokens"]) if isinstance(raw_usage.get("input_tokens"), (int, float)) else None,
-            cached_input_tokens=(
-                int(raw_usage["cache_read_input_tokens"])
-                if isinstance(raw_usage.get("cache_read_input_tokens"), (int, float))
+            # Anthropic reports uncached, cache-write, and cache-read tokens
+            # separately. Normalize input_tokens to the complete request so
+            # cache ratios have the same denominator as other providers.
+            input_tokens=(
+                uncached_input_tokens + created_input_tokens + (cached_input_tokens or 0)
+                if uncached_input_tokens is not None else None
+            ),
+            cached_input_tokens=cached_input_tokens,
+            cache_miss_input_tokens=(
+                uncached_input_tokens + created_input_tokens
+                if cached_input_tokens is not None and uncached_input_tokens is not None
                 else None
+            ),
+            cache_metrics_source=(
+                "anthropic.cache_read_input_tokens"
+                if cached_input_tokens is not None else None
             ),
             output_tokens=int(raw_usage["output_tokens"]) if isinstance(raw_usage.get("output_tokens"), (int, float)) else None,
         )
@@ -367,6 +454,7 @@ def build_provider(
     base_url: str | None = None,
     api_key: str | None = None,
     stream: bool = False,
+    reasoning_effort: str | None = None,
     use_system_proxy: bool = False,
     proxy_url: str | None = None,
 ) -> EchoProvider | OpenAICompatibleProvider | AnthropicProvider:
@@ -383,6 +471,7 @@ def build_provider(
             model,
             key,
             streaming=stream,
+            reasoning_effort=reasoning_effort,
             use_system_proxy=use_system_proxy,
             proxy_url=proxy_url,
         )
@@ -394,6 +483,7 @@ def build_provider(
         model,
         key,
         streaming=stream,
+        reasoning_effort=reasoning_effort,
         use_system_proxy=use_system_proxy,
         proxy_url=proxy_url,
     )

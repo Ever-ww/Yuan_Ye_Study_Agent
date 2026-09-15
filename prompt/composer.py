@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from Agent.config import RuntimeConfig
     from memory import MemoryStore
     from sandbox import SandboxStatus
+    from sandbox import PathMappingSnapshot
     from skill import SkillService
 
 
@@ -94,6 +95,23 @@ class SystemPromptComposer:
         sections = [
             skill_xml,
             (
+                "# Logical filesystem paths\n"
+                "Use the workspace path published in runtime context. Never infer or depend on a host absolute path. "
+                "YYWorkspace:\\ on Windows and /yy/workspace on POSIX name the current task workspace; "
+                "a successful logical mapping does not grant permission, so every Tool and Sandbox policy still applies."
+            ),
+            (
+                "# 能力缺口与 Tool 演进\n"
+                "在因为缺少 Tool 能力而告诉用户无法完成之前，先检查当前 Tool Schema，判断已有 Tool 或已有 Tool 的安全组合"
+                "是否能够完成。若确实不存在所需能力且当前提供了 `harness_capability`，必须调用 `harness_capability`，不要只"
+                "报告能力不足。提交一个具体、可复用的 Tool 能力缺口，准确填写 summary、desired_behavior、"
+                "current_limitation、可验证的 acceptance_criteria 以及适用的 safety_constraints。该调用只会启动受控的"
+                "Coding/Harness 审批、隔离 worktree、验证、合并和 reload 流程；流程成功前不得声称新 Tool 已经存在。"
+                "普通工作区代码任务若能用 read/write/edit/bash 完成，不得制造新 Tool；参数错误、缺少凭据、Policy 或审批"
+                "拒绝、临时 Provider/网络/Tool 故障，以及试图绕过既有安全边界，也都不是能力演进。若当前没有"
+                " `harness_capability`，才说明限制以及精确缺失的能力。"
+            ),
+            (
                 "# Tool concurrency\n"
                 "相互独立的只读工具可以在同一模型响应中一起调用；存在数据依赖时必须等待前一个结果。"
                 "不要并行规划写入、高风险或有副作用的工具。"
@@ -101,7 +119,7 @@ class SystemPromptComposer:
             "# Agent 身份（SOUL）\n" + soul,
             (
                 "# Skill 使用策略\n"
-                "处理每个用户任务前，必须先检查最上方 <available_skills> 目录。"
+                "先在不调用工具的情况下判断当前任务是否与最上方 <available_skills> 目录明确匹配。"
                 "只要任务与某个 Skill 的 name 或 description 明确匹配，就应优先调用 "
                 "skill_read 读取该 Skill 的 SKILL.md，并按照其中的工作流执行；"
                 "不要在尚未读取匹配 Skill 时自行改用通用工具流程。"
@@ -110,6 +128,9 @@ class SystemPromptComposer:
             ),
             (
                 "# 核心规则\n你是严谨、透明的本地 Agent。工具调用必须遵守权限、工作区边界和审批要求。"
+                "寒暄、自我介绍、能力介绍和已有上下文足以回答的简单对话必须直接回答；"
+                "不得为了个性化、自我介绍或确认自身能力而读取 Profile、Skill、工作区或调用其他工具。"
+                "只有回答当前请求确实依赖外部事实、文件、计算或操作时才调用工具。"
                 "网络调研中，web_search 只用于发现候选 URL；需要读取正文或核验摘要时，"
                 "应从搜索结果选择相关 URL 继续调用 web_fetch。需要保存公开论文 PDF 时调用 "
                 "download_paper，成功后使用其返回路径调用 read_file；不要把 HTML 页面当作 PDF 下载。"
@@ -161,7 +182,7 @@ class TaskPromptComposer:
 class PromptComposer:
     """兼容 Runtime 使用的 Prompt 门面，System Prompt 始终是一个字符串。"""
 
-    def __init__(self, config: "RuntimeConfig | Path", memory: "MemoryStore | SkillService | None" = None, skills: "SkillService | None" = None, sandbox_enabled: bool = False, *, resource_agent_root: Path | None = None, prefer_current_skill_catalog: bool = False) -> None:
+    def __init__(self, config: "RuntimeConfig | Path", memory: "MemoryStore | SkillService | None" = None, skills: "SkillService | None" = None, sandbox_enabled: bool = False, *, resource_agent_root: Path | None = None, prefer_current_skill_catalog: bool = False, path_mapping: "PathMappingSnapshot | None" = None) -> None:
         # 兼容独立 Prompt 测试：PromptComposer(project_root, skill_service)。
         if isinstance(config, Path):
             from Agent.config import load_runtime_config
@@ -180,7 +201,7 @@ class PromptComposer:
             prefer_current_skill_catalog=prefer_current_skill_catalog,
         )
         self.task = TaskPromptComposer()
-        self.dynamic_context = AgentDynamicContextBuilder(config, memory)
+        self.dynamic_context = AgentDynamicContextBuilder(config, memory, path_mapping=path_mapping)
 
     def compose(self, task: str, session_id: str | None = None) -> list[dict[str, str]]:
         if session_id is None:

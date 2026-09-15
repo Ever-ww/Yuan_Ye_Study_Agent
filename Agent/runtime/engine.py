@@ -47,6 +47,7 @@ from prompt import PromptComposer
 from reference import ReferenceService, ReferenceStore, build_embedding_provider
 from sandbox import (
     create_sandbox_session,
+    PathMappingSnapshot,
     SandboxSessionProtocol,
     WorkspaceLockManager,
     sandbox_status_of,
@@ -116,6 +117,7 @@ class AgentRuntime:
         extension_runtime_policy: ExtensionRuntimePolicy | None = None,
         resource_snapshot: RuntimeResourceSnapshot | None = None,
         auxiliary_resource_snapshots: Mapping[str, RuntimeResourceSnapshot] | None = None,
+        path_mapping: PathMappingSnapshot | None = None,
     ) -> None:
         self.config = config or load_runtime_config()
         self.resource_snapshot = resource_snapshot
@@ -132,6 +134,21 @@ class AgentRuntime:
             resource_snapshot.agent_root
             if resource_snapshot is not None else self.config.agent_root
         )
+        self.runtime_trace_id = uuid4().hex
+        context_path_mapping = (
+            tool_context.path_mapping if tool_context is not None else None
+        )
+        self.path_mapping = path_mapping or context_path_mapping or PathMappingSnapshot(
+            workspace_root=self.config.workspace_root,
+            # Generation snapshots are executable copies.  The logical source
+            # identity remains the primary checkout, except Harness explicitly
+            # freezes coding_source_root to its worktree below.
+            agent_source_root=self.config.coding_source_root or resource_source_root,
+            trace_id=self.runtime_trace_id,
+            generation_id=self.resource_generation_id or "",
+        )
+        if self.path_mapping.workspace_root != self.config.workspace_root.resolve():
+            raise ValueError("PathMappingSnapshot workspace must match RuntimeConfig.workspace_root")
         generation_tools = (
             load_generation_tool_module(resource_snapshot)
             if resource_snapshot is not None else None
@@ -143,6 +160,7 @@ class AgentRuntime:
             base_url=self.config.base_url,
             api_key=self.config.api_key,
             stream=self.config.stream,
+            reasoning_effort=self.config.reasoning_effort,
             use_system_proxy=self.config.use_system_proxy,
             proxy_url=self.config.proxy_url,
         )
@@ -173,6 +191,7 @@ class AgentRuntime:
             self.sandbox = create_sandbox_session(
                 self.config,
                 file_locks=self.file_locks,
+                path_mapping=self.path_mapping,
             )
             self._owns_sandbox = True
         else:
@@ -183,6 +202,7 @@ class AgentRuntime:
                 approval=approval,
                 sandbox=self.sandbox,
                 file_locks=self.file_locks,
+                path_mapping=self.path_mapping,
             )
         else:
             updates = {}
@@ -190,6 +210,14 @@ class AgentRuntime:
                 updates["sandbox"] = self.sandbox
             if tool_context.file_locks is None:
                 updates["file_locks"] = self.file_locks
+            # An explicitly injected legacy Context keeps object identity.
+            # Gateway-created contexts already carry the mapping; callers that
+            # inject a custom context may opt in by supplying the same snapshot.
+            if (
+                tool_context.path_mapping is not None
+                and tool_context.path_mapping != self.path_mapping
+            ):
+                raise ValueError("ToolContext and Runtime must share one immutable path mapping")
             self.tool_context = tool_context.model_copy(update=updates) if updates else tool_context
         self.approval = self.tool_context.approval
         self.retry_policy = retry_policy
@@ -339,6 +367,7 @@ class AgentRuntime:
             sandbox_enabled=self.sandbox is not None,
             resource_agent_root=resource_agent_root,
             prefer_current_skill_catalog=resource_snapshot is not None,
+            path_mapping=self.path_mapping,
         )
         if hooks is not None:
             self.hooks = hooks
@@ -384,6 +413,7 @@ class AgentRuntime:
                 state_backend=extension_state,
                 tool_registry=self.tools,
                 tool_context=self.tool_context,
+                path_mapping=self.path_mapping,
             )
             self.extensions.register(
                 self.hooks,
@@ -573,6 +603,7 @@ class AgentRuntime:
             )
         turn_started = False
         model = {
+            "profile_id": self.config.active_model_profile_id,
             "provider": self.config.provider,
             "name": self.config.model,
             "base_url": self.config.base_url,

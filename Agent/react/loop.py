@@ -199,6 +199,13 @@ class ReactLoop:
                                 })
                             if chunk.reasoning:
                                 reasoning_parts.append(chunk.reasoning)
+                                yield RunEvent(type=EventType.REASONING, payload={
+                                    "content": chunk.reasoning,
+                                    "loop": successful_steps + 1,
+                                    "logical_model_call_id": logical_model_call_id,
+                                    "model_call_id": model_call_id,
+                                    "attempt_no": operation_attempt_no,
+                                })
                             if chunk.tool_calls:
                                 calls = chunk.tool_calls
                             if chunk.usage is not None:
@@ -333,6 +340,12 @@ class ReactLoop:
                 emergency_compression_count=emergency_compression_count,
             )
             model_calls.append(call_metric)
+            # Session hooks retain this same normalized metric. This event is
+            # only the live client projection, never a second usage authority.
+            yield RunEvent(type=EventType.MODEL_USAGE, payload={
+                "model": copy.deepcopy(model),
+                "model_call": copy.deepcopy(call_metric),
+            })
             after = HookEvent(point=HookPoint.MODEL_AFTER, session_id=session_id, data={
                 "task": task, "model": model, "reply": reply, "error": None, "model_call": call_metric,
             })
@@ -457,6 +470,9 @@ class ReactLoop:
                 content, status = str(after.data.get("result", outcome.result or "")), "success"
             SessionPersistenceProjection.assert_no_ephemeral(outcome.arguments)
             content = SessionPersistenceProjection.strip_ephemeral(content)
+            # Host paths remain available to internal audit, but the model and
+            # Session observation use only the Trace-frozen logical namespace.
+            content = context.sanitize_model_output(content)
 
             request_error = isinstance(outcome.error, ToolRequestError) or bool(
                 getattr(outcome.error, "tool_request_error", False)
@@ -523,6 +539,8 @@ class ReactLoop:
                 "content": content,
                 "status": status,
                 "observation_id": observation_id,
+                "tool_call_id": outcome.tool_call_id,
+                "position": outcome.position,
                 "loop": outcome.loop,
                 "execution": outcome.execution,
                 "tool_batch_id": outcome.tool_batch_id,
@@ -706,6 +724,7 @@ class ReactLoop:
             yield RunEvent(type=EventType.TOOL_REQUESTED, payload={
                 "name": prepared.name,
                 "arguments": prepared.arguments,
+                "tool_call_id": prepared.tool_call_id,
                 "loop": loop_number,
                 "execution": (
                     "parallel"
@@ -846,16 +865,27 @@ def _model_call_metric(
     usage = reply.usage
     total_input = usage.input_tokens if usage and usage.input_tokens is not None else context_tokens
     cached_input = usage.cached_input_tokens if usage and usage.cached_input_tokens is not None else None
+    cache_miss_input = (
+        usage.cache_miss_input_tokens
+        if usage and usage.cache_miss_input_tokens is not None else None
+    )
+    cache_denominator = (
+        cached_input + cache_miss_input
+        if cached_input is not None and cache_miss_input is not None
+        else total_input
+    )
+    cache_hit_ratio = (
+        cached_input / cache_denominator
+        if cached_input is not None and cache_denominator > 0
+        else None
+    )
     metric = {
         "latency_ms": latency_ms,
         "input_tokens": {
             "context_total": total_input,
             "cached": cached_input,
-            "cache_hit_ratio": (
-                cached_input / total_input
-                if cached_input is not None and total_input > 0
-                else None
-            ),
+            "cache_miss": cache_miss_input,
+            "cache_hit_ratio": cache_hit_ratio,
             "current_question": question_tokens,
             "ephemeral_context": ephemeral_context_tokens,
             "context_source": "provider" if usage and usage.input_tokens is not None else "estimated",
@@ -864,6 +894,14 @@ def _model_call_metric(
         "output_tokens": usage.output_tokens if usage and usage.output_tokens is not None else _estimate_tokens(reply.text + serialized_calls),
         "output_tokens_source": "provider" if usage and usage.output_tokens is not None else "estimated",
         "emergency_compression_count": emergency_compression_count,
+        "prefix_cache": {
+            "status": "reported" if cached_input is not None else "unavailable",
+            "hit_tokens": cached_input,
+            "miss_tokens": cache_miss_input,
+            "total_tokens": cache_denominator if cached_input is not None else None,
+            "hit_ratio": cache_hit_ratio,
+            "source": usage.cache_metrics_source if usage is not None else None,
+        },
     }
     if context_budget is not None:
         metric["context_budget"] = context_budget

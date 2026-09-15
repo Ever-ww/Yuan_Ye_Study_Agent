@@ -9,9 +9,10 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -111,6 +112,20 @@ class FakeRuntime:
             message="unchanged",
             session_id=session_id,
         )
+
+
+class TokenFragmentRuntime(FakeRuntime):
+    """Expose many provider-sized fragments to verify Gateway coalescing."""
+
+    async def run_task(self, task: str, session_id: str | None = None):
+        async for event in super().run_task(task, session_id):
+            if event.type is EventType.TEXT:
+                for _ in range(120):
+                    yield RunEvent(type=EventType.REASONING, payload={"content": "想"})
+                for _ in range(120):
+                    yield RunEvent(type=EventType.TEXT, payload={"content": "字"})
+            else:
+                yield event
 
 
 class ConcurrencyTracker:
@@ -313,8 +328,17 @@ class GatewayTests(unittest.TestCase):
     def test_gateway_process_manager_uses_no_window_flags_and_closes_handles(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             manager = GatewayProcessManager(Path(value), 18768)
+            ready = {
+                "status": "ok",
+                "service": "yuan-ye-agent-gateway",
+                "accepting_work": True,
+            }
             with (
-                patch.object(manager, "_healthy", side_effect=[False, False, True, True]),
+                patch.object(
+                    manager,
+                    "_health_payload",
+                    side_effect=[None, None, ready, ready],
+                ),
                 patch("gateway.process._port_available", return_value=True),
                 patch("gateway.process.os.name", "nt"),
                 patch("gateway.process.subprocess.Popen") as popen,
@@ -328,14 +352,34 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(options["env"]["PYTHONUTF8"], "1")
             self.assertEqual(options["env"]["PYTHONIOENCODING"], "utf-8")
 
+    def test_gateway_readiness_requires_work_admission_for_clients(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            manager = GatewayProcessManager(Path(value), 18772)
+            response = Mock(status_code=200)
+            response.json.return_value = {
+                "status": "ok",
+                "service": "yuan-ye-agent-gateway",
+                "accepting_work": False,
+            }
+            with patch("gateway.process.httpx.get", return_value=response):
+                self.assertTrue(manager._healthy())
+                self.assertFalse(manager._healthy(require_accepting_work=True))
+                response.json.return_value["accepting_work"] = True
+                self.assertTrue(manager._healthy(require_accepting_work=True))
+
     def test_concurrent_gateway_starter_waits_instead_of_spawning_again(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             manager = GatewayProcessManager(Path(value), 18769)
+            ready = {
+                "status": "ok",
+                "service": "yuan-ye-agent-gateway",
+                "accepting_work": True,
+            }
             first = InstanceLock(manager.startup_lock_path)
             first.acquire()
             try:
                 with (
-                    patch.object(manager, "_healthy", side_effect=[False, True, True]),
+                    patch.object(manager, "_health_payload", side_effect=[None, ready]),
                     patch("gateway.process.subprocess.Popen") as popen,
                 ):
                     status = manager.ensure_running(timeout_seconds=0.2)
@@ -351,7 +395,7 @@ class GatewayTests(unittest.TestCase):
             existing.acquire()
             try:
                 with (
-                    patch.object(manager, "_healthy", return_value=False),
+                    patch.object(manager, "_health_payload", return_value=None),
                     patch("gateway.process.subprocess.Popen") as popen,
                 ):
                     with self.assertRaisesRegex(RuntimeError, "持有状态锁"):
@@ -411,6 +455,77 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(payload["sandbox_mode"], "checkpoint_only")
             self.assertFalse(payload["bash_available"])
             self.assertEqual(payload["sandbox_reason"], fallback.message)
+
+    def test_model_options_hide_secrets_and_selected_profile_is_durable_on_run(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(root, model_profiles=[{
+                "profile_id": "flash",
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "api_key": "secret-never-returned",
+            }])
+            application = GatewayApplication(
+                config,
+                runtime_factory=lambda workspace, approval: FakeRuntime(workspace),
+            )
+            project = application.register_project(root)
+            headers = {"Authorization": "Bearer test-token"}
+            with TestClient(create_gateway_api(application, access_token="test-token")) as client:
+                options = client.get("/api/v1/models", headers=headers)
+                self.assertEqual(options.status_code, 200)
+                serialized = options.json()
+                self.assertEqual(
+                    [item["profile_id"] for item in serialized],
+                    ["default", "flash"],
+                )
+                self.assertNotIn("secret-never-returned", options.text)
+                created = client.post(
+                    "/api/v1/runs", headers=headers,
+                    json={
+                        "project_id": project.project_id,
+                        "client_id": "model-switch-client",
+                        "task": "use selected model",
+                        "model_profile_id": "flash",
+                        "reasoning_effort": "max",
+                    },
+                )
+                self.assertEqual(created.status_code, 200)
+                self.assertEqual(created.json()["model_profile_id"], "flash")
+                self.assertEqual(created.json()["reasoning_effort"], "max")
+                session_id = None
+                for _ in range(100):
+                    current = client.get(
+                        f"/api/v1/runs/{created.json()['run_id']}", headers=headers,
+                    ).json()
+                    session_id = current.get("session_id")
+                    if current["status"] == "completed":
+                        break
+                    time.sleep(0.01)
+                restored = client.get(
+                    "/api/v1/models", headers=headers,
+                    params={"session_id": session_id},
+                ).json()
+                self.assertTrue(next(
+                    item["selected"] for item in restored
+                    if item["profile_id"] == "flash"
+                ))
+                self.assertEqual(next(
+                    item["reasoning_effort"] for item in restored
+                    if item["profile_id"] == "flash"
+                ), "max")
+                reopened = client.get(
+                    "/api/v1/models", headers=headers,
+                    params={"project_id": project.project_id},
+                ).json()
+                self.assertTrue(next(
+                    item["selected"] for item in reopened
+                    if item["profile_id"] == "flash"
+                ))
+                self.assertEqual(next(
+                    item["reasoning_effort"] for item in reopened
+                    if item["profile_id"] == "flash"
+                ), "max")
 
     def test_code_session_api_create_turn_events_and_finalize(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -518,7 +633,6 @@ class GatewayTests(unittest.TestCase):
                     current = client.get(f"/api/v1/runs/{run_id}", headers=headers).json()
                     if current["status"] == "completed":
                         break
-                    import time
                     time.sleep(0.01)
                 self.assertEqual(current["status"], "completed")
                 events = client.get(
@@ -550,6 +664,47 @@ class GatewayTests(unittest.TestCase):
                     replayed = socket.receive_json()
                 self.assertEqual(replayed["sequence"], 2)
 
+    def test_gateway_coalesces_stream_fragments_before_durable_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            application = GatewayApplication(
+                load_runtime_config(root, gateway_runtime_idle_seconds=30),
+                runtime_factory=lambda workspace, approval: TokenFragmentRuntime(workspace),
+            )
+            headers = {"Authorization": "Bearer test-token"}
+            with TestClient(create_gateway_api(application, access_token="test-token")) as client:
+                project_id = client.post(
+                    "/api/v1/projects", headers=headers, json={"path": str(root)},
+                ).json()["project_id"]
+                run_id = client.post("/api/v1/runs", headers=headers, json={
+                    "project_id": project_id, "client_id": "stream-client",
+                    "task": "stream", "session_id": None,
+                }).json()["run_id"]
+                for _ in range(200):
+                    current = client.get(
+                        f"/api/v1/runs/{run_id}", headers=headers,
+                    ).json()
+                    if current["status"] == "completed":
+                        break
+                    time.sleep(0.01)
+                events = client.get(
+                    f"/api/v1/runs/{run_id}/events", headers=headers,
+                ).json()
+                text_events = [item for item in events if item["type"] == "text"]
+                reasoning_events = [
+                    item for item in events if item["type"] == "reasoning"
+                ]
+                self.assertEqual(
+                    "".join(item["payload"]["content"] for item in reasoning_events),
+                    "想" * 120,
+                )
+                self.assertLessEqual(len(reasoning_events), 3)
+                self.assertEqual(
+                    "".join(item["payload"]["content"] for item in text_events),
+                    "字" * 120,
+                )
+                self.assertLessEqual(len(text_events), 3)
+
     def test_gateway_cancel_marks_run_and_creates_inbox(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
@@ -579,7 +734,6 @@ class GatewayTests(unittest.TestCase):
                     current = client.get(f"/api/v1/runs/{run['run_id']}", headers=headers).json()
                     if current["status"] == "running":
                         break
-                    import time
                     time.sleep(0.01)
                 cancelled = client.post(
                     f"/api/v1/runs/{run['run_id']}/cancel",
@@ -740,6 +894,34 @@ class GatewayTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             asyncio.run(rejected(Path(value)))
 
+    def test_client_disconnect_discards_stale_process_local_approval(self) -> None:
+        async def check(root: Path) -> None:
+            store = GatewayStore(root / ".yy" / "gateway")
+            controller = Mock()
+            controller.approval.side_effect = KeyError("already finalized")
+
+            async def publish(_request) -> None:
+                return None
+
+            broker = GatewayApprovalBroker(
+                store,
+                publish,
+                state_controller=controller,
+            )
+            future = asyncio.get_running_loop().create_future()
+            broker._pending["stale-approval"] = (
+                Mock(client_id="disconnected-client"),
+                future,
+            )
+
+            self.assertEqual(await broker.deny_client("disconnected-client"), 1)
+            self.assertFalse(await future)
+            self.assertEqual(broker._pending, {})
+            controller.apply.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(check(Path(value)))
+
     def test_approval_is_denied_when_origin_client_never_connects(self) -> None:
         async def rejected(root: Path) -> None:
             store = GatewayStore(root / ".yy" / "gateway")
@@ -843,6 +1025,39 @@ class GatewayTests(unittest.TestCase):
                 "目标配置不得覆盖",
             )
             self.assertTrue((target / ".yy" / "agent-home-migration.json").exists())
+
+    def test_agent_home_migration_partitions_the_source_not_a_stale_target_index(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            source, target = base / "source", base / "home"
+            initialize_project(source)
+            source_memory = MemoryStore(
+                source / ".yy" / "memory", workspace_root=source, agent_root=source,
+            )
+            source_session = source_memory.create_session("source")
+            source_memory.record_user(source_session, "source")
+
+            stale = MemoryStore(target / ".yy" / "memory", partition_by_workspace=False)
+            stale_session = stale.create_session("stale")
+            stale.record_user(stale_session, "stale")
+            migrate_source_home(source, target)
+
+            workspace_key = hashlib.sha256(
+                os.path.normcase(str(source.resolve())).encode(),
+            ).hexdigest()[:16]
+            partition_index = json.loads(
+                (target / ".yy" / "memory" / "session" / workspace_key / "index.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertIn(source_session, partition_index["sessions"])
+            self.assertNotIn(stale_session, partition_index["sessions"])
+            self.assertIn(
+                stale_session,
+                json.loads(
+                    (target / ".yy" / "memory" / "session" / "index.json")
+                    .read_text(encoding="utf-8")
+                )["sessions"],
+            )
 
     def test_instance_lock_rejects_second_gateway(self) -> None:
         with tempfile.TemporaryDirectory() as value:

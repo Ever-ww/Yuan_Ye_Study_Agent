@@ -4,7 +4,6 @@ from typing import Any
 from uuid import uuid4
 
 from tool.contracts import ToolContext
-from tool.path_guard import safe_workspace_path
 
 
 class WriteTool:
@@ -28,7 +27,7 @@ class WriteTool:
             raise RuntimeError("当前 Runtime 未启用 checkpoint，禁止执行 write")
         if context.file_locks is None:
             raise RuntimeError("当前 Runtime 未启用文件锁，禁止执行 write")
-        path = safe_workspace_path(context.project_root, arguments["path"])
+        path = context.resolve_workspace_path(arguments["path"])
         content = arguments["content"]
         async with context.file_locks.write(path):
             if path.is_file() and path.read_bytes() == content.encode("utf-8"):

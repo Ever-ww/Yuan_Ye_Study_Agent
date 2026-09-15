@@ -36,6 +36,7 @@ from Agent.state import (
 from gateway.state_controller import StateConflictError, StateController
 from gateway.outbox import OutboxDispatcher
 from gateway.durable_execution import DurableToolCoordinator
+from gateway.approval import GatewayApprovalBroker
 from gateway.store import GatewayStore
 from Agent import load_runtime_config
 from gateway.application import GatewayApplication
@@ -399,6 +400,88 @@ def test_preapproved_extension_tool_uses_durable_ledger_without_approval(
     assert operation.status is OperationStatus.COMPLETED
     assert attempt.status is OperationStatus.COMPLETED
     assert controller.state(state.run_id).execution.state is ExecutionState.OBSERVING
+
+
+@pytest.mark.parametrize("prepared_path", [False, True])
+def test_interactive_approval_is_bound_to_prepared_durable_operation(
+    durable, tmp_path: Path, prepared_path: bool,
+) -> None:
+    controller, state = durable
+    state = _running_tool_state(controller, state)
+    coordinator = DurableToolCoordinator(controller)
+    registry = AsyncToolRegistry([_ApprovalWriteTool()])
+    store = GatewayStore(tmp_path / ".yy" / "gateway")
+    published = []
+    broker: GatewayApprovalBroker
+
+    async def publish(request) -> None:
+        published.append(request)
+        await broker.decide(request.approval_id, request.client_id, True)
+
+    broker = GatewayApprovalBroker(
+        store,
+        publish,
+        state_controller=controller,
+        approval_timeout_seconds=5,
+    )
+
+    async def run() -> str:
+        operation_token = coordinator.bind(state.run_id, "approval-turn")
+        approval_token = broker.bind_run(state.run_id, "client")
+        try:
+            context = ToolContext(
+                project_root=tmp_path,
+                approval=broker,
+                operation_coordinator=coordinator,
+            )
+            if prepared_path:
+                prepared = registry.prepare_invocation(
+                    "approval_write",
+                    {"value": "ok"},
+                    context,
+                    tool_call_id="approval-call",
+                )
+                result = await registry.execute_prepared(prepared, context)
+                return result.result
+            return await registry.execute(
+                "approval_write",
+                {"value": "ok"},
+                context,
+                tool_call_id="approval-call",
+            )
+        finally:
+            broker.reset_run(approval_token)
+            coordinator.reset(operation_token)
+
+    assert asyncio.run(run()) == "ok"
+    assert len(published) == 1
+    operation = controller.operations(state.run_id)[0]
+    attempt = controller.current_attempt(operation.operation_id)
+    approval = controller.approval(published[0].approval_id)
+    assert approval.operation_id == operation.operation_id
+    assert approval.attempt_id == attempt.attempt_id
+    assert approval.status.value == "approved"
+    assert operation.status is OperationStatus.COMPLETED
+    assert broker._pending == {}
+
+
+class _ApprovalWriteTool:
+    name = "approval_write"
+    description = "write requiring interactive approval"
+    schema = {
+        "type": "object",
+        "properties": {"value": {"type": "string"}},
+        "required": ["value"],
+        "additionalProperties": False,
+    }
+    risk = "write"
+    idempotency = "IDEMPOTENT"
+    parallel_safe = False
+    extension_preapproval = False
+
+    async def run(self, arguments, context) -> str:
+        del context
+        return str(arguments["value"])
 
 
 @pytest.mark.parametrize(

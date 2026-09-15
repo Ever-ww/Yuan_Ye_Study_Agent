@@ -10,6 +10,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictFloat,
     StrictInt,
     TypeAdapter,
     ValidationError,
@@ -22,6 +23,32 @@ from bootstrap import ensure_project_initialized
 
 _JSON_OBJECT = TypeAdapter(dict[str, Any])
 
+ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
+REASONING_EFFORTS: tuple[ReasoningEffort, ...] = (
+    "none", "low", "medium", "high", "xhigh", "max",
+)
+
+
+class ModelProfile(BaseModel):
+    """One explicitly configured, user-selectable chat model."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    profile_id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_.-]+$")
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    base_url: str | None = None
+    api_key: str | None = None
+    stream: StrictBool | None = None
+    context_window_tokens: StrictInt | None = Field(default=None, ge=1024)
+    reasoning_effort: ReasoningEffort | None = None
+
+    @field_validator("base_url")
+    @classmethod
+    def _validate_base_url(cls, value: str | None) -> str | None:
+        if value and not value.startswith(("http://", "https://")):
+            raise ValueError("model profile base_url must use http:// or https://")
+        return value
 
 class RuntimeConfig(BaseModel):
     """核心运行时的最小且明确配置。"""
@@ -35,6 +62,9 @@ class RuntimeConfig(BaseModel):
     provider: str = Field(default="echo", min_length=1)
     base_url: str | None = None
     api_key: str | None = None
+    model_profiles: tuple[ModelProfile, ...] = ()
+    active_model_profile_id: str = Field(default="default", min_length=1)
+    reasoning_effort: ReasoningEffort = "low"
     web_search_api_key: str | None = None
     web_search_timeout_seconds: StrictInt = Field(default=20, ge=5, le=60)
     web_fetch_timeout_seconds: StrictInt = Field(default=20, ge=5, le=60)
@@ -95,6 +125,9 @@ class RuntimeConfig(BaseModel):
     runtime_plugin_generation_retention_days: StrictInt = Field(default=30, ge=1, le=3650)
     observer_enabled: StrictBool = True
     observer_correction_timeout_seconds: StrictInt = Field(default=60, ge=5, le=3600)
+    observer_plugin_timeout_seconds: StrictFloat = Field(default=2.0, ge=0.1, le=30.0)
+    observer_model: str | None = Field(default=None, min_length=1)
+    observer_model_timeout_seconds: StrictFloat = Field(default=60.0, ge=1.0, le=300.0)
     observer_skill_minimum_evidence: StrictInt = Field(default=3, ge=2, le=100)
     approval_timeout_seconds: StrictInt = Field(default=30, ge=5, le=3600)
     model_retry_max_attempts: StrictInt = Field(default=3, ge=1, le=20)
@@ -111,16 +144,43 @@ class RuntimeConfig(BaseModel):
     gateway_event_archive_schedule: str = Field(default="0 2 * * *", min_length=1, max_length=100)
     gateway_event_hot_retention_days: StrictInt = Field(default=180, ge=1, le=3650)
     gateway_event_archive_segment_max_events: StrictInt = Field(default=10000, ge=1, le=100000)
+    # Health polling stays cheap; full integrity checks and legacy command-result
+    # compaction run after readiness on a bounded background cadence.
+    gateway_health_cache_seconds: StrictFloat = Field(default=30.0, ge=1.0, le=300.0)
+    gateway_storage_health_cache_seconds: StrictFloat = Field(default=300.0, ge=10.0, le=3600.0)
+    gateway_database_maintenance_interval_seconds: StrictInt = Field(
+        default=21600, ge=300, le=604800,
+    )
+    gateway_database_maintenance_initial_delay_seconds: StrictInt = Field(
+        default=60, ge=1, le=3600,
+    )
+    gateway_processed_command_compression_min_bytes: StrictInt = Field(
+        default=1024, ge=256, le=1048576,
+    )
+    gateway_processed_command_compaction_batch_size: StrictInt = Field(
+        default=500, ge=1, le=10000,
+    )
+    gateway_database_incremental_vacuum_pages: StrictInt = Field(
+        default=1024, ge=0, le=100000,
+    )
+    gateway_database_warning_bytes: StrictInt = Field(default=500_000_000, ge=1_000_000)
+    gateway_database_critical_bytes: StrictInt = Field(default=1_000_000_000, ge=1_000_000)
     cron_heartbeat_seconds: StrictInt = Field(default=60, ge=5)
     dream_enabled: StrictBool = True
     dream_schedule: str = Field(default="0 3 * * *", min_length=1, max_length=100)
     dream_timezone: str = Field(default="local", min_length=1, max_length=100)
     dream_model: str | None = Field(default=None, min_length=1)
     dream_batch_tokens: StrictInt = Field(default=12000, ge=1000, le=200000)
+    # A custom/local Dream runner is not necessarily protected by the HTTP
+    # provider timeout. Bound both each attempt and the complete maintenance
+    # run so a wedged model cannot hold Gateway maintenance indefinitely.
+    dream_model_timeout_seconds: StrictFloat = Field(default=90.0, ge=0.1, le=600.0)
+    dream_run_timeout_seconds: StrictFloat = Field(default=900.0, ge=1.0, le=7200.0)
     harness_dream_enabled: StrictBool = False
     harness_dream_auto_restart: StrictBool = True
     harness_dream_restart_wait_timeout_seconds: StrictInt = Field(default=300, ge=30, le=3600)
     backup_enabled: StrictBool = True
+    backup_key_mode: Literal["os_managed", "passphrase"] = "os_managed"
     backup_schedule: str = Field(default="0 4 * * *", min_length=1, max_length=100)
     backup_timezone: str = Field(default="local", min_length=1, max_length=100)
     backup_directory: Path | None = None
@@ -186,6 +246,15 @@ class RuntimeConfig(BaseModel):
             raise ValueError("compression_safety_margin_tokens 必须小于 model_context_window_tokens")
         if self.compression_output_reserve_tokens >= self.model_context_window_tokens:
             raise ValueError("compression_output_reserve_tokens 必须小于 model_context_window_tokens")
+        if self.gateway_database_warning_bytes > self.gateway_database_critical_bytes:
+            raise ValueError(
+                "gateway_database_warning_bytes 不能大于 gateway_database_critical_bytes",
+            )
+        profile_ids = [item.profile_id for item in self.model_profiles]
+        if len(profile_ids) != len(set(profile_ids)):
+            raise ValueError("model_profiles.profile_id must be unique")
+        if "default" in profile_ids:
+            raise ValueError("model_profiles cannot use reserved profile_id 'default'")
         from croniter import croniter
         from zoneinfo import ZoneInfo
         from tzlocal import get_localzone_name
@@ -208,6 +277,50 @@ class RuntimeConfig(BaseModel):
         except Exception as exc:
             raise ValueError(f"backup_timezone 不是有效时区：{self.backup_timezone}") from exc
         return self
+
+    def selectable_model_profiles(self) -> tuple[ModelProfile, ...]:
+        """Return the default model plus explicit alternatives, without secrets."""
+
+        default = ModelProfile(
+            profile_id="default",
+            provider=self.provider,
+            model=self.model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            stream=self.stream,
+            context_window_tokens=self.model_context_window_tokens,
+            reasoning_effort=self.reasoning_effort,
+        )
+        return (default, *self.model_profiles)
+
+    def select_model_profile(
+        self,
+        profile_id: str | None,
+        reasoning_effort: ReasoningEffort | None = None,
+    ) -> "RuntimeConfig":
+        """Resolve one validated profile into an immutable per-Run config."""
+
+        selected_id = profile_id or "default"
+        selected = next(
+            (item for item in self.selectable_model_profiles() if item.profile_id == selected_id),
+            None,
+        )
+        if selected is None:
+            raise ValueError(f"Unknown configured model profile: {selected_id}")
+        inherited_key = self.api_key if selected.provider == self.provider else None
+        requested_effort = reasoning_effort or selected.reasoning_effort or "low"
+        return self.model_copy(update={
+            "active_model_profile_id": selected.profile_id,
+            "provider": selected.provider,
+            "model": selected.model,
+            "base_url": selected.base_url,
+            "api_key": selected.api_key or inherited_key,
+            "stream": self.stream if selected.stream is None else selected.stream,
+            "model_context_window_tokens": (
+                selected.context_window_tokens or self.model_context_window_tokens
+            ),
+            "reasoning_effort": requested_effort,
+        })
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -248,6 +361,12 @@ def load_runtime_config(
         "compression_api_key",
         "memory_embedding_api_key",
     }.intersection(shared)
+    shared_profiles = shared.get("model_profiles")
+    if isinstance(shared_profiles, list) and any(
+        isinstance(item, dict) and item.get("api_key")
+        for item in shared_profiles
+    ):
+        sensitive_keys.add("model_profiles.api_key")
     if sensitive_keys:
         raise ValueError(
             "禁止在 .yy/settings.json 保存 API Key；请移至已忽略的 .yy/settings.local.json",

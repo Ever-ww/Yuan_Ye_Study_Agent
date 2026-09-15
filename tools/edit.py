@@ -11,7 +11,6 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from tool.contracts import ToolContext
-from tool.path_guard import safe_workspace_path
 
 
 class EditBlock(BaseModel):
@@ -92,7 +91,7 @@ class EditTool:
         if context.file_locks is None:
             raise RuntimeError("当前 Runtime 未启用文件锁，禁止执行 edit")
 
-        path = safe_workspace_path(context.project_root, arguments["path"])
+        path = context.resolve_workspace_path(arguments["path"])
         blocks = _validate_blocks(arguments.get("edits"))
         async with context.file_locks.write(path):
             if not path.is_file():

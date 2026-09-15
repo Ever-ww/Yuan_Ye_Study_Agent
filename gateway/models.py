@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 RunStatus = Literal["queued", "running", "completed", "failed", "cancelled", "interrupted"]
 ApprovalState = Literal["pending", "approved", "denied"]
+ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
 
 
 class GatewayEventEnvelope(BaseModel):
@@ -75,6 +76,8 @@ class RunRecord(BaseModel):
     workload_kind: str = "chat"
     recovery_required: bool = False
     terminal_target: str | None = None
+    model_profile_id: str = "default"
+    reasoning_effort: ReasoningEffort = "none"
 
 
 class InboxItem(BaseModel):
@@ -133,6 +136,20 @@ class RunCreateRequest(BaseModel):
     session_id: str | None = None
     idempotency_key: str | None = Field(default=None, min_length=1)
     deadline_at: str | None = None
+    model_profile_id: str = Field(default="default", min_length=1, max_length=80)
+    reasoning_effort: ReasoningEffort | None = None
+
+
+class ModelOption(BaseModel):
+    """Non-sensitive model metadata exposed to interactive clients."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    profile_id: str = Field(min_length=1)
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    selected: bool = False
+    reasoning_effort: ReasoningEffort = "low"
 
 
 class RecoveryDecisionRequest(BaseModel):

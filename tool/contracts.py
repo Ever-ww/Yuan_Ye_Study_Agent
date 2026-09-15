@@ -64,3 +64,18 @@ class ToolContext(BaseModel):
     # Present only for an Extension invocation. The Registry validates this
     # proof and must never fall back to online human approval.
     extension_authorization: ExtensionToolAuthorization | None = None
+    # Frozen per Runtime/Trace. Logical paths are resolved here; Tool policy and
+    # the OS sandbox remain the actual authorization boundary.
+    path_mapping: Any | None = None
+
+    def resolve_workspace_path(self, requested: str) -> Path:
+        if self.path_mapping is not None:
+            return self.path_mapping.resolve_workspace_path(requested)
+        from .path_guard import safe_workspace_path
+
+        return safe_workspace_path(self.project_root, requested)
+
+    def sanitize_model_output(self, value: str) -> str:
+        if self.path_mapping is None:
+            return value
+        return self.path_mapping.sanitize_for_model(value)

@@ -30,7 +30,7 @@ class SessionStore:
             self._write_index({"version": 1, "sessions": {}})
 
     def create(self, first_message: str, session_id: str | None = None) -> str:
-        """创建会话；可接收 Runtime 预生成的稳定会话标识。"""
+        """预登记会话；第一条真实记录写入时才物化 JSONL。"""
         self.initialize()
         now = datetime.now().astimezone()
         session_id = session_id or hashlib.sha256(f"{now.isoformat()}:{first_message}:{uuid4().hex}".encode("utf-8")).hexdigest()[:16]
@@ -39,15 +39,15 @@ class SessionStore:
         if self.exists(session_id):
             raise ValueError(f"会话已存在：{session_id}")
         filename = f"{now:%Y-%m-%d}_{session_id}_001.jsonl"
-        path = self.directory / filename
-        self._publish_segment(path, [])
         index = self._read_index()
-        index["sessions"][session_id] = {"created_at": now.strftime("%Y-%m-%d %H:%M:%S"), "latest_file": filename, "files": [filename]}
-        try:
-            self._write_index(index)
-        except Exception:
-            path.unlink(missing_ok=True)
-            raise
+        index["sessions"][session_id] = {
+            "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "latest_file": filename,
+            "files": [filename],
+            "state": "pending",
+            "materialized_at": None,
+        }
+        self._write_index(index)
         return session_id
 
     def append(self, session_id: str, role: str, content: str | None, metadata: dict[str, object] | None = None) -> str:
@@ -83,6 +83,7 @@ class SessionStore:
             actual = existing.model_dump(mode="python", exclude_unset=True)
             if self._canonical_record(expected) != self._canonical_record(actual):
                 raise ValueError(f"Session record_id content conflict: {record_id}")
+            self._activate_if_materialized(session_id)
             return False
         selected.setdefault(
             "timestamp", datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
@@ -95,6 +96,10 @@ class SessionStore:
             handle.write(json.dumps(validated, ensure_ascii=False) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+        # The record is the durable fact.  Activation follows it so a crash can
+        # leave at worst a pending entry with recoverable content, never an
+        # active Session whose first record was not durable.
+        self._activate_if_materialized(session_id)
         return True
 
     def record_by_id_strict(self, session_id: str, record_id: str) -> SessionRecord | None:
@@ -113,6 +118,8 @@ class SessionStore:
                     or path.resolve().parent != self.directory.resolve()):
                 raise ValueError("Session segment escapes its authorized directory")
             if not path.is_file():
+                if entry.get("state") == "pending" and filename == entry["latest_file"]:
+                    continue
                 raise ValueError(f"Session index references missing segment: {filename}")
             with path.open("r", encoding="utf-8") as handle:
                 for number, line in enumerate(handle, 1):
@@ -264,6 +271,9 @@ class SessionStore:
     def read_records(self, session_id: str) -> list[dict[str, object]]:
         """读取最新分段的原始记录，保留时间戳供 CLI 展示。"""
         path = self._active_path(session_id)
+        entry = self.index_entry(session_id)
+        if not path.is_file() and entry.get("state") == "pending":
+            return []
         records: list[dict[str, object]] = []
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if not line.strip():
@@ -281,15 +291,24 @@ class SessionStore:
         return session_id in self._read_index()["sessions"]
 
     def list_sessions(self) -> list[dict[str, object]]:
-        """按创建时间倒序返回会话摘要和最新分段消息数。"""
+        """返回已物化会话；数量覆盖全部分段而非仅最新分段。"""
         self.initialize()
         sessions: list[dict[str, object]] = []
         for session_id, metadata in self._read_index()["sessions"].items():
-            path = self.directory / metadata["latest_file"]
-            message_count = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip()) if path.exists() else 0
-            updated_at = (
-                datetime.fromtimestamp(path.stat().st_mtime).astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")
-                if path.exists() else metadata["created_at"]
+            paths = [self.directory / str(filename) for filename in metadata["files"]]
+            existing = [path for path in paths if path.is_file()]
+            message_count = sum(
+                sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+                for path in existing
+            )
+            # Pre-bound Cron, /code and Gateway Sessions are intentionally
+            # invisible until they own at least one canonical conversation
+            # record.  Their identity remains recoverable from the index.
+            if message_count == 0:
+                continue
+            latest_activity = max(path.stat().st_mtime for path in existing)
+            updated_at = datetime.fromtimestamp(latest_activity).astimezone().strftime(
+                "%Y-%m-%d %H:%M:%S.%f",
             )
             sessions.append({
                 "session_id": session_id,
@@ -297,6 +316,7 @@ class SessionStore:
                 "updated_at": updated_at,
                 "latest_file": metadata["latest_file"],
                 "message_count": message_count,
+                "segment_count": len(metadata["files"]),
             })
         return sorted(
             sessions,
@@ -322,10 +342,16 @@ class SessionStore:
         session = index["sessions"].get(session_id)
         if not session:
             raise KeyError(f"未知会话：{session_id}")
+        active = self.directory / str(session["latest_file"])
+        pending_unmaterialized = session.get("state") == "pending" and not active.exists()
         number = len(session["files"]) + 1
         date = session["files"][0].split("_", 1)[0]
         filename = f"{date}_{session_id}_{number:03d}.jsonl"
         path = self.directory / filename
+        if pending_unmaterialized and not initial_records:
+            # A rollover boundary without any conversation fact is still only
+            # a reservation.  Do not turn it into a zero-byte segment.
+            return path
         temporary = path.with_suffix(path.suffix + ".tmp")
         lines = []
         for record in initial_records:
@@ -336,8 +362,19 @@ class SessionStore:
         self._write_file_durable(temporary, ("\n".join(lines) + "\n") if lines else "")
         os.replace(temporary, path)
         self._fsync_directory(path.parent)
-        session["files"].append(filename)
+        if pending_unmaterialized:
+            # `_001` was only a name reservation.  A real rollover (for
+            # example /skill refresh) keeps its `_002` boundary while removing
+            # the nonexistent segment from the canonical index.
+            session["files"] = [filename]
+        else:
+            session["files"].append(filename)
         session["latest_file"] = filename
+        if lines:
+            session["state"] = "active"
+            session["materialized_at"] = datetime.now().astimezone().strftime(
+                "%Y-%m-%d %H:%M:%S",
+            )
         if skill_catalog is not None:
             session["skill_catalog"] = skill_catalog
         self._write_index(index)
@@ -387,6 +424,23 @@ class SessionStore:
         if not session:
             raise KeyError(f"未知会话：{session_id}")
         return self.directory / session["latest_file"]
+
+    def _activate_if_materialized(self, session_id: str) -> None:
+        """幂等提交 pending → active；可修复记录先落盘后的崩溃窗口。"""
+        index = self._read_index()
+        session = index["sessions"].get(session_id)
+        if session is None:
+            raise KeyError(f"未知会话：{session_id}")
+        if session.get("state") == "active":
+            return
+        path = self.directory / str(session["latest_file"])
+        if not path.is_file() or path.stat().st_size == 0:
+            return
+        session["state"] = "active"
+        session["materialized_at"] = datetime.now().astimezone().strftime(
+            "%Y-%m-%d %H:%M:%S",
+        )
+        self._write_index(index)
 
     def _read_index(self) -> dict:
         """读取并校验索引 JSON。"""

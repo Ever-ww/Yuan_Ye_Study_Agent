@@ -155,6 +155,51 @@ class NativeSandboxTests(unittest.TestCase):
             self.assertEqual(api.userenv.DeleteAppContainerProfile.call_count, 1)
             self.assertEqual(list(runner.leases.glob("*.json")), [])
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows ACL boundary plan")
+    def test_appcontainer_acl_plan_is_bounded_by_policy_roots_not_workspace_files(self):
+        from sandbox.windows import AppContainerRunner
+
+        with tempfile.TemporaryDirectory() as value:
+            parent = Path(value)
+            root = parent / "workspace"
+            root.mkdir()
+            source = root / "src"
+            source.mkdir()
+            for index in range(200):
+                (source / f"module-{index}.py").write_text("pass")
+            git = root / ".git"
+            git.mkdir()
+            (git / "config").write_text("secret")
+            venv = root / ".venv"
+            venv.mkdir()
+            (venv / "python.exe").write_text("binary")
+            api = MagicMock()
+            api.userenv.DeriveAppContainerSidFromAppContainerName.return_value = 0
+            api.userenv.CreateAppContainerProfile.return_value = 0
+            api.userenv.DeleteAppContainerProfile.return_value = 0
+            runner = AppContainerRunner(NativePolicy(root), parent)
+            argv = [r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"]
+            record, sid, _ = runner._ensure_lease(
+                api, argv, ((git, True), (venv, False)), (root,),
+            )
+            try:
+                mutated = {Path(item) for item in record["paths"]}
+                self.assertIn(root, mutated)
+                self.assertIn(git, mutated)
+                self.assertIn(venv, mutated)
+                self.assertNotIn(source / "module-0.py", mutated)
+                self.assertLessEqual(api.check_acl_access.call_count, 3)
+                calls = {
+                    (call.args[0], call.kwargs.get("mode"), call.kwargs.get("permissions"))
+                    for call in api.acl.call_args_list
+                }
+                self.assertIn((git, 3, 0x1F01FF), calls)
+                self.assertIn((venv, 3, 0x130156), calls)
+            finally:
+                api.advapi.FreeSid(sid)
+                with patch("sandbox.windows.WinAPI", return_value=api):
+                    runner._close()
+
     def test_shell_argument_is_not_reparsed_by_host(self):
         command = 'echo "a b"; echo $TOKEN'
         self.assertEqual(shell_argv(command, "/bin/bash", "linux")[-1], command)

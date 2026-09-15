@@ -11,7 +11,6 @@ import httpx
 from pydantic import BaseModel, ConfigDict
 
 from tool.contracts import ToolContext
-from tool.path_guard import safe_workspace_path
 from .web_fetch import (
     HostResolver,
     WebFetchNetworkError,
@@ -106,7 +105,7 @@ class PaperDownloadTool(WebFetchTool):
 
         requested_url = str(arguments["url"]).strip()
         relative_path = str(arguments["path"])
-        path = safe_workspace_path(context.project_root, relative_path)
+        path = context.resolve_workspace_path(relative_path)
         if path.suffix.lower() != ".pdf":
             raise PaperDownloadSecurityError("download_paper.path 必须以 .pdf 结尾")
         if path.exists() and not path.is_file():

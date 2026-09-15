@@ -33,6 +33,7 @@ from .models import (
     RollbackResult,
     SandboxStatus,
 )
+from .path_mapping import LogicalRoot, PathMappingSnapshot
 
 
 def register_sandbox_callbacks(*args, **kwargs):
@@ -68,6 +69,8 @@ __all__ = [
     "SandboxStatus",
     "WorkspaceLockManager",
     "WorkspaceScanCache",
+    "LogicalRoot",
+    "PathMappingSnapshot",
     "register_sandbox_callbacks",
     "probe_docker_status",
     "sandbox_status_of",

@@ -12,7 +12,13 @@ from unittest.mock import AsyncMock, patch
 from Agent import load_runtime_config
 from gateway.api import _subscription_events
 from gateway.application import GatewayApplication
-from gateway.process import GatewayProcessManager, resume_completed_operator_stop
+from backup import AgentHomeMaintenanceCoordinator, AgentHomeWriteGate
+from backup.lifecycle_store import LifecycleStore
+from gateway.process import (
+    GatewayProcessManager,
+    resume_completed_operator_stop,
+    resume_completed_operator_stop_before_bootstrap,
+)
 
 
 class WebSocketShutdownTests(unittest.IsolatedAsyncioTestCase):
@@ -65,6 +71,44 @@ class WebSocketShutdownTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StopAcknowledgementTests(unittest.TestCase):
+    def test_ensure_running_reports_control_only_maintenance_without_timeout(self):
+        with tempfile.TemporaryDirectory() as value:
+            manager = GatewayProcessManager(Path(value))
+            health = {
+                "status": "ok",
+                "service": "yuan-ye-agent-gateway",
+                "accepting_work": False,
+                "maintenance": {
+                    "state": "failed",
+                    "maintenance_epoch": 7,
+                    "revision": 11,
+                },
+            }
+            with patch.object(manager, "_health_payload", return_value=health):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"failed.*python run.py gateway resume --epoch 7 --revision 11",
+                ):
+                    manager.ensure_running(timeout_seconds=30)
+
+    def test_clean_stop_resumes_before_mutable_gateway_bootstrap(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            gate = AgentHomeWriteGate()
+            lifecycle = AgentHomeMaintenanceCoordinator(root, gate)
+            asyncio.run(lifecycle.freeze("operator stop", timeout_seconds=5))
+            snapshot = lifecycle.snapshot
+            lifecycle.close()
+            manager = GatewayProcessManager(root)
+            manager.stopped_path.write_text(json.dumps({
+                key: getattr(snapshot, key)
+                for key in ("maintenance_epoch", "revision", "operation_id")
+            }), encoding="utf-8")
+
+            self.assertTrue(resume_completed_operator_stop_before_bootstrap(manager))
+            self.assertEqual(LifecycleStore(root).read().state.value, "running")
+            self.assertFalse(manager.stopped_path.exists())
+
     def test_drain_failure_is_reported_without_waiting_entire_deadline(self):
         with tempfile.TemporaryDirectory() as value:
             manager = GatewayProcessManager(Path(value))

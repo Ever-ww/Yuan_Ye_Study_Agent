@@ -64,6 +64,8 @@ class SessionIndexEntry(BaseModel):
     created_at: str = Field(min_length=1)
     latest_file: str = Field(min_length=1)
     files: list[str] = Field(min_length=1)
+    state: Literal["pending", "active"] = "active"
+    materialized_at: str | None = None
     skill_catalog: dict[str, Any] | None = None
 
     @model_validator(mode="after")

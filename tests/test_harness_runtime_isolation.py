@@ -76,6 +76,10 @@ def test_ephemeral_context_is_provider_only_and_prompt_prefix_is_reused(tmp_path
         (worktree / ".git").write_text("gitdir: isolated\n", encoding="utf-8")
         config = load_runtime_config(tmp_path, coding_source_root=ROOT)
         runtime = harness.create_coding_runtime(config, worktree)
+        assert runtime.path_mapping.workspace_root == worktree.resolve()
+        assert runtime.path_mapping.agent_source_root == worktree.resolve()
+        assert runtime.path_mapping.skills_root == worktree.resolve() / "skills"
+        assert runtime.path_mapping.hooks_root == worktree.resolve() / "extension" / "hook"
         provider = CapturingProvider()
         runtime.provider = provider
         runtime.harness_dynamic_context.update(
@@ -100,6 +104,8 @@ def test_ephemeral_context_is_provider_only_and_prompt_prefix_is_reused(tmp_path
         assert first_messages[0] == second_messages[0]
         assert first_tools == second_tools
         assert "harness_runtime_context" in first_messages[-1]["content"]
+        assert str(worktree.resolve()) not in str(first_messages)
+        assert str(ROOT.resolve()) not in str(first_messages)
         assert '"head":"abc"' in first_messages[-1]["content"]
         assert '"head":"def"' in second_messages[-1]["content"]
         assert "abc" not in second_messages[-2].get("content", "")
@@ -145,6 +151,20 @@ def test_provider_usage_exposes_cached_input_tokens() -> None:
     assert usage is not None
     assert usage.input_tokens == 1200
     assert usage.cached_input_tokens == 960
+    assert usage.cache_metrics_source == "openai_compatible.cached_tokens"
+
+
+def test_deepseek_usage_exposes_hit_and_miss_tokens() -> None:
+    usage = _openai_usage({
+        "prompt_tokens": 1200,
+        "completion_tokens": 20,
+        "prompt_cache_hit_tokens": 900,
+        "prompt_cache_miss_tokens": 300,
+    })
+    assert usage is not None
+    assert usage.cached_input_tokens == 900
+    assert usage.cache_miss_input_tokens == 300
+    assert usage.cache_metrics_source == "deepseek.prompt_cache_tokens"
 
 
 def test_model_metric_reports_cache_hit_ratio() -> None:
@@ -161,3 +181,20 @@ def test_model_metric_reports_cache_hit_ratio() -> None:
 
     assert metric["input_tokens"]["cache_hit_ratio"] == 0.8
     assert metric["input_tokens"]["ephemeral_context"] == 80
+    assert metric["prefix_cache"]["status"] == "reported"
+    assert metric["prefix_cache"]["hit_tokens"] == 960
+
+
+def test_model_metric_marks_cache_telemetry_unavailable_without_estimation() -> None:
+    from Agent.contracts import ModelReply, TokenUsage
+    from Agent.react.loop import _model_call_metric
+
+    metric = _model_call_metric(
+        1.0,
+        1200,
+        20,
+        ModelReply(text="done", usage=TokenUsage(input_tokens=1200)),
+    )
+
+    assert metric["prefix_cache"]["status"] == "unavailable"
+    assert metric["prefix_cache"]["hit_ratio"] is None

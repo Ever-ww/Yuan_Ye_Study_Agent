@@ -337,7 +337,11 @@ def build_default_hooks(
         runtime_profile=runtime_profile,
     )
     if runtime_config is not None:
-        from context_process import register_tool_output_trimming_callbacks
+        from context_process import (
+            register_direct_response_tool_policy,
+            register_tool_output_trimming_callbacks,
+        )
+        register_direct_response_tool_policy(registry)
         register_tool_output_trimming_callbacks(
             registry,
             selected_memory,

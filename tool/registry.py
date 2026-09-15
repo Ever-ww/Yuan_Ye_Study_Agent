@@ -350,10 +350,17 @@ class AsyncToolRegistry:
                 else:
                     if coordinator is not None:
                         await coordinator.waiting_human(operation)
-                    approved = bool(
-                        context.approval is not None
-                        and await context.approval(name, arguments)
-                    )
+                        approved = await coordinator.request_approval(
+                            operation,
+                            context.approval,
+                            tool_name=name,
+                            arguments=arguments,
+                        )
+                    else:
+                        approved = bool(
+                            context.approval is not None
+                            and await context.approval(name, arguments)
+                        )
                 denied_result = None
                 if coordinator is not None and extension_authorization is None:
                     denied_result = await coordinator.approval_decided(operation, approved=approved)
@@ -426,10 +433,17 @@ class AsyncToolRegistry:
                 else:
                     if coordinator is not None:
                         await coordinator.waiting_human(operation)
-                    approved = bool(
-                        context.approval is not None
-                        and await context.approval(name, arguments)
-                    )
+                        approved = await coordinator.request_approval(
+                            operation,
+                            context.approval,
+                            tool_name=name,
+                            arguments=arguments,
+                        )
+                    else:
+                        approved = bool(
+                            context.approval is not None
+                            and await context.approval(name, arguments)
+                        )
                 denied_result = None
                 if coordinator is not None and extension_authorization is None:
                     denied_result = await coordinator.approval_decided(

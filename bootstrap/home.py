@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -55,10 +56,7 @@ def migrate_source_home(source_root: Path, target_root: Path) -> None:
             target / ".yy",
             dirs_exist_ok=True,
             copy_function=_copy_missing,
-            ignore=shutil.ignore_patterns(
-                "*.lock", "*.tmp", "*.sqlite3-wal", "*.sqlite3-shm",
-                "instance.json", "stop.request",
-            ),
+            ignore=_migration_ignore(source_yy),
         )
         _partition_legacy_sessions(source, target / ".yy")
     source_skills = source / "skills"
@@ -142,29 +140,113 @@ def _copy_missing(source: str, destination: str) -> str:
     return str(target)
 
 
+def _migration_ignore(source_yy: Path):
+    """Skip transient files and loose legacy Session facts during tree copy.
+
+    Existing workspace partitions are still copied.  Loose Session records are
+    routed exactly once by ``_partition_legacy_sessions`` so a previous target
+    index cannot be mistaken for the current source's history.
+    """
+    legacy_session_root = (source_yy / "memory" / "session").resolve()
+    transient = (
+        "*.lock", "*.tmp", "*.sqlite3-wal", "*.sqlite3-shm",
+        "instance.json", "stop.request",
+    )
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        ignored = {
+            name for name in names
+            if any(fnmatch.fnmatch(name, pattern) for pattern in transient)
+        }
+        if Path(directory).resolve() == legacy_session_root:
+            ignored.update(
+                name for name in names
+                if name == "index.json" or name.endswith(".jsonl")
+            )
+        return ignored
+
+    return ignore
+
+
 def _partition_legacy_sessions(source_root: Path, target_yy: Path) -> None:
-    session_root = target_yy / "memory" / "session"
-    index = session_root / "index.json"
+    source_session_root = source_root / ".yy" / "memory" / "session"
+    index = source_session_root / "index.json"
     if not index.is_file():
         return
     key = hashlib.sha256(
         os.path.normcase(str(source_root.resolve())).encode("utf-8"),
     ).hexdigest()[:16]
-    destination = session_root / key
+    destination = target_yy / "memory" / "session" / key
     destination.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(index, destination / "index.json")
     try:
         value = json.loads(index.read_text(encoding="utf-8"))
-        filenames = {
-            filename
-            for session in value.get("sessions", {}).values()
-            if isinstance(session, dict)
-            for filename in session.get("files", [])
-            if isinstance(filename, str)
-        }
-    except (OSError, json.JSONDecodeError):
-        filenames = set()
-    for filename in filenames:
-        source = session_root / filename
-        if source.is_file():
-            shutil.copy2(source, destination / filename)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"旧 Session 索引无法迁移：{index}") from exc
+    source_sessions = value.get("sessions", {})
+    if not isinstance(source_sessions, dict):
+        raise RuntimeError(f"旧 Session 索引结构无效：{index}")
+    destination_index = destination / "index.json"
+    if destination_index.is_file():
+        try:
+            destination_value = json.loads(destination_index.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"目标 Session 索引无法合并：{destination_index}") from exc
+    else:
+        destination_value = {"version": 1, "sessions": {}}
+    target_sessions = destination_value.get("sessions")
+    if not isinstance(target_sessions, dict):
+        raise RuntimeError(f"目标 Session 索引结构无效：{destination_index}")
+    for session_id, metadata in source_sessions.items():
+        if not isinstance(metadata, dict):
+            raise RuntimeError(f"旧 Session 元数据无效：{session_id}")
+        filenames = metadata.get("files", [])
+        if not isinstance(filenames, list) or not filenames:
+            raise RuntimeError(f"旧 Session 文件索引无效：{session_id}")
+        for filename in filenames:
+            if not isinstance(filename, str) or Path(filename).name != filename:
+                raise RuntimeError(f"旧 Session 文件名越界：{filename}")
+            source = source_session_root / filename
+            if not source.is_file():
+                raise RuntimeError(f"旧 Session 文件缺失：{source}")
+            target = destination / filename
+            if target.is_file():
+                if _file_hash(source) != _file_hash(target):
+                    raise RuntimeError(f"Session 迁移内容冲突：{target}")
+            else:
+                shutil.copy2(source, target)
+        existing = target_sessions.get(session_id)
+        if existing is not None and not _session_metadata_compatible(existing, metadata):
+            raise RuntimeError(f"Session 迁移索引冲突：{session_id}")
+        if existing is None:
+            target_sessions[session_id] = metadata
+    _write_json_atomic(destination_index, destination_value)
+
+
+def _file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _session_metadata_compatible(left: object, right: object) -> bool:
+    """Compare immutable legacy identity while tolerating additive v1 fields."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    for name in ("created_at", "latest_file", "files"):
+        if left.get(name) != right.get(name):
+            return False
+    left_catalog = left.get("skill_catalog")
+    right_catalog = right.get("skill_catalog")
+    return left_catalog is None or right_catalog is None or left_catalog == right_catalog
+
+
+def _write_json_atomic(path: Path, value: dict[str, object]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)

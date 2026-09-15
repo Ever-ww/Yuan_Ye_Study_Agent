@@ -168,7 +168,7 @@ class OutboxDispatcher:
         if self._task is None:
             return
         self._task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
             await self._task
         self._task = None
 
@@ -248,9 +248,16 @@ class OutboxDispatcher:
             return connection.execute(
                 "SELECT d.delivery_id,d.revision FROM event_deliveries d "
                 "JOIN event_outbox o ON o.outbox_id=d.outbox_id "
+                "JOIN gateway_events e ON e.event_id=d.event_id "
                 "WHERE d.status IN ('pending','retrying') "
                 "AND (d.next_retry_at IS NULL OR d.next_retry_at<=?) "
-                "ORDER BY o.created_at,d.event_id,d.sink_id LIMIT 100",
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM event_deliveries prior_d "
+                "JOIN gateway_events prior_e ON prior_e.event_id=prior_d.event_id "
+                "WHERE prior_d.sink_id=d.sink_id AND prior_e.stream_id=e.stream_id "
+                "AND prior_e.stream_sequence<e.stream_sequence "
+                "AND prior_d.status NOT IN ('delivered','dead_lettered')) "
+                "ORDER BY o.created_at,e.stream_id,e.stream_sequence,d.sink_id LIMIT 100",
                 (now_iso(),),
             ).fetchall()
 

@@ -330,6 +330,15 @@ class AgentHomeMaintenanceCoordinator:
                     "started_at": datetime.now().astimezone(), "failure_reason": None,
                 })
                 async def drain():
+                    # Some background participants can cooperatively move an
+                    # already-admitted operation to a durable interruption
+                    # boundary.  Signal them before waiting for all leases;
+                    # otherwise the coordinator waits for the very operation
+                    # that only its participant knows how to stop.
+                    for participant in self._participants.values():
+                        prepare = getattr(participant, "prepare_quiesce", None)
+                        if callable(prepare):
+                            await prepare(epoch)
                     # First let already admitted workflows reach durable boundaries.
                     # New dispatches are blocked by the gate, not by boolean flags.
                     await self.gate.wait_for_idle(timeout_seconds)

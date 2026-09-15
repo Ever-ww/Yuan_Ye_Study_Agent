@@ -48,6 +48,7 @@ from gateway.models import (
     RunCreateRequest,
     RecoveryDecisionRequest,
     RunRecord,
+    ModelOption,
     ExtensionGrantRequest,
     ExtensionReenableRequest,
     RuntimeReloadRequest,
@@ -96,7 +97,11 @@ class GatewayClient:
             response.raise_for_status()
             return response.json()
 
-    async def create_backup(self, passphrase: str, output: Path | None = None) -> BackupRecord:
+    async def create_backup(
+        self,
+        passphrase: str | None = None,
+        output: Path | None = None,
+    ) -> BackupRecord:
         request = BackupCreateRequest(passphrase=passphrase, output=output)
         value = await self._request(
             "POST", "/api/v1/backup/create",
@@ -272,6 +277,8 @@ class GatewayClient:
         task: str,
         session_id: str | None = None,
         idempotency_key: str | None = None,
+        model_profile_id: str = "default",
+        reasoning_effort: str | None = None,
     ) -> RunRecord:
         payload = RunCreateRequest(
             project_id=project_id,
@@ -279,9 +286,25 @@ class GatewayClient:
             task=task,
             session_id=session_id,
             idempotency_key=idempotency_key,
+            model_profile_id=model_profile_id,
+            reasoning_effort=reasoning_effort,
         )
         value = await self._request("POST", "/api/v1/runs", json=payload.model_dump(mode="json"))
         return RunRecord.model_validate(value)
+
+    async def model_options(
+        self,
+        session_id: str | None = None,
+        project_id: str | None = None,
+    ) -> tuple[ModelOption, ...]:
+        params = {
+            key: value for key, value in {
+                "session_id": session_id,
+                "project_id": project_id,
+            }.items() if value
+        } or None
+        values = await self._request("GET", "/api/v1/models", params=params)
+        return tuple(ModelOption.model_validate(item) for item in values)
 
     async def cancel_run(self, run_id: str) -> bool:
         value = await self._request("POST", f"/api/v1/runs/{run_id}/cancel")
@@ -290,6 +313,11 @@ class GatewayClient:
     async def run(self, run_id: str) -> RunRecord:
         value = await self._request("GET", f"/api/v1/runs/{run_id}")
         return RunRecord.model_validate(value)
+
+    async def runs(self, project_id: str | None = None) -> list[RunRecord]:
+        params = {"project_id": project_id} if project_id is not None else None
+        value = await self._request("GET", "/api/v1/runs", params=params)
+        return [RunRecord.model_validate(item) for item in value]
 
     async def run_state(self, run_id: str) -> dict[str, Any]:
         return dict(await self._request("GET", f"/api/v1/runs/{run_id}/state"))
@@ -574,7 +602,52 @@ class GatewayClient:
                 async with contextlib.aclosing(
                     self.events(run_id, after_sequence=sequence),
                 ) as event_stream:
-                    async for event in event_stream:
+                    pending: asyncio.Task[GatewayEventEnvelope] | None = None
+                    while True:
+                        try:
+                            if pending is None:
+                                pending = asyncio.create_task(anext(event_stream))
+                            done, _ = await asyncio.wait({pending}, timeout=0.5)
+                            if not done:
+                                # EventBus/JSONL are delivery projections. If a Sink
+                                # is delayed, the terminal business fact is still in
+                                # SQLite; periodically replay it so CLI cannot hang
+                                # behind an Outbox backlog.
+                                current = await self.run(run_id)
+                                if current.status in {
+                                    "completed", "failed", "cancelled", "interrupted",
+                                }:
+                                    replay = await self._request(
+                                        "GET",
+                                        f"/api/v1/runs/{run_id}/events",
+                                        params={"after_sequence": sequence},
+                                    )
+                                    for value in replay:
+                                        event = GatewayEventEnvelope.model_validate(value)
+                                        if event.sequence <= sequence:
+                                            continue
+                                        sequence = event.sequence
+                                        yield event
+                                        if event.type in terminal:
+                                            pending.cancel()
+                                            await asyncio.gather(
+                                                pending, return_exceptions=True,
+                                            )
+                                            pending = None
+                                            return
+                                continue
+                            try:
+                                event = pending.result()
+                            except StopAsyncIteration:
+                                return
+                            finally:
+                                pending = None
+                        except BaseException:
+                            if pending is not None:
+                                pending.cancel()
+                                await asyncio.gather(pending, return_exceptions=True)
+                                pending = None
+                            raise
                         if event.sequence <= sequence:
                             continue
                         sequence = event.sequence
@@ -612,6 +685,12 @@ class GatewayClient:
             response = await client.request(method, f"{self.base_url}{path}", **kwargs)
             if response.status_code == 409:
                 raise RuntimeError(response.json().get("detail", "Gateway 状态冲突"))
+            if response.status_code == 422:
+                try:
+                    detail = response.json().get("detail", response.text)
+                except ValueError:
+                    detail = response.text
+                raise RuntimeError(f"Gateway 请求参数无效：{detail}")
             if response.status_code == 503:
                 # A live control-only Gateway is not ready for chat. Surface the
                 # exact durable resume identity, never silently unfreeze it.

@@ -90,8 +90,16 @@ class ObserverPlugin(Protocol):
 
     def initial_state(self, user_problem: str) -> ObserverState: ...
 
-    def reduce(
-        self, previous: ObserverState, event: VisibleObserverEvent,
+    def model_messages(
+        self,
+        previous: ObserverState,
+        event: VisibleObserverEvent,
+        *,
+        terminal: bool,
+    ) -> tuple[dict[str, str], ...]: ...
+
+    def parse_state(
+        self, raw: str, previous: ObserverState,
     ) -> ObserverState: ...
 
     def migrate_state(
@@ -99,7 +107,46 @@ class ObserverPlugin(Protocol):
     ) -> ObserverState: ...
 
 
-def render_observer_progress(state: ObserverState) -> str:
+def render_observer_progress(
+    state: ObserverState,
+    *,
+    terminal_event_type: str | None = None,
+    observer_failed: bool = False,
+) -> str:
+    """Render active progress or a compact, one-Turn terminal result."""
+    if observer_failed:
+        return "⚠ Observer 已隔离\n\n主任务不受影响"
+    if terminal_event_type is not None:
+        alignment = state.intent_alignment.status
+        # Final progress remains useful after the status icon changes. Keep a
+        # bounded task list rather than collapsing the whole Observer pane to a
+        # single sentence or duplicating an arbitrarily long final answer.
+        completed_items = []
+        for item in state.completed_tasks[-6:]:
+            compact = " ".join(str(item).split())
+            if len(compact) > 180:
+                compact = compact[:177] + "..."
+            if compact:
+                completed_items.append(f"- {compact}")
+        completed = "\n".join(completed_items) or "- 本轮已处理完成"
+        if alignment is IntentAlignmentStatus.DRIFTED:
+            return (
+                "⚠ 任务已结束，但检测到意图偏移\n\n"
+                f"**已完成**\n{completed}"
+            )
+        if terminal_event_type == "run_completed":
+            if alignment is IntentAlignmentStatus.UNCERTAIN:
+                return (
+                    "✓ 任务已完成 · 意图一致性待确认\n\n"
+                    f"**已完成**\n{completed}"
+                )
+            return f"✓ 任务已完成\n\n**已完成**\n{completed}"
+        terminal_labels = {
+            "run_failed": "任务执行失败",
+            "run_cancelled": "任务已取消",
+            "run_interrupted": "任务已中断",
+        }
+        return f"⚠ {terminal_labels.get(terminal_event_type, '任务已结束')}"
     completed = "\n".join(f"- {item}" for item in state.completed_tasks) or "- 暂无"
     progress = f"- {state.in_progress_task}" if state.in_progress_task else "- 暂无"
     problem = state.user_problem.strip() or "尚未识别"

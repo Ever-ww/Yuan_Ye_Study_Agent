@@ -24,7 +24,7 @@ from .control import (
 )
 from .models import RestoreFence, RestorePlan, RestoreState
 from .service import BackupService
-from .security import SensitiveEnvSanitizer
+from .security import BackupSecret, SensitiveEnvSanitizer
 from .maintenance import AgentHomeMaintenanceCoordinator, AgentHomeWriteGate
 from .models import MaintenanceState
 
@@ -78,7 +78,7 @@ class RestoreService:
     async def restore(
         self,
         archive: Path,
-        passphrase: str,
+        passphrase: str | BackupSecret,
         *,
         confirmation: str,
         non_interactive: bool = False,
@@ -87,11 +87,16 @@ class RestoreService:
         if read_restore_fence(self.agent_root) is not None:
             raise RestoreRecoveryRequired("存在未完成Restore，请先执行 backup recover/rollback")
         mappings = path_mappings or {}
-        plan = self.plan(archive, passphrase, mappings)
+        selected = (
+            passphrase
+            if isinstance(passphrase, BackupSecret)
+            else BackupSecret(passphrase, "passphrase")
+        )
+        plan = self.plan(archive, selected.value, mappings)
         expected = plan.backup_id[:8]
         if confirmation != expected:
             raise RestoreConfirmationError(f"必须输入备份短ID {expected} 确认")
-        if non_interactive and not passphrase:
+        if non_interactive and not selected.value:
             raise RestoreConfirmationError("non-interactive Restore必须提供Secret Provider")
         if plan.available_bytes < plan.estimated_peak_bytes:
             raise OSError(
@@ -144,13 +149,13 @@ class RestoreService:
             elif lifecycle.snapshot.state != MaintenanceState.QUIESCED:
                 raise RestoreRecoveryRequired("Lifecycle is already in an unfinished maintenance operation")
             await lifecycle.begin_restore(lifecycle.snapshot.maintenance_epoch)
-            EncryptedBackupArchive.extract(archive, passphrase, staging)
+            EncryptedBackupArchive.extract(archive, selected.value, staging)
             journal.append("restore_state", {
                 "state": RestoreState.PREPARED.value,
                 "staging_fingerprint": _tree_identity(staging),
             })
-            rescue = await self.backups.create(passphrase=passphrase, kind="rescue")
-            if not self.backups.verify(rescue.path, passphrase).valid:
+            rescue = await self.backups.create(resolved_secret=selected, kind="rescue")
+            if not self.backups.verify(rescue.path, selected.value).valid:
                 raise RuntimeError("救援备份验证失败")
             journal.append("rescue_backup", {
                 "path": str(rescue.path), "backup_id": rescue.backup_id,

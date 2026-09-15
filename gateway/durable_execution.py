@@ -90,6 +90,34 @@ class DurableToolCoordinator:
     def current_binding(self) -> DurableRunBinding | None:
         return _RUN_BINDING.get()
 
+    async def request_approval(
+        self,
+        operation: OperationRecord,
+        approval: Callable[[str, dict[str, Any]], Awaitable[bool]] | None,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> bool:
+        """Call approval with the already-prepared Operation/Attempt bound.
+
+        Approval precedes ``execute()``, so the Tool body cannot establish
+        these ContextVars. Binding them here keeps the durable identity explicit
+        and preserves an outer identity for nested Tool execution.
+        """
+        if approval is None:
+            return False
+        binding = self._binding()
+        if operation.run_id != binding.run_id:
+            raise RuntimeError("Durable Approval Operation does not belong to the bound Run")
+        attempt = self.controller.current_attempt(operation.operation_id)
+        operation_token = _CURRENT_OPERATION.set(operation.operation_id)
+        attempt_token = _CURRENT_ATTEMPT.set(attempt.attempt_id)
+        try:
+            return bool(await approval(tool_name, arguments))
+        finally:
+            _CURRENT_ATTEMPT.reset(attempt_token)
+            _CURRENT_OPERATION.reset(operation_token)
+
     def _run_lock(self, run_id: str) -> asyncio.Lock:
         lock = self._run_locks.get(run_id)
         if lock is None:

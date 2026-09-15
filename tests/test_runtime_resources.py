@@ -118,6 +118,46 @@ def test_approval_is_bound_to_exact_reload_plan(tmp_path: Path) -> None:
     assert changed_again.plan_hash != first_plan.plan_hash
 
 
+def test_profile_only_change_creates_a_new_approved_generation(tmp_path: Path) -> None:
+    manager, _ = _manager(tmp_path)
+    initial = manager.ensure_initial_generation()
+    manager.providers[0].profiles = (
+        RuntimeProfile.INTERACTIVE, RuntimeProfile.CRON,
+    )
+
+    pending = manager.reload(actor="test")
+
+    assert pending.status == "awaiting_approval"
+    assert pending.generation_id != initial.generation_id
+    activated = manager.reload(actor="test", approved_plan_hash=pending.plan_hash)
+    assert activated.status == "activated"
+    assert "test.tools" in manager.snapshot(RuntimeProfile.CRON).descriptor_ids
+
+
+def test_quarantined_plugin_without_fallback_is_removed_from_new_snapshot(
+    tmp_path: Path,
+) -> None:
+    manager, _ = _manager(tmp_path)
+    generation = manager.ensure_initial_generation()
+    for _ in range(3):
+        manager.report_failure(
+            generation_id=generation.generation_id,
+            plugin_id="test.tools",
+            profile=RuntimeProfile.INTERACTIVE,
+            failure_kind=RuntimePluginFailureKind.PLUGIN_EXCEPTION,
+            error="broken plugin",
+        )
+
+    snapshot = manager.snapshot(RuntimeProfile.INTERACTIVE)
+    old_snapshot = manager.snapshot(
+        RuntimeProfile.INTERACTIVE, generation_id=generation.generation_id,
+    )
+
+    assert "test.tools" not in snapshot.descriptor_ids
+    assert not (snapshot.source_root / "tools" / "__init__.py").exists()
+    assert "test.tools" in old_snapshot.descriptor_ids
+
+
 def test_exact_reload_approval_survives_manager_restart(tmp_path: Path) -> None:
     manager, source = _manager(tmp_path)
     manager.ensure_initial_generation()

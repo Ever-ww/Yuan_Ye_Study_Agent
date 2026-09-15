@@ -20,7 +20,6 @@ from pypdf import PdfReader
 from pptx import Presentation
 
 from tool.contracts import ToolContext
-from tool.path_guard import safe_workspace_path
 
 
 _MAX_FILE_BYTES = 100 * 1024 * 1024
@@ -85,7 +84,7 @@ class DocumentReader:
     """`read_file` 内部的结构化文档解析流程。"""
 
     async def read(self, arguments: dict[str, Any], context: ToolContext) -> str:
-        path = safe_workspace_path(context.project_root, arguments["path"])
+        path = context.resolve_workspace_path(arguments["path"])
         if context.file_locks is None:
             raise RuntimeError("当前 Runtime 未启用文件锁，禁止执行 read_file")
         relative = path.relative_to(context.project_root.resolve()).as_posix()
@@ -194,7 +193,7 @@ class ReadFileTool:
     }
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> str:
-        path = safe_workspace_path(context.project_root, arguments["path"])
+        path = context.resolve_workspace_path(arguments["path"])
         if path.suffix.lower() in _DOCUMENT_FORMAT_SUFFIXES:
             return await self._documents.read(arguments, context)
         if path.suffix.lower() in self._unsupported_binary_suffixes:

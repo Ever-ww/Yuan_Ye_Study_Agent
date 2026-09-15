@@ -3,8 +3,10 @@
 from pathlib import Path
 
 
-def safe_workspace_path(root: Path, requested: str) -> Path:
+def safe_workspace_path(root: Path, requested: str, *, path_mapping=None) -> Path:
     """解析路径，并阻止越界或访问敏感配置文件。"""
+    if path_mapping is not None:
+        return path_mapping.resolve_workspace_path(requested)
     workspace = root.resolve()
     path = (workspace / requested).resolve()
     if workspace != path and workspace not in path.parents:

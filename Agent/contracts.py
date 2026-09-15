@@ -15,8 +15,10 @@ class EventType(str, Enum):
     STARTED = "started"
     SANDBOX_FALLBACK = "sandbox_fallback"
     TEXT = "text"
+    REASONING = "reasoning"
     MODEL_RETRY = "model_retry"
     MODEL_RECONNECTED = "model_reconnected"
+    MODEL_USAGE = "model_usage"
     TOOL_REQUESTED = "tool_requested"
     TOOL_BATCH_STARTED = "tool_batch_started"
     TOOL_BATCH_COMPLETED = "tool_batch_completed"
@@ -56,6 +58,8 @@ class TokenUsage(BaseModel):
 
     input_tokens: int | None = Field(default=None, ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
+    cache_miss_input_tokens: int | None = Field(default=None, ge=0)
+    cache_metrics_source: str | None = Field(default=None, min_length=1)
     output_tokens: int | None = Field(default=None, ge=0)
 
 

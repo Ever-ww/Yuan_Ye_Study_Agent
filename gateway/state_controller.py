@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import sqlite3
+import threading
+import time
+import zlib
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -108,6 +112,7 @@ class StateController:
     """以 SQLite 事务实现 command 幂等、CAS、FSM guard 和 Outbox。"""
 
     SCHEMA_VERSION = 13
+    _PROCESSED_COMMAND_ENCODING_KEY = "__yy_processed_command_encoding__"
 
     def __init__(
         self,
@@ -116,11 +121,33 @@ class StateController:
         gateway_epoch: str,
         migration_backup_path: Path | None = None,
         write_gate: "AgentHomeWriteGate | None" = None,
+        health_cache_seconds: float = 30.0,
+        storage_health_cache_seconds: float = 300.0,
+        processed_command_compression_min_bytes: int = 1024,
+        database_warning_bytes: int = 500_000_000,
+        database_critical_bytes: int = 1_000_000_000,
     ) -> None:
         self.database_path = database_path.resolve()
         self.gateway_epoch = gateway_epoch
         self.migration_backup_path = migration_backup_path
         self.write_gate = write_gate
+        self.health_cache_seconds = max(0.0, float(health_cache_seconds))
+        self.storage_health_cache_seconds = max(0.0, float(storage_health_cache_seconds))
+        self.processed_command_compression_min_bytes = max(
+            0, int(processed_command_compression_min_bytes),
+        )
+        self.database_warning_bytes = max(1, int(database_warning_bytes))
+        self.database_critical_bytes = max(
+            self.database_warning_bytes, int(database_critical_bytes),
+        )
+        self._health_cache_lock = threading.RLock()
+        self._health_cache: dict[str, Any] | None = None
+        self._health_cache_monotonic = 0.0
+        self._storage_health_cache: dict[str, Any] | None = None
+        self._storage_health_cache_monotonic = 0.0
+        self._last_integrity_check = "pending"
+        self._last_integrity_checked_at: str | None = None
+        self._last_database_maintenance_error: str | None = None
         self._initializing = True
         self._backup_before_state_migration()
         try:
@@ -135,9 +162,7 @@ class StateController:
     def initialize(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as connection:
-            check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
-            if check != "ok":
-                raise RuntimeError(f"Gateway SQLite quick_check 失败：{check}")
+            starting_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS agent_states (
@@ -723,9 +748,17 @@ class StateController:
             foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
             if foreign_key_errors:
                 raise RuntimeError(f"Gateway SQLite foreign_key_check 失败：{foreign_key_errors[:5]}")
-            final_check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
-            if final_check != "ok":
-                raise RuntimeError(f"Gateway SQLite migration 后 quick_check 失败：{final_check}")
+            # A full quick_check walks the complete database.  It is mandatory
+            # after a schema migration, but doing it twice on every cold start
+            # made a healthy, growing Gateway database part of the readiness
+            # critical path.  Unchanged databases are checked by the periodic
+            # maintenance worker after the Gateway becomes ready.
+            if starting_version != self.SCHEMA_VERSION:
+                final_check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+                self._last_integrity_check = final_check
+                self._last_integrity_checked_at = now_iso()
+                if final_check != "ok":
+                    raise RuntimeError(f"Gateway SQLite migration 后 quick_check 失败：{final_check}")
 
     def _migrate_gateway_event_v10(self, connection: sqlite3.Connection) -> None:
         """Convert v9 sink columns into the final generic delivery ledger.
@@ -1183,6 +1216,8 @@ class StateController:
         parent_run_id: str | None = None,
         deadline_at: str | None = None,
         runtime_generation_id: str | None = None,
+        model_profile_id: str = "default",
+        reasoning_effort: str = "none",
     ) -> tuple[AgentState, bool]:
         """原子建立 Run、Event、Outbox及其可选Runtime Generation绑定。"""
         timestamp = now_iso()
@@ -1218,8 +1253,12 @@ class StateController:
             )
             connection.execute(
                 "INSERT INTO runs(run_id,project_id,session_id,client_id,task,status,created_at,"
-                "started_at,finished_at,answer,error) VALUES(?,?,?,?,?,'queued',?,NULL,NULL,NULL,NULL)",
-                (run_id, project_id, session_id, client_id, task, timestamp),
+                "started_at,finished_at,answer,error,model_profile_id,reasoning_effort) "
+                "VALUES(?,?,?,?,?,'queued',?,NULL,NULL,NULL,NULL,?,?)",
+                (
+                    run_id, project_id, session_id, client_id, task, timestamp,
+                    model_profile_id, reasoning_effort,
+                ),
             )
             connection.execute(
                 "INSERT INTO event_sequences(run_id,last_sequence) VALUES(?,0)", (run_id,),
@@ -1273,7 +1312,10 @@ class StateController:
             if duplicate is not None:
                 if duplicate["command_hash"] != command_hash:
                     raise StateConflictError("同一 command_id 被用于不同命令")
-                result = ApplyResult.model_validate_json(duplicate["result_json"], strict=True)
+                result = ApplyResult.model_validate_json(
+                    self._decode_processed_command_result(str(duplicate["result_json"])),
+                    strict=True,
+                )
                 connection.commit()
                 return result.model_copy(update={"duplicate": True})
 
@@ -1755,7 +1797,13 @@ class StateController:
             )
             connection.execute(
                 "INSERT INTO processed_commands VALUES(?,?,?,?,?)",
-                (command.command_id, state.run_id, command_hash, result.model_dump_json(), timestamp),
+                (
+                    command.command_id,
+                    state.run_id,
+                    command_hash,
+                    self._encode_processed_command_result(result.model_dump_json()),
+                    timestamp,
+                ),
             )
             connection.commit()
             return result
@@ -2842,30 +2890,183 @@ class StateController:
             ).fetchall()
         return [AgentState.model_validate_json(row["state_json"], strict=True) for row in rows]
 
-    def health(self) -> dict[str, Any]:
-        timestamp = datetime.now().astimezone()
+    def _encode_processed_command_result(self, raw: str) -> str:
+        """Keep exact command replay evidence while reducing its hot SQLite footprint."""
+
+        payload = raw.encode("utf-8")
+        if len(payload) < self.processed_command_compression_min_bytes:
+            return raw
+        compressed = zlib.compress(payload, level=6)
+        wrapper = canonical_json({
+            self._PROCESSED_COMMAND_ENCODING_KEY: "zlib-base64-v1",
+            "content_sha256": hashlib.sha256(payload).hexdigest(),
+            "data": base64.b64encode(compressed).decode("ascii"),
+            "uncompressed_bytes": len(payload),
+        })
+        # Tiny or already-compressed results can grow after base64 and metadata.
+        return wrapper if len(wrapper.encode("utf-8")) < len(payload) else raw
+
+    @classmethod
+    def _decode_processed_command_result(cls, stored: str) -> str:
+        try:
+            wrapper = json.loads(stored)
+        except json.JSONDecodeError:
+            # Old rows were stored as ordinary ApplyResult JSON.  An invalid row
+            # will still fail strict ApplyResult validation at the caller.
+            return stored
+        if not isinstance(wrapper, dict) or (
+            wrapper.get(cls._PROCESSED_COMMAND_ENCODING_KEY) != "zlib-base64-v1"
+        ):
+            return stored
+        try:
+            compressed = base64.b64decode(str(wrapper["data"]), validate=True)
+            payload = zlib.decompress(compressed)
+            expected_size = int(wrapper["uncompressed_bytes"])
+            expected_hash = str(wrapper["content_sha256"])
+        except (KeyError, TypeError, ValueError, zlib.error) as exc:
+            raise StateInvariantError("processed command replay evidence is corrupt") from exc
+        if len(payload) != expected_size or hashlib.sha256(payload).hexdigest() != expected_hash:
+            raise StateInvariantError("processed command replay evidence hash mismatch")
+        try:
+            return payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise StateInvariantError("processed command replay evidence is not UTF-8") from exc
+
+    def compact_processed_commands(self, *, limit: int = 500) -> dict[str, int]:
+        """Compress legacy replay results in bounded, restart-safe batches.
+
+        The command id, command hash and exact decoded ApplyResult remain intact,
+        so an old command retry has the same semantics as before compaction.
+        """
+
+        selected_limit = max(1, int(limit))
+        marker = f'"{self._PROCESSED_COMMAND_ENCODING_KEY}"'
+        inspected = 0
+        compacted = 0
+        bytes_before = 0
+        bytes_after = 0
         with self._connection() as connection:
-            quick_check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT command_id,result_json FROM processed_commands "
+                "WHERE LENGTH(CAST(result_json AS BLOB))>=? AND instr(result_json,?)=0 "
+                "ORDER BY rowid LIMIT ?",
+                (self.processed_command_compression_min_bytes, marker, selected_limit),
+            ).fetchall()
+            for row in rows:
+                inspected += 1
+                raw = str(row["result_json"])
+                encoded = self._encode_processed_command_result(raw)
+                if encoded == raw:
+                    continue
+                updated = connection.execute(
+                    "UPDATE processed_commands SET result_json=? "
+                    "WHERE command_id=? AND result_json=?",
+                    (encoded, str(row["command_id"]), raw),
+                )
+                if updated.rowcount == 1:
+                    compacted += 1
+                    bytes_before += len(raw.encode("utf-8"))
+                    bytes_after += len(encoded.encode("utf-8"))
+            connection.commit()
+        self.invalidate_storage_health_cache()
+        return {
+            "inspected": inspected,
+            "compacted": compacted,
+            "bytes_before": bytes_before,
+            "bytes_after": bytes_after,
+            "bytes_saved": max(0, bytes_before - bytes_after),
+        }
+
+    def invalidate_health_cache(self) -> None:
+        with self._health_cache_lock:
+            self._health_cache = None
+            self._health_cache_monotonic = 0.0
+
+    def invalidate_storage_health_cache(self) -> None:
+        with self._health_cache_lock:
+            self._storage_health_cache = None
+            self._storage_health_cache_monotonic = 0.0
+        self.invalidate_health_cache()
+
+    def record_database_maintenance_error(self, error: BaseException | str) -> None:
+        self._last_database_maintenance_error = (
+            str(error) or (type(error).__name__ if isinstance(error, BaseException) else "unknown")
+        )
+        self.invalidate_health_cache()
+
+    def refresh_integrity_check(self) -> str:
+        """Run the expensive full SQLite check outside readiness polling."""
+
+        try:
+            with self._connection() as connection:
+                result = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+        except Exception as exc:
+            result = f"error:{type(exc).__name__}"
+            self._last_database_maintenance_error = str(exc) or type(exc).__name__
+        self._last_integrity_check = result
+        self._last_integrity_checked_at = now_iso()
+        self.invalidate_health_cache()
+        return result
+
+    def run_database_maintenance(
+        self,
+        *,
+        processed_command_batch_size: int = 500,
+        incremental_vacuum_pages: int = 1024,
+    ) -> dict[str, Any]:
+        """Perform bounded maintenance without deleting durable evidence."""
+
+        compacted = self.compact_processed_commands(limit=processed_command_batch_size)
+        integrity = self.refresh_integrity_check()
+        vacuumed = 0
+        requested_pages = max(0, int(incremental_vacuum_pages))
+        if requested_pages:
+            if self.write_gate is not None:
+                self.write_gate.check_mutation_admission()
+            with self._connection() as connection:
+                auto_vacuum = int(connection.execute("PRAGMA auto_vacuum").fetchone()[0])
+                before = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+                if auto_vacuum == 2 and before:
+                    connection.execute(f"PRAGMA incremental_vacuum({requested_pages})")
+                    after = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+                    vacuumed = max(0, before - after)
+                connection.execute("PRAGMA optimize")
+        self._last_database_maintenance_error = None if integrity == "ok" else integrity
+        self.invalidate_storage_health_cache()
+        return {
+            "processed_commands": compacted,
+            "sqlite_quick_check": integrity,
+            "incremental_vacuum_pages": vacuumed,
+        }
+
+    def health(self) -> dict[str, Any]:
+        now_monotonic = time.monotonic()
+        with self._health_cache_lock:
+            if self._health_cache is not None and (
+                now_monotonic - self._health_cache_monotonic <= self.health_cache_seconds
+            ):
+                cached = dict(self._health_cache)
+                cached["health_cache_age_seconds"] = round(
+                    max(0.0, now_monotonic - self._health_cache_monotonic), 3,
+                )
+                return cached
+        result = self._collect_health()
+        with self._health_cache_lock:
+            self._health_cache = dict(result)
+            self._health_cache_monotonic = time.monotonic()
+        result["health_cache_age_seconds"] = 0.0
+        return result
+
+    def _collect_health(self) -> dict[str, Any]:
+        timestamp = datetime.now().astimezone()
+        storage = self._storage_health()
+        with self._connection() as connection:
             outbox = int(connection.execute(
                 "SELECT COUNT(*) FROM event_outbox WHERE completed_at IS NULL",
             ).fetchone()[0])
             dead_letters = int(connection.execute(
                 "SELECT COUNT(*) FROM event_deliveries WHERE status='dead_lettered'",
-            ).fetchone()[0])
-            hot_count, hot_bytes, oldest_hot = connection.execute(
-                "SELECT COUNT(*),COALESCE(SUM(LENGTH(CAST(canonical_event_json AS BLOB))),0),"
-                "MIN(occurred_at) FROM gateway_events WHERE storage_tier='hot'",
-            ).fetchone()
-            archive_count, archived_events, oldest_archive = connection.execute(
-                "SELECT COUNT(*),COALESCE(SUM(event_count),0),MIN(created_at) "
-                "FROM gateway_event_archives WHERE status='verified'",
-            ).fetchone()
-            archive_paths = [Path(str(row[0])) for row in connection.execute(
-                "SELECT archive_path FROM gateway_event_archives WHERE status='verified'",
-            ).fetchall()]
-            archive_failures = int(connection.execute(
-                "SELECT COUNT(*) FROM gateway_event_archives "
-                "WHERE status IN ('failed','recovery_required')",
             ).fetchone()[0])
             retrying = int(connection.execute(
                 "SELECT COUNT(*) FROM event_deliveries WHERE status='retrying'",
@@ -2919,17 +3120,11 @@ class StateController:
                 "('pending','waiting','requested')",
             ).fetchone()[0])
         return {
-            "sqlite_quick_check": quick_check,
+            "sqlite_quick_check": self._last_integrity_check,
+            "sqlite_quick_check_at": self._last_integrity_checked_at,
             "outbox_backlog": outbox,
             "outbox_dead_letters": dead_letters,
-            "gateway_event_hot_count": int(hot_count),
-            "gateway_event_hot_bytes": int(hot_bytes),
-            "oldest_hot_event_at": oldest_hot,
-            "archive_count": int(archive_count),
-            "archived_event_count": int(archived_events),
-            "archive_bytes": sum(path.stat().st_size for path in archive_paths if path.exists()),
-            "oldest_archive_at": oldest_archive,
-            "archive_verification_failures": archive_failures,
+            **storage,
             "delivery_retrying": retrying,
             "delivery_dead_lettered": dead_letters,
             "delivery_attempt_failures": attempt_failures,
@@ -2942,10 +3137,87 @@ class StateController:
             "stalled_operations": stalled,
             "harness_dream_recovery_required": dream_recovery,
             "gateway_restart_pending": restart_pending,
+            "gateway_database_maintenance_error": self._last_database_maintenance_error,
             "max_state_age_seconds": _age_seconds(oldest_state, timestamp),
             "max_heartbeat_age_seconds": _age_seconds(oldest_heartbeat, timestamp),
             "migration_backup": str(self.migration_backup_path) if self.migration_backup_path else None,
         }
+
+    def _storage_health(self) -> dict[str, Any]:
+        now_monotonic = time.monotonic()
+        with self._health_cache_lock:
+            if self._storage_health_cache is not None and (
+                now_monotonic - self._storage_health_cache_monotonic
+                <= self.storage_health_cache_seconds
+            ):
+                cached = dict(self._storage_health_cache)
+                cached["storage_health_cache_age_seconds"] = round(
+                    max(0.0, now_monotonic - self._storage_health_cache_monotonic), 3,
+                )
+                return cached
+        with self._connection() as connection:
+            hot_count, hot_bytes, oldest_hot = connection.execute(
+                "SELECT COUNT(*),COALESCE(SUM(LENGTH(CAST(canonical_event_json AS BLOB))),0),"
+                "MIN(occurred_at) FROM gateway_events WHERE storage_tier='hot'",
+            ).fetchone()
+            archive_count, archived_events, oldest_archive = connection.execute(
+                "SELECT COUNT(*),COALESCE(SUM(event_count),0),MIN(created_at) "
+                "FROM gateway_event_archives WHERE status='verified'",
+            ).fetchone()
+            archive_paths = [Path(str(row[0])) for row in connection.execute(
+                "SELECT archive_path FROM gateway_event_archives WHERE status='verified'",
+            ).fetchall()]
+            archive_failures = int(connection.execute(
+                "SELECT COUNT(*) FROM gateway_event_archives "
+                "WHERE status IN ('failed','recovery_required')",
+            ).fetchone()[0])
+            processed_count, processed_bytes, compressed_commands = connection.execute(
+                "SELECT COUNT(*),COALESCE(SUM(LENGTH(CAST(result_json AS BLOB))),0),"
+                "COALESCE(SUM(CASE WHEN instr(result_json,?)>0 THEN 1 ELSE 0 END),0) "
+                "FROM processed_commands",
+                (f'"{self._PROCESSED_COMMAND_ENCODING_KEY}"',),
+            ).fetchone()
+            page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+            freelist_pages = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+            auto_vacuum = int(connection.execute("PRAGMA auto_vacuum").fetchone()[0])
+        database_bytes = self.database_path.stat().st_size if self.database_path.exists() else 0
+        wal_path = Path(f"{self.database_path}-wal")
+        wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+        total_database_bytes = database_bytes + wal_bytes
+        if total_database_bytes >= self.database_critical_bytes:
+            capacity_status = "critical"
+        elif total_database_bytes >= self.database_warning_bytes:
+            capacity_status = "warning"
+        else:
+            capacity_status = "ok"
+        result = {
+            "gateway_event_hot_count": int(hot_count),
+            "gateway_event_hot_bytes": int(hot_bytes),
+            "oldest_hot_event_at": oldest_hot,
+            "archive_count": int(archive_count),
+            "archived_event_count": int(archived_events),
+            "archive_bytes": sum(path.stat().st_size for path in archive_paths if path.exists()),
+            "oldest_archive_at": oldest_archive,
+            "archive_verification_failures": archive_failures,
+            "processed_command_count": int(processed_count),
+            "processed_command_storage_bytes": int(processed_bytes),
+            "processed_command_compressed_count": int(compressed_commands),
+            "gateway_database_bytes": database_bytes,
+            "gateway_database_wal_bytes": wal_bytes,
+            "gateway_database_total_bytes": total_database_bytes,
+            "gateway_database_reclaimable_bytes": freelist_pages * page_size,
+            "gateway_database_auto_vacuum": (
+                "incremental" if auto_vacuum == 2 else "full" if auto_vacuum == 1 else "none"
+            ),
+            "gateway_database_capacity_status": capacity_status,
+            "gateway_database_warning_bytes": self.database_warning_bytes,
+            "gateway_database_critical_bytes": self.database_critical_bytes,
+            "storage_health_cache_age_seconds": 0.0,
+        }
+        with self._health_cache_lock:
+            self._storage_health_cache = dict(result)
+            self._storage_health_cache_monotonic = time.monotonic()
+        return result
 
     def prune_retention(self, *, now: datetime | None = None) -> dict[str, int]:
         """Apply control-plane retention without deleting durable operation evidence."""

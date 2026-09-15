@@ -54,6 +54,9 @@ def test_main_agent_uses_stable_prefix_and_provider_only_dynamic_tail(tmp_path: 
         assert "Session ID：" not in first_messages[0]["content"]
         assert "分段绝对路径：" not in first_messages[0]["content"]
         assert str(config.workspace_root) not in first_messages[0]["content"]
+        assert "# 能力缺口与 Tool 演进" in first_messages[0]["content"]
+        assert "必须调用 `harness_capability`" in first_messages[0]["content"]
+        assert "参数错误、缺少凭据、Policy 或审批拒绝" in first_messages[0]["content"]
 
         assert first_messages[-1]["content"].startswith("<user_query>\nfirst query\n</user_query>")
         assert '<agent_runtime_context ephemeral="true">' in first_messages[-1]["content"]

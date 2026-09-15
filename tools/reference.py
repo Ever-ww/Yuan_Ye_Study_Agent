@@ -17,7 +17,6 @@ from reference import (
 )
 from reference.models import PaperFile
 from tool.contracts import ToolContext
-from tool.path_guard import safe_workspace_path
 
 if TYPE_CHECKING:
     from paper_library import PaperLibraryService
@@ -283,7 +282,7 @@ class ReferenceWriteTool:
                 workspace_hash = "global-paper-library"
             else:
                 relative_path = _required(arguments, "path")
-                path = safe_workspace_path(context.project_root, relative_path)
+                path = context.resolve_workspace_path(relative_path)
                 if not path.is_file() or path.suffix.casefold() != ".pdf":
                     raise ValueError("reference_write.link_file 只能关联当前 workspace 中存在的 PDF")
                 if context.file_locks is not None:

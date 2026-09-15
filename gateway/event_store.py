@@ -667,7 +667,7 @@ class GatewayEventArchiveScheduler:
             return
         self._stop.set()
         self._task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
             await self._task
         self._task = None
 

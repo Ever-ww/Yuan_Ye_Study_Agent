@@ -84,6 +84,21 @@ def _sanitize(value: Any, secrets: tuple[str, ...] = ()) -> Any:
     return str(value)
 
 
+def _model_visible(value: Any, path_mapping: Any | None) -> Any:
+    """Project known host roots to the Runtime's immutable logical namespace."""
+    if path_mapping is None:
+        return value
+    if isinstance(value, dict):
+        return {key: _model_visible(item, path_mapping) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_model_visible(item, path_mapping) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_model_visible(item, path_mapping) for item in value)
+    if isinstance(value, str):
+        return path_mapping.sanitize_for_model(value)
+    return value
+
+
 class ErrorSnapshotWriter:
     """创建无索引、只按哈希命名的完整错误复现 JSONL。"""
 
@@ -804,6 +819,9 @@ def create_coding_runtime(
     """复用正式 AgentRuntime 装配具备完整工作区能力的 Coding Agent。"""
     isolated = config.model_copy(update={
         "workspace_root": worktree_root.resolve(),
+        # Harness/Dream code changes must resolve YYAgentSource, YYSkills and
+        # YYHooks against this exact worktree for the lifetime of the Runtime.
+        "coding_source_root": worktree_root.resolve(),
         "stream": False,
         "compression_threshold_tokens": config.compression_threshold_tokens or 200000,
     })
@@ -917,7 +935,11 @@ def _runtime_profile_and_trace(
         else Path(__file__).resolve().parent / "runtime"
     )
     profile = resource_loader.profile(HarnessRuntimeTrigger(trigger))
-    isolated = config.model_copy(update={"workspace_root": worktree.resolve(), "stream": False})
+    isolated = config.model_copy(update={
+        "workspace_root": worktree.resolve(),
+        "coding_source_root": worktree.resolve(),
+        "stream": False,
+    })
     skills = resource_loader.build_skills(
         profile,
         agent_root=isolated.agent_root,
@@ -1772,7 +1794,10 @@ class HarnessEvolutionEngine:
         if request.snapshot_path is not None:
             snapshot = request.snapshot_path.resolve()
             origin_refs["error_snapshot"] = {
-                "path": str(snapshot),
+                # The snapshot lives in Gateway state, outside the coding
+                # worktree.  Give the model a stable evidence identity, never
+                # an unusable host path.
+                "ref": f"error-snapshot:{snapshot.name}",
                 "content_hash": hashlib.sha256(snapshot.read_bytes()).hexdigest()
                 if snapshot.is_file() else "",
             }
@@ -1790,8 +1815,9 @@ class HarnessEvolutionEngine:
             sort_keys=True,
             separators=(",", ":"),
         )
+        mapping = getattr(runtime, "path_mapping", None)
         controller.update(
-            origin_refs=_sanitize(origin_refs),
+            origin_refs=_model_visible(_sanitize(origin_refs), mapping),
             worktree_state={
                 "isolated": True,
                 "workspace_name": worktree.name,
@@ -1799,7 +1825,7 @@ class HarnessEvolutionEngine:
             git_state=_sanitize(git_state),
             current_attempt=attempt,
             assigned_validation={"test_file": test_file} if test_file else {},
-            previous_validation_summary=str(_sanitize(feedback[-12000:])),
+            previous_validation_summary=str(_model_visible(_sanitize(feedback[-12000:]), mapping)),
             recovery_constraints=(
                 "Do not repeat an UNKNOWN external or Git side effect.",
                 "Do not modify durable history to make recovery appear successful.",
@@ -1808,6 +1834,8 @@ class HarnessEvolutionEngine:
         )
 
     async def _invoke_runtime(self, runtime: Any, prompt: str) -> str:
+        mapping = getattr(runtime, "path_mapping", None)
+        prompt = str(_model_visible(prompt, mapping))
         session_id = str(getattr(runtime, "coding_session_id", "")) or None
         run_task = getattr(runtime, "run_task", None)
         if callable(run_task):
@@ -2157,6 +2185,18 @@ def _runtime_targets_worktree(runtime: Any, worktree: Path) -> bool:
     if declared is not None:
         roots.append(Path(declared).resolve())
     expected = worktree.resolve()
+    mapping = getattr(runtime, "path_mapping", None)
+    if mapping is not None:
+        roots.extend((
+            Path(mapping.workspace_root).resolve(),
+            Path(mapping.agent_source_root).resolve(),
+        ))
+        # Aliases are derived, but assert their exact target here as a defense
+        # against a future independently-configurable Skill/Hook path.
+        if Path(mapping.skills_root).resolve() != expected / "skills":
+            return False
+        if Path(mapping.hooks_root).resolve() != expected / "extension" / "hook":
+            return False
     return bool(roots) and all(root == expected for root in roots)
 
 

@@ -66,6 +66,16 @@ class GatewayApprovalBroker:
             return False
         if self.state_controller is None:
             raise RuntimeError("Interactive approval requires StateController durable authority")
+        operation_id = current_operation_id()
+        attempt_id = current_attempt_id()
+        if operation_id is None or attempt_id is None:
+            raise RuntimeError("Durable Approval 缺少对应的 Operation")
+        operation = self.state_controller.operation(operation_id)
+        if operation.run_id != run_id:
+            raise RuntimeError("Durable Approval Operation 与当前 Run 不匹配")
+        attempt = self.state_controller.current_attempt(operation_id)
+        if attempt.attempt_id != attempt_id:
+            raise RuntimeError("Durable Approval Attempt 已变化")
         request = ApprovalRequest(
             approval_id=uuid4().hex,
             run_id=run_id,
@@ -75,16 +85,6 @@ class GatewayApprovalBroker:
             created_at=now_iso(),
         )
         future = asyncio.get_running_loop().create_future()
-        async with self._lock:
-            self._pending[request.approval_id] = (request, future)
-        operation_id = current_operation_id()
-        attempt_id = current_attempt_id()
-        if operation_id is None or attempt_id is None:
-            raise RuntimeError("Durable Approval 缺少对应的 Operation")
-        operation = self.state_controller.operation(operation_id)
-        attempt = self.state_controller.current_attempt(operation_id)
-        if attempt.attempt_id != attempt_id:
-            raise RuntimeError("Durable Approval Attempt 已变化")
         expires = (
             datetime.now().astimezone() + timedelta(seconds=self.approval_timeout_seconds)
         ).isoformat(timespec="seconds")
@@ -110,6 +110,11 @@ class GatewayApprovalBroker:
                 expires_at=expires,
             ),
         ))
+        # Publish an in-process waiter only after its canonical Approval exists.
+        # Validation or durable-write failures must not leak phantom requests
+        # that disconnect cleanup cannot resolve from SQLite.
+        async with self._lock:
+            self._pending[request.approval_id] = (request, future)
         try:
             await self.publish(request)
             if self.wait_for_client is not None and not await self.wait_for_client(client_id):
@@ -172,7 +177,18 @@ class GatewayApprovalBroker:
             ]
             for approval_id, future in selected:
                 if self.state_controller is not None:
-                    approval = self.state_controller.approval(approval_id)
+                    try:
+                        approval = self.state_controller.approval(approval_id)
+                    except KeyError:
+                        # The durable Approval may already have been finalized or
+                        # removed by recovery while the process-local waiter was
+                        # still present.  WebSocket disconnect cleanup is
+                        # idempotent: resolve that stale waiter as denied instead
+                        # of leaking a KeyError through the ASGI connection.
+                        if not future.done():
+                            future.set_result(False)
+                        self._pending.pop(approval_id, None)
+                        continue
                     state = self.state_controller.state(approval.run_id)
                     self.state_controller.apply(DecideApprovalCommand(
                         command_id=f"approval:{approval_id}:disconnect-deny",
@@ -190,6 +206,7 @@ class GatewayApprovalBroker:
                     pass
                 if not future.done():
                     future.set_result(False)
+                self._pending.pop(approval_id, None)
         return len(selected)
 
     async def deny_all(self) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -13,10 +14,12 @@ from backup import (
     AgentHomeDurabilityCatalog,
     AgentHomeWriteGate,
     BackupService,
+    BackupSecret,
     EncryptedBackupArchive,
     MaintenanceBlockedError,
     RestoreJournal,
     RestoreService,
+    SystemManagedBackupKeyStore,
 )
 from backup.control import create_restore_fence, remove_restore_fence
 from backup.control import ExternalControlLock
@@ -27,6 +30,52 @@ from gateway.application import GatewayApplication
 
 
 class BackupTests(unittest.TestCase):
+    def test_system_managed_backup_uses_key_reference_and_restores_without_prompt(self) -> None:
+        class FakeSystemKeyStore:
+            key_id = "a" * 64
+
+            def get_or_create(self) -> BackupSecret:
+                return BackupSecret("generated-system-secret", "os_managed", self.key_id)
+
+            def get(self, key_id: str | None = None) -> BackupSecret | None:
+                if key_id != self.key_id:
+                    return None
+                return BackupSecret("generated-system-secret", "os_managed", self.key_id)
+
+            def status(self) -> dict[str, object]:
+                return {"supported": True, "key_available": True, "key_id": self.key_id}
+
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            home = root / ".yy"
+            home.mkdir()
+            (home / "profile.txt").write_text("managed", encoding="utf-8")
+            service = BackupService(root, system_key_store=FakeSystemKeyStore())  # type: ignore[arg-type]
+            record = asyncio.run(service.create())
+            header = EncryptedBackupArchive.read_header(record.path)
+            self.assertEqual(record.encryption_mode, "os_managed")
+            self.assertEqual(header.key_mode, "os_managed")
+            self.assertEqual(header.key_id, "a" * 64)
+            self.assertTrue(service.verify(record.path).valid)
+
+    @unittest.skipUnless(os.name == "nt", "Windows DPAPI integration")
+    def test_windows_system_key_is_stable_and_not_stored_in_plaintext(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            home = root / ".yy"
+            home.mkdir()
+            (home / "profile.txt").write_text("dpapi", encoding="utf-8")
+            first_store = SystemManagedBackupKeyStore(root)
+            first = first_store.get_or_create()
+            second = SystemManagedBackupKeyStore(root).get_or_create()
+            self.assertEqual(first, second)
+            raw = first_store.protected_path.read_bytes()
+            self.assertNotIn(first.value.encode("utf-8"), raw)
+            self.assertEqual(first.mode, "os_managed")
+            service = BackupService(root)
+            backup = asyncio.run(service.create())
+            self.assertTrue(service.verify(backup.path).valid)
+
     def test_automatic_backup_inbox_is_silent_on_success_and_coalesces_failures(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             config = load_runtime_config(Path(value), dream_enabled=False)
@@ -73,6 +122,7 @@ class BackupTests(unittest.TestCase):
             archive = EncryptedBackupArchive.write(
                 root / "test.yybackup", "secret", manifest, sources,
             )
+            self.assertEqual(EncryptedBackupArchive.read_header(archive).key_mode, "passphrase")
             restored = root / "restored"
             selected = EncryptedBackupArchive.extract(archive, "secret", restored)
             self.assertEqual(selected.backup_id, manifest.backup_id)

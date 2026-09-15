@@ -55,6 +55,7 @@ class DreamScheduler:
         self._retry_after: datetime | None = None
         self.last_error: str | None = None
         self._maintenance_epoch: int | None = None
+        self._active_ticks: set[asyncio.Task[DreamRunResult | None]] = set()
         self.write_gate = write_gate
 
     async def start(self) -> None:
@@ -69,17 +70,38 @@ class DreamScheduler:
         task, self._task = self._task, None
         if task is not None:
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await task
 
     def wake(self) -> None:
         self._wake.set()
 
     async def tick(self) -> DreamRunResult | None:
-        if self.write_gate is not None:
-            async with self.write_gate.operation("dream", f"tick:{self._local_now().isoformat()}"):
-                return await self._tick_impl()
-        return await self._tick_impl()
+        async def execute() -> DreamRunResult | None:
+            if self.write_gate is not None:
+                async with self.write_gate.operation(
+                    "dream", f"tick:{self._local_now().isoformat()}",
+                ):
+                    return await self._tick_impl()
+            return await self._tick_impl()
+
+        task = asyncio.create_task(execute(), name="gateway-dream-tick")
+        self._active_ticks.add(task)
+        try:
+            return await task
+        except asyncio.CancelledError:
+            # A participant pre-drain cancellation is an expected cooperative
+            # pause.  Parent cancellation (Gateway close/caller cancellation)
+            # must retain normal asyncio propagation semantics.
+            if (
+                self._maintenance_epoch is not None
+                and not self._closing
+                and task.cancelled()
+            ):
+                return None
+            raise
+        finally:
+            self._active_ticks.discard(task)
 
     async def _tick_impl(self) -> DreamRunResult | None:
         async with self._tick_lock:
@@ -111,7 +133,7 @@ class DreamScheduler:
                         result = no_work
                     else:
                         result = await self.run_day(due)
-                        await self.on_result(result, True)
+                        await self._finish_durable_result(result)
                 except Exception as exc:
                     self.last_error = str(exc) or type(exc).__name__
                     self._retry_after = now + timedelta(seconds=max(300, self.heartbeat_seconds))
@@ -140,17 +162,44 @@ class DreamScheduler:
                     self.last_error = str(exc) or type(exc).__name__
             return result
 
-    async def quiesce(self, maintenance_epoch: int) -> QuiesceResult:
-        if self._maintenance_epoch is not None and maintenance_epoch <= self._maintenance_epoch:
-            return QuiesceResult(participant="dream", maintenance_epoch=maintenance_epoch,
-                                  acknowledged=maintenance_epoch == self._maintenance_epoch,
-                                  stale=maintenance_epoch < self._maintenance_epoch)
+    async def _finish_durable_result(self, result: DreamRunResult) -> None:
+        """Do not abandon Run finalization after Dream facts have committed."""
+        run_id = str(getattr(result, "run_id", "unknown"))
+        finishing = asyncio.create_task(
+            self.on_result(result, True),
+            name=f"gateway-dream-finalize-{run_id}",
+        )
+        try:
+            await asyncio.shield(finishing)
+        except asyncio.CancelledError:
+            # Once DreamService returned, its canonical Memory transaction may
+            # already be committed. Keep the lease until the matching Gateway
+            # Run/event projection reaches its durable terminal boundary.
+            await finishing
+            raise
+
+    async def prepare_quiesce(self, maintenance_epoch: int) -> None:
+        """Stop active Dream model work before the global lease drain."""
+        if self._maintenance_epoch is not None and maintenance_epoch < self._maintenance_epoch:
+            return
         self._maintenance_epoch = maintenance_epoch
         self._wake.set()
+        for task in tuple(self._active_ticks):
+            if not task.done():
+                task.cancel()
+
+    async def quiesce(self, maintenance_epoch: int) -> QuiesceResult:
+        if self._maintenance_epoch is not None and maintenance_epoch < self._maintenance_epoch:
+            return QuiesceResult(participant="dream", maintenance_epoch=maintenance_epoch,
+                                  acknowledged=False, stale=True)
+        await self.prepare_quiesce(maintenance_epoch)
+        if self._active_ticks:
+            await asyncio.gather(*tuple(self._active_ticks), return_exceptions=True)
         async with self._tick_lock:
             pass
         return QuiesceResult(participant="dream", maintenance_epoch=maintenance_epoch,
-                              acknowledged=True, safe_boundary="day_run_persisted")
+                              acknowledged=True,
+                              safe_boundary="dream_interrupted_or_day_run_persisted")
 
     async def resume(self, maintenance_epoch: int) -> None:
         if self._maintenance_epoch == maintenance_epoch:
@@ -158,7 +207,15 @@ class DreamScheduler:
             self._wake.set()
 
     def status(self) -> DreamStatus:
-        return self.service.status(next_run_at=self._next_run_at())
+        status = self.service.status(next_run_at=self._next_run_at())
+        # Runner/finalization failures happen outside DreamService and used to
+        # be invisible through the status API.
+        if self.last_error:
+            return status.model_copy(update={
+                "last_status": "failed",
+                "last_error": self.last_error,
+            })
+        return status
 
     def _due_date(self, now: datetime) -> date | None:
         state = self.service.status()
@@ -208,5 +265,5 @@ class DreamScheduler:
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=self.heartbeat_seconds)
                 self._wake.clear()
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 pass

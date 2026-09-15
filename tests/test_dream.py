@@ -57,6 +57,191 @@ class _DreamModel:
 
 
 class DreamTests(unittest.TestCase):
+    def test_model_attempt_timeout_becomes_failed_result(self) -> None:
+        async def check(root: Path) -> None:
+            config = load_runtime_config(
+                root,
+                dream_enabled=False,
+                dream_timezone="UTC",
+                dream_model_timeout_seconds=0.1,
+            )
+            memory = MemoryStore(
+                config.memory_dir,
+                workspace_root=root / "workspace",
+                agent_root=root,
+            )
+            session_id = "6" * 16
+            memory.create_session("remember this", session_id)
+            _append(
+                memory,
+                session_id,
+                "user",
+                "remember this stable preference",
+                "2026-09-14 09:00:00+00:00",
+            )
+
+            calls = 0
+
+            async def blocked_model(_messages):
+                nonlocal calls
+                calls += 1
+                await asyncio.Event().wait()
+
+            service = DreamService(config, model_runner=blocked_model)
+            result = await service.process_pending(
+                date(2026, 9, 14),
+                run_id="timed-out-model-run",
+            )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(calls, 3)
+            self.assertIn("TimeoutError", result.message)
+            self.assertIsNone(service.status().last_completed_date)
+            journal = service.executions_root / "timed-out-model-run.jsonl"
+            self.assertEqual(
+                journal.read_text(encoding="utf-8").count('"kind":"model_attempt_failed"'),
+                3,
+            )
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(check(Path(value)))
+
+    def test_whole_dream_timeout_is_persisted_and_run_finalizes(self) -> None:
+        async def check(root: Path) -> None:
+            app = GatewayApplication(load_runtime_config(
+                root,
+                observer_enabled=False,
+                dream_enabled=False,
+                harness_dream_enabled=False,
+                dream_run_timeout_seconds=1.0,
+            ))
+
+            async def blocked_process(_selected, *, run_id):
+                del run_id
+                await asyncio.Event().wait()
+
+            app.dream_service.process_pending = blocked_process
+            result = await app._execute_dream_day(
+                date(2026, 9, 14),
+                automatic=True,
+            )
+            self.assertEqual(result.status, "failed")
+            self.assertIn("exceeded 1 seconds", result.message)
+            self.assertEqual(app.dream_service.status().last_run_id, result.run_id)
+            self.assertEqual(app.dream_service.status().last_status, "failed")
+
+            await app._record_dream_result(result, True)
+            self.assertEqual(
+                app.state_controller.state(result.run_id).task_state.value,
+                "failed",
+            )
+            await app.close()
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(check(Path(value)))
+
+    def test_scheduler_boundary_error_is_visible_in_status(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            config = load_runtime_config(root, dream_enabled=False)
+            service = DreamService(config, model_runner=_DreamModel())
+            scheduler = DreamScheduler(
+                service,
+                lambda: True,
+                lambda result, automatic: asyncio.sleep(0),
+            )
+            scheduler.last_error = "runner boundary failed"
+
+            status = scheduler.status()
+
+            self.assertEqual(status.last_status, "failed")
+            self.assertEqual(status.last_error, "runner boundary failed")
+
+    def test_cancelled_dream_records_interruption_without_consuming_evidence(self) -> None:
+        async def check(root: Path) -> None:
+            config = load_runtime_config(
+                root,
+                dream_enabled=False,
+                dream_timezone="UTC",
+            )
+            memory = MemoryStore(
+                config.memory_dir,
+                workspace_root=root / "workspace",
+                agent_root=root,
+            )
+            session_id = "9" * 16
+            memory.create_session("remember this", session_id)
+            _append(
+                memory,
+                session_id,
+                "user",
+                "remember this stable preference",
+                "2026-09-14 09:00:00+00:00",
+            )
+            _append(
+                memory,
+                session_id,
+                "assistant",
+                "acknowledged",
+                "2026-09-14 09:00:01+00:00",
+            )
+            entered = asyncio.Event()
+
+            async def blocked_model(_messages):
+                entered.set()
+                await asyncio.Event().wait()
+
+            service = DreamService(config, model_runner=blocked_model)
+            task = asyncio.create_task(
+                service.process_pending(date(2026, 9, 14), run_id="interrupted-run"),
+            )
+            await asyncio.wait_for(entered.wait(), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            journal = service.executions_root / "interrupted-run.jsonl"
+            self.assertIn('"kind":"execution_interrupted"', journal.read_text(encoding="utf-8"))
+            self.assertIsNone(service.status().last_completed_date)
+            self.assertFalse(service.status().running)
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(check(Path(value)))
+
+    def test_cancelled_dream_reaches_durable_terminal_run(self) -> None:
+        async def check(root: Path) -> None:
+            app = GatewayApplication(load_runtime_config(
+                root,
+                observer_enabled=False,
+                dream_enabled=False,
+                harness_dream_enabled=False,
+            ))
+            entered = asyncio.Event()
+
+            async def process_pending(selected, *, run_id):
+                del selected, run_id
+                entered.set()
+                await asyncio.Event().wait()
+
+            app.dream_service.process_pending = process_pending
+            task = asyncio.create_task(
+                app._execute_dream_day(date(2026, 9, 14), automatic=True),
+            )
+            await asyncio.wait_for(entered.wait(), 1)
+            run_id = next(
+                run.run_id for run in app.store.list_runs("dream")
+                if run.workload_kind == "dream"
+            )
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(app.state_controller.state(run_id).task_state.value, "cancelled")
+            self.assertEqual(app.store.run(run_id).status, "cancelled")
+            await app.close()
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(check(Path(value)))
+
     def test_archive_scans_all_workspaces_and_only_user_owns_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)

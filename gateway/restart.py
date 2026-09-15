@@ -152,7 +152,7 @@ def run_restart_helper(
         return
     manager.restart_request_path.unlink(missing_ok=True)
     try:
-        manager.ensure_running(timeout_seconds=20)
+        manager.ensure_running(timeout_seconds=45)
         head = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=source_root, check=False,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,

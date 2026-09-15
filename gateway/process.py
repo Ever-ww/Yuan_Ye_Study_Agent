@@ -20,7 +20,13 @@ from typing import IO
 import httpx
 
 from gateway.security import GatewayCredentials
-from backup import SensitiveEnvSanitizer, assert_restore_inactive, external_control_root
+from backup import (
+    AgentHomeMaintenanceCoordinator,
+    AgentHomeWriteGate,
+    SensitiveEnvSanitizer,
+    assert_restore_inactive,
+    external_control_root,
+)
 from backup.control import _atomic_json
 from backup.models import GatewayControlRequest, MaintenanceState
 from backup.lifecycle_store import LifecycleStore
@@ -68,38 +74,55 @@ class GatewayProcessManager:
                             if (self.directory / "lifecycle.sqlite3").exists() else None),
         }
 
-    def ensure_running(self, timeout_seconds: float = 15.0) -> dict[str, object]:
+    def ensure_running(self, timeout_seconds: float = 45.0) -> dict[str, object]:
+        """Return a healthy Gateway, allowing bounded time for cold recovery.
+
+        A production Agent Home may need to verify a sizeable SQLite store,
+        reconcile durable work and build a Runtime resource Generation before
+        ASGI becomes ready.  Fifteen seconds caused the CLI to report failure
+        while that healthy child was still completing startup.
+        """
         assert_restore_inactive(self.agent_root)
-        if self._healthy():
+        health = self._health_payload()
+        if self._accepts_work(health):
             return self._status_payload(True)
+        self._raise_if_control_only(health)
         deadline = time.monotonic() + timeout_seconds
         startup_lock = InstanceLock(self.startup_lock_path, timeout_seconds=timeout_seconds)
         try:
             startup_lock.acquire()
         except RuntimeError as exc:
-            if self._healthy():
+            health = self._health_payload()
+            if self._accepts_work(health):
                 return self._status_payload(True)
+            self._raise_if_control_only(health)
             raise RuntimeError("等待 Gateway 启动协调锁超时") from exc
         try:
             # 拿到跨进程启动锁后必须重新探测，避免前一个客户端刚刚完成启动。
             assert_restore_inactive(self.agent_root)
-            if self._healthy():
+            health = self._health_payload()
+            if self._accepts_work(health):
                 return self._status_payload(True)
+            self._raise_if_control_only(health)
             self._remove_stale_metadata()
             if self._instance_lock_held():
                 owner = self._instance_owner_pid()
                 suffix = f" PID={owner}" if owner is not None else ""
                 while time.monotonic() < deadline:
-                    if self._healthy():
+                    health = self._health_payload()
+                    if self._accepts_work(health):
                         return self._status_payload(True)
+                    self._raise_if_control_only(health)
                     time.sleep(0.15)
                 raise RuntimeError(
                     f"已有 Gateway 实例{suffix}持有状态锁，但健康接口不可用；"
                     "请先执行 gateway stop 后重试",
                 )
             if not _port_available(self.port):
-                if self._healthy():
+                health = self._health_payload()
+                if self._accepts_work(health):
                     return self._status_payload(True)
+                self._raise_if_control_only(health)
                 raise RuntimeError(f"端口 {self.port} 已被其他程序占用，Gateway 无法启动")
             self._rotate_logs()
             command = _gateway_command(self.agent_root, self.port)
@@ -131,8 +154,10 @@ class GatewayProcessManager:
 
     def _wait_until_healthy(self, deadline: float) -> dict[str, object]:
         while time.monotonic() < deadline:
-            if self._healthy():
+            health = self._health_payload()
+            if self._accepts_work(health):
                 return self._status_payload(True)
+            self._raise_if_control_only(health)
             time.sleep(0.15)
         raise RuntimeError(f"Gateway 启动超时；请查看日志：{self.log_path}")
 
@@ -194,7 +219,20 @@ class GatewayProcessManager:
         assert_restore_inactive(self.agent_root)
         return GatewayCredentials(self.directory).load_or_create()
 
-    def _healthy(self) -> bool:
+    def _healthy(self, *, require_accepting_work: bool = False) -> bool:
+        """Return process health, optionally requiring normal work admission.
+
+        The ASGI server deliberately answers health probes while durable
+        maintenance recovery is still quiesced or resuming.  That proves the
+        process is alive, but it is not sufficient for an interactive client:
+        mutation endpoints correctly return 503 until ``accepting_work`` is
+        true.  Callers that are about to submit work must request readiness.
+        """
+        payload = self._health_payload()
+        return self._accepts_work(payload) if require_accepting_work else payload is not None
+
+    def _health_payload(self) -> dict[str, object] | None:
+        """Return a validated local health payload without conflating readiness."""
         try:
             response = httpx.get(
                 f"{self.base_url}/api/v1/health",
@@ -202,13 +240,44 @@ class GatewayProcessManager:
                 trust_env=False,
             )
             payload = response.json()
-            return (
+            if (
                 response.status_code == 200
                 and payload.get("status") == "ok"
                 and payload.get("service") == "yuan-ye-agent-gateway"
-            )
+            ):
+                return dict(payload)
+            return None
         except (httpx.HTTPError, ValueError):
-            return False
+            return None
+
+    @staticmethod
+    def _accepts_work(payload: dict[str, object] | None) -> bool:
+        return payload is not None and payload.get("accepting_work") is True
+
+    @staticmethod
+    def _raise_if_control_only(payload: dict[str, object] | None) -> None:
+        """Fail fast when the process is healthy but maintenance blocks work.
+
+        Waiting for the cold-start deadline cannot change a durable maintenance
+        decision.  Surface the exact recovery coordinates instead of reporting
+        the healthy control-plane process as a startup timeout.
+        """
+        if payload is None or payload.get("accepting_work") is True:
+            return
+        maintenance = payload.get("maintenance")
+        snapshot = maintenance if isinstance(maintenance, dict) else {}
+        state = str(snapshot.get("state") or "maintenance")
+        epoch = snapshot.get("maintenance_epoch")
+        revision = snapshot.get("revision")
+        recovery = ""
+        if isinstance(epoch, int) and isinstance(revision, int):
+            recovery = (
+                f"；确认状态后执行 python run.py gateway resume --epoch {epoch} "
+                f"--revision {revision}"
+            )
+        raise RuntimeError(
+            f"Gateway 控制接口在线，但当前处于 {state}，不接收 Agent 工作{recovery}",
+        )
 
     def _metadata(self) -> dict[str, object]:
         if not self.instance_path.exists():
@@ -363,6 +432,12 @@ def run_gateway(agent_root: Path, port: int) -> None:
         temporary.replace(manager.instance_path)
         try:
             config = load_runtime_config(root, gateway_port=port)
+            # A clean operator stop deliberately leaves the durable lifecycle
+            # QUIESCED. Resume that verified state before GatewayApplication
+            # constructs components which may need to publish a new Runtime
+            # resource Generation. Otherwise the bootstrap write is correctly
+            # denied by WriteGate and the control API can never come up to resume.
+            resume_completed_operator_stop_before_bootstrap(manager)
             api = create_gateway_api(GatewayApplication(config), access_token=token)
             server = uvicorn.Server(uvicorn.Config(
                 api,
@@ -502,6 +577,41 @@ async def resume_completed_operator_stop(manager, gateway) -> bool:
     if any(marker.get(key) != getattr(snapshot, key) for key in ("maintenance_epoch", "revision", "operation_id")):
         return False
     await gateway.resume(snapshot.maintenance_epoch, expected_revision=snapshot.revision)
+    manager.stopped_path.unlink(missing_ok=True)
+    return True
+
+
+def resume_completed_operator_stop_before_bootstrap(
+    manager: GatewayProcessManager,
+) -> bool:
+    """Resume an exactly proven clean stop before mutable app construction.
+
+    This is intentionally narrower than general maintenance recovery. Backup,
+    restore, failed or interrupted maintenance states remain control-only and
+    require the normal explicit recovery path.
+    """
+    marker = _read_control_json(manager.stopped_path)
+    store = LifecycleStore(manager.agent_root)
+    snapshot = store.read()
+    if (
+        not marker
+        or snapshot.state != MaintenanceState.QUIESCED
+        or snapshot.reason != "operator stop"
+        or any(
+            marker.get(key) != getattr(snapshot, key)
+            for key in ("maintenance_epoch", "revision", "operation_id")
+        )
+    ):
+        return False
+    assert_restore_inactive(manager.agent_root)
+    gate = AgentHomeWriteGate()
+    coordinator = AgentHomeMaintenanceCoordinator(manager.agent_root, gate)
+    try:
+        asyncio.run(coordinator.resume(
+            snapshot.maintenance_epoch, expected_revision=snapshot.revision,
+        ))
+    finally:
+        coordinator.close()
     manager.stopped_path.unlink(missing_ok=True)
     return True
 

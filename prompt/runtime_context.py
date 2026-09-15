@@ -12,12 +12,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from memory.persistence import AGENT_EPHEMERAL_CONTEXT_CLOSE, AGENT_EPHEMERAL_CONTEXT_OPEN
 from memory.provider_context import ProviderContextRecord, context_baseline, prepare_context
+from sandbox.path_mapping import LogicalRoot
 
 DYNAMIC_CONTEXT_REFRESH_INTERVAL = timedelta(hours=2)
 
 if TYPE_CHECKING:
     from Agent.config import RuntimeConfig
     from memory import MemoryStore
+    from sandbox import PathMappingSnapshot
 
 
 class AgentRuntimeContextEnvelope(BaseModel):
@@ -99,9 +101,17 @@ class ProviderContextFragmentRegistry:
 
 
 class AgentDynamicContextBuilder:
-    def __init__(self, config: "RuntimeConfig", memory: "MemoryStore") -> None:
+    def __init__(self, config: "RuntimeConfig", memory: "MemoryStore", *, path_mapping: "PathMappingSnapshot | None" = None) -> None:
         self.config = config
         self.memory = memory
+        if path_mapping is None:
+            from sandbox import PathMappingSnapshot
+
+            path_mapping = PathMappingSnapshot(
+                workspace_root=config.workspace_root,
+                agent_source_root=config.coding_source_root or config.workspace_root,
+            )
+        self.path_mapping = path_mapping
         self.sandbox_mode = "closed"
         self.sandbox_shell = None
         self.last_envelope_hash = ""
@@ -123,7 +133,7 @@ class AgentDynamicContextBuilder:
             session_id=session_id,
             session_created_at=self.memory.session_created_at(session_id),
             session_segment=self.memory.active_path(session_id).name,
-            workspace_root=str(self.config.workspace_root),
+            workspace_root=self.path_mapping.shell_root(LogicalRoot.WORKSPACE),
             operating_system=f"{platform.system()} {platform.release()}",
             architecture=platform.machine(),
             python_version=platform.python_version(),

@@ -35,6 +35,23 @@ def _sha256(value: bytes | str) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _descriptor_semantic_identity(descriptor: "RuntimePluginDescriptor") -> str:
+    """Cover behavior and exposure metadata while ignoring source formatting."""
+    return _sha256(_canonical_json({
+        "plugin_id": descriptor.plugin_id,
+        "plugin_version": descriptor.plugin_version,
+        "core_api_version": descriptor.core_api_version,
+        "requires_plugins": descriptor.requires_plugins,
+        "conflicts_with": descriptor.conflicts_with,
+        "contributions": [
+            item.model_dump(mode="json") for item in descriptor.contributions
+        ],
+        "member_semantics": [
+            (item.root, item.path, item.semantic_hash) for item in descriptor.files
+        ],
+    }))
+
+
 class RuntimeProfile(str, Enum):
     INTERACTIVE = "interactive"
     CRON = "cron"
@@ -691,11 +708,19 @@ class RuntimePluginManager:
             RuntimeResourceGeneration.model_validate_json(current["generation_json"], strict=True)
             if current else None
         )
-        old = {item.plugin_id: item.semantic_hash for item in (current_generation.descriptors if current_generation else ())}
-        new = {item.plugin_id: item.semantic_hash for item in descriptors}
+        old = {
+            item.plugin_id: _descriptor_semantic_identity(item)
+            for item in (current_generation.descriptors if current_generation else ())
+        }
+        new = {item.plugin_id: _descriptor_semantic_identity(item) for item in descriptors}
         changed = tuple(sorted(name for name, digest in new.items() if old.get(name) != digest))
         removed = tuple(sorted(set(old) - set(new)))
-        semantically_unchanged = current_generation is not None and not changed and not removed
+        semantically_unchanged = (
+            current_generation is not None
+            and semantic_hash == current_generation.semantic_hash
+            and not changed
+            and not removed
+        )
         generation_id = (
             current_generation.generation_id
             if semantically_unchanged
@@ -838,7 +863,16 @@ class RuntimePluginManager:
             plugin_id=plugin_id, excluding_generation_id=generation_id,
         )
         if fallback is None:
-            return None
+            active = self.state_controller.active_runtime_generation()
+            if active is None or str(active["generation_id"]) != generation_id:
+                self.state_controller.mark_runtime_generation_quarantined(generation_id)
+                return None
+            result = self._disable_quarantined_member(
+                plugin_id, generation_id=generation_id,
+                actor=f"{actor}:automatic-quarantine",
+            )
+            self.state_controller.mark_runtime_generation_quarantined(generation_id)
+            return result
         result = self.rollback_member(
             plugin_id,
             from_generation_id=str(fallback),
@@ -846,6 +880,76 @@ class RuntimePluginManager:
         )
         self.state_controller.mark_runtime_generation_quarantined(generation_id)
         return result
+
+    def _disable_quarantined_member(
+        self, plugin_id: str, *, generation_id: str, actor: str,
+    ) -> RuntimeReloadResult:
+        current = self.generation(generation_id)
+        disabled = {plugin_id}
+        expanded = True
+        while expanded:
+            expanded = False
+            for descriptor in current.descriptors:
+                if descriptor.plugin_id in disabled:
+                    continue
+                if disabled.intersection(descriptor.requires_plugins):
+                    disabled.add(descriptor.plugin_id)
+                    expanded = True
+        descriptors = tuple(
+            item for item in current.descriptors if item.plugin_id not in disabled
+        )
+        semantic_payload = [
+            {
+                "plugin_id": item.plugin_id,
+                "semantic_hash": item.semantic_hash,
+                "core_api_version": item.core_api_version,
+                "requires_plugins": item.requires_plugins,
+                "conflicts_with": item.conflicts_with,
+                "contributions": [
+                    value.model_dump(mode="json") for value in item.contributions
+                ],
+            }
+            for item in descriptors
+        ]
+        new_generation_id = _sha256(_canonical_json({
+            "core_api_version": self.CORE_API_VERSION,
+            "parent_generation_id": current.generation_id,
+            "quarantined_plugins": sorted(disabled),
+            "semantic": semantic_payload,
+        }))
+        generation = RuntimeResourceGeneration(
+            generation_id=new_generation_id,
+            parent_generation_id=current.generation_id,
+            descriptors=descriptors,
+            semantic_hash=_sha256(_canonical_json(semantic_payload)),
+            source_hash=_sha256(_canonical_json([
+                (item.plugin_id, item.source_hash) for item in descriptors
+            ])),
+            artifact_root=self._artifact_root(new_generation_id),
+        )
+        self._materialize(generation, fallback_generations=(current,))
+        self._smoke_test(generation)
+        reason = "quarantine-disable:" + ",".join(sorted(disabled))
+        payload = {
+            "generation_id": new_generation_id,
+            "parent_generation_id": current.generation_id,
+            "changed_plugins": sorted(disabled),
+            "removed_plugins": sorted(disabled),
+            "approval_required": False,
+            "reasons": [reason],
+        }
+        plan = RuntimeReloadPlan(
+            plan_hash=_sha256(_canonical_json(payload)), generation=generation,
+            changed_plugins=tuple(sorted(disabled)),
+            removed_plugins=tuple(sorted(disabled)), reasons=(reason,),
+        )
+        self.state_controller.activate_runtime_generation(plan, actor=actor)
+        return RuntimeReloadResult(
+            status="activated",
+            message=f"Disabled quarantined Runtime plugin {plugin_id}",
+            generation_id=new_generation_id, plan_hash=plan.plan_hash,
+            changed_plugins=tuple(sorted(disabled)),
+        )
 
     def report_success(
         self,
@@ -1150,7 +1254,14 @@ class RuntimePluginManager:
     ) -> Path:
         """Create a derived file view containing only profile-authorized members."""
         profile_name = profile.value.replace(":", "-")
-        target = generation.artifact_root / "profiles" / profile_name
+        view_hash = _sha256(_canonical_json([
+            (
+                descriptor.plugin_id,
+                tuple((member.root, member.path, member.source_hash) for member in descriptor.files),
+            )
+            for descriptor in descriptors
+        ]))
+        target = generation.artifact_root / "profiles" / f"{profile_name}-{view_hash[:16]}"
         expected = {
             (member.root, self._profile_member_path(profile, member)): (
                 member.path, member.source_hash

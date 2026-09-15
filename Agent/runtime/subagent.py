@@ -50,6 +50,7 @@ class RuntimeSubagentRunner:
             base_url=config.base_url,
             api_key=config.api_key,
             stream=False,
+            reasoning_effort=config.reasoning_effort,
             use_system_proxy=config.use_system_proxy,
             proxy_url=config.proxy_url,
         )

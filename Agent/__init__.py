@@ -1,6 +1,9 @@
 """Yuan Ye Study Agent 的正式异步公共接口。"""
 
-from .config import RuntimeConfig, default_agent_root, load_runtime_config, prepare_default_agent_root
+from .config import (
+    ModelProfile, RuntimeConfig, default_agent_root, load_runtime_config,
+    prepare_default_agent_root,
+)
 from .extensions import (
     CapabilityTier,
     ExtensionCapability,
@@ -150,6 +153,7 @@ __all__ = [
     "register_runtime_resource_callbacks",
     "RunEvent",
     "RuntimeConfig",
+    "ModelProfile",
     "default_agent_root",
     "RuntimeFailure",
     "RuntimeResult",

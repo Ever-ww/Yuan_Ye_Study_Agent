@@ -10,16 +10,16 @@ from .models import SandboxStatus
 from .session import SandboxUnavailableError
 
 
-def create_sandbox_session(config, *, project_root: Path | None = None, file_locks=None):
+def create_sandbox_session(config, *, project_root: Path | None = None, file_locks=None, path_mapping=None):
     options = dict(state_root=config.agent_root, checkpoint_limit=config.sandbox_checkpoint_limit,
                    file_locks=file_locks)
     root = project_root or config.workspace_root
     if config.sandbox_backend == "docker":
-        return DockerSandboxSession(root, **options)
+        return DockerSandboxSession(root, path_mapping=path_mapping, **options)
     if config.sandbox_backend != "os":
         raise ValueError("Unsupported sandbox backend")
     return NativeSandboxSession(root, readable_roots=config.sandbox_readable_roots,
-                                shell=config.sandbox_shell, **options)
+                                shell=config.sandbox_shell, path_mapping=path_mapping, **options)
 
 
 async def probe_sandbox_status(config) -> SandboxStatus:

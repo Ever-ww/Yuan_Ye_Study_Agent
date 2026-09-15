@@ -13,7 +13,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Iterable
+from typing import BinaryIO, Iterable, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -47,6 +47,8 @@ class ArchiveHeader(BaseModel):
     key_length: int = KEY_BYTES
     salt: str
     nonce: str
+    key_mode: Literal["passphrase", "os_managed"] = "passphrase"
+    key_id: str | None = Field(default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,10 @@ def _validate_header(raw: bytes) -> ArchiveHeader:
     header = ArchiveHeader.model_validate_json(raw, strict=True)
     if header.format_version != 1 or header.algorithm != "AES-256-GCM" or header.kdf != "scrypt":
         raise ValueError("Backup Header 版本、算法或KDF不受支持")
+    if header.key_mode == "os_managed" and not header.key_id:
+        raise ValueError("系统托管 Backup Header 缺少 key_id")
+    if header.key_mode == "passphrase" and header.key_id is not None:
+        raise ValueError("手动口令 Backup Header 不得包含 key_id")
     try:
         salt = base64.b64decode(header.salt, validate=True)
         nonce = base64.b64decode(header.nonce, validate=True)
@@ -178,6 +184,9 @@ class EncryptedBackupArchive:
         passphrase: str,
         manifest: BackupManifest,
         sources: Iterable[ArchiveSource],
+        *,
+        key_mode: Literal["passphrase", "os_managed"] = "passphrase",
+        key_id: str | None = None,
     ) -> Path:
         Cipher, algorithms, modes, _ = _crypto()
         target = target.resolve()
@@ -189,6 +198,8 @@ class EncryptedBackupArchive:
         header = ArchiveHeader(
             salt=base64.b64encode(salt).decode("ascii"),
             nonce=base64.b64encode(nonce).decode("ascii"),
+            key_mode=key_mode,
+            key_id=key_id,
         )
         header_bytes = header.model_dump_json().encode("utf-8")
         aad = MAGIC + len(header_bytes).to_bytes(4, "big") + header_bytes
@@ -225,6 +236,20 @@ class EncryptedBackupArchive:
             temporary.unlink(missing_ok=True)
             raise
         return target
+
+    @classmethod
+    def read_header(cls, archive: Path) -> ArchiveHeader:
+        """Read and validate non-secret encryption metadata without decrypting."""
+        with archive.resolve().open("rb") as source:
+            if source.read(len(MAGIC)) != MAGIC:
+                raise ValueError("不是有效的 Yuan Ye Backup")
+            length_bytes = source.read(4)
+            if len(length_bytes) != 4:
+                raise ValueError("Backup Header 被截断")
+            header_length = int.from_bytes(length_bytes, "big")
+            if not 1 <= header_length <= MAX_HEADER_BYTES:
+                raise ValueError("Backup Header 长度超出安全限制")
+            return _validate_header(source.read(header_length))
 
     @classmethod
     def decrypt_to_zip(cls, archive: Path, passphrase: str, destination: Path) -> ArchiveHeader:

@@ -148,12 +148,14 @@ class BackupRecord(BaseModel):
     size_bytes: int = Field(ge=0)
     created_at: datetime
     retention_class: str
+    encryption_mode: Literal["passphrase", "os_managed"] = "passphrase"
+    key_id: str | None = None
 
 
 class BackupCreateRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    passphrase: str = Field(min_length=1, max_length=4096)
+    passphrase: str | None = Field(default=None, min_length=1, max_length=4096)
     output: Path | None = None
     kind: Literal["automatic", "manual", "rescue"] = "manual"
 

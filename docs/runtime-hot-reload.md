@@ -136,6 +136,12 @@ Profile head 都会阻止删除。GC 先在 SQLite 写入删除 fencing，再删
 崩溃时，下一次启动继续相同清理，不重新选择其他 Generation。Generation 元数据、Reload
 审计、审批与健康证据仍保存在 SQLite。
 
+当被隔离成员没有任何已验证的历史版本可回退时，Core 会发布一个新的不可变 Generation，
+从中移除该成员及依赖它的成员。系统不会在读取 Snapshot 时根据可变健康状态临时过滤资源，
+所以已经绑定旧 Generation 的 Run 仍能精确恢复，只有后续 Turn 使用移除后的 Generation。
+Profile 暴露范围也属于 Descriptor 的语义身份；即使源码内容没变，单独扩大 Profile allowlist
+也不会被错误识别为 `unchanged`，仍需生成新 Plan 并按权限扩张规则审批。
+
 ## 同进程边界
 
 热插拔只提供版本、权限、装配和恢复边界，不是恶意 Python 的强隔离。Extension Hook

@@ -25,8 +25,9 @@ class DockerSandboxSession(CheckpointSandboxSession):
     """Explicit alternative backend; lifecycle and checkpoint logic are shared."""
     image = "yy-agent-sandbox:local"
 
-    def __init__(self, project_root: Path, *, command_runner=None, **kwargs):
+    def __init__(self, project_root: Path, *, command_runner=None, path_mapping=None, **kwargs):
         super().__init__(project_root, **kwargs)
+        self.path_mapping = path_mapping
         self._run_command = command_runner or _subprocess_runner
         self._container_name = None
 
@@ -42,7 +43,7 @@ class DockerSandboxSession(CheckpointSandboxSession):
 
     async def _execute_shell(self, command: str, timeout_seconds: int) -> CommandResult:
         arguments = [
-            "docker", "exec", "--workdir", "/workspace", self._require_container(),
+            "docker", "exec", "--workdir", self._workspace_target, self._require_container(),
             "timeout", "--signal=KILL", f"{timeout_seconds}s",
             "bash", "--noprofile", "--norc", "-c", command,
         ]
@@ -108,7 +109,8 @@ class DockerSandboxSession(CheckpointSandboxSession):
             raise RuntimeError(f"Docker 沙箱镜像构建失败：{_result_message(built)}")
 
     def _docker_run_arguments(self, container_name: str) -> list[str]:
-        mount = f"type=bind,source={self.project_root},target=/workspace"
+        workspace_target = self._workspace_target
+        mount = f"type=bind,source={self.project_root},target={workspace_target}"
         arguments = [
             "docker",
             "run",
@@ -137,7 +139,7 @@ class DockerSandboxSession(CheckpointSandboxSession):
         for relative in (".git", ".yy", ".venv", ".agents", ".codex"):
             arguments.extend([
                 "--tmpfs",
-                f"/workspace/{relative}:rw,noexec,nosuid,nodev,size=16m",
+                f"{workspace_target}/{relative}:rw,noexec,nosuid,nodev,size=16m",
             ])
         blank = self.state_root / ".yy" / "sandbox" / "empty-secret"
         blank.parent.mkdir(parents=True, exist_ok=True)
@@ -146,10 +148,64 @@ class DockerSandboxSession(CheckpointSandboxSession):
             relative = PurePosixPath(path.relative_to(self.project_root).as_posix())
             arguments.extend([
                 "--mount",
-                f"type=bind,source={blank},target=/workspace/{relative},readonly",
+                f"type=bind,source={blank},target={workspace_target}/{relative},readonly",
             ])
+        if self.path_mapping is not None and self.path_mapping.agent_source_root == self.project_root:
+            arguments.extend([
+                "--mount",
+                f"type=bind,source={self.project_root},target=/yy/agent-source",
+            ])
+            if self.path_mapping.skills_root.is_dir():
+                arguments.extend([
+                    "--mount",
+                    f"type=bind,source={self.path_mapping.skills_root},target=/yy/skills,readonly",
+                ])
+                arguments.extend(self._alias_carveouts(self.path_mapping.skills_root, "/yy/skills", blank))
+            if self.path_mapping.hooks_root.is_dir():
+                arguments.extend([
+                    "--mount",
+                    f"type=bind,source={self.path_mapping.hooks_root},target=/yy/hooks,readonly",
+                ])
+                arguments.extend(self._alias_carveouts(self.path_mapping.hooks_root, "/yy/hooks", blank))
+            # The source alias must not re-expose paths hidden under the
+            # Workspace mount.  Docker cannot create a relative alias without
+            # image cooperation, so repeat the same carveouts here.
+            for relative in (".git", ".yy", ".venv", ".agents", ".codex"):
+                arguments.extend([
+                    "--tmpfs",
+                    f"/yy/agent-source/{relative}:rw,noexec,nosuid,nodev,size=16m",
+                ])
+            for path in _environment_files(self.project_root):
+                relative = PurePosixPath(path.relative_to(self.project_root).as_posix())
+                arguments.extend([
+                    "--mount",
+                    f"type=bind,source={blank},target=/yy/agent-source/{relative},readonly",
+                ])
         arguments.append(self.image)
         return arguments
+
+    @staticmethod
+    def _alias_carveouts(root: Path, target: str, blank: Path) -> list[str]:
+        arguments: list[str] = []
+        for relative in (".git", ".yy", ".venv", ".agents", ".codex"):
+            if (root / relative).exists():
+                arguments.extend([
+                    "--tmpfs",
+                    f"{target}/{relative}:rw,noexec,nosuid,nodev,size=16m",
+                ])
+        for path in _environment_files(root):
+            relative = PurePosixPath(path.relative_to(root).as_posix())
+            arguments.extend([
+                "--mount",
+                f"type=bind,source={blank},target={target}/{relative},readonly",
+            ])
+        return arguments
+
+    @property
+    def _workspace_target(self) -> str:
+        # Preserve the public standalone Sandbox compatibility surface while
+        # all Runtime-created sessions use the new logical namespace.
+        return "/yy/workspace" if self.path_mapping is not None else "/workspace"
 
     def _require_container(self) -> str:
         if self._container_name is None:

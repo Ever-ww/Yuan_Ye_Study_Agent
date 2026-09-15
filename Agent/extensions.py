@@ -249,6 +249,7 @@ class ExtensionServices:
     state_backend: Any | None = None
     tool_registry: Any | None = None
     tool_context: Any | None = None
+    path_mapping: Any | None = None
 
 
 class ExtensionContext:
@@ -307,7 +308,10 @@ class ExtensionContext:
 
     def read_workspace(self, relative_path: str, *, max_bytes: int = 1_048_576) -> str:
         self._require(ExtensionCapability.WORKSPACE_READ)
-        candidate = (self._services.workspace_root / relative_path).resolve()
+        if self._services.path_mapping is not None:
+            candidate = self._services.path_mapping.resolve_workspace_path(relative_path)
+        else:
+            candidate = (self._services.workspace_root / relative_path).resolve()
         root = self._services.workspace_root.resolve()
         if candidate == root or root not in candidate.parents or candidate.is_symlink():
             raise ExtensionContractViolation("workspace.read path escapes the workspace")

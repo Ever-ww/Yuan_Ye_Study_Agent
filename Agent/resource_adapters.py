@@ -110,9 +110,11 @@ class DynamicContextRuntimeAdapter:
     def install(self, registry: HookRegistry) -> None:
         from context_process import (
             register_context_callbacks,
+            register_direct_response_tool_policy,
             register_tool_output_trimming_callbacks,
         )
 
+        register_direct_response_tool_policy(registry)
         register_tool_output_trimming_callbacks(
             registry,
             self.memory,

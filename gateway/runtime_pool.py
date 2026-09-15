@@ -58,6 +58,8 @@ class RuntimeEntry:
     last_used: float
     generation_id: str | None = None
     reference_owner_id: str | None = None
+    model_profile_id: str = "default"
+    reasoning_effort: str = "none"
 
 
 class RuntimePool:
@@ -131,6 +133,8 @@ class RuntimePool:
         self.observer_service = observer_service
         self._pending_profile_refresh: set[tuple[str, str]] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._observer_tasks: set[asyncio.Task[None]] = set()
+        self._observer_chains: dict[str, asyncio.Task[None]] = {}
         self._submitting: set[str] = set()
         self._closing = False
         self._lock = asyncio.Lock()
@@ -244,7 +248,58 @@ class RuntimePool:
         if task is None or task.done():
             return False
         task.cancel()
+        # A successful cancel response should normally mean the durable Run has
+        # reached its terminal cancellation boundary, not merely that an
+        # in-process Task received a signal.  Keep a finite bound so a broken
+        # Provider/extension cannot hold the control request forever.
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # _execute owns durable failure projection. Cancellation callers do
+            # not reinterpret an unrelated terminal error as a failed request.
+            pass
+        # Cancellation can land in the narrow scheduling window after a Run is
+        # marked RUNNING but before _execute's cancellation handler is active.
+        # If the process Task is already terminal, close that durable gap here.
+        current = self.state_controller.state(run_id)
+        if task.done() and current.task_state not in {
+            TaskState.SUCCEEDED, TaskState.FAILED,
+            TaskState.CANCELLED, TaskState.INTERRUPTED,
+            TaskState.RECOVERY_REQUIRED,
+        }:
+            await self._finish_run(
+                run_id, ExecutionOutcome.CANCELLED, "当前运行已取消",
+            )
         return True
+
+    @staticmethod
+    def _ensure_cancelled_session_records(runtime, run: RunRecord, state) -> None:
+        """Close the STARTED-to-TURN_START cancellation persistence window."""
+        memory = getattr(runtime, "memory", None)
+        session_id = state.session_id
+        if memory is None or not session_id:
+            return
+        audit = {"run_id": run.run_id, "turn_id": state.turn_id}
+        records = memory.sessions.find_records_strict(
+            session_id, run_id=run.run_id, turn_id=state.turn_id,
+        )
+        if not records:
+            memory.record_user(
+                session_id,
+                run.task,
+                origin=("cron" if run.client_id.startswith("cron:") else "interactive"),
+                audit={
+                    **audit,
+                    "record_id": hashlib.sha256(
+                        f"cancelled-user:{run.run_id}:{state.turn_id}".encode("utf-8")
+                    ).hexdigest(),
+                },
+            )
+        memory.record_cancellation(session_id, audit=audit)
 
     async def close(self, grace_seconds: float = 5.0) -> None:
         self._closing = True
@@ -257,6 +312,13 @@ class RuntimePool:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+        observer_tasks = [task for task in self._observer_tasks if not task.done()]
+        for task in observer_tasks:
+            task.cancel()
+        if observer_tasks:
+            await asyncio.gather(*observer_tasks, return_exceptions=True)
+        self._observer_tasks.clear()
+        self._observer_chains.clear()
         if self._reaper is not None:
             self._reaper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -453,7 +515,49 @@ class RuntimePool:
                 )
                 token = self.approvals.bind_run(current.run_id, current.client_id)
                 try:
+                    pending_stream_parts: list[str] = []
+                    pending_stream_payload: dict[str, object] | None = None
+                    pending_stream_type: EventType | None = None
+                    pending_stream_length = 0
+                    last_stream_flush = monotonic()
+
+                    async def flush_stream() -> None:
+                        nonlocal pending_stream_payload, pending_stream_type
+                        nonlocal pending_stream_length, last_stream_flush
+                        if pending_stream_payload is None or pending_stream_type is None:
+                            return
+                        payload = dict(pending_stream_payload)
+                        payload["content"] = "".join(pending_stream_parts)
+                        event_type = pending_stream_type
+                        pending_stream_parts.clear()
+                        pending_stream_payload = None
+                        pending_stream_type = None
+                        pending_stream_length = 0
+                        last_stream_flush = monotonic()
+                        await self._emit(current, event_type.value, payload)
+
                     async for event in runtime.run_task(current.task, current.session_id):
+                        if event.type in {EventType.TEXT, EventType.REASONING}:
+                            if pending_stream_type is not None and pending_stream_type is not event.type:
+                                await flush_stream()
+                            content = str(event.payload.get("content", ""))
+                            if pending_stream_payload is None:
+                                pending_stream_payload = dict(event.payload)
+                                pending_stream_type = event.type
+                                last_stream_flush = monotonic()
+                            pending_stream_parts.append(content)
+                            pending_stream_length += len(content)
+                            # Coalesce provider token fragments before creating
+                            # canonical events. Roughly 20 FPS keeps streaming
+                            # responsive without building an fsync backlog that
+                            # strands the terminal event behind hundreds of rows.
+                            if (
+                                pending_stream_length >= 48
+                                or monotonic() - last_stream_flush >= 0.05
+                            ):
+                                await flush_stream()
+                            continue
+                        await flush_stream()
                         if event.type is EventType.STARTED:
                             session_id = str(event.payload["session_id"])
                             if isolated_cron:
@@ -493,6 +597,8 @@ class RuntimePool:
                                 runtime, monotonic(),
                                 getattr(runtime, "resource_generation_id", None),
                                 getattr(runtime, "runtime_generation_reference_owner", None),
+                                current.model_profile_id,
+                                current.reasoning_effort,
                             )
                         if event.type is EventType.FINAL:
                             answer = str(event.payload.get("answer", ""))
@@ -501,6 +607,7 @@ class RuntimePool:
                             event.type.value,
                             dict(event.payload),
                         )
+                    await flush_stream()
                     await self._finish_run(current.run_id, ExecutionOutcome.SUCCESS, answer or "任务完成")
                     current = self.store.run(current.run_id)
                     await self._emit(current, "run_completed", {"answer": answer})
@@ -509,6 +616,11 @@ class RuntimePool:
         except asyncio.CancelledError:
             state = self.state_controller.state(original.run_id)
             if state.task_state is not TaskState.RECOVERY_REQUIRED:
+                if runtime is not None and state.session_id:
+                    await asyncio.to_thread(
+                        self._ensure_cancelled_session_records,
+                        runtime, original, state,
+                    )
                 await self._finish_run(original.run_id, ExecutionOutcome.CANCELLED, "当前运行已取消")
             current = self.store.run(original.run_id)
             await self._emit(current, "run_cancelled", {"message": "当前运行已取消"})
@@ -675,8 +787,12 @@ class RuntimePool:
             entry = self._runtimes.get(key)
             if entry is not None:
                 if (
-                    resource_snapshot is None
-                    or entry.generation_id == resource_snapshot.generation_id
+                    (
+                        resource_snapshot is None
+                        or entry.generation_id == resource_snapshot.generation_id
+                    )
+                    and entry.model_profile_id == run.model_profile_id
+                    and entry.reasoning_effort == run.reasoning_effort
                 ):
                     entry.last_used = monotonic()
                     return entry.runtime
@@ -792,6 +908,10 @@ class RuntimePool:
         resource_snapshot=None,
     ) -> AgentRuntime:
         config = load_runtime_config(self.agent_root, workspace_root=workspace)
+        config = config.select_model_profile(
+            run.model_profile_id,
+            run.reasoning_effort,
+        )
         scheduled = run.client_id.startswith("cron:")
         auxiliary_snapshots = {}
         if self.runtime_resource_manager is not None and resource_snapshot is not None:
@@ -867,36 +987,68 @@ class RuntimePool:
             payload=payload,
             mark_progress=event_type in {"text", "model_reconnected", "tool_completed"},
         ))
-        if self.observer_service is not None and result.event_id is not None:
+        if (
+            self.observer_service is not None
+            and result.event_id is not None
+            and self.observer_service.accepts_event_type(event_type)
+        ):
+            self._schedule_observer(run.run_id, result.event_id)
+        if self.outbox is not None:
+            self.outbox.wake()
+
+    def _schedule_observer(self, run_id: str, event_id: str) -> None:
+        """Queue one ordered Observer update without delaying Main event output."""
+        previous = self._observer_chains.get(run_id)
+
+        async def process() -> None:
+            if previous is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await previous
+            if self._closing:
+                return
             try:
-                outputs = self.observer_service.observe_event(result.event_id)
+                outputs = await asyncio.to_thread(
+                    self.observer_service.observe_event, event_id,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # Observer is an isolated enhancement.  Its implementation
-                # failure is attributed/quarantined but never fails Main/Harness.
                 try:
-                    self.observer_service.record_failure(run.run_id, exc)
+                    self.observer_service.record_failure(run_id, exc)
                 except Exception:
                     pass
-                outputs = ()
+                return
             for output in outputs:
-                current = self.state_controller.state(run.run_id)
+                current = self.state_controller.state(run_id)
+                source_identity = (
+                    output.payload.get("source_event_id")
+                    or output.payload.get("proposal_id")
+                    or event_id
+                )
                 self.state_controller.apply(RecordRuntimeEventCommand(
                     command_id=hashlib.sha256(
-                        f"observer-output:{run.run_id}:{output.event_type}:"
-                        f"{output.payload.get('source_event_id') or output.payload.get('proposal_id') or result.event_id}".encode("utf-8")
+                        f"observer-output:{run_id}:{output.event_type}:{source_identity}".encode("utf-8")
                     ).hexdigest(),
-                    run_id=run.run_id,
+                    run_id=run_id,
                     expected_revision=current.revision,
                     gateway_epoch=self.state_controller.gateway_epoch,
                     event_type=output.event_type,
                     payload=output.payload,
                     mark_progress=False,
                 ))
-        if self.outbox is not None:
-            self.outbox.wake()
-            await self.outbox.drain_once()
+                if self.outbox is not None:
+                    self.outbox.wake()
+
+        task = asyncio.create_task(process(), name=f"observer-{run_id}-{event_id[:12]}")
+        self._observer_chains[run_id] = task
+        self._observer_tasks.add(task)
+
+        def settled(completed: asyncio.Task[None]) -> None:
+            self._observer_tasks.discard(completed)
+            if self._observer_chains.get(run_id) is completed:
+                self._observer_chains.pop(run_id, None)
+
+        task.add_done_callback(settled)
 
     async def _publish_approval(self, request: ApprovalRequest) -> None:
         run = self.store.run(request.run_id)

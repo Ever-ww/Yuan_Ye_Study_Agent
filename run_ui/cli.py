@@ -1,4 +1,4 @@
-"""实时 Rich CLI：生产命令只消费 Gateway 事件。"""
+"""Textual conversation client with a Rich compatibility command surface."""
 
 from __future__ import annotations
 
@@ -10,13 +10,17 @@ import signal
 import sys
 from pathlib import Path
 from types import FrameType
+from typing import Any
 
 import typer
+from rich import box
 from rich.console import Console
-from rich.columns import Columns
 from rich.live import Live
+from rich.markup import escape
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 import json
 
 from Agent import (
@@ -41,8 +45,9 @@ from cron import (
 )
 from skill import SkillInstallRequest
 from .approval import InteractiveApproval, active_live as _active_live
+from .chat_tui import YuanYeChatApp
 from .web import serve
-from backup import BackupService, RestoreService
+from backup import BackupService, EncryptedBackupArchive, RestoreService
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Yuan Ye Study Agent 本地入口")
 session_app = typer.Typer(help="列出、查看和恢复本地会话")
@@ -162,6 +167,116 @@ def _offer_initial_paper_research_cron(yy_dir: Path) -> None:
     )
 
 
+class _GatewayLiveView:
+    """One stable Rich surface for Main output and the per-Turn Observer."""
+
+    def __init__(
+        self,
+        main_content: str | Text,
+        observer_content: str,
+        *,
+        phase: str,
+        height: int | None = None,
+        history_content: str | None = None,
+    ) -> None:
+        # Kept as the user-visible plain projection for lightweight terminal
+        # adapters and read-receipt tests. Rich itself renders ``_panel``.
+        self.renderable = main_content.plain if isinstance(main_content, Text) else main_content
+        self.history_content = history_content
+        self.observer_content = observer_content
+        self.phase = phase
+        grid = Table(
+            expand=True,
+            # The Panel supplies the outer border. MINIMAL preserves the header
+            # rule and adds one continuous divider between Main and Observer.
+            box=box.MINIMAL,
+            show_edge=False,
+            pad_edge=False,
+            padding=(0, 1),
+        )
+        grid.add_column(
+            "MAIN AGENT", ratio=2, min_width=24,
+            overflow="fold", header_style="bold cyan",
+        )
+        grid.add_column(
+            "TURN OBSERVER", ratio=1, min_width=22,
+            overflow="fold", header_style="bold magenta",
+        )
+        grid.add_row(
+            (
+                main_content
+                if isinstance(main_content, Text)
+                else Text.from_markup(main_content or "正在运行…")
+            ),
+            Markdown(observer_content or "正在建立本轮监控…"),
+        )
+        border = "green" if phase == "已完成" else "red" if phase == "已结束" else "cyan"
+        self._panel = Panel(
+            grid, title=f"Yuan Ye · {phase}", border_style=border, height=height,
+        )
+
+    def __rich_console__(self, console, options):
+        del console, options
+        yield self._panel
+
+
+def _live_main_window(main_content: str, selected_console: Console) -> Text:
+    """Return a bounded, width-aware tail for the mutable Live surface."""
+
+    full = Text.from_markup(main_content or "正在运行…")
+    # Account for the outer Panel, two cell paddings and the column separator.
+    main_width = max(20, ((selected_console.size.width - 8) * 2 // 3) - 2)
+    max_lines = max(3, selected_console.size.height - 8)
+    wrapped = full.wrap(selected_console, main_width, overflow="fold")
+    if len(wrapped) <= max_lines:
+        return full
+    clipped = Text("… 较早内容已滚动；任务结束后显示完整结果 …", style="dim")
+    for line in wrapped[-(max_lines - 1):]:
+        clipped.append("\n")
+        clipped.append_text(line)
+    return clipped
+
+
+def _gateway_live_height(selected_console: Console) -> int:
+    """Reserve one terminal row while keeping the answer surface stable."""
+
+    return max(7, selected_console.size.height - 1)
+
+
+async def _wait_for_observer_terminal(
+    client: GatewayClient,
+    run_id: str,
+    *,
+    timeout_seconds: float = 2.0,
+) -> dict[str, Any] | None:
+    """Briefly await the isolated terminal projection without delaying output."""
+    getter = getattr(client, "observer_status", None)
+    if not callable(getter):
+        return None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    last: dict[str, Any] | None = None
+    while True:
+        try:
+            value = await getter(run_id)
+            if isinstance(value, dict):
+                last = value
+                if value.get("status") in {"finalized", "failed"}:
+                    return value
+        except Exception as exc:
+            # The Observer instance may not exist yet because its first
+            # milestone is deliberately processed off the Main output path.
+            # Retry only inside this small terminal grace window.
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            if not isinstance(exc, (KeyError, LookupError)) and status_code not in {404, 409, 500}:
+                return last
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return last
+        await asyncio.sleep(min(0.1, remaining))
+
+
 async def _render_gateway(
     client: GatewayClient,
     project_id: str,
@@ -174,10 +289,24 @@ async def _render_gateway(
     streaming_text = ""
     active_session_id = session_id or ""
     terminal_error = ""
-    observer_progress = "等待可见运行进度…"
+    observer_progress = "正在建立本轮监控…"
     handled_observer_proposals: set[str] = set()
+    completed_view: _GatewayLiveView | None = None
     approval_selector = InteractiveApproval(console)
-    with Live(Panel("正在排队…", title="Yuan Ye Gateway"), console=console, refresh_per_second=10) as live:
+    initial_view = _GatewayLiveView(
+        "正在排队…", observer_progress, phase="准备中",
+        height=_gateway_live_height(console), history_content="正在排队…",
+    )
+    async with contextlib.AsyncExitStack() as stack:
+        # Persistent chat owns the sole Textual UI. One-shot ``run`` and
+        # ``chat --classic`` stay on the lightweight Rich projection.
+        live = stack.enter_context(Live(
+            initial_view,
+            console=console,
+            refresh_per_second=12,
+            vertical_overflow="crop",
+            transient=True,
+        ))
         token = _active_live.set(live)
 
         async def decide_observer_proposal(proposal: dict[str, object]) -> None:
@@ -220,7 +349,10 @@ async def _render_gateway(
                     if event.session_id:
                         active_session_id = event.session_id
                     if event.type == EventType.TEXT.value:
-                        streaming_text += str(event.payload.get("content", ""))
+                        # Model text is data, not Rich markup. Escaping each
+                        # chunk prevents Markdown links or bracketed text from
+                        # being consumed as terminal style tags.
+                        streaming_text += escape(str(event.payload.get("content", "")))
                     elif event.type == EventType.MODEL_RETRY.value:
                         if streaming_text:
                             lines.append("[yellow]网络中断前的不完整流式片段已丢弃[/]")
@@ -238,15 +370,17 @@ async def _render_gateway(
                         if streaming_text:
                             lines.append(streaming_text)
                             streaming_text = ""
-                        lines.append(f"[cyan]工具请求[/] {event.payload.get('name', '')}")
+                        lines.append(
+                            f"[cyan]工具请求[/] {escape(str(event.payload.get('name', '')))}"
+                        )
                     elif event.type == EventType.TOOL_COMPLETED.value:
+                        tool_name = escape(str(event.payload.get("name", "")))
                         if event.payload.get("status") == "error":
-                            lines.append(f"[red]工具失败[/] {event.payload.get('name', '')}")
+                            lines.append(f"[red]工具失败[/] {tool_name}")
                         else:
-                            lines.append(f"[green]工具完成[/] {event.payload.get('name', '')}")
+                            lines.append(f"[green]工具完成[/] {tool_name}")
                         reference = event.payload.get("observation_id")
                         if isinstance(reference, str) and reference:
-                            from rich.markup import escape
                             lines.append(f"[dim]详情：/tool-result {escape(shlex.quote(reference))}[/]")
                     elif event.type == "observer_progress":
                         observer_progress = str(
@@ -276,7 +410,7 @@ async def _render_gateway(
                         lines.append(f"[yellow]{event.payload.get('message', '上下文裁剪降级')}[/]")
                     elif event.type in {"run_failed", "run_cancelled", "run_interrupted"}:
                         terminal_error = str(event.payload.get("message", "运行结束"))
-                        lines.append(f"[red]{terminal_error}[/]")
+                        lines.append(f"[red]{escape(terminal_error)}[/]")
                     elif event.type == "harness_evolution_proposed":
                         live.stop()
                         confirmed = typer.confirm(
@@ -296,28 +430,51 @@ async def _render_gateway(
                             live.start(refresh=True)
                     elif event.type == "run_completed":
                         answer = str(event.payload.get("answer", ""))
-                        if answer and not streaming_text:
-                            lines.append(f"[bold green]{answer}[/]")
-                    display = lines[-12:] + ([streaming_text] if streaming_text else [])
+                        if answer:
+                            # The terminal event carries the authoritative full
+                            # answer. Replace any incomplete/coalesced stream
+                            # projection so completion can never show a blank or
+                            # fragmented left pane.
+                            streaming_text = escape(answer)
+                    # Keep the entire Turn in the presentation buffer. The
+                    # viewport, rather than destructive list slicing, decides
+                    # which fixed-height window is currently visible.
+                    display = lines + ([streaming_text] if streaming_text else [])
                     terminal = event.type in {"run_completed", "run_failed", "run_cancelled", "run_interrupted"}
-                    observer_columns = Columns((
-                        Panel("\n".join(display) or "正在运行…", title="Yuan Ye Gateway"),
-                        Panel(observer_progress, title="Observer Progress"),
-                    ), expand=True, equal=True)
-                    # Keep the primary visible content available to legacy Live
-                    # adapters/read-receipt tests while Rich renders both columns.
-                    observer_columns.renderable = "\n".join(display) or "正在运行…"
-                    live.update(observer_columns, refresh=terminal)
+                    main_content = "\n".join(display) or "正在运行…"
+                    phase = (
+                        "已完成" if event.type == "run_completed"
+                        else "已结束" if terminal else "运行中"
+                    )
+                    if terminal:
+                        observer_progress = (
+                            "✓ 主任务已完成\n\n正在完成最终意图核对…"
+                            if event.type == "run_completed"
+                            else "主任务已结束\n\n正在完成最终状态核对…"
+                        )
+                    live.update(
+                        _GatewayLiveView(
+                            _live_main_window(main_content, console),
+                            observer_progress,
+                            phase=phase,
+                            height=_gateway_live_height(console),
+                            history_content=main_content,
+                        ),
+                        refresh=terminal,
+                    )
                     if terminal:
                         # A correction proposal is created from the terminal
                         # Observer state, so it can be sequenced after the Run's
                         # terminal event. Querying the durable projection avoids
                         # losing it when a client closes its live subscription.
                         try:
-                            status = await client.observer_status(run.run_id)
-                            observer_progress = str(
-                                status.get("progress_markdown") or observer_progress
-                            )
+                            status = await _wait_for_observer_terminal(client, run.run_id)
+                            if status is None:
+                                status = {}
+                            if status.get("status") in {"finalized", "failed"}:
+                                observer_progress = str(
+                                    status.get("progress_markdown") or observer_progress
+                                )
                             proposal = status.get("correction_proposal")
                             if isinstance(proposal, dict):
                                 if proposal.get("status") == "pending":
@@ -326,6 +483,26 @@ async def _render_gateway(
                             # Observer status is an isolated enhancement. It must
                             # not prevent display/acknowledgement of the Run result.
                             pass
+                        if "正在完成最终" in observer_progress:
+                            observer_progress = (
+                                "✓ 任务已完成"
+                                if event.type == "run_completed"
+                                else "⚠ 主任务已结束"
+                            )
+                        live.update(
+                            _GatewayLiveView(
+                                _live_main_window(main_content, console),
+                                observer_progress,
+                                phase=phase,
+                                height=_gateway_live_height(console),
+                                history_content=main_content,
+                            ),
+                            refresh=True,
+                        )
+                        completed_view = _GatewayLiveView(
+                            main_content, observer_progress, phase=phase,
+                            history_content=main_content,
+                        )
                         try:
                             await client.acknowledge_run_result(event.run_id)
                         except Exception:
@@ -337,6 +514,10 @@ async def _render_gateway(
             raise
         finally:
             _active_live.reset(token)
+    if completed_view is not None:
+        # The final Rich projection enters ordinary terminal scrollback and
+        # does not need a second fixed-height Textual lifecycle.
+        console.print(completed_view, crop=False)
     return active_session_id, terminal_error
 
 
@@ -444,18 +625,24 @@ def chat(
     continue_last: bool = typer.Option(
         False, "--continue", help="恢复当前 workspace 最近使用的 Session",
     ),
+    classic: bool = typer.Option(
+        False, "--classic", help="使用兼容性的逐行终端界面",
+    ),
 ) -> None:
     """连接 Gateway 并启动连续交互会话。"""
     if session_id and continue_last:
         raise typer.BadParameter("--session 与 --continue 不能同时使用")
+    use_tui = console.is_terminal and not classic
     interrupts = ChatInterruptController()
     previous_handler = signal.getsignal(signal.SIGINT)
-    signal.signal(signal.SIGINT, interrupts.handle_sigint)
+    if not use_tui:
+        signal.signal(signal.SIGINT, interrupts.handle_sigint)
     try:
         asyncio.run(_chat_gateway(
             session_id,
             continue_last=continue_last,
             interrupt_controller=interrupts,
+            use_tui=use_tui,
         ))
     except KeyboardInterrupt:
         console.print("\n[dim]已退出会话。[/]")
@@ -463,7 +650,32 @@ def chat(
         console.print(Panel(f"[red]{str(exc) or type(exc).__name__}[/]", title="Yuan Ye Agent 配置错误"))
         raise typer.Exit(code=1) from exc
     finally:
-        signal.signal(signal.SIGINT, previous_handler)
+        if not use_tui:
+            signal.signal(signal.SIGINT, previous_handler)
+
+
+async def _latest_session_observer_status(
+    client: GatewayClient,
+    project_id: str,
+    session_id: str,
+) -> dict[str, Any] | None:
+    """Restore the newest durable Observer projection for a chat Session."""
+    try:
+        runs = await client.runs(project_id)
+    except Exception:
+        # Observer is a presentation enhancement. A missing/older Gateway API
+        # must not prevent the conversation itself from being restored.
+        return None
+    for run in runs:
+        if run.session_id != session_id or run.workload_kind != "chat":
+            continue
+        try:
+            return await client.observer_status(run.run_id)
+        except Exception:
+            # A Run may predate Observer support or have failed before the
+            # first visible event. Continue to the previous Turn in Session.
+            continue
+    return None
 
 
 async def _chat_gateway(
@@ -471,11 +683,13 @@ async def _chat_gateway(
     *,
     continue_last: bool = False,
     interrupt_controller: ChatInterruptController,
+    use_tui: bool = False,
 ) -> None:
-    console.print(
-        "[bold cyan]Yuan Ye Gateway[/]  输入 /help 查看命令，/exit 退出；"
-        "运行中按 Ctrl+C 终止当前回答。"
-    )
+    if not use_tui:
+        console.print(
+            "[bold cyan]Yuan Ye Gateway[/]  输入 /help 查看命令，/exit 退出；"
+            "运行中按 Ctrl+C 终止当前回答。"
+        )
     client = _gateway_client()
     project = await _gateway_project(client)
     project_id = str(project["project_id"])
@@ -485,14 +699,84 @@ async def _chat_gateway(
             console.print("[dim]当前 workspace 还没有可恢复的 Session，将创建新会话。[/]")
         else:
             session_id = str(sessions[0]["session_id"])
+    records: list[dict[str, Any]] = []
     if session_id:
         sessions = await client.sessions(project_id)
         if not any(item.get("session_id") == session_id for item in sessions):
             raise ValueError(f"当前 workspace 未找到 Session：{session_id}")
-        records = await client.session(project_id, session_id)
-        console.print(f"[green]已恢复会话[/] {session_id}（{len(records)} 条记录）")
-        _render_restored_history(records)
-        await _acknowledge_displayed_history(client, project_id, session_id, records)
+        records = list(await client.session(project_id, session_id))
+        if not use_tui:
+            console.print(f"[green]已恢复会话[/] {session_id}（{len(records)} 条记录）")
+            _render_restored_history(records)
+            await _acknowledge_displayed_history(client, project_id, session_id, records)
+    if use_tui:
+        model_options = await client.model_options(session_id, project_id)
+        selected_model = next(
+            (item.model for item in model_options if item.selected),
+            model_options[0].model if model_options else None,
+        )
+        unread_count = await _prepare_actionable_inbox(client)
+        initial_observer_status = (
+            await _latest_session_observer_status(client, project_id, session_id)
+            if session_id else None
+        )
+
+        async def external_command(command: str, active_session_id: str | None) -> None:
+            if command == "/code":
+                await _code_mode(client, project_id, active_session_id)
+                return
+            if command == "/skill" or command.startswith("/skill "):
+                await _handle_gateway_skill_command(
+                    client, project_id, active_session_id, command,
+                )
+                return
+            if command == "/inbox" or command.startswith("/inbox "):
+                await _handle_inbox_command(client, command)
+                return
+            if command == "/tool-result" or command.startswith("/tool-result "):
+                await _handle_tool_result_command(
+                    client, project_id, active_session_id, command,
+                )
+                return
+            if command == "/cron" or command.startswith("/cron "):
+                await _handle_cron_command(client, project_id, command)
+                return
+            if command == "/dream" or command.startswith("/dream "):
+                await _handle_dream_command(client, command)
+                return
+            if command == "/harness" or command.startswith("/harness "):
+                await _handle_harness_command(client, command)
+                return
+            if command == "/extension" or command.startswith("/extension "):
+                await _handle_extension_command(client, command)
+                return
+            if command == "/reload" or command.startswith("/reload "):
+                await _handle_runtime_reload_command(client, command)
+                return
+            # /compress and /context refresh are Runtime commands and therefore
+            # intentionally travel through the ordinary Run API.
+            raise ValueError(f"未知本地命令：{command}")
+
+        async def history_displayed() -> None:
+            if session_id and records:
+                await _acknowledge_displayed_history(
+                    client, project_id, session_id, records,
+                )
+
+        tui = YuanYeChatApp(
+            client,
+            project_id,
+            session_id=session_id,
+            records=records,
+            external_command=external_command,
+            history_displayed=history_displayed,
+            unread_count=unread_count,
+            initial_observer_status=initial_observer_status,
+            model_name=selected_model,
+            model_options=model_options,
+        )
+        await tui.run_async(mouse=True)
+        return
     interrupt_controller.bind(asyncio.get_running_loop())
     await _notify_actionable_inbox(client)
     while True:
@@ -785,9 +1069,24 @@ async def _notify_actionable_inbox(client: GatewayClient) -> None:
     history but are silently acknowledged.  Failures remain unread, while chat
     startup shows only one compact hint instead of expanding maintenance rows.
     """
-    unread = await client.inbox(unread_only=True)
+    count = await _prepare_actionable_inbox(client)
+    if count:
+        console.print(
+            f"[yellow]后台有 {count} 条需要处理的通知；"
+            "使用 /inbox 查看详情。[/]"
+        )
+
+
+async def _prepare_actionable_inbox(client: GatewayClient) -> int:
+    """Acknowledge routine results and return the actionable unread count."""
+    try:
+        unread = await client.inbox(unread_only=True)
+    except Exception:
+        # Inbox is a projection/notification surface. An outage must not make
+        # the primary chat client unusable.
+        return 0
     if not unread:
-        return
+        return 0
     actionable: list[dict[str, object]] = []
     for item in unread:
         status = str(item.get("status", "")).casefold()
@@ -803,11 +1102,7 @@ async def _notify_actionable_inbox(client: GatewayClient) -> None:
             # A receipt outage must not prevent an interactive chat from
             # starting. The completed row may be acknowledged next time.
             continue
-    if actionable:
-        console.print(
-            f"[yellow]后台有 {len(actionable)} 条需要处理的通知；"
-            "使用 /inbox 查看详情。[/]"
-        )
+    return len(actionable)
 
 
 async def _resolve_inbox_item(
@@ -1553,7 +1848,14 @@ def gateway_quiesce(timeout: float = typer.Option(30, min=1, max=3600),
 def gateway_resume(epoch: int = typer.Option(..., min=1), revision: int = typer.Option(..., min=0)) -> None:
     """按精确 maintenance epoch/revision 健康检查后恢复。"""
     config = load_runtime_config()
-    client = GatewayClient(config.agent_root, port=config.gateway_port)
+    # Resume is a control-plane command whose purpose is to make a healthy but
+    # non-accepting Gateway accept work again. Requiring normal work readiness
+    # in GatewayClient.__init__ makes that recovery path self-deadlock.
+    client = GatewayClient(
+        config.agent_root,
+        port=config.gateway_port,
+        auto_start=False,
+    )
     console.print(asyncio.run(client.resume(epoch, revision)))
 
 
@@ -1793,15 +2095,26 @@ def _cron_preview_local(preview) -> tuple[str, ...]:
 @backup_app.command("create")
 def backup_create(
     output: Path | None = typer.Option(None, "--output", help="输出 .yybackup 路径"),
+    manual_passphrase: bool = typer.Option(
+        False,
+        "--manual-passphrase",
+        help="使用手动口令创建可跨设备恢复的备份",
+    ),
 ) -> None:
-    """通过运行中的 Gateway 协作冻结并创建手动加密快照。"""
-    first = getpass.getpass("Backup 口令: ")
-    second = getpass.getpass("再次输入口令: ")
-    if not first or first != second:
-        raise typer.BadParameter("两次口令不一致或为空")
+    """默认使用系统托管密钥；可显式选择手动口令。"""
+    config = load_runtime_config()
+    first: str | None = None
+    if manual_passphrase or config.backup_key_mode == "passphrase":
+        first = getpass.getpass("Backup 口令: ")
+        second = getpass.getpass("再次输入口令: ")
+        if not first or first != second:
+            raise typer.BadParameter("两次口令不一致或为空")
     record = asyncio.run(_gateway_client().create_backup(first, output))
     console.print(f"[green]Backup 完成[/] {record.path}")
-    console.print(f"backup_id={record.backup_id} size={record.size_bytes}")
+    console.print(
+        f"backup_id={record.backup_id} size={record.size_bytes} "
+        f"encryption={record.encryption_mode}",
+    )
 
 
 @backup_app.command("list")
@@ -1825,8 +2138,10 @@ def backup_status() -> None:
 @backup_app.command("verify")
 def backup_verify(archive: Path) -> None:
     """解密并验证GCM、Manifest、文件哈希和SQLite一致性。"""
-    password = getpass.getpass("Backup 口令: ")
-    result = BackupService(default_agent_root()).verify(archive, password)
+    service = BackupService(default_agent_root())
+    header = EncryptedBackupArchive.read_header(archive)
+    password = getpass.getpass("Backup 口令: ") if header.key_mode == "passphrase" else None
+    result = service.verify(archive, password)
     console.print_json(data=result.model_dump(mode="json"))
     if not result.valid:
         raise typer.Exit(1)
@@ -1841,7 +2156,10 @@ def backup_restore(
 ) -> None:
     """停止Gateway，创建救援备份，然后整体替换Agent Home。"""
     root = default_agent_root()
-    password = getpass.getpass("Backup 口令: ")
+    service = BackupService(root)
+    header = EncryptedBackupArchive.read_header(archive)
+    entered = getpass.getpass("Backup 口令: ") if header.key_mode == "passphrase" else None
+    password = service.resolve_archive_secret(archive, entered)
     mappings: dict[str, str] = {}
     for item in map_path:
         if "=" not in item:
@@ -1850,9 +2168,8 @@ def backup_restore(
         if not old or not new or old in mappings:
             raise typer.BadParameter("--map-path 不能为空或重复")
         mappings[old] = new
-    service = BackupService(root)
     restore = RestoreService(root, service)
-    plan = restore.plan(archive, password, mappings)
+    plan = restore.plan(archive, password.value, mappings)
     console.print(
         f"backup_id={plan.backup_id}\ncreated={plan.created_at.isoformat()}\n"
         f"agent={plan.agent_version}\narchive={plan.archive_size} bytes\n"

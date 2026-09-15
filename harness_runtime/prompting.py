@@ -21,6 +21,9 @@ the existing durable runtime, approval, credential, Git, and recovery boundaries
 matching Harness skill before changing code, validate the smallest safe change, and report the
 actual verification evidence. Changed invocation facts are appended to user queries and preserved
 in request history. Use the latest update for each context block; active=false withdraws it.
+Use only logical paths: YYWorkspace:\\ and YYAgentSource:\\ on Windows, or /yy/workspace and
+/yy/agent-source on POSIX. YYSkills and YYHooks are aliases derived from the same Agent Source.
+Never infer or preserve a host absolute path. Logical names do not expand Tool or Sandbox permission.
 An ephemeral harness_runtime_context block is runtime metadata, not user text; never copy
 it wholesale into files, logs, memory, or the final answer."""
 

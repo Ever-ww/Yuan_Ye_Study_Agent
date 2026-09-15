@@ -13,7 +13,12 @@ from pydantic import BaseModel, ValidationError
 
 from Agent import AgentRuntime, EventType, HookEvent, HookPoint, HookRegistry, load_runtime_config
 from Agent.contracts import ModelReply, TokenUsage, ToolCall
-from Agent.models.providers import _http_client_options, build_provider
+from Agent.models.providers import (
+    AnthropicProvider,
+    OpenAICompatibleProvider,
+    _http_client_options,
+    build_provider,
+)
 from Agent.runtime.subagent import RuntimeSubagentRunner
 from bootstrap import ensure_project_initialized, is_project_initialized
 from context_process import ContextProcessor
@@ -144,6 +149,14 @@ class StreamProvider:
     async def stream(self, messages, tools):
         yield ModelReply(text="你", finished=False)
         yield ModelReply(text="好", finished=False)
+        yield ModelReply(finished=True)
+
+
+class ReasoningStreamProvider(StreamProvider):
+    async def stream(self, messages, tools):
+        yield ModelReply(reasoning="先分析", finished=False)
+        yield ModelReply(reasoning="再回答", finished=False)
+        yield ModelReply(text="结果", finished=False)
         yield ModelReply(finished=True)
 
 
@@ -287,6 +300,79 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(config.base_url, "https://gateway.example/v1")
             self.assertEqual(config.api_key, "local-key")
             self.assertFalse(config.stream)
+            self.assertEqual(config.reasoning_effort, "low")
+
+    def test_configured_model_profiles_switch_provider_without_mutating_default(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            (root / ".yy").mkdir()
+            (root / ".yy" / "settings.local.json").write_text(json.dumps({
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "api_key": "deepseek-key",
+                "model_profiles": [
+                    {
+                        "profile_id": "flash",
+                        "provider": "deepseek",
+                        "model": "deepseek-flash",
+                        "stream": True,
+                    },
+                    {
+                        "profile_id": "other",
+                        "provider": "openai",
+                        "model": "gpt-pro",
+                        "base_url": "https://example.test/v1",
+                        "api_key": "other-key",
+                    },
+                ],
+            }), encoding="utf-8")
+            config = load_runtime_config(root)
+
+            same_provider = config.select_model_profile("flash")
+            self.assertEqual(same_provider.model, "deepseek-flash")
+            self.assertEqual(same_provider.api_key, "deepseek-key")
+            self.assertTrue(same_provider.stream)
+            other = config.select_model_profile("other")
+            self.assertEqual(other.provider, "openai")
+            self.assertEqual(other.api_key, "other-key")
+            self.assertEqual(config.model, "deepseek-chat")
+
+    def test_openai_and_anthropic_reasoning_payload_formats(self) -> None:
+        openai = OpenAICompatibleProvider(
+            "https://api.deepseek.com/v1", "deepseek-chat", "secret",
+            reasoning_effort="max",
+        )
+        openai_payload = openai._payload([], [], stream=False)
+        self.assertEqual(openai_payload["reasoning_effort"], "max")
+        self.assertNotIn("temperature", openai_payload)
+
+        anthropic = AnthropicProvider(
+            "https://api.anthropic.com/v1", "claude-opus-5", "secret",
+            reasoning_effort="max",
+        )
+        anthropic_payload = anthropic._payload("system", [])
+        self.assertEqual(anthropic_payload["thinking"], {"type": "adaptive"})
+        self.assertEqual(
+            anthropic_payload["output_config"], {"effort": "max"},
+        )
+        anthropic.reasoning_effort = "none"
+        self.assertEqual(
+            anthropic._payload("system", [])["thinking"],
+            {"type": "disabled"},
+        )
+
+    def test_shared_model_profile_cannot_contain_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            (root / ".yy").mkdir()
+            (root / ".yy" / "settings.json").write_text(json.dumps({
+                "model_profiles": [{
+                    "profile_id": "unsafe", "provider": "openai",
+                    "model": "gpt", "api_key": "must-not-be-shared",
+                }],
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "settings.local.json"):
+                load_runtime_config(root)
 
     def test_model_proxy_defaults_to_direct_and_supports_explicit_opt_in(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -492,6 +578,41 @@ class CoreTests(unittest.TestCase):
             self.assertIn("timestamp", records[0])
             self.assertEqual(memory.restore_messages(session_id)[1]["content"], "你好，我可以帮助你。")
 
+    def test_session_is_materialized_by_first_record_and_empty_sessions_are_hidden(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value) / ".yy" / "memory"
+            memory = MemoryStore(root)
+            session_id = memory.create_session("预绑定")
+            path = memory.sessions.active_path(session_id)
+
+            self.assertFalse(path.exists())
+            self.assertTrue(memory.has_session(session_id))
+            self.assertEqual(memory.restore_messages(session_id), [])
+            self.assertEqual(memory.list_sessions(), [])
+
+            memory.record_user(session_id, "第一条真实消息")
+            self.assertTrue(path.is_file())
+            self.assertEqual(memory.list_sessions()[0]["message_count"], 1)
+            index = json.loads((root / "session" / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(index["sessions"][session_id]["state"], "active")
+            self.assertIsNotNone(index["sessions"][session_id]["materialized_at"])
+
+    def test_session_list_counts_every_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            memory = MemoryStore(Path(value) / ".yy" / "memory")
+            session_id = memory.create_session("first")
+            memory.record_user(session_id, "first")
+            memory.record_assistant(session_id, "answer")
+            memory.sessions.rollover(session_id, [{
+                "role": "summary", "content": "summary", "record_id": "summary-1",
+                "timestamp": "2026-09-13 10:00:00",
+            }])
+            memory.record_user(session_id, "second")
+
+            listed = memory.list_sessions()[0]
+            self.assertEqual(listed["message_count"], 4)
+            self.assertEqual(listed["segment_count"], 2)
+
     def test_memory_rejects_invalid_jsonl_records(self) -> None:
         """损坏或角色字段非法的持久化记录必须在恢复边界明确失败。"""
         with tempfile.TemporaryDirectory() as value:
@@ -512,6 +633,7 @@ class CoreTests(unittest.TestCase):
             path = memory.sessions.start_new_segment(session_id)
             self.assertEqual(path.name.split("_")[1], session_id)
             self.assertTrue(path.name.endswith("_002.jsonl"))
+            self.assertFalse(path.exists())
 
     def test_memory_callbacks_restore_session_messages(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -922,6 +1044,41 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(call["output_tokens_source"], "provider")
             self.assertGreaterEqual(call["latency_ms"], 0)
 
+    def test_runtime_records_provider_prefix_cache_telemetry_in_session(self) -> None:
+        class CachedUsageProvider:
+            streaming = False
+
+            async def complete(self, messages, tools):
+                return ModelReply(
+                    text="cached",
+                    usage=TokenUsage(
+                        input_tokens=100,
+                        cached_input_tokens=75,
+                        cache_miss_input_tokens=25,
+                        cache_metrics_source="deepseek.prompt_cache_tokens",
+                        output_tokens=3,
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as value:
+            config = load_runtime_config(
+                Path(value), provider="deepseek", model="deepseek-chat",
+                base_url="https://api.deepseek.com/v1",
+            )
+            memory = MemoryStore(config.memory_dir)
+            runtime = AgentRuntime(
+                config, provider=CachedUsageProvider(), memory=memory,
+                enable_sandbox=False,
+            )
+            result = asyncio.run(runtime.run("cache telemetry"))
+            assistant = memory.session_records(result.session_id)[-1]
+            cache = assistant["model_calls"][0]["prefix_cache"]
+            self.assertEqual(cache["status"], "reported")
+            self.assertEqual(cache["hit_tokens"], 75)
+            self.assertEqual(cache["miss_tokens"], 25)
+            self.assertEqual(cache["hit_ratio"], 0.75)
+            self.assertEqual(cache["source"], "deepseek.prompt_cache_tokens")
+
     def test_all_ten_hook_points_follow_turn_and_tool_order(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             points: list[str] = []
@@ -1010,6 +1167,30 @@ class CoreTests(unittest.TestCase):
                 )
                 return [str(event.payload["content"]) async for event in runtime.run_task("问候") if event.type is EventType.TEXT]
         self.assertEqual(asyncio.run(collect()), ["你", "好"])
+
+    def test_runtime_streams_reasoning_and_persists_the_complete_value(self) -> None:
+        async def collect(root: Path):
+            runtime = AgentRuntime(
+                load_runtime_config(root), provider=ReasoningStreamProvider(),
+                enable_sandbox=False,
+            )
+            events = [event async for event in runtime.run_task("分析后回答")]
+            records = runtime.memory.session_records(str(runtime.active_session_id))
+            await runtime.close()
+            return events, records
+
+        with tempfile.TemporaryDirectory() as value:
+            events, records = asyncio.run(collect(Path(value)))
+        self.assertEqual(
+            [event.payload["content"] for event in events if event.type is EventType.REASONING],
+            ["先分析", "再回答"],
+        )
+        self.assertEqual(
+            [event.payload["loop"] for event in events if event.type is EventType.REASONING],
+            [1, 1],
+        )
+        self.assertEqual(events[-1].payload["reasoning"], "先分析再回答")
+        self.assertEqual(records[-1]["reasoning"], "先分析再回答")
 
     def test_restart_required_tool_finishes_without_second_model_call(self) -> None:
         async def collect():
@@ -1424,7 +1605,7 @@ class CoreTests(unittest.TestCase):
             self.assertLess(system.index("身份内容"), system.index("项目内容"))
             self.assertLess(system.index("身份内容"), system.index("# Skill 使用策略"))
             self.assertLess(system.index("# Skill 使用策略"), system.index("# 核心规则"))
-            self.assertIn("必须先检查最上方 <available_skills> 目录", system)
+            self.assertIn("先在不调用工具的情况下判断当前任务", system)
             self.assertIn("优先调用 skill_read", system)
             self.assertNotIn("根目录不得进入模型", system)
             self.assertNotIn(f"Session ID：{result.session_id}", system)

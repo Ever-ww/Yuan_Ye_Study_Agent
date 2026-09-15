@@ -10,6 +10,7 @@ import sys
 import tempfile
 
 from .models import SandboxStatus
+from .path_mapping import LogicalRoot, PathMappingSnapshot
 from .policy import NativePolicy
 from .scan_cache import WorkspaceScanCache
 from .process import run_isolated
@@ -56,6 +57,7 @@ def linux_arguments(
     *,
     protected_paths: tuple[tuple[Path, bool], ...] | None = None,
     writable_roots: tuple[Path, ...] | None = None,
+    path_mapping: PathMappingSnapshot | None = None,
 ) -> list[str]:
     args = [executable, "--unshare-all", "--unshare-user", "--unshare-pid", "--unshare-net",
             "--die-with-parent", "--new-session", "--cap-drop", "ALL",
@@ -65,23 +67,55 @@ def linux_arguments(
         if Path(path).exists():
             args += ["--ro-bind", path, path]
     args += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/tmp/home"]
-    for path in policy.readable_roots:
-        args += ["--ro-bind", str(path), str(path)]
-    selected = writable_roots or (policy.workspace,)
-    if selected == (policy.workspace,):
-        args += ["--bind", str(policy.workspace), str(policy.workspace)]
+    if path_mapping is None:
+        for path in policy.readable_roots:
+            args += ["--ro-bind", str(path), str(path)]
     else:
-        args += ["--ro-bind", str(policy.workspace), str(policy.workspace)]
+        args += ["--dir", "/yy", "--dir", "/yy/read-only"]
+        for index, path in enumerate(policy.readable_roots):
+            args += ["--ro-bind", str(path), f"/yy/read-only/{index}"]
+    selected = writable_roots or (policy.workspace,)
+    workspace_target = (
+        path_mapping.shell_root(LogicalRoot.WORKSPACE)
+        if path_mapping is not None else str(policy.workspace)
+    )
+    if selected == (policy.workspace,):
+        args += ["--bind", str(policy.workspace), workspace_target]
+    else:
+        args += ["--ro-bind", str(policy.workspace), workspace_target]
         for path in selected:
-            args += ["--bind", str(path), str(path)]
+            target = (
+                f"{workspace_target}/{path.relative_to(policy.workspace).as_posix()}"
+                if path_mapping is not None else str(path)
+            )
+            args += ["--bind", str(path), target]
+    if path_mapping is not None and path_mapping.agent_source_root == policy.workspace:
+        # Aliases point back into the already-carved Workspace mount.  A second
+        # bind of the host directory would bypass .git/.env/.venv overlays.
+        args += ["--symlink", "workspace", path_mapping.shell_root(LogicalRoot.AGENT_SOURCE)]
+        if path_mapping.skills_root.is_dir():
+            args += ["--symlink", "agent-source/skills", path_mapping.shell_root(LogicalRoot.SKILLS)]
+        if path_mapping.hooks_root.is_dir():
+            args += ["--symlink", "agent-source/extension/hook", path_mapping.shell_root(LogicalRoot.HOOKS)]
     for path, hidden in protected_paths if protected_paths is not None else policy.protected_paths():
         if hidden and path.is_dir():
-            args += ["--tmpfs", str(path), "--chmod", "000", str(path)]
+            target = _sandbox_target(path, policy.workspace, workspace_target)
+            args += ["--tmpfs", target, "--chmod", "000", target]
         elif hidden:
-            args += ["--ro-bind", "/dev/null", str(path)]
+            args += ["--ro-bind", "/dev/null", _sandbox_target(path, policy.workspace, workspace_target)]
         else:
-            args += ["--ro-bind", str(path), str(path)]
-    return args + ["--chdir", str(policy.workspace), "--", *command]
+            args += ["--ro-bind", str(path), _sandbox_target(path, policy.workspace, workspace_target)]
+    return args + ["--chdir", workspace_target, "--", *command]
+
+
+def _sandbox_target(path: Path, workspace: Path, workspace_target: str) -> str:
+    if workspace_target == str(workspace):
+        return str(path)
+    if path == workspace:
+        return workspace_target
+    if path.is_relative_to(workspace):
+        return f"{workspace_target}/{path.relative_to(workspace).as_posix()}"
+    return str(path)
 
 
 def seatbelt_profile(
@@ -112,9 +146,10 @@ def seatbelt_profile(
 
 
 class NativeSandboxSession(CheckpointSandboxSession):
-    def __init__(self, project_root: Path, *, readable_roots=(), shell: str | None = None, **kwargs):
+    def __init__(self, project_root: Path, *, readable_roots=(), shell: str | None = None, path_mapping=None, **kwargs):
         super().__init__(project_root, **kwargs)
         self.policy = NativePolicy(self.project_root, tuple(Path(p).resolve() for p in readable_roots))
+        self.path_mapping = path_mapping
         self.platform = sys.platform
         self.configured_shell = shell
         self.shell = ""
@@ -248,7 +283,13 @@ class NativeSandboxSession(CheckpointSandboxSession):
             command = ("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); "
                        "try { New-PSDrive -Name YYWorkspace -PSProvider FileSystem "
                        f"-Root '{location}' -ErrorAction Stop | Out-Null; "
-                       "Set-Location YYWorkspace: -ErrorAction Stop } catch { Write-Error $_; exit 125 }; " + command)
+                       + self._windows_source_drives()
+                       + "Set-Location YYWorkspace: -ErrorAction Stop } catch { Write-Error $_; exit 125 }; " + command)
+        elif self.platform == "darwin" and self.path_mapping is not None:
+            # Seatbelt provides the security boundary but no mount namespace.
+            # Translate only the fixed logical roots before invoking the shell;
+            # model-visible output is projected back after execution.
+            command = self.path_mapping.translate_posix_command(command)
         argv = shell_argv(command, self.shell, self.platform)
         if self.platform == "win32":
             return await self._windows.run(
@@ -263,6 +304,7 @@ class NativeSandboxSession(CheckpointSandboxSession):
             argv = linux_arguments(
                 self.policy, executable, argv, protected_paths=protected,
                 writable_roots=self._current_writable_roots,
+                path_mapping=self.path_mapping,
             )
             temp = "/tmp"
         else:
@@ -282,13 +324,44 @@ class NativeSandboxSession(CheckpointSandboxSession):
         env = {"PATH": os.defpath, "HOME": temp, "TMPDIR": temp, "TMP": temp, "TEMP": temp,
                "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1", "UV_OFFLINE": "1",
                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
-        tool_dirs = [str(p / "bin") for p in self.policy.readable_roots if (p / "bin").is_dir()]
-        tool_dirs += [str(self.policy.workspace / ".venv/bin")]
+        if self.platform == "linux" and self.path_mapping is not None:
+            tool_dirs = [f"/yy/read-only/{index}/bin" for index, p in enumerate(self.policy.readable_roots) if (p / "bin").is_dir()]
+            tool_dirs += ["/yy/workspace/.venv/bin"]
+        else:
+            tool_dirs = [str(p / "bin") for p in self.policy.readable_roots if (p / "bin").is_dir()]
+            tool_dirs += [str(self.policy.workspace / ".venv/bin")]
         env["PATH"] = os.pathsep.join([*tool_dirs, str(Path(self.shell).parent), os.defpath])
         return await run_isolated(argv, cwd=str(self.project_root), env=env, timeout=timeout_seconds)
 
+    def _windows_source_drives(self) -> str:
+        mapping = self.path_mapping
+        if mapping is None or mapping.agent_source_root != self.project_root:
+            return ""
+        values = (
+            ("YYAgentSource", mapping.agent_source_root),
+            ("YYSkills", mapping.skills_root),
+            ("YYHooks", mapping.hooks_root),
+        )
+        commands = []
+        for name, path in values:
+            if path.is_dir():
+                location = str(path).replace("'", "''")
+                commands.append(
+                    f"New-PSDrive -Name {name} -PSProvider FileSystem -Root '{location}' -ErrorAction Stop | Out-Null; "
+                )
+        return "".join(commands)
+
     def _configure_bash_access(self, writable_paths: tuple[str, ...] | None) -> None:
-        selected = self.policy.writable_roots(writable_paths)
+        normalized = writable_paths
+        if writable_paths is not None and self.path_mapping is not None:
+            normalized = tuple(
+                self.path_mapping.resolve_workspace_path(value)
+                .relative_to(self.project_root)
+                .as_posix()
+                or "."
+                for value in writable_paths
+            )
+        selected = self.policy.writable_roots(normalized)
         self._current_writable_roots = selected
         if self.platform != "win32":
             return

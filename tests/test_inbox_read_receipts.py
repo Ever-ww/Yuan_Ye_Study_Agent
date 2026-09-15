@@ -116,6 +116,69 @@ def test_receipt_failure_does_not_fail_displayed_chat(monkeypatch):
     assert client.start_run.await_count == 1
 
 
+def test_gateway_live_view_keeps_main_and_observer_in_one_surface():
+    output = io.StringIO()
+    view = cli._GatewayLiveView(
+        "最终答案", "✓ 任务已完成", phase="已完成",
+    )
+    Console(file=output, width=100, color_system=None).print(view)
+    rendered = output.getvalue()
+    assert "MAIN AGENT" in rendered
+    assert "TURN OBSERVER" in rendered
+    assert "最终答案" in rendered
+    assert "任务已完成" in rendered
+    # Keep the horizontal header rule and a visible column divider throughout
+    # the body so Main and Observer remain visually distinct while streaming.
+    assert "│" in rendered
+    assert "─" in rendered
+    # There is one outer surface rather than two Panels that can reflow into
+    # a vertical completion layout.
+    assert rendered.count("Yuan Ye") == 1
+
+
+def test_long_live_output_uses_a_bounded_tail_but_final_view_keeps_full_text():
+    output = io.StringIO()
+    selected_console = Console(
+        file=output, width=100, height=18, color_system=None,
+    )
+    content = "\n".join(f"第 {index:03d} 行：" + "很长的内容" * 12 for index in range(80))
+
+    live_window = cli._live_main_window(content, selected_console)
+
+    assert "较早内容已滚动" in live_window.plain
+    assert "第 079" in live_window.plain
+    assert "第 000" not in live_window.plain
+    final_view = cli._GatewayLiveView(content, "✓ 任务已完成", phase="已完成")
+    selected_console.print(final_view, crop=False)
+    assert "第 000" in output.getvalue()
+    assert "第 079" in output.getvalue()
+
+
+def test_subscription_replays_terminal_fact_when_live_delivery_stalls():
+    client = object.__new__(GatewayClient)
+    terminal = GatewayEventEnvelope(
+        event_id="terminal", run_id="run", project_id="project", session_id="session",
+        sequence=4, timestamp="2026-09-13T00:00:00+08:00", type="run_completed",
+        payload={"answer": "完整最终答案"},
+    )
+
+    async def stalled_events(*args, **kwargs):
+        del args, kwargs
+        await asyncio.Event().wait()
+        if False:
+            yield terminal
+
+    client.events = stalled_events
+    client.run = AsyncMock(return_value=SimpleNamespace(status="completed"))
+    client._request = AsyncMock(return_value=[terminal.model_dump(mode="json")])
+
+    async def collect():
+        return [item async for item in client.subscribe("run", after_sequence=3)]
+
+    events = asyncio.run(asyncio.wait_for(collect(), timeout=2))
+    assert [item.event_id for item in events] == ["terminal"]
+
+
 def test_restore_acknowledges_only_after_rendering(monkeypatch):
     client = SimpleNamespace(
         sessions=AsyncMock(return_value=[{"session_id": "session"}]),

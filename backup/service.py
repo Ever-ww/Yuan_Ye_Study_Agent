@@ -29,10 +29,10 @@ from .models import (
     DurabilityClass,
     ExternalDependency,
 )
-from .security import SensitiveEnvSanitizer
+from .security import BackupSecret, SensitiveEnvSanitizer, SystemManagedBackupKeyStore
 
 
-SecretProvider = Callable[[], str | None]
+SecretProvider = Callable[[], BackupSecret | str | None]
 _SQLITE_HEADER = b"SQLite format 3\x00"
 _REQUIRED_SQLITE_PATHS = {
     "gateway/gateway.sqlite3",
@@ -55,6 +55,7 @@ class BackupService:
         retention_monthly: int = 12,
         min_free_space_bytes: int | None = None,
         max_storage_bytes: int | None = None,
+        system_key_store: SystemManagedBackupKeyStore | None = None,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.home = self.agent_root / ".yy"
@@ -74,18 +75,20 @@ class BackupService:
         self.min_free_space_bytes = min_free_space_bytes
         self.max_storage_bytes = max_storage_bytes
         self.index_path = self.control_root / "index.json"
+        self.system_key_store = system_key_store or SystemManagedBackupKeyStore(self.agent_root)
 
     async def create(
         self,
         *,
         passphrase: str | None = None,
+        resolved_secret: BackupSecret | None = None,
         output: Path | None = None,
         kind: str = "manual",
         drain_timeout_seconds: float = 300,
     ) -> BackupRecord:
-        selected = passphrase or (self.secret_provider() if self.secret_provider else None)
-        if not selected:
-            raise ValueError("没有可用的加密口令；Backup绝不降级为明文")
+        if resolved_secret is not None and passphrase is not None:
+            raise ValueError("passphrase 与 resolved_secret 不能同时提供")
+        selected = resolved_secret or self._secret_for_create(passphrase)
         if not self.home.is_dir():
             raise FileNotFoundError(f"Agent Home尚未初始化：{self.home}")
         self._ensure_backup_space()
@@ -123,8 +126,15 @@ class BackupService:
             target = output or self.backup_directory / (
                 f"{created_at:%Y-%m-%d_%H%M%S}_{backup_id[:12]}.yybackup"
             )
-            path = EncryptedBackupArchive.write(target, selected, manifest, sources)
-            verification = self.verify(path, selected)
+            path = EncryptedBackupArchive.write(
+                target,
+                selected.value,
+                manifest,
+                sources,
+                key_mode=selected.mode,
+                key_id=selected.key_id,
+            )
+            verification = self.verify(path, selected.value)
             if not verification.valid:
                 path.unlink(missing_ok=True)
                 raise RuntimeError("Backup发布后验证失败：" + "; ".join(verification.errors))
@@ -136,6 +146,8 @@ class BackupService:
                 size_bytes=path.stat().st_size,
                 created_at=created_at,
                 retention_class=kind,
+                encryption_mode=selected.mode,
+                key_id=selected.key_id,
             )
             self._record_backup(record)
             if kind == "automatic":
@@ -152,13 +164,14 @@ class BackupService:
             if completed:
                 shutil.rmtree(maintenance, ignore_errors=True)
 
-    def verify(self, archive: Path, passphrase: str) -> BackupVerificationResult:
+    def verify(self, archive: Path, passphrase: str | None = None) -> BackupVerificationResult:
         errors: list[str] = []
         manifest: BackupManifest | None = None
         with tempfile.TemporaryDirectory(prefix="yy-backup-verify-") as directory:
             destination = Path(directory) / "home"
             try:
-                manifest = EncryptedBackupArchive.extract(archive, passphrase, destination)
+                selected = self.resolve_archive_secret(archive, passphrase)
+                manifest = EncryptedBackupArchive.extract(archive, selected.value, destination)
             except Exception as exc:
                 return BackupVerificationResult(
                     valid=False,
@@ -203,6 +216,41 @@ class BackupService:
                 },
                 errors=tuple(errors),
             )
+
+    def resolve_archive_secret(
+        self,
+        archive: Path,
+        passphrase: str | None = None,
+    ) -> BackupSecret:
+        """Resolve an archive key without ever falling back to plaintext storage."""
+        header = EncryptedBackupArchive.read_header(archive)
+        if passphrase:
+            return BackupSecret(passphrase, "passphrase")
+        if header.key_mode == "os_managed":
+            selected = self.system_key_store.get(header.key_id)
+            if selected is None:
+                raise ValueError(
+                    "当前系统账户没有这份备份的托管密钥；请回到原账户恢复，或使用手动口令备份迁移",
+                )
+            return selected
+        raise ValueError("该备份使用手动口令，请输入创建它时使用的口令")
+
+    def key_status(self) -> dict[str, object]:
+        return self.system_key_store.status()
+
+    def _secret_for_create(self, passphrase: str | None) -> BackupSecret:
+        if passphrase:
+            return BackupSecret(passphrase, "passphrase")
+        if self.secret_provider is not None:
+            supplied = self.secret_provider()
+            if isinstance(supplied, BackupSecret):
+                return supplied
+            if isinstance(supplied, str) and supplied:
+                return BackupSecret(supplied, "passphrase")
+            raise ValueError(
+                "没有可用的自动备份口令；请设置 YY_BACKUP_PASSPHRASE，或改用 os_managed 模式",
+            )
+        return self.system_key_store.get_or_create()
 
     def list(self) -> tuple[BackupRecord, ...]:
         indexed = self._read_index()

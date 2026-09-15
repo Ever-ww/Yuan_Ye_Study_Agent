@@ -1,6 +1,6 @@
 """Maintenance is one durable authority; leases are transient liveness only."""
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import tempfile
@@ -9,6 +9,7 @@ import subprocess
 import sys
 import sqlite3
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from Agent import load_runtime_config
@@ -18,6 +19,7 @@ from gateway.application import GatewayApplication
 from gateway.api import create_gateway_api
 from gateway.models import RunCreateRequest
 from gateway.process import GatewayProcessManager, process_control_request
+from dream import DreamScheduler, DreamStatus
 from fastapi.testclient import TestClient
 
 
@@ -95,6 +97,66 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         await task
         await self.lifecycle.resume(1)
         self.assertEqual(self.gate.state, S.RUNNING)
+
+    async def test_dream_cooperatively_interrupts_before_global_lease_drain(self):
+        entered = asyncio.Event()
+        interrupted = asyncio.Event()
+        callbacks = []
+        service = SimpleNamespace(
+            config=SimpleNamespace(
+                dream_enabled=True,
+                harness_dream_enabled=False,
+                dream_schedule="0 3 * * *",
+                dream_timezone="UTC",
+            ),
+            status=lambda **_kwargs: DreamStatus(
+                enabled=True,
+                running=True,
+                schedule="0 3 * * *",
+                timezone="UTC",
+                initialized_at="2026-09-01T00:00:00+00:00",
+                last_completed_date=None,
+            ),
+        )
+
+        async def run_day(_selected):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                interrupted.set()
+                raise
+
+        async def on_result(result, automatic):
+            callbacks.append((result, automatic))
+
+        scheduler = DreamScheduler(
+            service,
+            lambda: True,
+            on_result,
+            clock=lambda: datetime(2026, 9, 15, 4, tzinfo=timezone.utc),
+            run_day=run_day,
+            write_gate=self.gate,
+        )
+        self.lifecycle.register("dream", scheduler)
+        ticking = asyncio.create_task(scheduler.tick())
+        await asyncio.wait_for(entered.wait(), 1)
+
+        snapshot = await self.lifecycle.quiesce(timeout=1)
+
+        self.assertEqual(snapshot.state, S.QUIESCED)
+        self.assertTrue(interrupted.is_set())
+        self.assertIsNone(await ticking)
+        self.assertEqual(callbacks, [])
+        self.assertEqual(snapshot.active_work, ())
+        self.assertEqual(
+            snapshot.participant_status["dream"].safe_boundary,
+            "dream_interrupted_or_day_run_persisted",
+        )
+        await self.lifecycle.resume(
+            snapshot.maintenance_epoch,
+            expected_revision=snapshot.revision,
+        )
 
     async def test_resume_health_and_participant_failure_remain_failed(self):
         participant = Participant(fail_resume=True)

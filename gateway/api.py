@@ -193,6 +193,8 @@ def create_gateway_api(
             "maintenance": gateway.maintenance.snapshot.model_dump(mode="json"),
             **gateway.backup_scheduler.status(),
             "backup_directory": str(gateway.backup_service.backup_directory),
+            "key_mode": config.backup_key_mode,
+            "system_key": gateway.backup_service.key_status(),
         }
 
     @app.get("/api/v1/status", dependencies=[Depends(authorize)])
@@ -225,6 +227,13 @@ def create_gateway_api(
             "cron": cron_status.model_dump(mode="json"),
             "dream": dream_status.model_dump(mode="json"),
         }
+
+    @app.get("/api/v1/models", dependencies=[Depends(authorize)])
+    async def model_options(
+        session_id: str | None = None,
+        project_id: str | None = None,
+    ):
+        return gateway.model_options(session_id, project_id)
 
     @app.get("/api/v1/extensions/status", dependencies=[Depends(authorize)])
     async def extension_status(hook_id: str | None = None):
@@ -262,7 +271,13 @@ def create_gateway_api(
 
     @app.get("/api/v1/observer/runs/{run_id}", dependencies=[Depends(authorize)])
     async def observer_status(run_id: str):
-        return gateway.observer_status(run_id)
+        try:
+            return gateway.observer_status(run_id)
+        except KeyError as exc:
+            # Observer creation is asynchronous relative to Main output. A
+            # short-lived missing projection is an ordinary not-ready result,
+            # not a Gateway internal error.
+            raise HTTPException(404, "Observer state is not ready") from exc
 
     @app.post(
         "/api/v1/observer/corrections/{proposal_id}/decision",
@@ -271,7 +286,7 @@ def create_gateway_api(
     async def decide_observer_correction(
         proposal_id: str, payload: ObserverCorrectionDecisionRequest,
     ):
-        return gateway.decide_observer_correction(
+        return await gateway.decide_observer_correction(
             proposal_id, expected_revision=payload.expected_revision,
             action=payload.action, actor=payload.actor,
             edited_prompt=payload.edited_prompt, reason=payload.reason,
@@ -631,6 +646,21 @@ def create_gateway_api(
             # closes sockets during graceful shutdown.
             async with aclosing(_subscription_events(socket, queue)) as delivery:
                 async for event in delivery:
+                    if event.run_id == run_id and event.sequence <= last_sent:
+                        continue
+                    if (
+                        run_id and event.run_id == run_id
+                        and event.sequence > last_sent + 1
+                    ):
+                        # A physical EventBus delivery may arrive after a retry
+                        # or queue overflow. Fill the immutable SQLite sequence
+                        # gap before forwarding the live item.
+                        for missing in gateway.run_events(run_id, last_sent):
+                            if missing.sequence >= event.sequence:
+                                break
+                            await socket.send_text(missing.model_dump_json())
+                            acknowledge_if_origin(missing)
+                            last_sent = missing.sequence
                     if event.run_id == run_id and event.sequence <= last_sent:
                         continue
                     await socket.send_text(event.model_dump_json())

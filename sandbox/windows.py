@@ -410,36 +410,17 @@ class AppContainerRunner:
         sid = C.c_void_p()
         if api.userenv.DeriveAppContainerSidFromAppContainerName(name, C.byref(sid)) < 0:
             raise OSError("Cannot derive AppContainer SID")
-        excluded = {path for path, _ in protected}
-
-        def access_entries(root: Path) -> list[tuple[Path, bool]]:
-            entries = [(root, not any(path.is_relative_to(root) for path in excluded))]
-            if entries[0][1]:
-                return entries
-            for directory, dirs, files in os.walk(root):
-                base = Path(directory)
-                dirs[:] = [child for child in dirs if base / child not in excluded]
-                for child in list(dirs):
-                    path = base / child
-                    can_inherit = not any(item.is_relative_to(path) for item in excluded)
-                    entries.append((path, can_inherit))
-                    if can_inherit:
-                        dirs.remove(child)
-                entries.extend(
-                    (base / child, False)
-                    for child in files if base / child not in excluded
-                )
-            return entries
-
-        # Read access covers the repository, while write access is the explicit
-        # per-command/trace subset. Protected paths never receive either ACL.
-        workspace_readable = access_entries(self.policy.workspace)
-        writable: list[tuple[Path, bool]] = []
-        for root in writable_roots:
-            writable.extend(access_entries(root))
+        # Grant at directory boundaries and carve protected descendants out
+        # with explicit deny ACEs.  The old implementation expanded an ACL
+        # entry for every file whenever the workspace contained .git/.venv.
+        # A normal repository therefore spent tens of seconds preparing even
+        # a one-line command.  Explicit child denies take precedence over the
+        # inherited workspace grant, retaining the same capability boundary
+        # while making setup proportional to policy roots instead of files.
+        workspace_readable = [(self.policy.workspace, True)]
+        writable = [(root, True) for root in writable_roots]
         external_readable = list(dict.fromkeys([
             *self.policy.readable_roots, Path(argv[0]).parent,
-            *(path for path, hidden in protected if not hidden),
         ]))
         shell_root = Path(argv[0]).parent
         if self.policy.workspace.is_relative_to(shell_root) or shell_root.is_relative_to(self.policy.workspace):
@@ -449,6 +430,7 @@ class AppContainerRunner:
             *(path for path, _ in workspace_readable),
             *(path for path, _ in writable),
             *external_readable,
+            *(path for path, _hidden in protected),
         ]))
         # System binaries already have AppContainer execute permission. Do not edit System32 ACLs.
         system = Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve()
@@ -486,6 +468,14 @@ class AppContainerRunner:
             for path, inherit in writable:
                 api.acl(path, sid, mode=1, permissions=0x1301BF, inherit=inherit)
                 api.acl(path, sid, mode=3, permissions=0xC0040, inherit=inherit)
+            for path, hidden in protected:
+                if hidden:
+                    # Full deny hides credentials, VCS internals and Agent
+                    # control data from the inherited workspace grant.
+                    api.acl(path, sid, mode=3, permissions=0x1F01FF, inherit=True)
+                else:
+                    # Toolchain trees remain readable but cannot be mutated.
+                    api.acl(path, sid, mode=3, permissions=0x130156, inherit=True)
             self._lease_file = file
             self._lease_path = lease
             self._lease_record = record

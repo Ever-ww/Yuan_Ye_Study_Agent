@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -68,7 +69,11 @@ class BackupScheduler:
         self._wake.set()
         task, self._task = self._task, None
         if task is not None:
-            await task
+            task.cancel()
+            # Python 3.10 wait_for may surface cancellation as its legacy
+            # asyncio.TimeoutError while unwinding the heartbeat waiter.
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await task
 
     def wake(self) -> None:
         self._wake.set()
@@ -135,7 +140,7 @@ class BackupScheduler:
             self._wake.clear()
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=self.heartbeat_seconds)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 pass
 
     async def _write_state_result(

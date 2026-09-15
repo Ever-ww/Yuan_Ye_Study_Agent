@@ -26,6 +26,12 @@ class GatewayStore:
         self.backups_directory = self.directory / "backups"
         self.migration_backup_path: Path | None = None
         self._lock = threading.RLock()
+        self.directory.mkdir(parents=True, exist_ok=True)
+        if not self.database_path.exists() or self.database_path.stat().st_size == 0:
+            # journal_mode=WAL makes auto_vacuum immutable without a full VACUUM,
+            # so select the reclaim strategy before the normal connection setup.
+            with sqlite3.connect(self.database_path, timeout=30) as connection:
+                connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
         self._backup_before_migration()
         self.initialize()
 
@@ -33,9 +39,10 @@ class GatewayStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.runs_directory.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
-            check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
-            if check != "ok":
-                raise RuntimeError(f"Gateway SQLite quick_check failed: {check}")
+            # StateController owns database integrity and migration checks.  This
+            # metadata facade must not perform a second full-database scan on the
+            # Gateway readiness path merely because both objects share one file.
+            connection.execute("SELECT 1").fetchone()
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS projects (
@@ -46,7 +53,7 @@ class GatewayStore:
                     run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, session_id TEXT,
                     client_id TEXT NOT NULL, task TEXT NOT NULL, status TEXT NOT NULL,
                     created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
-                    answer TEXT, error TEXT
+                    answer TEXT, error TEXT, reasoning_effort TEXT NOT NULL DEFAULT 'none'
                 );
                 CREATE TABLE IF NOT EXISTS inbox (
                     item_id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE,
@@ -248,6 +255,8 @@ class GatewayStore:
             "finish_reason": "TEXT", "state_revision": "INTEGER NOT NULL DEFAULT 0",
             "workload_kind": "TEXT NOT NULL DEFAULT 'chat'",
             "recovery_required": "INTEGER NOT NULL DEFAULT 0", "terminal_target": "TEXT",
+            "model_profile_id": "TEXT NOT NULL DEFAULT 'default'",
+            "reasoning_effort": "TEXT NOT NULL DEFAULT 'none'",
         }
         for name, declaration in additions.items():
             if name not in columns:

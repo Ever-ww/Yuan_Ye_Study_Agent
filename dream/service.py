@@ -215,6 +215,39 @@ class DreamService:
             next_run_at=next_run_at,
         )
 
+    async def record_external_failure(
+        self,
+        selected_date: date,
+        *,
+        run_id: str,
+        error: str,
+    ) -> DreamRunResult:
+        """Persist a failure raised around the normal Dream processing body.
+
+        Whole-run timeouts are enforced by the Gateway because they cover
+        archive reads, custom runners and projections. Source evidence remains
+        unconsumed, allowing a later scheduled pass to retry it safely.
+        """
+        async with self._lock:
+            async with self.file_locks.write(self.state_path):
+                result = DreamRunResult(
+                    run_id=run_id,
+                    date=selected_date.isoformat(),
+                    range_start=selected_date.isoformat(),
+                    range_end=selected_date.isoformat(),
+                    status="failed",
+                    message=f"Dream failed: {error}",
+                    model=self.config.dream_model or self.config.model,
+                    created_at=_now(),
+                )
+                state = self._state()
+                state.last_run_id = run_id
+                state.last_status = "failed"
+                state.last_error = error
+                self._write_state(state)
+                self._write_run(result, candidates=[], rejected=[])
+                return result
+
     async def _process_range(
         self,
         start_date: date,
@@ -332,6 +365,15 @@ class DreamService:
                 "candidate_count": len(consolidated),
             })
             return result
+        except asyncio.CancelledError:
+            # Cancellation is a maintenance/recovery boundary, not a failed
+            # Dream conclusion.  Leave the source Evidence unconsumed so the
+            # next scheduled pass can safely process it again.
+            execution.append_once("result", "execution_interrupted", {
+                "reason": "cooperative_maintenance_or_shutdown",
+                "attempts": attempts,
+            })
+            raise
         except Exception as exc:
             error = str(exc) or type(exc).__name__
             failed = DreamRunResult(
@@ -375,7 +417,10 @@ class DreamService:
                     {"phase": phase, "attempt": attempt, "input_hash": input_hash,
                      "message_count": len(messages)},
                 )
-                raw = await self._run_model(messages)
+                raw = await asyncio.wait_for(
+                    self._run_model(messages),
+                    timeout=float(self.config.dream_model_timeout_seconds),
+                )
                 parsed = DreamCandidateList.model_validate_json(_json_text(raw))
                 execution.append_once(
                     f"{phase}:attempt:{attempt}:completed", "model_attempt_completed",
@@ -445,7 +490,13 @@ class DreamService:
             retry_policy=ModelRetryPolicy(max_attempts=3, delay_seconds=2),
             raise_errors=True,
         )
-        result = await runtime.run("执行每日 Dream 记忆维护")
+        try:
+            result = await runtime.run("执行每日 Dream 记忆维护")
+        finally:
+            # Each Dream model attempt owns a memoryless Runtime.  Always emit
+            # TRACE_END and release provider/hook resources, including when a
+            # maintenance pre-drain cancels the in-flight provider request.
+            await runtime.close()
         if not result.completed:
             raise RuntimeError("Dream 维护 Runtime 未返回完整结果")
         return result.answer

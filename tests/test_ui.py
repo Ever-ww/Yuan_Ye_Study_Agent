@@ -6,6 +6,7 @@ import io
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import typer
@@ -20,6 +21,7 @@ from run_ui.cli import (
     _active_live,
     _approve,
     _handle_inbox_command,
+    _latest_session_observer_status,
     _render,
     _render_restored_history,
     app,
@@ -42,6 +44,7 @@ class UiTests(unittest.TestCase):
             memory = MemoryStore(Path(value) / ".yy" / "memory")
             active = memory.create_session("first")
             newer = memory.create_session("second")
+            memory.record_user(active, "older activity")
             memory.record_user(newer, "newer activity")
             os.utime(
                 memory.sessions.active_path(active),
@@ -177,6 +180,68 @@ class UiTests(unittest.TestCase):
         self.assertIn('data.type==="compression_fallback"', script)
         self.assertIn('data.type==="model_retry"', script)
         self.assertIn('data.type==="model_reconnected"', script)
+
+    def test_continue_restores_latest_available_observer_for_session(self) -> None:
+        class Run:
+            def __init__(self, run_id, session_id, workload_kind="chat"):
+                self.run_id = run_id
+                self.session_id = session_id
+                self.workload_kind = workload_kind
+
+        class Client:
+            async def runs(self, project_id):
+                self.project_id = project_id
+                return [
+                    Run("other", "other-session"),
+                    Run("newest", "session"),
+                    Run("previous", "session"),
+                ]
+
+            async def observer_status(self, run_id):
+                if run_id == "newest":
+                    raise RuntimeError("Observer not created for this Run")
+                return {"run_id": run_id, "progress_markdown": "restored progress"}
+
+        async def check():
+            client = Client()
+            status = await _latest_session_observer_status(
+                client, "project", "session",
+            )
+            self.assertEqual(client.project_id, "project")
+            self.assertEqual(status["run_id"], "previous")
+
+        asyncio.run(check())
+
+    def test_gateway_resume_uses_control_plane_client_without_auto_start(self) -> None:
+        created: dict[str, object] = {}
+
+        class Client:
+            def __init__(self, agent_root, **kwargs):
+                created.update(agent_root=agent_root, **kwargs)
+
+            async def resume(self, epoch, revision):
+                created.update(epoch=epoch, revision=revision)
+                return {"state": "running"}
+
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as value, \
+             patch(
+                 "run_ui.cli.load_runtime_config",
+                 return_value=SimpleNamespace(
+                     agent_root=Path(value),
+                     gateway_port=8765,
+                 ),
+             ), \
+             patch("run_ui.cli.GatewayClient", Client):
+            result = runner.invoke(
+                app,
+                ["gateway", "resume", "--epoch", "7", "--revision", "11"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(created["auto_start"], False)
+        self.assertEqual(created["epoch"], 7)
+        self.assertEqual(created["revision"], 11)
 
     def test_ctrl_c_cancels_active_answer_and_is_exit_when_idle(self) -> None:
         async def check() -> None:

@@ -47,7 +47,7 @@ class CronScheduler:
         task, self._task = self._task, None
         if task:
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await task
         with contextlib.suppress(Exception):
             if self.write_gate:
@@ -193,7 +193,7 @@ class CronScheduler:
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=max(0.0, (next_tick - self._now()).total_seconds()))
                     self._wake.clear()
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     pass
                 if not self._closing:
                     await self.tick()

@@ -10,6 +10,7 @@ import secrets
 import subprocess
 import sys
 import sqlite3
+from contextlib import suppress
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
@@ -78,6 +79,7 @@ from gateway.models import (
     HarnessDreamRunRequest,
     HarnessDreamRevertRequest,
     ProjectRecord,
+    ModelOption,
     RunCreateRequest,
     RecoveryDecisionRequest,
     RunRecord,
@@ -124,13 +126,14 @@ class GatewayApplication:
         *,
         runtime_factory: RuntimeFactory | None = None,
         store: GatewayStore | None = None,
+        observer_provider_factory=None,
     ) -> None:
         self.config = config
         assert_restore_inactive(config.agent_root)
         self.write_gate = AgentHomeWriteGate()
         self.maintenance = AgentHomeMaintenanceCoordinator(config.agent_root, self.write_gate)
-        # Backup passphrase is consumed before Runtime/Tool/Harness construction and
-        # never enters RuntimeConfig or ToolContext.
+        # Legacy passphrase mode consumes the secret before Runtime/Tool/Harness
+        # construction. OS-managed mode never places its key in RuntimeConfig.
         self._backup_passphrase = SensitiveEnvSanitizer.consume_backup_passphrase()
         self.store = store or GatewayStore(config.agent_root / ".yy" / "gateway")
         self.store.write_gate = self.write_gate
@@ -141,6 +144,13 @@ class GatewayApplication:
             gateway_epoch=self.gateway_epoch,
             migration_backup_path=self.store.migration_backup_path,
             write_gate=self.write_gate,
+            health_cache_seconds=config.gateway_health_cache_seconds,
+            storage_health_cache_seconds=config.gateway_storage_health_cache_seconds,
+            processed_command_compression_min_bytes=(
+                config.gateway_processed_command_compression_min_bytes
+            ),
+            database_warning_bytes=config.gateway_database_warning_bytes,
+            database_critical_bytes=config.gateway_database_critical_bytes,
         )
         self.event_store = EventStore(self.store.database_path)
         self.event_archive = GatewayEventArchiveService(
@@ -174,10 +184,16 @@ class GatewayApplication:
         self.runtime_plugins.ensure_initial_generation()
         self.observer = GatewayObserverService(
             event_store=self.event_store,
-            state_store=ObserverStateStore(self.store.database_path),
+            state_store=ObserverStateStore(
+                self.store.database_path, write_gate=self.write_gate,
+            ),
             gateway_store=self.store,
             resource_manager=self.runtime_plugins,
+            config=config,
             timeout_seconds=config.observer_correction_timeout_seconds,
+            plugin_timeout_seconds=config.observer_plugin_timeout_seconds,
+            model_timeout_seconds=config.observer_model_timeout_seconds,
+            provider_factory=observer_provider_factory,
         ) if config.observer_enabled else None
         interactive_resources = self.runtime_plugins.snapshot(RuntimeProfile.INTERACTIVE)
         self.extensions = ExtensionLoader(interactive_resources.source_root).scan()
@@ -305,6 +321,8 @@ class GatewayApplication:
             self.maintenance.register("memory_embedding", self.memory_embedding_worker)
         self.maintenance.register("harness", self.code_sessions)
         self.maintenance.register("runtime_plugins", self.runtime_plugin_watcher)
+        if self.observer is not None:
+            self.maintenance.register("observer", self.observer)
         self.restart_coordinator = GatewayRestartCoordinator(
             agent_root=config.agent_root, source_root=source_root,
             port=config.gateway_port, gateway_epoch=self.gateway_epoch,
@@ -315,7 +333,11 @@ class GatewayApplication:
         self.backup_service = BackupService(
             config.agent_root,
             coordinator=self.maintenance,
-            secret_provider=lambda: self._backup_passphrase,
+            secret_provider=(
+                (lambda: self._backup_passphrase)
+                if config.backup_key_mode == "passphrase"
+                else None
+            ),
             backup_directory=config.backup_directory,
             source_root=source_root,
             retention_daily=config.backup_retention_daily,
@@ -335,6 +357,7 @@ class GatewayApplication:
             heartbeat_seconds=config.cron_heartbeat_seconds,
         )
         self._services_started = False
+        self._database_maintenance_task: asyncio.Task[None] | None = None
         self.maintenance.health_check = self._maintenance_health_check
         self.maintenance.flush = self._maintenance_flush
         self.event_archive_scheduler.write_gate = self.write_gate
@@ -350,6 +373,53 @@ class GatewayApplication:
                 "maintenance": self.maintenance.snapshot.model_dump(mode="json"),
                 "accepting_work": self.write_gate.state == MaintenanceState.RUNNING,
                 "runtime_plugins": self.runtime_plugin_status()}
+
+    def model_options(
+        self,
+        session_id: str | None = None,
+        project_id: str | None = None,
+    ) -> tuple[ModelOption, ...]:
+        """Expose configured model identities without leaking credentials."""
+
+        selected = "default"
+        selected_run: RunRecord | None = None
+        selected_run = next(
+            (
+                run for run in self.store.list_runs(project_id)
+                if run.workload_kind == "chat"
+                and (session_id is None or run.session_id == session_id)
+            ),
+            None,
+        )
+        if selected_run is not None:
+            selected = selected_run.model_profile_id
+        return tuple(
+            self._model_option(
+                item.profile_id,
+                selected_run if item.profile_id == selected else None,
+                is_selected=item.profile_id == selected,
+            )
+            for item in self.config.selectable_model_profiles()
+        )
+
+    def _model_option(
+        self,
+        profile_id: str,
+        selected_run: RunRecord | None,
+        *,
+        is_selected: bool,
+    ) -> ModelOption:
+        selected = self.config.select_model_profile(
+            profile_id,
+            selected_run.reasoning_effort if selected_run is not None else None,
+        )
+        return ModelOption(
+            profile_id=profile_id,
+            provider=selected.provider,
+            model=selected.model,
+            selected=is_selected,
+            reasoning_effort=selected.reasoning_effort,
+        )
 
     async def quiesce(self, timeout: float = 30, reason: str = "maintenance"):
         return await self.maintenance.quiesce(reason, timeout)
@@ -499,12 +569,74 @@ class GatewayApplication:
             await self.dream_scheduler.start()
             await self.backup_scheduler.start()
             self._services_started = True
+            self._database_maintenance_task = asyncio.create_task(
+                self._database_maintenance_loop(),
+                name="gateway-database-maintenance",
+            )
         except Exception:
             await self.outbox.close()
             self.maintenance.close()
             await self.reference_embedding_worker.close()
             if self.memory_embedding_worker is not None:
                 await self.memory_embedding_worker.close()
+            raise
+
+    async def _database_maintenance_loop(self) -> None:
+        """Run full checks and bounded compaction away from readiness polling."""
+
+        delay = float(self.config.gateway_database_maintenance_initial_delay_seconds)
+        interval = float(self.config.gateway_database_maintenance_interval_seconds)
+        while True:
+            await asyncio.sleep(delay)
+            if self.write_gate.state != MaintenanceState.RUNNING or not self.pool.is_idle():
+                # A due maintenance pass waits for the next quiet boundary instead
+                # of competing with an interactive or background Agent run.
+                delay = min(60.0, interval)
+                continue
+            delay = interval
+            try:
+                result = await self._database_maintenance_call(
+                    self.state_controller.run_database_maintenance,
+                    processed_command_batch_size=(
+                        self.config.gateway_processed_command_compaction_batch_size
+                    ),
+                    incremental_vacuum_pages=(
+                        self.config.gateway_database_incremental_vacuum_pages
+                    ),
+                )
+                compacted = int(
+                    dict(result.get("processed_commands") or {}).get("compacted", 0),
+                )
+                batch_size = self.config.gateway_processed_command_compaction_batch_size
+                # Drain an old database in small transactions with a cooperative
+                # pause.  Full quick_check remains on the long cadence above.
+                while (
+                    compacted >= batch_size
+                    and self.write_gate.state == MaintenanceState.RUNNING
+                    and self.pool.is_idle()
+                ):
+                    await asyncio.sleep(1)
+                    batch = await self._database_maintenance_call(
+                        self.state_controller.compact_processed_commands,
+                        limit=batch_size,
+                    )
+                    compacted = int(batch["compacted"])
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Maintenance is observable but never allowed to take the normal
+                # Agent runtime down.  The next cadence retries the bounded work.
+                self.state_controller.record_database_maintenance_error(exc)
+
+    @staticmethod
+    async def _database_maintenance_call(function, /, **kwargs):
+        """Do not abandon a SQLite worker thread during Gateway shutdown."""
+
+        work = asyncio.create_task(asyncio.to_thread(function, **kwargs))
+        try:
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            await work
             raise
 
     async def _reconcile_cron_dispatches(self) -> None:
@@ -524,7 +656,7 @@ class GatewayApplication:
             if run.status in {"completed", "failed", "cancelled", "interrupted"}:
                 await self._settle_cron_terminal(run)
 
-    async def create_backup(self, passphrase: str, output: Path | None = None):
+    async def create_backup(self, passphrase: str | None, output: Path | None = None):
         return await self.backup_service.create(
             passphrase=passphrase,
             output=output,
@@ -676,8 +808,11 @@ class GatewayApplication:
 
     async def close(self) -> None:
         try:
-            if self.observer is not None:
-                await self.observer.close()
+            if self._database_maintenance_task is not None:
+                self._database_maintenance_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._database_maintenance_task
+                self._database_maintenance_task = None
             await self.runtime_plugin_watcher.close()
             await self.event_archive_scheduler.close()
             await self.restart_coordinator.close()
@@ -686,6 +821,8 @@ class GatewayApplication:
             await self.cron_scheduler.close()
             await self.code_sessions.close()
             await self.pool.close()
+            if self.observer is not None:
+                await self.observer.close()
         finally:
             if self.memory_embedding_worker is not None:
                 await self.memory_embedding_worker.close()
@@ -765,7 +902,7 @@ class GatewayApplication:
             raise RuntimeError("Runtime Observer is disabled")
         return self.observer.state_store.status(run_id)
 
-    def decide_observer_correction(
+    async def decide_observer_correction(
         self, proposal_id: str, *, expected_revision: int, action: str,
         actor: str, edited_prompt: str | None = None, reason: str = "",
     ) -> dict[str, object]:
@@ -794,7 +931,18 @@ class GatewayApplication:
             # The decision and finalized Evidence are authoritative; UI delivery
             # remains a retryable projection and must not reverse the decision.
             pass
-        return evidence.model_dump(mode="json")
+        result = evidence.model_dump(mode="json")
+        if action in {"adopt", "edit"} and evidence.adopted_correction_prompt:
+            origin = self.store.run(evidence.run_id)
+            followup = await self.start_run(RunCreateRequest(
+                project_id=origin.project_id,
+                client_id=actor,
+                task=evidence.adopted_correction_prompt,
+                session_id=origin.session_id,
+                idempotency_key=f"observer-correction:{proposal_id}",
+            ))
+            result["correction_run_id"] = followup.run_id
+        return result
 
     def observer_skill_candidates(self) -> tuple[dict[str, object], ...]:
         if self.observer is None:
@@ -812,6 +960,10 @@ class GatewayApplication:
         )
         if not approved:
             return candidate
+        if candidate.get("status") == "published":
+            return {**candidate, "effective_next_turn": True}
+        if candidate.get("status") != "approved":
+            raise RuntimeError("Observer Skill Candidate has no durable approval")
         name = str(candidate["name"])
         profile = str(candidate["runtime_profile"])
         trigger = str(candidate["trigger"])
@@ -830,27 +982,35 @@ class GatewayApplication:
             target = source_root / "runtime-resources" / "interactive" / "skills" / name
         else:
             raise RuntimeError(f"Observer Skill profile cannot be published: {profile}")
+        expected_markdown = str(candidate["skill_markdown"])
         if target.exists():
-            raise RuntimeError(f"Observer Skill target already exists: {target}")
-        staging = target.parent / f".{name}.{candidate_id[-12:]}.tmp"
-        temporary = staging / name
-        temporary.mkdir(parents=True, exist_ok=False)
-        try:
-            skill_file = temporary / "SKILL.md"
-            with skill_file.open("w", encoding="utf-8", newline="\n") as handle:
-                handle.write(str(candidate["skill_markdown"]))
-                handle.flush()
-                os.fsync(handle.fileno())
-            parsed = parse_skill(temporary)
-            if parsed.name != name:
-                raise RuntimeError("Observer Skill validation changed its identity")
-            os.replace(temporary, target)
-            staging.rmdir()
-        except Exception:
-            if staging.is_dir():
-                import shutil
-                shutil.rmtree(staging, ignore_errors=True)
-            raise
+            skill_file = target / "SKILL.md"
+            if (
+                target.is_symlink() or not skill_file.is_file()
+                or skill_file.read_text(encoding="utf-8") != expected_markdown
+                or parse_skill(target).name != name
+            ):
+                raise RuntimeError(f"Observer Skill target conflicts with Candidate: {target}")
+        else:
+            staging = target.parent / f".{name}.{candidate_id[-12:]}.tmp"
+            temporary = staging / name
+            temporary.mkdir(parents=True, exist_ok=False)
+            try:
+                skill_file = temporary / "SKILL.md"
+                with skill_file.open("w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(expected_markdown)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                parsed = parse_skill(temporary)
+                if parsed.name != name:
+                    raise RuntimeError("Observer Skill validation changed its identity")
+                os.replace(temporary, target)
+                staging.rmdir()
+            except Exception:
+                if staging.is_dir():
+                    import shutil
+                    shutil.rmtree(staging, ignore_errors=True)
+                raise
         reload_result = self.runtime_plugins.reload(actor=f"{actor}:observer-skill")
         if reload_result.status not in {"activated", "unchanged"}:
             raise RuntimeError(
@@ -1804,9 +1964,40 @@ class GatewayApplication:
         )
         if not is_runnable(state, None, now=datetime.now().astimezone()):
             raise RuntimeError(f"Dream workload 不可调度：{state.task_state.value}")
-        if automatic:
-            return await self.dream_service.process_pending(selected, run_id=run_id)
-        return await self.dream_service.process_day(selected, run_id=run_id)
+        try:
+            operation = (
+                self.dream_service.process_pending(selected, run_id=run_id)
+                if automatic
+                else self.dream_service.process_day(selected, run_id=run_id)
+            )
+            return await asyncio.wait_for(
+                operation,
+                timeout=float(self.config.dream_run_timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            seconds = float(self.config.dream_run_timeout_seconds)
+            error = f"Dream run exceeded {seconds:g} seconds"
+            try:
+                return await self.dream_service.record_external_failure(
+                    selected,
+                    run_id=run_id,
+                    error=error,
+                )
+            except Exception:
+                # Do not leave the Gateway Run active when Dream's own failure
+                # projection cannot be persisted.
+                await self._finish_workload(run_id, TerminalTarget.FAILED, error)
+                raise
+        except asyncio.CancelledError:
+            # The scheduler may cooperatively interrupt model-only Dream work
+            # for maintenance. Its Gateway Run must still reach a durable
+            # terminal state; unconsumed Evidence remains eligible next cycle.
+            await self._finish_workload(
+                run_id,
+                TerminalTarget.CANCELLED,
+                "Dream interrupted at maintenance boundary",
+            )
+            raise
 
     def _begin_workload_run(
         self,
@@ -1994,16 +2185,29 @@ class GatewayApplication:
     @lifecycle_work("request")
     async def start_run(self, request: RunCreateRequest) -> RunRecord:
         self.store.project(request.project_id)
+        # Resolve before creating durable state. Unknown or malformed choices
+        # cannot produce a queued Run that later fails during Runtime loading.
+        selected_config = self.config.select_model_profile(
+            request.model_profile_id,
+            request.reasoning_effort,
+        )
         run_id = uuid4().hex
         resource_snapshot = self.runtime_plugins.snapshot(RuntimeProfile.INTERACTIVE)
+        request_identity = {
+            "project_id": request.project_id,
+            "client_id": request.client_id,
+            "task": request.task,
+            "session_id": request.session_id,
+            "deadline_at": request.deadline_at,
+        }
+        # Preserve the pre-switching request hash for the default profile so
+        # an idempotent request accepted before an upgrade still reconciles.
+        if request.model_profile_id != "default":
+            request_identity["model_profile_id"] = request.model_profile_id
+        if request.reasoning_effort is not None:
+            request_identity["reasoning_effort"] = selected_config.reasoning_effort
         request_body = json.dumps(
-            {
-                "project_id": request.project_id,
-                "client_id": request.client_id,
-                "task": request.task,
-                "session_id": request.session_id,
-                "deadline_at": request.deadline_at,
-            },
+            request_identity,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -2020,6 +2224,8 @@ class GatewayApplication:
             request_hash=request_hash,
             deadline_at=request.deadline_at,
             runtime_generation_id=resource_snapshot.generation_id,
+            model_profile_id=request.model_profile_id,
+            reasoning_effort=selected_config.reasoning_effort,
         )
         run = self.store.run(state.run_id)
         if duplicate:

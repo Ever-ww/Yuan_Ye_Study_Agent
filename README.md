@@ -58,7 +58,7 @@ tools/      仅保存模型可直接调用的受控工具实现
   subagent.py          受父 Agent 限权的临时子 Agent
   skill_read.py        渐进读取已审核 Skill 文本
   skill_install.py     审批后获取、审核和安装 Skill
-run_ui/     Rich CLI、FastAPI 路由、模板和静态资源
+run_ui/     Textual 会话 TUI、Rich 兼容命令面、Web 路由与静态资源
 ui/         Web 与 Tauri 共用的 React/TypeScript 工作台
 desktop/    Tauri 2 原生窗口与 Gateway sidecar 启动外壳
 packaging/  PyInstaller sidecar 构建与平台文件名准备
@@ -180,6 +180,21 @@ uv run python run.py run "验证新版入口"
 uv run python run.py chat
 ```
 
+交互终端默认启动会话级 Textual TUI：左侧是可用鼠标滚轮、`PgUp`、`PgDn`
+浏览的完整对话时间线，右侧是当前 Turn Observer，下方输入框在整个 Session
+期间保持不变。模型 Token 会被合并到稳定帧率后刷新，避免每个 Token 重新解析
+Markdown 而拖慢 Gateway 事件消费。时间线默认粘在最新内容；用户向上滚动后会暂停自动跟随，
+只有回到真正底部才恢复；滚轮向上会在滚动偏移生效前立即暂停跟随，流式刷新不会把视图抢回底部。
+当前 ReAct Loop 使用一个单色转圈折叠状态卡：模型生成阶段显示
+“思考中...”，Tool 阶段显示该 Loop 正在执行的全部 Tool 名称；展开后可查看各 Tool 的参数、
+结果和持久记录引用。Gateway 给出 Canonical Final 后，当前 Turn 的中间文字、草稿和 Tool
+状态卡会被最终答案整体替换。在输入框中键入 `/` 会在上方显示可点击的命令面板，
+并支持方向键选择和 `Tab` 补全。当终端不支持全屏 TUI，或需要管道/日志兼容输出时，使用：
+
+```powershell
+uv run python run.py chat --classic
+```
+
 在交互模式中输入 `/help` 查看帮助，输入 `/exit` 或 `/quit` 退出。
 
 ## 配置真实模型
@@ -253,10 +268,16 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
   "dream_schedule": "0 3 * * *",
   "dream_timezone": "local",
   "dream_model": null,
-  "dream_batch_tokens": 12000
+  "dream_batch_tokens": 12000,
+  "dream_model_timeout_seconds": 90.0,
+  "dream_run_timeout_seconds": 900.0
 }
 '@ | Set-Content -Encoding utf8 (Join-Path $AgentHome ".yy\settings.local.json")
 ```
+
+`dream_model_timeout_seconds` 限制每次 Dream 模型尝试（包括本地或自定义 runner）；
+`dream_run_timeout_seconds` 限制整轮 Dream。超时会持久化为普通 FAILED 结果，源 Evidence
+不会被消费，后续可安全重试，同时不会无限占用 Gateway 的维护租约。
 
 `compression_protect_last_n` 与 `compression_target_ratio` 仅为旧配置兼容保留；自动压缩现在按完整 Turn 边界保护上下文，不再按原始消息条数截断。
 
@@ -272,6 +293,36 @@ notepad (Join-Path $AgentHome ".yy\settings.local.json")
 | `kimi` | `MOONSHOT_API_KEY` | 供应商支持的模型名 |
 
 `base_url` 允许接入兼容 OpenAI 或 Anthropic 协议的企业网关；未填写时使用 Provider 内置官方地址。`api_key` 未填写时，程序才尝试读取下表所列环境变量。
+
+可在同一份 `settings.local.json` 中配置多个可切换模型。顶部模型名可点击展开选择卡片，空闲时按 `Shift+Tab` 可轮换；切换只影响下一 Turn，不改变正在运行的请求。`api_key` 可按模型单独配置；同 Provider 未填写时继承主配置的 Key，不同 Provider 未填写时读取其环境变量：
+
+```json
+{
+  "provider": "deepseek",
+  "model": "deepseek-chat",
+  "api_key": "主 DeepSeek Key",
+  "model_profiles": [
+    {
+      "profile_id": "ds-flash",
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "base_url": "https://api.deepseek.com",
+      "stream": true
+    },
+    {
+      "profile_id": "openai-pro",
+      "provider": "openai",
+      "model": "gpt-5",
+      "api_key": "对应 Provider Key",
+      "stream": true,
+      "context_window_tokens": 262144,
+      "reasoning_effort": "high"
+    }
+  ]
+}
+```
+
+`profile_id` 必须唯一；`default` 保留给顶部的主 `provider/model` 配置。Gateway 的模型列表接口只返回非敏感的模型与 reasoning 元数据，不会向 TUI 暴露 Key。顶部模型选择器右侧可选择 `none / low / medium / high / xhigh / max`。YYAgent 不维护模型档位映射：OpenAI-compatible 请求原样发送 `reasoning_effort`，Anthropic 请求转换为 `thinking` 与 `output_config.effort`，实际支持、映射或拒绝行为由对应 API 服务决定。
 
 模型网络请求默认使用 `use_system_proxy=false`，即忽略 Python/HTTPX 可见的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 等环境代理，直接连接模型服务。这可避免 Windows 系统代理或代理软件意外接管并中断 DeepSeek 等服务的 TLS 连接。修改代理配置后需要重启 Gateway，使新建的 Provider 生效。
 
@@ -407,7 +458,9 @@ uv run python run.py backup recover
 uv run python run.py backup rollback
 ```
 
-手动命令使用隐藏输入读取口令；`backup create` 还会要求二次输入。口令不会进入 argv、RuntimeConfig、ToolContext、Harness 或普通子进程。自动备份默认每天本地时间 04:00 运行，只从受信任 Backup Secret Provider（源码运行可用 `YY_BACKUP_PASSPHRASE`）取得口令；Gateway 读取后立即从全局环境移除。缺少口令时记录 `backup_skipped`，绝不生成明文备份。自动成功只保留已读审计；连续失败只保留最新一条未读通知，普通聊天启动时仅提示待处理数量，详情由 `/inbox` 显式查看。
+`backup_key_mode` 默认是 `os_managed`：首次备份自动生成高熵随机密钥，Windows 使用当前用户 DPAPI、macOS 使用 Keychain、Linux 使用 Secret Service 托管。用户不需要设置或重复输入口令，`backup verify/restore` 会根据归档 Header 自动取回对应密钥。Windows 只在 `~/.yy-backups/control/credentials/` 保存 DPAPI 密文，明文密钥不写入代码、配置、Agent Home、日志或子进程环境。系统托管备份默认只适合在同一系统账户和 Agent Home 恢复；跨设备迁移应使用 `backup create --manual-passphrase` 创建手动口令备份。
+
+兼容模式 `backup_key_mode=passphrase` 继续支持 `YY_BACKUP_PASSPHRASE`；Gateway 启动时读取一次并从全局环境移除。无论采用哪种模式都不会降级生成明文备份。自动备份默认每天本地时间 04:00 运行；自动成功只保留已读审计，连续失败只保留最新一条未读通知，普通聊天启动时仅提示待处理数量，详情由 `/inbox` 显式查看。
 
 归档格式使用流式 ZIP64 与 AES-256-GCM，明文 Header 作为 AAD；程序会先限制 Header 与 scrypt 资源参数，再执行 KDF。正常创建过程不生成完整明文 ZIP，也不把整个归档读入内存。正式文件先以 `.partial` 写入，完成认证、校验和 fsync 后原子发布为 `.yybackup`。SQLite 使用 Backup API 生成干净快照，不归档 WAL/SHM。
 
@@ -975,6 +1028,14 @@ member 集合；Archive Writer 只能处理这组成员。Archive 分别验证 E
 `events_content_hash` 和不包含自身 Hash 的 `manifest_hash`，成员位置使用 UTF-8 byte offset。
 验证成功后只清空 SQLite 中的热正文，Event 索引行、Hash、Delivery 和 Attempt Evidence 永久保留。
 普通 retention 不得删除未归档 Canonical Event。
+
+Gateway 数据库增长采用“保留事实、压缩热负载”的策略。`processed_commands` 仍永久保存精确的
+command hash 与可重放 `ApplyResult`，但超过阈值的结果使用带原文长度和 SHA-256 的 zlib 包装；
+旧结果由后台任务分批转换，任何损坏都会在重放时明确失败，不会猜测或删除幂等证据。`/health`
+使用短期统计缓存，不再在每次进程探活时扫描完整数据库；完整 `quick_check`、`PRAGMA optimize`
+和小批量压缩在 Gateway 就绪后周期执行。新建数据库预先启用 incremental auto-vacuum，已有数据库
+不会在启动路径被隐式执行昂贵的全量 `VACUUM`。Health 会报告数据库/WAL大小、可回收空间、压缩进度
+以及 500 MB/1 GB 默认容量告警；这些阈值和维护周期均可通过 Runtime 配置调整。
 
 权威层级固定为：Level 1 是 Run/AgentState/Operation/Attempt/Approval 与 Canonical Event；
 Level 2 是 Outbox、Delivery、Delivery Attempt、Consumer Cursor 和 Archive Evidence；Level 3 是
