@@ -17,25 +17,25 @@ class AgentHomeDurabilityCatalog:
     """Explicit registry. Unknown files are protected as canonical."""
 
     _TRANSIENT_FILES = {
-        ".yy/gateway/instance.json",
-        ".yy/gateway/instance.lock",
-        ".yy/gateway/startup.lock",
-        ".yy/gateway/stop.request",
-        ".yy/gateway/empty-secret",
+        "gateway/instance.json",
+        "gateway/instance.lock",
+        "gateway/startup.lock",
+        "gateway/stop.request",
+        "gateway/empty-secret",
     }
     _TRANSIENT_DIRS = {
-        ".yy/uv-cache",
-        ".yy/sandbox/docker",
-        ".yy/harness-evolution/worktrees",
+        "uv-cache",
+        "sandbox/docker",
+        "harness-evolution/worktrees",
     }
     _REBUILDABLE_SUFFIXES = {".events.idx"}
     _REBUILDABLE_FILES = {
-        ".yy/memory/index.sqlite3",
-        ".yy/harness-evolution/memory/index.sqlite3",
-        ".yy/harness-evolution/memory/profile/CHANGES.md",
-        ".yy/harness-evolution/memory/profile/LESSONS.md",
+        "memory/index.sqlite3",
+        "harness-evolution/memory/index.sqlite3",
+        "harness-evolution/memory/profile/CHANGES.md",
+        "harness-evolution/memory/profile/LESSONS.md",
     }
-    _REBUILDABLE_DIRS = {".yy/memory/profile"}
+    _REBUILDABLE_DIRS = {"memory/profile"}
 
     def classify(self, relative: PurePosixPath) -> DurabilityClass:
         value = relative.as_posix().lstrip("./")
@@ -64,14 +64,20 @@ class AgentHomeDurabilityCatalog:
             kept: list[str] = []
             for name in sorted(directories):
                 child = root_path / name
-                self._reject_special(child)
+                try:
+                    self._reject_special(child)
+                except FileNotFoundError:
+                    continue
                 relative = PurePosixPath(child.relative_to(home).as_posix())
                 if self.classify(relative) is not DurabilityClass.TRANSIENT:
                     kept.append(name)
             directories[:] = kept
             for name in sorted(files):
                 child = root_path / name
-                self._reject_special(child)
+                try:
+                    self._reject_special(child)
+                except FileNotFoundError:
+                    continue
                 relative = PurePosixPath(child.relative_to(home).as_posix())
                 durability = self.classify(relative)
                 if durability is not DurabilityClass.TRANSIENT:

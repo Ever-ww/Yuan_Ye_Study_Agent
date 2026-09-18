@@ -185,9 +185,14 @@ class RuntimeConfig(BaseModel):
     backup_timezone: str = Field(default="local", min_length=1, max_length=100)
     backup_directory: Path | None = None
     backup_drain_timeout_seconds: StrictInt = Field(default=300, ge=10, le=3600)
+    # Deprecated v1 GFS settings remain parseable so existing local configs do
+    # not break.  Snapshot Manifest v2 intentionally ignores them.
     backup_retention_daily: StrictInt = Field(default=7, ge=0, le=365)
     backup_retention_weekly: StrictInt = Field(default=4, ge=0, le=104)
     backup_retention_monthly: StrictInt = Field(default=12, ge=0, le=120)
+    # Snapshot Manifests are a rolling local recovery window.  Object GC runs
+    # only after expired manifests are durably removed.
+    backup_retention_days: StrictInt = Field(default=27, ge=1, le=27)
     backup_min_free_space_bytes: StrictInt | None = Field(default=None, ge=0)
     backup_max_storage_bytes: StrictInt | None = Field(default=None, ge=1)
     reference_search_mode: Literal["rrf", "weighted", "separate"] = "rrf"

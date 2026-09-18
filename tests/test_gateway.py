@@ -41,6 +41,7 @@ from gateway.process import (
     InstanceLock,
     _GatewayProtocolNoiseFilter,
     _is_benign_closed_h11_response,
+    _load_gateway_runtime_config,
     _pid_alive,
     _windows_background_creationflags,
     run_gateway,
@@ -176,8 +177,11 @@ class FakeCodeSessions:
             origin_run_id=origin_run_id,
         )
 
-    async def run_turn(self, session_id: str, client_id: str, task: str):
+    async def run_turn(
+        self, session_id: str, client_id: str, task: str, **kwargs,
+    ):
         del client_id, task
+        self.last_turn_options = kwargs
         return CodeTurnResult(
             code_session_id=session_id,
             status="verified",
@@ -430,6 +434,12 @@ class GatewayTests(unittest.TestCase):
             with patch.object(InstanceLock, "acquire", side_effect=RuntimeError("held")):
                 self.assertIsNone(run_gateway(Path(value), 18770))
 
+    def test_background_gateway_uses_agent_source_as_maintenance_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            config = _load_gateway_runtime_config(Path(value), 18770)
+            self.assertEqual(config.workspace_root, config.coding_source_root.resolve())
+            self.assertNotEqual(config.workspace_root, config.agent_root)
+
     def test_gateway_status_reports_checkpoint_only_capabilities(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
@@ -545,12 +555,28 @@ class GatewayTests(unittest.TestCase):
                 )
                 self.assertEqual(created.status_code, 200)
                 session_id = created.json()["code_session_id"]
+                start_items = [
+                    item for item in application.store.list_inbox()
+                    if application.store.run(item.run_id).workload_kind
+                    == WorkloadKind.CODE_SESSION_START.value
+                ]
+                self.assertEqual(len(start_items), 1)
+                self.assertTrue(start_items[0].read)
                 turn = client.post(
                     f"/api/v1/code/sessions/{session_id}/turns",
                     headers=headers,
-                    json={"client_id": "code-client", "task": "新增审计扩展"},
+                    json={
+                        "client_id": "code-client",
+                        "task": "新增审计扩展",
+                        "model_profile_id": "default",
+                        "reasoning_effort": "high",
+                    },
                 )
                 self.assertEqual(turn.json()["status"], "verified")
+                self.assertEqual(application.code_sessions.last_turn_options, {
+                    "model_profile_id": "default",
+                    "reasoning_effort": "high",
+                })
                 events = client.get(
                     f"/api/v1/code/sessions/{session_id}/events",
                     headers=headers,
@@ -562,6 +588,39 @@ class GatewayTests(unittest.TestCase):
                     params={"client_id": "code-client"},
                 )
                 self.assertTrue(finalized.json()["merged"])
+
+    def test_failed_code_session_start_remains_unread_inbox(self) -> None:
+        class FailingCodeSessions(FakeCodeSessions):
+            async def start(self, *args, **kwargs):
+                del args, kwargs
+                raise RuntimeError("coding startup failed")
+
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            application = GatewayApplication(
+                load_runtime_config(root),
+                runtime_factory=lambda workspace, approval: FakeRuntime(workspace),
+            )
+            application.code_sessions = FailingCodeSessions()
+            project = application.register_project(root)
+            headers = {"Authorization": "Bearer test-token"}
+            with TestClient(
+                create_gateway_api(application, access_token="test-token"),
+                raise_server_exceptions=False,
+            ) as client:
+                response = client.post(
+                    "/api/v1/code/sessions",
+                    headers=headers,
+                    json={"project_id": project.project_id, "client_id": "code-client"},
+                )
+                self.assertEqual(response.status_code, 409)
+                failed = [
+                    item for item in application.store.list_inbox(unread_only=True)
+                    if application.store.run(item.run_id).workload_kind
+                    == WorkloadKind.CODE_SESSION_START.value
+                ]
+                self.assertEqual(len(failed), 1)
+                self.assertEqual(failed[0].status, "failed")
 
     def test_state_controller_persists_replayable_monotonic_events(self) -> None:
         with tempfile.TemporaryDirectory() as value:

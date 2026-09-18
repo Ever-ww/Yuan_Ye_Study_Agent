@@ -340,9 +340,7 @@ class GatewayApplication:
             ),
             backup_directory=config.backup_directory,
             source_root=source_root,
-            retention_daily=config.backup_retention_daily,
-            retention_weekly=config.backup_retention_weekly,
-            retention_monthly=config.backup_retention_monthly,
+            retention_days=config.backup_retention_days,
             min_free_space_bytes=config.backup_min_free_space_bytes,
             max_storage_bytes=config.backup_max_storage_bytes,
         )
@@ -528,6 +526,10 @@ class GatewayApplication:
     async def start(self) -> None:
         if self._services_started:
             return
+        # Backup operations live outside .yy and can outlive the process.
+        # Reconcile their exact frozen snapshot before deciding whether this
+        # Gateway is control-only due to an interrupted maintenance state.
+        await self.backup_service.reconcile_startup()
         if self.write_gate.state != MaintenanceState.RUNNING:
             if self.write_gate.state in {MaintenanceState.QUIESCING, MaintenanceState.RESUMING}:
                 await self.maintenance.fail(f"Interrupted {self.write_gate.state.value} at Gateway startup")
@@ -535,6 +537,7 @@ class GatewayApplication:
             # an interrupted transition as FAILED. Neither admits new work.
             # Only explicit resume after health checks can launch recovery/workers.
             return
+        await asyncio.to_thread(self.maintenance.prune_completed_epochs)
         self.state_controller.prune_retention()
         await asyncio.to_thread(
             self.runtime_plugins.collect_garbage,
@@ -657,12 +660,15 @@ class GatewayApplication:
                 await self._settle_cron_terminal(run)
 
     async def create_backup(self, passphrase: str | None, output: Path | None = None):
-        return await self.backup_service.create(
+        record = await self.backup_service.create(
             passphrase=passphrase,
             output=output,
             kind="manual",
             drain_timeout_seconds=self.config.backup_drain_timeout_seconds,
         )
+        await self.backup_scheduler.record_manual_success(record.created_at, record.path)
+        self.store.coalesce_project_inbox("backup")
+        return record
 
     async def _recover_harness_dream_generations(self) -> None:
         """Reconcile active DREAM generations without ever replaying the Engine."""
@@ -1138,7 +1144,13 @@ class GatewayApplication:
             project_id,
             request.client_id,
             request.task,
-            lambda _run_id: self.harness_manual_tool.turn(session_id, request.client_id, request.task),
+            lambda _run_id: self.harness_manual_tool.turn(
+                session_id,
+                request.client_id,
+                request.task,
+                model_profile_id=request.model_profile_id,
+                reasoning_effort=request.reasoning_effort,
+            ),
         )
 
     @lifecycle_work("request")
@@ -1185,6 +1197,10 @@ class GatewayApplication:
             await self._finish_workload(state.run_id, TerminalTarget.FAILED, str(exc) or type(exc).__name__)
             raise
         await self._finish_workload(state.run_id, TerminalTarget.SUCCEEDED, "Coding workload 完成")
+        if kind is WorkloadKind.CODE_SESSION_START:
+            # Session creation is returned synchronously to the caller, so a
+            # successful duplicate Inbox notification is not actionable.
+            self.store.mark_run_inbox_read(state.run_id)
         return result
 
     def _latest_origin_run_id(
@@ -2165,7 +2181,11 @@ class GatewayApplication:
         )).state
         await self._finalize_control_plane(state.run_id)
         state = self.state_controller.state(state.run_id)
-        if automatic:
+        if not automatic:
+            # The caller receives a manual Dream result synchronously; it is
+            # not a background notification and must not inflate unread Inbox.
+            self.store.mark_run_inbox_read(state.run_id)
+        else:
             if result.status == "failed":
                 # One current actionable failure is enough.  Preserve older
                 # rows as read audit history instead of growing the counter.

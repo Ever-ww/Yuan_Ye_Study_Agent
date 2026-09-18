@@ -110,7 +110,15 @@ class CodeSessionManager:
             return self._record(raw, project_id, client_id)
 
     @lifecycle_work("run", continuation=True)
-    async def run_turn(self, session_id: str, client_id: str, task: str) -> CodeTurnResult:
+    async def run_turn(
+        self,
+        session_id: str,
+        client_id: str,
+        task: str,
+        *,
+        model_profile_id: str = "default",
+        reasoning_effort: str | None = None,
+    ) -> CodeTurnResult:
         self._require_available()
         controller = self._owned(session_id, client_id)
         lock = self._turn_locks[session_id]
@@ -118,7 +126,11 @@ class CodeSessionManager:
             raise RuntimeError("同一个 Coding Session 同时只能运行一条需求")
         async with lock:
             self._require_available()
-            raw = await controller.run_turn(task)
+            raw = await controller.run_turn(
+                task,
+                model_profile_id=model_profile_id,
+                reasoning_effort=reasoning_effort,
+            )
         return CodeTurnResult.model_validate(raw.model_dump(mode="json"))
 
     @lifecycle_work("run", continuation=True)

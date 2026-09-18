@@ -77,6 +77,25 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r["to_state"] for r in self.lifecycle.store.history()],
                          ["quiescing", "quiesced", "resuming", "running"])
 
+    async def test_completed_epoch_snapshots_are_pruned_only_after_running(self):
+        snapshot = await self.lifecycle.quiesce()
+        completed = (
+            self.root / ".yy-backups" / "maintenance" /
+            str(snapshot.maintenance_epoch) / "sqlite"
+        )
+        completed.mkdir(parents=True)
+        (completed / "state.sqlite3").write_bytes(b"snapshot")
+        future = self.root / ".yy-backups" / "maintenance" / "999" / "evidence"
+        future.mkdir(parents=True)
+
+        self.assertEqual(self.lifecycle.prune_completed_epochs(), ())
+        self.assertTrue(completed.exists())
+
+        await self.lifecycle.resume(snapshot.maintenance_epoch)
+
+        self.assertFalse(completed.exists())
+        self.assertTrue(future.exists())
+
     async def test_timeout_and_cancellation_never_cancel_a_run_or_auto_resume(self):
         release, entered = asyncio.Event(), asyncio.Event()
         async def run():

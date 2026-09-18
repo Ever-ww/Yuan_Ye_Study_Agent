@@ -20,10 +20,14 @@ from run_ui.cli import (
     ChatInterruptController,
     _active_live,
     _approve,
+    _handle_gateway_skill_command,
+    _handle_harness_command,
     _handle_inbox_command,
     _latest_session_observer_status,
     _render,
+    _render_inbox_table,
     _render_restored_history,
+    _render_skill_catalog,
     app,
 )
 from run_ui.approval import InteractiveApproval, _arguments_preview
@@ -130,6 +134,76 @@ class UiTests(unittest.TestCase):
         self.assertIn("后台执行成功", rendered)
         self.assertIn("已标记为已读", rendered)
         self.assertIn("已将 1 条 Inbox 结果标记为已读", rendered)
+
+    def test_tui_tables_preserve_metadata_and_elide_only_prose(self) -> None:
+        output = io.StringIO()
+        local_console = Console(file=output, force_terminal=False, width=110)
+        item_id = "5697e8da292a"
+        created_at = "2026-09-18T10:20:30+08:00"
+        location = "skills/search-summary-paper/SKILL.md"
+        long_prose = "very long descriptive prose " * 12
+
+        with patch("run_ui.cli.console", local_console):
+            _render_inbox_table([{
+                "item_id": item_id,
+                "status": "failed",
+                "title": "Start Coding Session",
+                "summary": long_prose,
+                "created_at": created_at,
+                "read": False,
+            }], unread_only=True)
+            _render_skill_catalog([(
+                "search-summary-paper",
+                long_prose,
+                location,
+            )])
+
+        rendered = output.getvalue()
+        self.assertIn(item_id, rendered)
+        self.assertIn(created_at, rendered)
+        self.assertIn("search-summary-paper", rendered)
+        self.assertIn(location, "".join(rendered.split()))
+        self.assertIn("…", rendered)
+        self.assertNotIn(long_prose, rendered)
+
+    def test_tui_confirmation_callback_replaces_terminal_prompts(self) -> None:
+        class Client:
+            async def manage_skill(self, payload):
+                self.skill_payload = payload
+                return {"status": "installed", "message": "installed"}
+
+            async def run_harness_dream(self, selected):
+                self.harness_selected = selected
+                return {"status": "started"}
+
+        async def run_case() -> tuple[list[tuple[str, str]], Client]:
+            client = Client()
+            confirmations: list[tuple[str, str]] = []
+
+            async def confirm(title: str, message: str) -> bool:
+                confirmations.append((title, message))
+                return True
+
+            await _handle_gateway_skill_command(
+                client, "project", "session",
+                "/skill update sample https://example.invalid/skill.git",
+                confirm=confirm,
+            )
+            await _handle_harness_command(
+                client, "/harness dream run", confirm=confirm,
+            )
+            return confirmations, client
+
+        with (
+            patch("run_ui.cli.console", Console(file=io.StringIO(), force_terminal=False)),
+            patch("run_ui.cli.typer.confirm", side_effect=AssertionError("terminal prompt")),
+        ):
+            confirmations, client = asyncio.run(run_case())
+        self.assertEqual(
+            [item[0] for item in confirmations], ["更新 Skill", "Harness Dream"],
+        )
+        self.assertTrue(client.skill_payload["confirmed"])
+        self.assertIsNone(client.harness_selected)
 
     def test_session_commands_list_and_show_restorable_history(self) -> None:
         with tempfile.TemporaryDirectory() as value:

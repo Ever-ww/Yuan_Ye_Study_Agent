@@ -332,6 +332,7 @@ class CodeTurnResult(BaseModel):
     commit: str = ""
     diagnostic: str = ""
     grant_plan: dict[str, Any] = Field(default_factory=dict)
+    model_calls: tuple[dict[str, Any], ...] = ()
 
 
 class CodeFinalizeResult(BaseModel):
@@ -427,7 +428,7 @@ class CodeSessionController:
         if self.record is not None:
             raise RuntimeError("Coding Session 已经启动")
         root = (source_root or self.config.coding_source_root or Path(__file__).resolve().parents[1]).resolve()
-        await self._require_clean_source(root)
+        await self._require_git_source(root)
         branch_name = (await self._git(root, "symbolic-ref", "--quiet", "--short", "HEAD")).stdout.strip()
         if not branch_name:
             raise RuntimeError("Yuan Ye 源码仓库处于 detached HEAD，不能启动 /code")
@@ -523,42 +524,71 @@ class CodeSessionController:
         """Compatibility alias; the single Evolution Engine owns the execution pipeline."""
         return await self.run_turn(task)
 
-    async def run_turn(self, task: str) -> CodeTurnResult:
+    async def run_turn(
+        self,
+        task: str,
+        *,
+        model_profile_id: str = "default",
+        reasoning_effort: str | None = None,
+    ) -> CodeTurnResult:
         """Thin MANUAL adapter: the shared engine owns generation, repair and validation."""
-        await self._refresh_runtime_generation()
+        selected_config = self.config.select_model_profile(
+            model_profile_id,
+            reasoning_effort,
+        )
+        await self._refresh_runtime_generation(selected_config)
         return await HarnessEvolutionEngine.for_config(
-            self.config,
+            selected_config,
             runtime_factory=self.runtime_factory or create_coding_runtime,
             memory_provider_factory=self.memory_provider_factory,
             runtime_resource_manager=self.runtime_resource_manager,
         ).run_manual_turn(self, task)
 
-    async def _refresh_runtime_generation(self) -> None:
+    async def _refresh_runtime_generation(
+        self,
+        selected_config: RuntimeConfig | None = None,
+    ) -> None:
         """Switch /code resources only at a Turn boundary, preserving Memory."""
-        if self.runtime_resource_manager is None or self.record is None:
+        if self.record is None:
             return
-        snapshot = self.runtime_resource_manager.snapshot(RuntimeProfile.HARNESS_MANUAL)
-        if self.runtime is not None and self.record.resource_generation_id == snapshot.generation_id:
+        runtime_config = selected_config or self.config
+        snapshot = (
+            self.runtime_resource_manager.snapshot(RuntimeProfile.HARNESS_MANUAL)
+            if self.runtime_resource_manager is not None else None
+        )
+        same_generation = (
+            snapshot is None
+            or self.record.resource_generation_id == snapshot.generation_id
+        )
+        current_config = getattr(self.runtime, "config", None)
+        same_model = (
+            current_config is not None
+            and current_config.active_model_profile_id
+            == runtime_config.active_model_profile_id
+            and current_config.reasoning_effort == runtime_config.reasoning_effort
+        )
+        if same_generation and same_model:
             return
         record = self.record
         if self.runtime is not None:
             await self.runtime.close()
             self.runtime = None
-        referenced = self.runtime_resource_manager.referenced_generation(
-            owner_kind="harness", owner_id=record.code_session_id,
-        )
-        if referenced != snapshot.generation_id:
-            if referenced is not None:
-                self.runtime_resource_manager.release_reference(
-                    owner_kind="harness", owner_id=record.code_session_id,
-                )
-            self.runtime_resource_manager.acquire_reference(
-                snapshot.generation_id,
+        if self.runtime_resource_manager is not None and snapshot is not None:
+            referenced = self.runtime_resource_manager.referenced_generation(
                 owner_kind="harness", owner_id=record.code_session_id,
             )
+            if referenced != snapshot.generation_id:
+                if referenced is not None:
+                    self.runtime_resource_manager.release_reference(
+                        owner_kind="harness", owner_id=record.code_session_id,
+                    )
+                self.runtime_resource_manager.acquire_reference(
+                    snapshot.generation_id,
+                    owner_kind="harness", owner_id=record.code_session_id,
+                )
         runtime = _create_profiled_runtime(
             self.runtime_factory or create_coding_runtime,
-            self.config,
+            runtime_config,
             record.worktree_path,
             trigger="manual",
             target="extension",
@@ -571,12 +601,17 @@ class CodeSessionController:
             raise RuntimeError("Reloaded Coding Runtime escaped its isolated worktree")
         self.runtime = runtime
         self.record = record.model_copy(update={
-            "resource_generation_id": snapshot.generation_id,
+            "resource_generation_id": (
+                snapshot.generation_id if snapshot is not None
+                else record.resource_generation_id
+            ),
         })
         self.audit.append_event(
             record.audit_path,
             "runtime_generation_switched",
-            generation_id=snapshot.generation_id,
+            generation_id=(snapshot.generation_id if snapshot is not None else None),
+            model_profile_id=runtime_config.active_model_profile_id,
+            reasoning_effort=runtime_config.reasoning_effort,
         )
 
     async def finalize(
@@ -729,13 +764,10 @@ class CodeSessionController:
             branch_preserved=keep_branch,
         )
 
-    async def _require_clean_source(self, root: Path) -> None:
+    async def _require_git_source(self, root: Path) -> None:
         inside = await self._git(root, "rev-parse", "--is-inside-work-tree", check=False)
         if inside.returncode != 0 or inside.stdout.strip() != "true":
             raise RuntimeError(f"Yuan Ye 源码目录不是 Git 仓库：{root}")
-        status = await self._git(root, "status", "--porcelain", "--untracked-files=all")
-        if status.stdout.strip():
-            raise RuntimeError("Yuan Ye 源码仓库存在未提交修改；/code 不会 stash 或覆盖这些内容")
 
     def _active(self) -> tuple[CodeSessionRecord, AgentRuntime]:
         if self.record is None or self.runtime is None:
@@ -749,6 +781,7 @@ class CodeSessionController:
         attempts: int,
         feedback: str,
         diagnostic: str,
+        model_calls: tuple[dict[str, Any], ...] = (),
     ) -> CodeTurnResult:
         self.audit.append_event(
             record.audit_path, "code_turn_unverified",
@@ -763,6 +796,7 @@ class CodeSessionController:
             test_file=test_file,
             attempts=attempts,
             diagnostic=diagnostic,
+            model_calls=model_calls,
         )
 
     @staticmethod
@@ -978,6 +1012,7 @@ def _create_profiled_runtime(
     target: str,
     invocation_id: str,
     resource_snapshot: RuntimeResourceSnapshot | None = None,
+    coding_session_id: str | None = None,
 ) -> AgentRuntime:
     signature = inspect.signature(factory)
     supports_profile = (
@@ -1359,6 +1394,7 @@ class HarnessEvolutionEngine:
 
     async def run_manual_turn(self, controller: CodeSessionController, task: str) -> CodeTurnResult:
         record, runtime = controller._active()
+        runtime.code_turn_model_calls = []
         requirement = task.strip()
         if not requirement:
             raise ValueError("Coding 需求不能为空")
@@ -1395,7 +1431,14 @@ class HarnessEvolutionEngine:
         )
         if feedback:
             controller.record = record.model_copy(update={"status": "unverified"})
-            return controller._failed_turn(record, test_file, attempts, feedback, diagnostic)
+            return controller._failed_turn(
+                record,
+                test_file,
+                attempts,
+                feedback,
+                diagnostic,
+                tuple(getattr(runtime, "code_turn_model_calls", ())),
+            )
         await self._commit_candidate(
             record.worktree_path,
             f"Extension: {_code_slug(requirement)} ({record.verified_turns + 1})",
@@ -1417,6 +1460,7 @@ class HarnessEvolutionEngine:
             message="扩展代码和测试已通过统一 Harness Engine 验证，并提交到隔离临时分支。",
             test_file=test_file, attempts=attempts, commit=commit, diagnostic=diagnostic,
             grant_plan=grant_plan,
+            model_calls=tuple(getattr(runtime, "code_turn_model_calls", ())),
         )
 
     async def finalize_manual(
@@ -1469,9 +1513,9 @@ class HarnessEvolutionEngine:
                 worktree_path=str(record.worktree_path), branch=record.branch,
                 grant_plan=grant_plan,
             )
-        await runtime.close()
-        controller.runtime = None
         if record.last_verified_commit == record.base_commit:
+            await runtime.close()
+            controller.runtime = None
             await controller._cleanup(record, keep_branch=False)
             controller.record = None
             if controller.runtime_resource_manager is not None:
@@ -1498,15 +1542,26 @@ class HarnessEvolutionEngine:
             verified=record.last_verified_commit, branch=record.branch,
             audit=lambda event, **data: controller.audit.append_event(record.audit_path, event, **data),
             invocation_id=record.code_session_id, trigger="manual",
+            allow_dirty_source=True,
         )
         if merge != "merged":
             controller.record = record.model_copy(update={"status": "main_changed"})
+            local_conflict = merge == "blocked_local_changes"
             return CodeFinalizeResult(
-                code_session_id=record.code_session_id, status="main_changed",
-                message="源码仓库 HEAD 已变化，已保留临时分支与 worktree，未执行合并。",
+                code_session_id=record.code_session_id,
+                status="local_changes_conflict" if local_conflict else "main_changed",
+                message=(
+                    "人工未提交修改与 Coding 候选改动冲突；"
+                    "已保留两边内容，请处理冲突后再输入 /exit。"
+                    if local_conflict else
+                    "源码仓库 HEAD 已变化，已保留临时分支与 worktree，未执行合并。"
+                ),
+                stay_in_code_mode=True,
                 worktree_path=str(record.worktree_path), branch=record.branch,
                 grant_plan=grant_plan,
             )
+        await runtime.close()
+        controller.runtime = None
         if controller.grant_backend is not None:
             controller.grant_backend.commit_extension_grant_intent(grant_plan["plan_hash"])
         changed = await self._changed_files(record.source_root, record.base_commit, record.last_verified_commit)
@@ -1841,6 +1896,12 @@ class HarnessEvolutionEngine:
         if callable(run_task):
             answers: list[str] = []
             async for event in run_task(prompt, session_id=session_id):
+                if event.type is EventType.MODEL_USAGE:
+                    metric = event.payload.get("model_call")
+                    if isinstance(metric, dict):
+                        calls = getattr(runtime, "code_turn_model_calls", None)
+                        if isinstance(calls, list):
+                            calls.append(dict(metric))
                 if event.type is EventType.FINAL:
                     answers.append(str(event.payload.get("answer", "")))
             return answers[-1] if answers else ""
@@ -1957,6 +2018,7 @@ class HarnessEvolutionEngine:
         self, *, root: Path, base: str, verified: str, branch: str,
         audit: Callable[..., None], invocation_id: str, trigger: str,
         target_branch: str | None = None,
+        allow_dirty_source: bool = False,
     ) -> str:
         clean = await self._command(
             root, ["git", "status", "--porcelain", "--untracked-files=all"], check=False,
@@ -1965,10 +2027,12 @@ class HarnessEvolutionEngine:
         selected_branch = target_branch or (
             await self._command(root, ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], check=False)
         ).stdout.strip()
-        if clean.returncode or clean.stdout.strip() or current != base:
+        source_is_dirty = bool(clean.stdout.strip())
+        if clean.returncode or current != base or (source_is_dirty and not allow_dirty_source):
             audit(
                 "merge_blocked", invocation_id=invocation_id, trigger=trigger,
                 expected_head=base, current_head=current, target_branch=selected_branch,
+                source_is_dirty=source_is_dirty,
             )
             return "blocked_main_changed"
         changed_files = await self._changed_files(root, base, verified)
@@ -1980,6 +2044,17 @@ class HarnessEvolutionEngine:
         )
         merged = await self._command(root, ["git", "merge", "--ff-only", branch], check=False)
         if merged.returncode:
+            actual = (
+                await self._command(root, ["git", "rev-parse", "HEAD"])
+            ).stdout.strip()
+            if allow_dirty_source and actual == base:
+                audit(
+                    "merge_blocked_local_changes",
+                    invocation_id=invocation_id,
+                    trigger=trigger,
+                    error=merged.stderr[-4096:],
+                )
+                return "blocked_local_changes"
             audit("merge_unknown", invocation_id=invocation_id, error=merged.stderr[-4096:])
             return "unknown"
         actual = (await self._command(root, ["git", "rev-parse", "HEAD"])).stdout.strip()

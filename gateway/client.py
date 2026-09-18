@@ -406,8 +406,20 @@ class GatewayClient:
         )
         return CodeSessionRecord.model_validate(value)
 
-    async def run_code_turn(self, session_id: str, task: str) -> CodeTurnResult:
-        payload = CodeTurnRequest(client_id=self.client_id, task=task)
+    async def run_code_turn(
+        self,
+        session_id: str,
+        task: str,
+        *,
+        model_profile_id: str = "default",
+        reasoning_effort: str | None = None,
+    ) -> CodeTurnResult:
+        payload = CodeTurnRequest(
+            client_id=self.client_id,
+            task=task,
+            model_profile_id=model_profile_id,
+            reasoning_effort=reasoning_effort,
+        )
         value = await self._request(
             "POST", f"/api/v1/code/sessions/{session_id}/turns",
             json=payload.model_dump(mode="json"),

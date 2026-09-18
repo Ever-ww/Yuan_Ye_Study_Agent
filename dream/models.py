@@ -109,6 +109,7 @@ class DreamState(BaseModel):
     version: Literal[1] = 1
     initialized_at: str
     last_completed_date: str | None = None
+    last_attempted_date: str | None = None
     processed_evidence: dict[str, list[str]] = Field(default_factory=dict)
     successful_runs: list[str] = Field(default_factory=list)
     last_run_id: str | None = None
@@ -155,6 +156,7 @@ class DreamStatus(BaseModel):
     timezone: str
     initialized_at: str
     last_completed_date: str | None = None
+    last_attempted_date: str | None = None
     last_run_id: str | None = None
     last_status: DreamRunStatus | None = None
     last_error: str | None = None

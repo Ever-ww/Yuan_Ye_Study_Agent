@@ -446,23 +446,25 @@ uv run python run.py gateway stop
 
 ### Agent Home Backup / Restore
 
-Backup 对统一的 `~/.yy` 创建完整加密快照。运行中的 Gateway 会先进入 `DRAINING`，拒绝新的写入；Runtime、Cron、Dream、Outbox、Embedding 与 Harness 到达可持久化边界后进入 `FROZEN`。Outbox 不要求清空 backlog，已经持久化的 `UNKNOWN` Tool Attempt 也允许冻结。被动 Store 不实现虚假的生命周期接口，但所有 Gateway 写请求和核心 State mutation 都受同一个 WriteGate 约束。
+Backup 对统一的 `~/.yy` 创建一致性快照。Gateway 只在复制不可变 staging 时短暂进入 `QUIESCING → QUIESCED`；staging 原子发布后立即恢复服务。压缩、加密、内容去重、验证和 retention 在后台继续，不占用维护窗口。Runtime、Cron、Dream、Outbox、Embedding 与 Harness 仍须先到达可持久化边界；Outbox 不要求清空 backlog。
 
 ```powershell
 uv run python run.py backup create
 uv run python run.py backup list
 uv run python run.py backup status
-uv run python run.py backup verify D:\backups\example.yybackup
-uv run python run.py backup restore D:\backups\example.yybackup
+uv run python run.py backup verify D:\backups\backup-2026-09-17_040000_000000_ab12cd34ef56.manifest
+uv run python run.py backup restore D:\backups\backup-2026-09-17_040000_000000_ab12cd34ef56.manifest
 uv run python run.py backup recover
 uv run python run.py backup rollback
 ```
 
-`backup_key_mode` 默认是 `os_managed`：首次备份自动生成高熵随机密钥，Windows 使用当前用户 DPAPI、macOS 使用 Keychain、Linux 使用 Secret Service 托管。用户不需要设置或重复输入口令，`backup verify/restore` 会根据归档 Header 自动取回对应密钥。Windows 只在 `~/.yy-backups/control/credentials/` 保存 DPAPI 密文，明文密钥不写入代码、配置、Agent Home、日志或子进程环境。系统托管备份默认只适合在同一系统账户和 Agent Home 恢复；跨设备迁移应使用 `backup create --manual-passphrase` 创建手动口令备份。
+`backup_key_mode` 默认是 `os_managed`：首次备份自动生成高熵随机密钥，Windows 使用当前用户 DPAPI、macOS 使用 Keychain、Linux 使用 Secret Service 托管。用户不需要设置或重复输入口令，`backup verify/restore` 会根据 Manifest 自动取回对应密钥。Windows 只在 `~/.yy-backups/control/credentials/` 保存 DPAPI 密文，明文密钥不写入代码、配置、Agent Home、日志或子进程环境。系统托管备份默认只适合在同一系统账户和 Agent Home 恢复；跨设备迁移应使用独立备份目录和手动口令。
 
 兼容模式 `backup_key_mode=passphrase` 继续支持 `YY_BACKUP_PASSPHRASE`；Gateway 启动时读取一次并从全局环境移除。无论采用哪种模式都不会降级生成明文备份。自动备份默认每天本地时间 04:00 运行；自动成功只保留已读审计，连续失败只保留最新一条未读通知，普通聊天启动时仅提示待处理数量，详情由 `/inbox` 显式查看。
 
-归档格式使用流式 ZIP64 与 AES-256-GCM，明文 Header 作为 AAD；程序会先限制 Header 与 scrypt 资源参数，再执行 KDF。正常创建过程不生成完整明文 ZIP，也不把整个归档读入内存。正式文件先以 `.partial` 写入，完成认证、校验和 fsync 后原子发布为 `.yybackup`。SQLite 使用 Backup API 生成干净快照，不归档 WAL/SHM。
+备份根目录由 `control/backup/backup_operations.sqlite3`、`objects/<前两位>/<sha256>` 和 `manifests/backup-<日期时间>-<id>.manifest` 组成。对象按明文 SHA-256 寻址，只写一次，并分别使用 zlib 与 AES-256-GCM 流式压缩、加密和认证；相邻快照中未变化的内容不会重复保存。Manifest 自身有 canonical hash，发布使用 `write → flush → fsync → atomic replace`。SQLite 使用 Backup API 生成干净快照，不归档 WAL/SHM。每个 Manifest 最多保留 27 天；删除过期 Manifest 后才回收没有任何剩余 Manifest 引用的对象。旧 `.yybackup` 读取器只用于兼容历史归档，不再生成新归档。
+
+Operation FSM 保存在 Agent Home 外部：`PREPARING → SNAPSHOTTING → SNAPSHOT_READY → STORING_OBJECTS → VERIFYING → COMPLETED`。进程在 `SNAPSHOT_READY` 之后退出时，下一次 Gateway 启动会先恢复服务，再严格复用原 staging 和成员集合续跑；不会重新扫描当前 `.yy` 猜测原快照。
 
 Restore 是整体替换而不是状态合并。破坏性替换前会显示 Backup ID、版本、大小、外部依赖和峰值空间，并要求输入短 ID；随后创建并验证救援备份。控制面位于 `~/.yy-backups/`，不随 `.yy` 一起替换：Fence 阻止普通 Gateway 启动，append-only 哈希链 Journal 对关键 rename 采用 `intent → filesystem action → committed`。如果强杀发生在 rename 与 commit 之间，`backup recover` 只依据记录的身份和指纹协调；无法证明时进入 `RECOVERY_REQUIRED`，不会猜测。
 

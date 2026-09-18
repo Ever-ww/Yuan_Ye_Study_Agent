@@ -117,6 +117,10 @@ class BackupFileRecord(BaseModel):
     size: int = Field(ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     durability: DurabilityClass
+    # Format v2 stores file bodies in the content-addressed object store.  Old
+    # v1 encrypted archives leave these fields empty and remain readable.
+    object_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    stored_size: int | None = Field(default=None, ge=0)
 
 
 class BackupManifest(BaseModel):
@@ -136,6 +140,48 @@ class BackupManifest(BaseModel):
     external_dependencies: tuple[ExternalDependency, ...] = ()
     skill_manifest_hashes: dict[str, str] = Field(default_factory=dict)
     harness_snapshots: tuple[str, ...] = ()
+    encryption_mode: Literal["passphrase", "os_managed"] | None = None
+    key_id: str | None = None
+    object_store_salt: str | None = None
+    key_verifier: str | None = None
+    manifest_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class BackupOperationPhase(str, Enum):
+    PREPARING = "preparing"
+    SNAPSHOTTING = "snapshotting"
+    SNAPSHOT_READY = "snapshot_ready"
+    STORING_OBJECTS = "storing_objects"
+    VERIFYING = "verifying"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    RECOVERY_REQUIRED = "recovery_required"
+
+
+class BackupOperation(BaseModel):
+    """Durable backup workflow evidence outside the replaceable Agent Home."""
+
+    model_config = ConfigDict(frozen=True)
+
+    operation_id: str
+    backup_id: str
+    kind: Literal["automatic", "manual", "rescue"]
+    phase: BackupOperationPhase
+    maintenance_epoch: int | None = Field(default=None, ge=1)
+    lifecycle_operation_id: str | None = None
+    staging_path: Path
+    manifest_path: Path
+    manifest_json: str | None = None
+    manifest_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    encryption_mode: Literal["passphrase", "os_managed"]
+    key_id: str | None = None
+    attempt_count: int = Field(default=0, ge=0)
+    last_error_type: str | None = None
+    last_error: str | None = None
+    revision: int = Field(default=0, ge=0)
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
 
 
 class BackupRecord(BaseModel):
@@ -215,6 +261,7 @@ class RestorePlan(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     backup_id: str
+    backup_format_version: int = Field(ge=1)
     archive_path: Path
     created_at: datetime
     agent_version: str
@@ -228,6 +275,8 @@ class RestorePlan(BaseModel):
 
 
 __all__ = [
+    "BackupOperation",
+    "BackupOperationPhase",
     "BackupFileRecord",
     "BackupCreateRequest",
     "BackupManifest",

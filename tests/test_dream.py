@@ -447,6 +447,28 @@ class DreamTests(unittest.TestCase):
         )
         self.assertEqual(scheduler._due_date(scheduler._local_now()), date(2026, 8, 9))
 
+    def test_failed_automatic_cutoff_is_not_retried_until_next_schedule(self) -> None:
+        service = type("Service", (), {
+            "config": type("Config", (), {
+                "dream_enabled": True,
+                "harness_dream_enabled": False,
+                "dream_schedule": "0 3 * * *",
+                "dream_timezone": "Asia/Shanghai",
+            })(),
+            "status": lambda self, **kwargs: DreamStatus(
+                enabled=True, running=False, schedule="0 3 * * *",
+                timezone="Asia/Shanghai", initialized_at="2026-08-01T00:00:00+08:00",
+                last_completed_date="2026-08-01", last_attempted_date="2026-08-09",
+                last_status="failed",
+            ),
+        })()
+        scheduler = DreamScheduler(
+            service, lambda: True, lambda result, automatic: asyncio.sleep(0),
+            clock=lambda: datetime(2026, 8, 10, 4, tzinfo=ZoneInfo("Asia/Shanghai")),
+            run_day=lambda selected: asyncio.sleep(0),
+        )
+        self.assertIsNone(scheduler._due_date(scheduler._local_now()))
+
     def test_automatic_no_work_advances_cursor_without_run_or_callback(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
@@ -531,6 +553,7 @@ class DreamTests(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.json()["status"], "completed")
+                self.assertEqual(application.store.list_inbox(unread_only=True), [])
 
     def test_cli_bare_dream_command_displays_status(self) -> None:
         class Client:

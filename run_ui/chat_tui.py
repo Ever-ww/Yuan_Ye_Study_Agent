@@ -28,8 +28,8 @@ from Agent.config import REASONING_EFFORTS
 from gateway import GatewayClient
 
 
-ExternalCommand = Callable[[str, str | None], Awaitable[None]]
-HistoryDisplayed = Callable[[], Awaitable[None]]
+ExternalCommand = Callable[[str, str | None], Awaitable[str | None]]
+HistoryDisplayed = Callable[[], Awaitable[str | None]]
 _COMPOSER_PLACEHOLDER = "输入消息，或使用 /help 查看命令"
 
 
@@ -90,6 +90,13 @@ class ConversationTimeline(VerticalScroll):
         self.call_after_refresh(self.follow_tail_if_enabled)
         self.set_timer(0.05, self.follow_tail_if_enabled)
 
+    def scroll_home(self, *args: Any, **kwargs: Any) -> None:
+        # Disable sticky-tail at intent time, before an animated/programmatic
+        # scroll produces its first offset update. This fences older deferred
+        # tail callbacks from snapping the viewport back down.
+        self.follow_tail = False
+        super().scroll_home(*args, **kwargs)
+
     def follow_tail_if_enabled(self) -> None:
         """Honor a deferred tail request only while follow mode is still active.
 
@@ -101,6 +108,7 @@ class ConversationTimeline(VerticalScroll):
             # This callback already runs after layout. Do not queue a second
             # unconditional scroll that could outlive a subsequent wheel event.
             self.scroll_end(animate=False, immediate=True)
+            self.refresh(layout=True)
 
     def _on_mouse_scroll_up(self, event: MouseScrollUp) -> None:
         # Suspend sticky-tail before Textual applies the wheel delta.  Waiting
@@ -675,6 +683,23 @@ class YuanYeChatApp(App[str | None]):
         padding: 0 2 1 2;
         scrollbar-size-vertical: 1;
     }
+    #code-timeline {
+        display: none;
+        width: 1fr;
+        padding: 0 2 1 2;
+        scrollbar-size-vertical: 1;
+    }
+    #data-view {
+        display: none;
+        width: 1fr;
+        padding: 1 2;
+        overflow-y: auto;
+        scrollbar-size-vertical: 1;
+    }
+    #data-content {
+        width: 100%;
+        height: auto;
+    }
     #observer-pane {
         width: 36;
         min-width: 30;
@@ -895,6 +920,7 @@ class YuanYeChatApp(App[str | None]):
         initial_observer_status: dict[str, Any] | None = None,
         model_name: str | None = None,
         model_options: tuple[Any, ...] = (),
+        initial_notices: tuple[str, ...] = (),
     ) -> None:
         super().__init__()
         self.client = client
@@ -905,6 +931,7 @@ class YuanYeChatApp(App[str | None]):
         self.history_displayed = history_displayed
         self.unread_count = unread_count
         self.initial_observer_status = initial_observer_status
+        self.initial_notices = initial_notices
         self.current_run_id: str | None = None
         self._active_worker: Worker[Any] | None = None
         self._assistant: Markdown | None = None
@@ -922,8 +949,25 @@ class YuanYeChatApp(App[str | None]):
         self._last_ctrl_c = 0.0
         self._current_status = "就绪"
         self._approval_future: asyncio.Future[bool] | None = None
+        self._code_mode = False
+        self._code_session: Any | None = None
+        self._code_event_sequence = 0
+        self._code_progress: list[str] = []
+        self._saved_observer: tuple[str, str] | None = None
+        self._data_mode: str | None = None
+        self._observer_caption_text = (
+            "已恢复最近 Turn · 仅可见事件"
+            if self.initial_observer_status else "当前 Turn · 仅可见事件"
+        )
+        self._observer_progress_text = str(
+            (self.initial_observer_status or {}).get("progress_markdown")
+            or "等待下一轮任务"
+        )
         self._cache_metrics: list[dict[str, Any]] = []
         self._initial_cache_status = _restored_cache_status(records)
+        self._main_cache_status = self._initial_cache_status
+        self._code_cache_metrics: list[dict[str, Any]] = []
+        self._code_cache_status = "缓存 ??.?%"
         self._model_name = model_name or _restored_model_name(records)
         self._model_options = [
             {
@@ -969,16 +1013,14 @@ class YuanYeChatApp(App[str | None]):
             yield Static("就绪", id="run-status")
         with Horizontal(id="workspace"):
             yield ConversationTimeline(id="timeline")
+            yield ConversationTimeline(id="code-timeline")
+            with VerticalScroll(id="data-view"):
+                yield Static("", id="data-content", markup=False)
             with VerticalScroll(id="observer-pane"):
                 yield Static("TURN OBSERVER", id="observer-heading")
-                yield Static(
-                    "已恢复最近 Turn · 仅可见事件"
-                    if self.initial_observer_status else "当前 Turn · 仅可见事件",
-                    id="observer-caption",
-                )
+                yield Static(self._observer_caption_text, id="observer-caption")
                 yield Markdown(
-                    str((self.initial_observer_status or {}).get("progress_markdown")
-                        or "等待下一轮任务"),
+                    self._observer_progress_text,
                     id="observer-progress",
                 )
         yield OptionList(id="command-menu", compact=True)
@@ -1003,11 +1045,17 @@ class YuanYeChatApp(App[str | None]):
 
     async def on_mount(self) -> None:
         await self._restore_history()
+        for notice in self.initial_notices:
+            await self._append_notice(notice)
         if self.history_displayed is not None:
             # A read receipt follows the actual presentation boundary.  A
             # transient projection failure must not prevent chat startup.
-            with contextlib.suppress(Exception):
-                await self.history_displayed()
+            try:
+                warning = await self.history_displayed()
+            except Exception:
+                warning = None
+            if warning:
+                await self._append_notice(warning)
         self._set_status("就绪")
         # Coalesce token events. Re-parsing Markdown for every tiny provider
         # chunk makes the terminal appear slower even though Gateway streaming
@@ -1040,7 +1088,7 @@ class YuanYeChatApp(App[str | None]):
 
     def _apply_responsive_layout(self, width: int) -> None:
         observer = self.query_one("#observer-pane", VerticalScroll)
-        observer.display = width >= 92
+        observer.display = self._data_mode is None and width >= 92
 
     @on(Input.Changed, "#composer")
     def update_command_menu(self, event: Input.Changed) -> None:
@@ -1055,9 +1103,32 @@ class YuanYeChatApp(App[str | None]):
             self._hide_command_menu()
             return
         query = value.casefold()
+        if self._code_mode:
+            commands = (
+                ("/exit", "验证并合并后返回 Main Agent"),
+                ("/abort", "放弃 Code Session 后返回 Main Agent"),
+            )
+        elif self._data_mode == "inbox":
+            commands = (
+                ("/inbox", "刷新未读结果"),
+                ("/inbox all", "显示全部结果"),
+                ("/inbox show <ID>", "查看完整结果"),
+                ("/inbox read <ID>", "标记一条已读"),
+                ("/inbox read-all", "全部标记已读"),
+                ("/exit", "返回 Main Agent"),
+            )
+        elif self._data_mode == "skill":
+            commands = (
+                ("/skill list", "刷新 Skill 列表"),
+                ("/skill audit <review-id>", "查看审核结果"),
+                ("/skill refresh", "刷新当前 Session Skill"),
+                ("/exit", "返回 Main Agent"),
+            )
+        else:
+            commands = COMMANDS
         matches = [
             (command, description)
-            for command, description in COMMANDS
+            for command, description in commands
             if command.casefold().startswith(query)
             or query in command.casefold()
             or query[1:] in description.casefold()
@@ -1218,6 +1289,34 @@ class YuanYeChatApp(App[str | None]):
                 return
         self._hide_command_menu()
         event.input.value = ""
+        if self._data_mode is not None:
+            if value in {"/exit", "/quit"}:
+                self._leave_data_mode()
+                return
+            expected = f"/{self._data_mode}"
+            if not value.startswith(expected):
+                self._update_data_view(
+                    f"当前是 {expected} 数据视图；请输入 {expected} 子命令，"
+                    "或使用 /exit 返回 Main Agent。",
+                )
+                return
+            self._active_worker = self.run_external_command(value)
+            return
+        if self._code_mode:
+            self.query_one("#code-timeline", ConversationTimeline).return_to_live_edge()
+            if value in {"/exit", "/quit"}:
+                self._active_worker = self.finalize_code_mode()
+            elif value == "/abort":
+                self._active_worker = self.abort_code_mode()
+            elif value == "/help":
+                await self._append_code_notice(
+                    "/exit 验证并合并 · /abort 放弃全部修改 · "
+                    "连续两次 Ctrl+C 保留现场并返回 Main Agent",
+                )
+            else:
+                await self._append_code_user(value)
+                self._active_worker = self.run_code_turn(value)
+            return
         # Sending a new prompt is an explicit return to the live edge. History
         # scrolling remains sticky only while reading; a new Turn must start
         # with the user's just-submitted message visible at the bottom.
@@ -1232,6 +1331,9 @@ class YuanYeChatApp(App[str | None]):
             )
             return
         if self._is_local_command(value):
+            data_mode = self._data_view_kind(value)
+            if data_mode is not None:
+                self._enter_data_mode(data_mode)
             self._active_worker = self.run_external_command(value)
         else:
             await self._append_user(value)
@@ -1240,13 +1342,301 @@ class YuanYeChatApp(App[str | None]):
 
     @work(exclusive=True, group="gateway-command", exit_on_error=False)
     async def run_external_command(self, command: str) -> None:
+        data_mode = self._data_view_kind(command)
+        if data_mode is not None and self._data_mode is None:
+            self._enter_data_mode(data_mode)
         self._set_busy(True, f"执行 {command.split(maxsplit=1)[0]}")
         try:
-            with self.suspend():
-                await self.external_command(command, self.session_id)
-            await self._append_notice(f"命令完成：{command.split(maxsplit=1)[0]}")
+            if command == "/code":
+                await self._enter_code_mode()
+            else:
+                output = await self.external_command(command, self.session_id)
+                message = output or f"命令完成：{command.split(maxsplit=1)[0]}"
+                if self._data_mode is not None:
+                    self._update_data_view(message)
+                else:
+                    await self._append_notice(message)
         except Exception as exc:
-            await self._append_error(str(exc) or type(exc).__name__)
+            message = str(exc) or type(exc).__name__
+            if self._data_mode is not None:
+                self._update_data_view(message)
+            else:
+                await self._append_error(message)
+        finally:
+            self._set_busy(
+                False,
+                "Code 就绪" if self._code_mode
+                else "数据视图" if self._data_mode is not None
+                else "就绪",
+            )
+
+    def command_output_width(self) -> int:
+        """Return the usable width for Rich output mounted in the timeline."""
+        if self._data_mode is not None:
+            workspace = self.query_one("#workspace", Horizontal)
+            return max(48, workspace.content_size.width - 8)
+        timeline = self.query_one("#timeline", ConversationTimeline)
+        # Account for the notice widget's horizontal margin and padding so
+        # Rich output is laid out once rather than re-wrapped by Textual.
+        return max(32, timeline.content_size.width - 8)
+
+    @staticmethod
+    def _data_view_kind(command: str) -> str | None:
+        head = command.split(maxsplit=1)[0]
+        return head[1:] if head in {"/inbox", "/skill"} else None
+
+    def _enter_data_mode(self, kind: str) -> None:
+        self._data_mode = kind
+        self.query_one("#timeline", ConversationTimeline).display = False
+        self.query_one("#code-timeline", ConversationTimeline).display = False
+        self.query_one("#observer-pane", VerticalScroll).display = False
+        view = self.query_one("#data-view", VerticalScroll)
+        view.display = True
+        self.query_one("#data-content", Static).update("正在加载…")
+        self.query_one("#brand", Static).update(kind.upper())
+        self.query_one("#session-context", Static).update("DATA VIEW  /  FULL WIDTH  /")
+        composer = self.query_one("#composer", Input)
+        composer.placeholder = f"输入 /{kind} 子命令，或 /exit 返回 Main Agent"
+        self.query_one("#key-hints", Static).update(
+            "Enter 执行  ·  / 命令  ·  Ctrl+C / /exit 返回 Main Agent"
+        )
+        self._set_status("数据视图")
+
+    def _leave_data_mode(self) -> None:
+        if self._data_mode is None:
+            return
+        self._data_mode = None
+        self.query_one("#data-view", VerticalScroll).display = False
+        self.query_one("#timeline", ConversationTimeline).display = True
+        self._apply_responsive_layout(self.size.width)
+        self.query_one("#brand", Static).update("YUAN YE")
+        self.query_one("#composer", Input).placeholder = _COMPOSER_PLACEHOLDER
+        self.query_one("#key-hints", Static).update(
+            "Enter 发送  ·  / 命令  ·  ↑↓ 选择  ·  Tab 补全  ·  "
+            "Ctrl+C 中断 / 再按退出  ·  滚轮查看历史"
+        )
+        self._set_status("就绪")
+        self._update_brand()
+        self.query_one("#timeline", ConversationTimeline).return_to_live_edge()
+
+    def _update_data_view(self, content: str) -> None:
+        self.query_one("#data-content", Static).update(Text(
+            content,
+            no_wrap=True,
+            overflow="crop",
+        ))
+        view = self.query_one("#data-view", VerticalScroll)
+        self.call_after_refresh(view.scroll_home)
+
+    async def confirm(self, title: str, message: str) -> bool:
+        """Request a command confirmation without leaving the TUI."""
+        return await self._request_inline_confirmation(f"{title} · {message}")
+
+    async def _enter_code_mode(self) -> None:
+        if self._code_session is None:
+            self._set_status("启动 Code")
+            self._code_session = await self.client.start_code_session(
+                self.project_id, self.session_id,
+            )
+            self._code_event_sequence = 0
+            self._code_progress.clear()
+            self._code_cache_metrics = []
+            self._code_cache_status = "缓存 ??.?%"
+            await self._append_code_notice(
+                f"隔离 Coding Session 已就绪 · 分支 {self._code_session.branch}",
+            )
+        self._saved_observer = (
+            self._observer_caption_text, self._observer_progress_text,
+        )
+        self._code_mode = True
+        self.query_one("#timeline", ConversationTimeline).display = False
+        code_timeline = self.query_one("#code-timeline", ConversationTimeline)
+        code_timeline.display = True
+        code_timeline.return_to_live_edge()
+        self.query_one("#brand", Static).update("YY CODE")
+        self.query_one("#observer-heading", Static).update("CODE OBSERVER")
+        self._update_observer(
+            "当前 Coding Session · 隔离 Worktree",
+            "等待 Coding 需求",
+        )
+        self.query_one("#cache-status", Static).update(self._code_cache_status)
+        self._update_brand()
+        composer = self.query_one("#composer", Input)
+        composer.placeholder = "输入 Coding 需求，或使用 /exit、/abort"
+        self.query_one("#key-hints", Static).update(
+            "Enter 执行  ·  /exit 合并  ·  /abort 放弃  ·  "
+            "连续两次 Ctrl+C 返回 Main Agent",
+        )
+
+    def _leave_code_mode(self, *, preserved: bool) -> None:
+        if not self._code_mode:
+            return
+        self._code_mode = False
+        self.query_one("#code-timeline", ConversationTimeline).display = False
+        timeline = self.query_one("#timeline", ConversationTimeline)
+        timeline.display = True
+        timeline.return_to_live_edge()
+        self.query_one("#brand", Static).update("YUAN YE")
+        self.query_one("#observer-heading", Static).update("TURN OBSERVER")
+        if self._saved_observer is not None:
+            self._update_observer(*self._saved_observer)
+        self._saved_observer = None
+        self.query_one("#cache-status", Static).update(self._main_cache_status)
+        self.query_one("#composer", Input).placeholder = _COMPOSER_PLACEHOLDER
+        self.query_one("#key-hints", Static).update(
+            "Enter 发送  ·  / 命令  ·  ↑↓ 选择  ·  Tab 补全  ·  "
+            "Ctrl+C 中断 / 再按退出  ·  滚轮查看历史",
+        )
+        self._update_brand()
+        self._set_composer_notice(
+            "Coding Session 已保留，可再次输入 /code 继续"
+            if preserved else "已返回 Main Agent",
+        )
+
+    @work(exclusive=True, group="gateway-command", exit_on_error=False)
+    async def run_code_turn(self, task: str) -> None:
+        self._set_busy(True, "Code 运行中")
+        pending = asyncio.create_task(
+            self.client.run_code_turn(
+                self._code_session.code_session_id,
+                task,
+                model_profile_id=self._model_profile_id,
+                reasoning_effort=self._reasoning_effort,
+            ),
+        )
+        try:
+            while not pending.done():
+                await self._poll_code_events()
+                await asyncio.sleep(0.25)
+            result = await pending
+            await self._poll_code_events()
+            for metric in result.model_calls:
+                if isinstance(metric, dict):
+                    self._code_cache_metrics.append(metric)
+            if any(_cache_values(metric) is not None for metric in result.model_calls):
+                self._code_cache_status = _cache_status_text(self._code_cache_metrics)
+                self.query_one("#cache-status", Static).update(self._code_cache_status)
+            details = [
+                result.message,
+                f"测试文件：{result.test_file}",
+                f"尝试次数：{result.attempts}",
+            ]
+            if result.commit:
+                details.append(f"临时提交：{result.commit}")
+            if result.diagnostic:
+                details.append(f"诊断：\n{result.diagnostic}")
+            await self._append_code_assistant("\n\n".join(details))
+            self._update_observer(
+                "本轮 Coding 已结束",
+                "✓ 验证通过" if result.status == "verified" else "⚠ 验证未通过",
+            )
+        except asyncio.CancelledError:
+            # The Gateway owns the durable Coding operation. Do not pretend a
+            # cancelled local waiter cancelled work which may still be running.
+            pending.add_done_callback(
+                lambda task: task.exception() if not task.cancelled() else None,
+            )
+            await self._append_code_notice("客户端停止等待；Coding 操作仍由 Gateway 持续记录")
+            raise
+        except Exception as exc:
+            await self._append_code_error(str(exc) or type(exc).__name__)
+            self._update_observer("Coding Turn 失败", f"⚠ {str(exc) or type(exc).__name__}")
+        finally:
+            self._set_busy(False, "Code 就绪" if self._code_mode else "就绪")
+
+    async def _poll_code_events(self) -> None:
+        if self._code_session is None:
+            return
+        events = await self.client.code_session_events(
+            self._code_session.code_session_id,
+            after_sequence=self._code_event_sequence,
+        )
+        labels = {
+            "code_turn_started": "正在分析需求并分配测试文件",
+            "code_generation": "Coding Agent 正在生成代码",
+            "code_auto_repair": "测试未通过，正在自动修复",
+            "code_test": "正在执行验证命令",
+            "code_turn_verified": "验证通过并已创建临时提交",
+            "code_turn_unverified": "自动修复后仍未通过验证",
+        }
+        for event in events:
+            self._code_event_sequence = max(
+                self._code_event_sequence, int(event.get("sequence", 0)),
+            )
+            label = labels.get(str(event.get("record_type", "")))
+            if not label:
+                continue
+            if str(event.get("record_type")) == "code_test":
+                command = event.get("command")
+                if isinstance(command, list):
+                    label += "：" + " ".join(str(item) for item in command)
+            self._code_progress.append(label)
+            await self._append_code_notice(f"◌ {label}")
+            self._update_observer(
+                "当前 Coding Turn · Harness 可见事件",
+                "## 进行中\n\n" + label + "\n\n## 已完成\n\n" + "\n".join(
+                    f"- {item}" for item in self._code_progress[:-1]
+                ),
+            )
+
+    @work(exclusive=True, group="gateway-command", exit_on_error=False)
+    async def finalize_code_mode(self) -> None:
+        self._set_busy(True, "验证并合并")
+        try:
+            result = await self.client.finalize_code_session(
+                self._code_session.code_session_id,
+            )
+            if result.status == "capability_confirmation_required":
+                plan = result.grant_plan
+                lines = []
+                for hook in plan.get("hooks", []):
+                    capabilities = hook.get("confirmation_required_capabilities", [])
+                    tools = [item.get("name") for item in hook.get("tools", [])]
+                    if capabilities or tools:
+                        lines.append(
+                            f"{hook.get('hook_id')}: capabilities={capabilities or '-'}; "
+                            f"tools={tools or '-'}"
+                        )
+                approved = await self.push_screen_wait(ConfirmModal(
+                    "Extension 权限确认",
+                    "\n".join(lines) or "没有新增受控权限",
+                ))
+                if not approved:
+                    await self._append_code_notice("已取消合并，Coding Session 保持活动")
+                    return
+                result = await self.client.finalize_code_session(
+                    self._code_session.code_session_id,
+                    str(plan["plan_hash"]),
+                )
+            await self._append_code_notice(result.message)
+            if not result.stay_in_code_mode:
+                self._code_session = None
+                self._leave_code_mode(preserved=False)
+                await self._append_notice(result.message)
+        except Exception as exc:
+            await self._append_code_error(str(exc) or type(exc).__name__)
+        finally:
+            self._set_busy(False, "Code 就绪" if self._code_mode else "就绪")
+
+    @work(exclusive=True, group="gateway-command", exit_on_error=False)
+    async def abort_code_mode(self) -> None:
+        approved = await self.confirm(
+            "放弃 Coding Session",
+            "将删除当前隔离修改，且不能恢复。是否继续？",
+        )
+        if not approved:
+            await self._append_code_notice("已取消放弃操作")
+            return
+        self._set_busy(True, "放弃 Code")
+        try:
+            result = await self.client.abort_code_session(
+                self._code_session.code_session_id,
+            )
+            self._code_session = None
+            self._leave_code_mode(preserved=False)
+            await self._append_notice(result.message)
+        except Exception as exc:
+            await self._append_code_error(str(exc) or type(exc).__name__)
         finally:
             self._set_busy(False, "就绪")
 
@@ -1256,8 +1646,7 @@ class YuanYeChatApp(App[str | None]):
         self._last_ctrl_c = 0.0
         self._terminal_status = None
         self._cache_metrics = []
-        self.query_one("#observer-caption", Static).update("当前 Turn · 仅可见事件")
-        self.query_one("#observer-progress", Markdown).update("正在建立本轮监控")
+        self._update_observer("当前 Turn · 仅可见事件", "正在建立本轮监控")
         self._assistant_text = ""
         self._stream_dirty = False
         self._assistant = None
@@ -1273,7 +1662,12 @@ class YuanYeChatApp(App[str | None]):
         await self._turn_container.mount(self._turn_trace)
         self._current_activity = LoopActivityCard()
         await self._turn_trace.detail.mount(self._current_activity)
-        self._follow_timeline()
+        timeline = self.query_one("#timeline", ConversationTimeline)
+        timeline.return_to_live_edge()
+        # Present the submitted question and compact activity row before the
+        # provider call can block on network I/O.
+        await timeline.wait_for_refresh()
+        timeline.pin_to_tail()
         try:
             run = await self.client.start_run(
                 self.project_id, prompt, self.session_id,
@@ -1307,6 +1701,10 @@ class YuanYeChatApp(App[str | None]):
             self.current_run_id = None
             self._assistant = None
             self._set_busy(False, self._terminal_status or "就绪")
+            timeline = self.query_one("#timeline", ConversationTimeline)
+            if timeline.follow_tail:
+                await timeline.wait_for_refresh()
+                timeline.follow_tail_if_enabled()
 
     async def _consume_gateway_event(self, event: Any) -> None:
         raw_type = event.type
@@ -1416,9 +1814,8 @@ class YuanYeChatApp(App[str | None]):
                 # the last known value instead of making the footer flicker
                 # from a real ratio back to an indeterminate placeholder.
                 if _cache_values(metric) is not None:
-                    self.query_one("#cache-status", Static).update(
-                        _cache_status_text(self._cache_metrics),
-                    )
+                    self._main_cache_status = _cache_status_text(self._cache_metrics)
+                    self.query_one("#cache-status", Static).update(self._main_cache_status)
         elif event_type == EventType.FINAL.value:
             if self._current_activity is not None:
                 self._current_activity.set_reasoning_summary(payload.get("reasoning"))
@@ -1435,8 +1832,8 @@ class YuanYeChatApp(App[str | None]):
             # A delayed non-terminal projection must not roll a completed Turn
             # back to an active-looking sidebar.
             if self._terminal_status is None:
-                self.query_one("#observer-progress", Markdown).update(
-                    str(payload.get("progress_markdown") or "正在观察"),
+                self._update_observer(
+                    progress=str(payload.get("progress_markdown") or "正在观察"),
                 )
         elif event_type == "approval_requested":
             approved = await self._request_inline_approval(payload)
@@ -1458,10 +1855,8 @@ class YuanYeChatApp(App[str | None]):
             # Observer reduction is isolated from the Main Run and may finish
             # after its canonical terminal event. Never leave the stale active
             # projection beside an already completed Run.
-            self.query_one("#observer-caption", Static).update(
+            self._update_observer(
                 "本轮已完成 · 最终状态核对",
-            )
-            self.query_one("#observer-progress", Markdown).update(
                 "✓ 任务已完成\n\n正在完成最终意图核对…",
             )
             self._terminal_status = "已完成"
@@ -1471,16 +1866,26 @@ class YuanYeChatApp(App[str | None]):
         elif event_type in {"run_failed", "run_cancelled", "run_interrupted"}:
             message = str(payload.get("message") or event_type)
             await self._append_turn_error(message)
-            self.query_one("#observer-caption", Static).update(
+            self._update_observer(
                 "本轮已结束 · 最终状态核对",
-            )
-            self.query_one("#observer-progress", Markdown).update(
                 "⚠ 主任务已结束\n\n正在完成最终状态核对…",
             )
             self._terminal_status = (
                 "已取消" if event_type == "run_cancelled" else "执行失败"
             )
             self._set_status(self._terminal_status)
+
+    def _update_observer(
+        self,
+        caption: str | None = None,
+        progress: str | None = None,
+    ) -> None:
+        if caption is not None:
+            self._observer_caption_text = caption
+            self.query_one("#observer-caption", Static).update(caption)
+        if progress is not None:
+            self._observer_progress_text = progress
+            self.query_one("#observer-progress", Markdown).update(progress)
 
     async def _finish_observer(
         self,
@@ -1506,8 +1911,8 @@ class YuanYeChatApp(App[str | None]):
         # "进行中" list merely because the isolated Observer exceeded grace.
         if not status or status.get("status") not in {"finalized", "failed"}:
             return
-        self.query_one("#observer-progress", Markdown).update(
-            str(status.get("progress_markdown") or "✓ 任务已完成"),
+        self._update_observer(
+            progress=str(status.get("progress_markdown") or "✓ 任务已完成"),
         )
         proposal = status.get("correction_proposal")
         if isinstance(proposal, dict) and proposal.get("status") == "pending":
@@ -1524,12 +1929,6 @@ class YuanYeChatApp(App[str | None]):
             )
 
     async def _request_inline_approval(self, payload: dict[str, Any]) -> bool:
-        """Temporarily replace the composer with one compact approval control."""
-
-        if self._approval_future is not None and not self._approval_future.done():
-            raise RuntimeError("已有工具审批正在等待处理")
-        future = asyncio.get_running_loop().create_future()
-        self._approval_future = future
         tool_name = str(payload.get("tool_name") or "tool")
         arguments = payload.get("arguments")
         argument_text = ""
@@ -1545,6 +1944,15 @@ class YuanYeChatApp(App[str | None]):
         prompt = f"工具 {tool_name} 请求执行 · ← → 选择，Enter 确定"
         if argument_text:
             prompt += f"  {argument_text}"
+        return await self._request_inline_confirmation(prompt)
+
+    async def _request_inline_confirmation(self, prompt: str) -> bool:
+        """Temporarily replace the composer with one compact approval control."""
+
+        if self._approval_future is not None and not self._approval_future.done():
+            raise RuntimeError("已有确认正在等待处理")
+        future = asyncio.get_running_loop().create_future()
+        self._approval_future = future
 
         bar = self.query_one("#approval-bar", Vertical)
         composer = self.query_one("#composer", Input)
@@ -1827,6 +2235,35 @@ class YuanYeChatApp(App[str | None]):
         await self._mount_timeline(Static("YOU", classes="sender user-sender"))
         await self._mount_timeline(Static(Text(content), classes="user-message"))
 
+    async def _append_code_user(self, content: str) -> None:
+        await self._mount_code_timeline(Static("YOU", classes="sender user-sender"))
+        await self._mount_code_timeline(Static(Text(content), classes="user-message"))
+
+    async def _append_code_assistant(self, content: str) -> None:
+        await self._mount_code_timeline(Static(
+            "YY CODE", classes="sender assistant-sender",
+        ))
+        await self._mount_code_timeline(Markdown(
+            content, classes="assistant-message", open_links=False,
+        ))
+
+    async def _append_code_notice(self, content: str) -> None:
+        await self._mount_code_timeline(Static(
+            content, classes="tool-message notice-message",
+        ))
+
+    async def _append_code_error(self, content: str) -> None:
+        await self._mount_code_timeline(Static(
+            content, classes="tool-message error-message",
+        ))
+
+    async def _mount_code_timeline(self, widget: Static | Markdown) -> None:
+        timeline = self.query_one("#code-timeline", ConversationTimeline)
+        should_follow = timeline.follow_tail
+        await timeline.mount(widget)
+        if should_follow:
+            self.call_after_refresh(timeline.follow_tail_if_enabled)
+
     async def _append_assistant(self, content: str) -> Markdown:
         await self._mount_timeline(Static(
             "YUAN YE", classes="sender assistant-sender",
@@ -2033,6 +2470,20 @@ class YuanYeChatApp(App[str | None]):
         self._update_brand()
 
     def _update_brand(self) -> None:
+        if self._data_mode is not None:
+            self.query_one("#brand", Static).update(self._data_mode.upper())
+            self.query_one("#session-context", Static).update(
+                "DATA VIEW  /  FULL WIDTH  /",
+            )
+            self.query_one("#model-switch", Button).label = self._model_name or "model"
+            return
+        if self._code_mode:
+            branch = str(getattr(self._code_session, "branch", "isolated"))
+            self.query_one("#session-context", Static).update(
+                f"ISOLATED WORKTREE  /  {branch}  /",
+            )
+            self.query_one("#model-switch", Button).label = self._model_name or "model"
+            return
         session = self.session_id[:12] if self.session_id else "新会话"
         self.query_one("#session-context", Static).update(
             f"LOCAL GATEWAY  /  {session}  /",
@@ -2060,6 +2511,28 @@ class YuanYeChatApp(App[str | None]):
         )
 
     def action_interrupt_or_exit(self) -> None:
+        if self._data_mode is not None:
+            if self._worker_running and self._active_worker is not None:
+                self._active_worker.cancel()
+            self._leave_data_mode()
+            return
+        if self._code_mode:
+            now = monotonic()
+            if now - self._last_ctrl_c <= 2:
+                if self._worker_running and self._active_worker is not None:
+                    self._active_worker.cancel()
+                self._clear_ctrl_c_confirmation()
+                self._leave_code_mode(preserved=True)
+            else:
+                self._last_ctrl_c = now
+                message = (
+                    "再按一次 Ctrl+C 停止等待并返回；Gateway 会保留 Coding 记录"
+                    if self._worker_running else
+                    "再按一次 Ctrl+C 保留 Coding Session 并返回 Main Agent"
+                )
+                self._set_composer_notice(message)
+                self.set_timer(2, self._expire_ctrl_c_confirmation)
+            return
         if self._worker_running:
             self._clear_ctrl_c_confirmation()
             self._active_worker.cancel()
@@ -2087,7 +2560,12 @@ class YuanYeChatApp(App[str | None]):
         composer.border_title = message
         # Keep the notice in one stable place. Mirroring it into the placeholder
         # renders the same sentence twice whenever the composer is empty.
-        composer.placeholder = _COMPOSER_PLACEHOLDER
+        composer.placeholder = (
+            "输入 Coding 需求，或使用 /exit、/abort"
+            if self._code_mode else
+            f"输入 /{self._data_mode} 子命令，或 /exit 返回 Main Agent"
+            if self._data_mode else _COMPOSER_PLACEHOLDER
+        )
 
     def action_exit_chat(self) -> None:
         if self._worker_running:
@@ -2098,12 +2576,24 @@ class YuanYeChatApp(App[str | None]):
         self.query_one("#composer", Input).focus()
 
     def action_history_up(self) -> None:
-        timeline = self.query_one("#timeline", ConversationTimeline)
+        if self._data_mode is not None:
+            self.query_one("#data-view", VerticalScroll).scroll_page_up()
+            return
+        timeline = self.query_one(
+            "#code-timeline" if self._code_mode else "#timeline",
+            ConversationTimeline,
+        )
         timeline.follow_tail = False
         timeline.scroll_page_up()
 
     def action_history_down(self) -> None:
-        timeline = self.query_one("#timeline", ConversationTimeline)
+        if self._data_mode is not None:
+            self.query_one("#data-view", VerticalScroll).scroll_page_down()
+            return
+        timeline = self.query_one(
+            "#code-timeline" if self._code_mode else "#timeline",
+            ConversationTimeline,
+        )
         timeline.scroll_page_down()
         self.call_after_refresh(
             lambda: setattr(

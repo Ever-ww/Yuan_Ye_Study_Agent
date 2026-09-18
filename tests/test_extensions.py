@@ -8,6 +8,7 @@ import textwrap
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import uuid4
 
 from Agent import (
@@ -612,6 +613,34 @@ class _FakeCodingRuntime:
 
 
 class CodeSessionControllerTests(unittest.TestCase):
+    def test_profiled_runtime_forwards_coding_session_identity(self) -> None:
+        from run_ui.harness_loader import load_harness_module
+
+        harness = load_harness_module()
+        captured: dict[str, object] = {}
+
+        def factory(config, worktree, **kwargs):
+            del config, worktree
+            captured.update(kwargs)
+            return SimpleNamespace()
+
+        with patch.object(
+            harness,
+            "_runtime_profile_and_trace",
+            return_value=("profile", "trace"),
+        ):
+            harness._create_profiled_runtime(
+                factory,
+                SimpleNamespace(),
+                Path("worktree"),
+                trigger="manual",
+                target="extension",
+                invocation_id="invocation",
+                coding_session_id="coding-memory-session",
+            )
+
+        self.assertEqual(captured["coding_session_id"], "coding-memory-session")
+
     def test_worktree_is_under_agent_home_and_no_change_finalize_cleans(self) -> None:
         from run_ui.harness_loader import load_harness_module
 
@@ -626,6 +655,8 @@ class CodeSessionControllerTests(unittest.TestCase):
                  "commit", "-m", "seed"],
                 cwd=source, check=True, capture_output=True,
             )
+            (source / "seed.txt").write_text("manual edit\n", encoding="utf-8")
+            (source / "manual-notes.txt").write_text("untracked manual edit\n", encoding="utf-8")
             config = load_runtime_config(
                 home,
                 workspace_root=source,
@@ -668,6 +699,8 @@ class CodeSessionControllerTests(unittest.TestCase):
                  "commit", "-m", "seed"],
                 cwd=source, check=True, capture_output=True,
             )
+            (source / "seed.txt").write_text("manual edit\n", encoding="utf-8")
+            (source / "manual-notes.txt").write_text("untracked manual edit\n", encoding="utf-8")
             config = load_runtime_config(
                 home,
                 workspace_root=source,
@@ -682,6 +715,11 @@ class CodeSessionControllerTests(unittest.TestCase):
 
             async def scenario():
                 record = await controller.start()
+                self.assertEqual(
+                    (record.worktree_path / "seed.txt").read_text(encoding="utf-8"),
+                    "seed\n",
+                )
+                self.assertFalse((record.worktree_path / "manual-notes.txt").exists())
                 turn = await controller.run_turn("增加一项扩展能力")
                 self.assertEqual(turn.status, "verified")
                 self.assertNotEqual(turn.commit, record.base_commit)
@@ -689,6 +727,14 @@ class CodeSessionControllerTests(unittest.TestCase):
                 self.assertTrue(result.merged)
                 self.assertTrue(
                     (source / "extension" / "hook" / "turn_start" / "added_capability.py").is_file()
+                )
+                self.assertEqual(
+                    (source / "seed.txt").read_text(encoding="utf-8"),
+                    "manual edit\n",
+                )
+                self.assertEqual(
+                    (source / "manual-notes.txt").read_text(encoding="utf-8"),
+                    "untracked manual edit\n",
                 )
 
             asyncio.run(scenario())

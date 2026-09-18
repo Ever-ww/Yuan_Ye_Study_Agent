@@ -1,4 +1,4 @@
-"""Consistent encrypted Agent Home backup and whole-home restore."""
+"""Consistent Snapshot Manifest/Object Store backup and whole-home restore."""
 
 from .archive import ArchiveHeader, EncryptedBackupArchive
 from .catalog import AgentHomeDurabilityCatalog, UnsafeArchiveEntryError
@@ -27,6 +27,7 @@ from .security import (
 )
 from .scheduler import BackupScheduler
 from .service import BackupService
+from .snapshot import read_manifest
 
 __all__ = [
     "AgentHomeDurabilityCatalog",
@@ -53,4 +54,5 @@ __all__ = [
     "assert_restore_inactive",
     "external_control_root",
     "read_restore_fence",
+    "read_manifest",
 ]

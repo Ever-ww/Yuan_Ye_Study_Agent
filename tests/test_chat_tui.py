@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from textual.containers import VerticalScroll
-from textual.events import MouseScrollUp
+from textual.events import MouseScrollDown, MouseScrollUp
 from textual.widgets import Button, Input, Markdown, OptionList, Select, Static
 from textual.worker import WorkerState
 
@@ -282,6 +282,61 @@ class _SelectedModelClient(_Client):
         return SimpleNamespace(run_id="run-1", session_id=session_id)
 
 
+class _CodeClient(_Client):
+    def __init__(self) -> None:
+        super().__init__()
+        self.events_sent = False
+        self.selected_profile = ""
+        self.selected_reasoning_effort = ""
+
+    async def start_code_session(self, project_id, origin_session_id=None):
+        assert (project_id, origin_session_id) == ("project", "session")
+        return SimpleNamespace(code_session_id="code-1", branch="yy/code-1")
+
+    async def run_code_turn(
+        self, session_id, task, *, model_profile_id="default", reasoning_effort=None,
+    ):
+        assert (session_id, task) == ("code-1", "add a tool")
+        self.selected_profile = model_profile_id
+        self.selected_reasoning_effort = reasoning_effort
+        await asyncio.sleep(0.02)
+        return SimpleNamespace(
+            status="verified", message="扩展已通过验证", test_file="tests/test_tool.py",
+            attempts=1, commit="abc123", diagnostic="all checks passed",
+            model_calls=(),
+        )
+
+    async def code_session_events(self, session_id, after_sequence=0):
+        assert session_id == "code-1"
+        if self.events_sent or after_sequence:
+            return []
+        self.events_sent = True
+        return [{"sequence": 1, "record_type": "code_generation"}]
+
+    async def finalize_code_session(self, session_id, approved_plan_hash=None):
+        assert session_id == "code-1"
+        return SimpleNamespace(
+            status="merged", message="已合并", stay_in_code_mode=False,
+            grant_plan={},
+        )
+
+    async def abort_code_session(self, session_id):
+        assert session_id == "code-1"
+        return SimpleNamespace(message="已放弃", stay_in_code_mode=False)
+
+
+class _SlowCodeClient(_CodeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.code_started = asyncio.Event()
+        self.code_release = asyncio.Event()
+
+    async def run_code_turn(self, session_id, task, **kwargs):
+        self.code_started.set()
+        await self.code_release.wait()
+        return await super().run_code_turn(session_id, task, **kwargs)
+
+
 async def _external(command: str, session_id: str | None) -> None:
     del command, session_id
 
@@ -318,6 +373,243 @@ def test_chat_tui_is_one_persistent_scrollable_session_surface() -> None:
             assert trace.collapsed is True
             assert "用时" in str(trace.header.render())
             assert "查看过程" in str(trace.header.render())
+
+    asyncio.run(check())
+
+
+def test_external_command_output_is_rendered_inside_timeline() -> None:
+    async def check() -> None:
+        async def external(command: str, session_id: str | None) -> str:
+            assert command == "/inbox"
+            assert session_id == "session"
+            return "Inbox 暂无结果。"
+
+        app = YuanYeChatApp(
+            _Client(), "project", session_id="session", records=[],
+            external_command=external,
+        )
+        async with app.run_test(size=(120, 34)) as pilot:
+            worker = app.run_external_command("/inbox")
+            await worker.wait()
+            await pilot.pause()
+            assert app._data_mode == "inbox"
+            assert app.query_one("#timeline", ConversationTimeline).display is False
+            assert app.query_one("#observer-pane", VerticalScroll).display is False
+            assert app.query_one("#data-view", VerticalScroll).display is True
+            assert "Inbox 暂无结果" in str(
+                app.query_one("#data-content", Static).render()
+            )
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            assert app._data_mode is None
+            assert app.query_one("#timeline", ConversationTimeline).display is True
+
+    asyncio.run(check())
+
+
+def test_long_data_table_scrolls_with_mouse_wheel() -> None:
+    async def check() -> None:
+        async def external(command: str, session_id: str | None) -> str:
+            return "\n".join(f"table row {index}" for index in range(100))
+
+        app = YuanYeChatApp(
+            _Client(), "project", session_id="session", records=[],
+            external_command=external,
+        )
+        async with app.run_test(size=(100, 28)) as pilot:
+            worker = app.run_external_command("/inbox")
+            await worker.wait()
+            await pilot.pause(0.1)
+            view = app.query_one("#data-view", VerticalScroll)
+            content = app.query_one("#data-content", Static)
+            assert view.max_scroll_y > 0
+            assert view.scroll_y == 0
+            await pilot._post_mouse_events(
+                [MouseScrollDown], content, offset=(10, 5),
+            )
+            await pilot.pause()
+            assert view.scroll_y > 0
+
+    asyncio.run(check())
+
+
+def test_data_view_accepts_subcommands_and_exit_without_polluting_main() -> None:
+    async def check() -> None:
+        commands: list[str] = []
+
+        async def external(command: str, session_id: str | None) -> str:
+            commands.append(command)
+            return f"result for {command}"
+
+        app = YuanYeChatApp(
+            _Client(), "project", session_id="session", records=[],
+            external_command=external,
+        )
+        async with app.run_test(size=(120, 34)) as pilot:
+            composer = app.query_one("#composer", Input)
+            composer.value = "/inbox"
+            await pilot.press("enter")
+            if app._active_worker is not None:
+                await app._active_worker.wait()
+            composer.value = "/inbox show abc123"
+            await pilot.press("enter")
+            if app._active_worker is not None:
+                await app._active_worker.wait()
+            assert commands == ["/inbox", "/inbox show abc123"]
+            assert "show abc123" in str(app.query_one("#data-content", Static).render())
+            assert not list(app.query_one("#timeline").query(".notice-message"))
+            composer.value = "/exit"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._data_mode is None
+
+    asyncio.run(check())
+
+
+def test_external_command_width_tracks_timeline_content() -> None:
+    async def check() -> None:
+        app = YuanYeChatApp(
+            _Client(), "project", session_id="session", records=[],
+            external_command=_external,
+        )
+        async with app.run_test(size=(120, 34)) as pilot:
+            await pilot.pause()
+            wide = app.command_output_width()
+            await pilot.resize_terminal(80, 34)
+            await pilot.pause()
+            narrow = app.command_output_width()
+            assert 32 <= narrow < wide
+
+    asyncio.run(check())
+
+
+def test_code_mode_stays_inside_tui_and_double_ctrl_c_returns_to_chat() -> None:
+    async def check() -> None:
+        app = YuanYeChatApp(
+            _CodeClient(), "project", session_id="session", records=[],
+            external_command=_external,
+        )
+        async with app.run_test(size=(120, 34)) as pilot:
+            worker = app.run_external_command("/code")
+            await worker.wait()
+            await pilot.pause()
+            assert app._code_mode is True
+            assert "YY CODE" in str(app.query_one("#brand", Static).render())
+            assert app.query_one("#timeline", ConversationTimeline).display is False
+            assert app.query_one("#code-timeline", ConversationTimeline).display is True
+            assert "CODE OBSERVER" in str(
+                app.query_one("#observer-heading", Static).render(),
+            )
+
+            composer = app.query_one("#composer", Input)
+            composer.value = "add a tool"
+            await pilot.press("enter")
+            if app._active_worker is not None:
+                await app._active_worker.wait()
+            await pilot.pause()
+            code_timeline = app.query_one("#code-timeline", ConversationTimeline)
+            assert any(
+                "扩展已通过验证" in str(item._markdown)
+                for item in code_timeline.query(".assistant-message")
+            )
+            assert any(
+                "Coding Agent 正在生成代码" in str(item.render())
+                for item in code_timeline.query(".notice-message")
+            )
+
+            await pilot.press("ctrl+c", "ctrl+c")
+            await pilot.pause()
+            assert app._code_mode is False
+            assert app._code_session is not None
+            assert "YUAN YE" in str(app.query_one("#brand", Static).render())
+            assert app.query_one("#timeline", ConversationTimeline).display is True
+
+    asyncio.run(check())
+
+
+def test_code_mode_uses_selected_model_and_its_own_cache_session() -> None:
+    class CodeCacheClient(_CodeClient):
+        async def run_code_turn(self, session_id, task, **kwargs):
+            result = await super().run_code_turn(session_id, task, **kwargs)
+            result.model_calls = ({
+                "prefix_cache": {
+                    "status": "reported",
+                    "hit_tokens": 50,
+                    "total_tokens": 100,
+                },
+            },)
+            return result
+
+    async def check() -> None:
+        client = CodeCacheClient()
+        options = (
+            SimpleNamespace(
+                profile_id="default", provider="openai", model="main-model",
+                selected=True, reasoning_effort="low",
+            ),
+            SimpleNamespace(
+                profile_id="flash", provider="openai", model="code-model",
+                selected=False, reasoning_effort="high",
+            ),
+        )
+        records = [{
+            "model_calls": [{
+                "prefix_cache": {
+                    "status": "reported",
+                    "hit_tokens": 90,
+                    "total_tokens": 100,
+                },
+            }],
+        }]
+        app = YuanYeChatApp(
+            client, "project", session_id="session", records=records,
+            external_command=_external, model_options=options,
+        )
+        async with app.run_test(size=(120, 34)) as pilot:
+            worker = app.run_external_command("/code")
+            await worker.wait()
+            await pilot.pause()
+            assert app.query_one("#model-switch", Button).disabled is False
+            assert app.query_one("#reasoning-switch", Select).disabled is False
+            assert "??.?%" in str(app.query_one("#cache-status", Static).render())
+            app._select_model(1)
+            app._reasoning_effort = "high"
+            composer = app.query_one("#composer", Input)
+            composer.value = "add a tool"
+            await pilot.press("enter")
+            if app._active_worker is not None:
+                await app._active_worker.wait()
+            await pilot.pause()
+            assert client.selected_profile == "flash"
+            assert client.selected_reasoning_effort == "high"
+            assert "50.0%" in str(app.query_one("#cache-status", Static).render())
+            await pilot.press("ctrl+c", "ctrl+c")
+            await pilot.pause()
+            assert "90.0%" in str(app.query_one("#cache-status", Static).render())
+
+    asyncio.run(check())
+
+
+def test_double_ctrl_c_can_detach_an_active_code_turn() -> None:
+    async def check() -> None:
+        client = _SlowCodeClient()
+        app = YuanYeChatApp(
+            client, "project", session_id="session", records=[],
+            external_command=_external,
+        )
+        async with app.run_test(size=(120, 34)) as pilot:
+            worker = app.run_external_command("/code")
+            await worker.wait()
+            composer = app.query_one("#composer", Input)
+            composer.value = "add a tool"
+            await pilot.press("enter")
+            await asyncio.wait_for(client.code_started.wait(), timeout=2)
+            await pilot.press("ctrl+c", "ctrl+c")
+            await pilot.pause()
+            assert app._code_mode is False
+            assert app._code_session is not None
+            client.code_release.set()
+            await pilot.pause()
 
     asyncio.run(check())
 

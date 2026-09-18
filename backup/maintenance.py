@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -304,11 +305,44 @@ class AgentHomeMaintenanceCoordinator:
 
     get_lifecycle_state = lambda self: self.snapshot
 
-    def participant_directory(self, epoch, name):
-        self.gate._check_epoch(epoch)
-        if name not in self._participants:
-            raise ValueError("Unknown participant")
-        return self.control_root / "maintenance" / str(epoch) / "participants" / name
+    def prune_completed_epochs(self) -> tuple[Path, ...]:
+        """Remove transient snapshots that can no longer participate in recovery.
+
+        Epoch directories are useful only while that exact maintenance epoch is
+        unfinished.  Once the durable lifecycle is RUNNING, every directory at
+        or below its epoch is fenced out permanently.  Future-looking or
+        path-escaping entries are retained for explicit inspection.
+        """
+        snapshot = self.snapshot
+        if snapshot.state is not MaintenanceState.RUNNING:
+            return ()
+        root = self.control_root / "maintenance"
+        if not root.is_dir():
+            return ()
+        resolved_root = root.resolve()
+        removed: list[Path] = []
+        for candidate in tuple(root.iterdir()):
+            if not candidate.name.isdecimal() or int(candidate.name) > snapshot.maintenance_epoch:
+                continue
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError:
+                continue
+            # Refuse symlinks, junctions, reparse points, or any other entry
+            # whose canonical parent is not the maintenance root.
+            if candidate.is_symlink() or resolved.parent != resolved_root or not resolved.is_dir():
+                continue
+            try:
+                shutil.rmtree(resolved)
+            except OSError:
+                continue
+            removed.append(resolved)
+        try:
+            if not any(root.iterdir()):
+                root.rmdir()
+        except OSError:
+            pass
+        return tuple(removed)
 
     async def quiesce(self, reason="maintenance", timeout=30):
         return await self.freeze(reason, timeout)
@@ -392,9 +426,10 @@ class AgentHomeMaintenanceCoordinator:
                     else:
                         validate_home_databases(self.agent_root)
                     # Errors are deliberately NOT swallowed.
-                    for participant in self._participants.values():
-                        await participant.resume(epoch)
+                for participant in self._participants.values():
+                    await participant.resume(epoch)
                 await self.gate.running(epoch)
+                await asyncio.to_thread(self.prune_completed_epochs)
             except BaseException as exc:
                 await self.gate.fail(epoch, f"Resume {type(exc).__name__}: {str(exc)[:300]}")
                 raise

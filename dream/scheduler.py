@@ -52,7 +52,6 @@ class DreamScheduler:
         self._wake = asyncio.Event()
         self._closing = False
         self._tick_lock = asyncio.Lock()
-        self._retry_after: datetime | None = None
         self.last_error: str | None = None
         self._maintenance_epoch: int | None = None
         self._active_ticks: set[asyncio.Task[DreamRunResult | None]] = set()
@@ -116,8 +115,7 @@ class DreamScheduler:
             if (not profile_enabled and not harness_enabled and not checkpoint_enabled) or not self.is_idle():
                 return None
             now = self._local_now()
-            profile_retry_blocked = self._retry_after is not None and now < self._retry_after
-            due = self._due_date(now) if profile_enabled and not profile_retry_blocked else None
+            due = self._due_date(now) if profile_enabled else None
             profile_cycle_due = due is not None
             scheduled_day = self._latest_scheduled_day(now)
             if due is None and not harness_enabled:
@@ -136,16 +134,11 @@ class DreamScheduler:
                         await self._finish_durable_result(result)
                 except Exception as exc:
                     self.last_error = str(exc) or type(exc).__name__
-                    self._retry_after = now + timedelta(seconds=max(300, self.heartbeat_seconds))
                 else:
                     if result.status == "failed":
                         self.last_error = result.message
-                        self._retry_after = now + timedelta(
-                            seconds=max(300, self.heartbeat_seconds),
-                        )
                     else:
                         self.last_error = None
-                        self._retry_after = None
             # 代码类Dream阶段拥有独立持久状态；Profile失败不能阻止同一tick中的独立阶段。
             if (
                 checkpoint_enabled and self.run_checkpoint_day is not None
@@ -223,14 +216,23 @@ class DreamScheduler:
             # 第一次启用不回溯全部历史，只处理最近到期的一天。
             start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(seconds=1)
             today_run = croniter(self.service.config.dream_schedule, start).get_next(datetime)
-            return now.date() - timedelta(days=1) if today_run <= now else None
-        previous = croniter(self.service.config.dream_schedule, now).get_prev(datetime)
-        due = previous.date() - timedelta(days=1)
-        last = date.fromisoformat(state.last_completed_date)
+            due = now.date() - timedelta(days=1) if today_run <= now else None
+        else:
+            previous = croniter(self.service.config.dream_schedule, now).get_prev(datetime)
+            due = previous.date() - timedelta(days=1)
+            last = date.fromisoformat(state.last_completed_date)
+            if last >= due:
+                return None
         # Automatic Dream is one incremental changeset, not one Run per missed
         # calendar day.  All unconsumed Evidence through this cutoff is handled
         # by one memoryless execution.  Explicit backfill remains date-based.
-        return due if last < due else None
+        if (
+            due is not None
+            and state.last_status == "failed"
+            and state.last_attempted_date == due.isoformat()
+        ):
+            return None
+        return due
 
     def _next_run_at(self) -> str:
         now = self._local_now()

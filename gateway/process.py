@@ -161,7 +161,13 @@ class GatewayProcessManager:
             time.sleep(0.15)
         raise RuntimeError(f"Gateway 启动超时；请查看日志：{self.log_path}")
 
-    def stop(self, timeout_seconds: float = 30.0, *, shutdown_grace_seconds: float = 10.0) -> bool:
+    def stop(
+        self,
+        timeout_seconds: float = 30.0,
+        *,
+        shutdown_grace_seconds: float = 10.0,
+        maintenance_wait_seconds: float = 0.0,
+    ) -> bool:
         startup_lock = InstanceLock(self.startup_lock_path, timeout_seconds=timeout_seconds)
         startup_lock.acquire()
         try:
@@ -186,7 +192,11 @@ class GatewayProcessManager:
             _atomic_json(self.stop_request_path, request.model_dump_json())
             # Drain and ASGI/socket teardown are separate phases. Giving both
             # the same deadline falsely reports failure at the drain boundary.
-            deadline = time.monotonic() + timeout_seconds + shutdown_grace_seconds
+            lifecycle = LifecycleStore(self.agent_root).read()
+            drain_seconds = timeout_seconds
+            if _backup_maintenance_in_progress(lifecycle):
+                drain_seconds = max(drain_seconds, maintenance_wait_seconds)
+            deadline = time.monotonic() + drain_seconds + shutdown_grace_seconds
             request_hash = hashlib.sha256(self.stop_request_path.read_bytes()).hexdigest()
             ack = {}
             while time.monotonic() < deadline:
@@ -393,9 +403,25 @@ class InstanceLock:
         self.close()
 
 
+def _load_gateway_runtime_config(agent_root: Path, port: int):
+    """Load maintenance Runtime against Agent source, never the Agent Home."""
+    from Agent import load_runtime_config
+
+    source_root = Path(__file__).resolve().parents[1]
+    config = load_runtime_config(
+        agent_root, workspace_root=source_root, gateway_port=port,
+    )
+    if config.coding_source_root is not None:
+        configured_source = config.coding_source_root.resolve()
+        if configured_source != config.workspace_root:
+            config = load_runtime_config(
+                agent_root, workspace_root=configured_source, gateway_port=port,
+            )
+    return config
+
+
 def run_gateway(agent_root: Path, port: int) -> None:
     import uvicorn
-    from Agent import load_runtime_config
     from gateway.api import create_gateway_api
     from gateway.application import GatewayApplication
     from gateway.models import now_iso
@@ -431,7 +457,7 @@ def run_gateway(agent_root: Path, port: int) -> None:
         temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temporary.replace(manager.instance_path)
         try:
-            config = load_runtime_config(root, gateway_port=port)
+            config = _load_gateway_runtime_config(root, port)
             # A clean operator stop deliberately leaves the durable lifecycle
             # QUIESCED. Resume that verified state before GatewayApplication
             # constructs components which may need to publish a new Runtime
@@ -542,6 +568,13 @@ async def process_control_request(manager, gateway, instance_id: str) -> bool:
         result.update(request_id=request.request_id, action=request.action)
         if request.instance_id != instance_id:
             raise ValueError("Control request targets a different Gateway instance")
+        # An automatic backup owns this maintenance epoch.  Treating its
+        # QUIESCED state as a completed operator stop leaves the next Gateway
+        # fenced without the exact operator-stop marker needed for recovery.
+        # Keep the request pending; after backup resumes RUNNING, the next poll
+        # performs a fresh operator-stop drain and records the proper evidence.
+        if _backup_maintenance_in_progress(gateway.maintenance.snapshot):
+            return False
         if gateway.write_gate.state != MaintenanceState.QUIESCED:
             await gateway.quiesce(request.timeout_seconds, request.reason)
         result.update(status="completed", lifecycle_revision=gateway.maintenance.snapshot.revision,
@@ -553,6 +586,17 @@ async def process_control_request(manager, gateway, instance_id: str) -> bool:
     result["completed_at"] = datetime.now().astimezone().isoformat()
     _atomic_json(manager.stop_ack_path, json.dumps(result, sort_keys=True))
     return result.get("status") == "completed" and result.get("action") == "stop"
+
+
+def _backup_maintenance_in_progress(snapshot) -> bool:
+    return (
+        snapshot.reason == "backup"
+        and snapshot.state in {
+            MaintenanceState.QUIESCING,
+            MaintenanceState.QUIESCED,
+            MaintenanceState.RESUMING,
+        }
+    )
 
 
 def _read_control_json(path: Path) -> dict:

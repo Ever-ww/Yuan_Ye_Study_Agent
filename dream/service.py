@@ -147,6 +147,7 @@ class DreamService:
                 state.last_completed_date = _max_date(
                     state.last_completed_date, cutoff_date.isoformat(),
                 )
+                state.last_attempted_date = cutoff_date.isoformat()
                 state.last_status, state.last_error = "noop", None
                 self._write_state(state)
                 return DreamRunResult(
@@ -209,6 +210,7 @@ class DreamService:
             timezone=self.config.dream_timezone,
             initialized_at=state.initialized_at,
             last_completed_date=state.last_completed_date,
+            last_attempted_date=state.last_attempted_date,
             last_run_id=state.last_run_id,
             last_status=state.last_status,
             last_error=state.last_error,
@@ -242,6 +244,7 @@ class DreamService:
                 )
                 state = self._state()
                 state.last_run_id = run_id
+                state.last_attempted_date = selected_date.isoformat()
                 state.last_status = "failed"
                 state.last_error = error
                 self._write_state(state)
@@ -281,6 +284,7 @@ class DreamService:
                 model=self.config.dream_model or self.config.model,
             )
             state.last_completed_date = _max_date(state.last_completed_date, selected_date.isoformat())
+            state.last_attempted_date = selected_date.isoformat()
             state.last_run_id, state.last_status, state.last_error = run_id, "noop", None
             self._write_state(state)
             self._write_run(result, candidates=[], rejected=[])
@@ -342,6 +346,7 @@ class DreamService:
                 already = set(state.processed_evidence.get(day, []))
                 state.processed_evidence[day] = sorted(already | evidence_ids)
             state.last_completed_date = _max_date(state.last_completed_date, selected_date.isoformat())
+            state.last_attempted_date = selected_date.isoformat()
             state.last_run_id, state.last_status, state.last_error = run_id, "completed", None
             state.successful_runs.append(run_id)
             result = DreamRunResult(
@@ -388,6 +393,7 @@ class DreamService:
                 created_at=created_at,
             )
             state.last_run_id, state.last_status, state.last_error = run_id, "failed", error
+            state.last_attempted_date = selected_date.isoformat()
             self._write_state(state)
             self._write_run(failed, candidates=extracted, rejected=rejected)
             execution.append_once("result", "execution_failed", {

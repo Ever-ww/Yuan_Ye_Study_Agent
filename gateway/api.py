@@ -195,6 +195,7 @@ def create_gateway_api(
             "backup_directory": str(gateway.backup_service.backup_directory),
             "key_mode": config.backup_key_mode,
             "system_key": gateway.backup_service.key_status(),
+            "storage": gateway.backup_service.storage_status(),
         }
 
     @app.get("/api/v1/status", dependencies=[Depends(authorize)])

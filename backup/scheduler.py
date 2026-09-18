@@ -109,13 +109,39 @@ class BackupScheduler:
             return "backup_completed"
 
     def status(self) -> dict[str, object]:
+        state = self._read_state()
+        # Manual and rescue snapshots use the same canonical store but do not
+        # pass through ``tick()``.  Project the newest verified Manifest into
+        # status so an older automatic failure cannot remain the user-visible
+        # headline after a later successful backup.  The scheduler's durable
+        # catch-up cursor remains unchanged: a manual backup does not silently
+        # suppress the next scheduled automatic run.
+        records = self.service.list()
+        if records:
+            latest = max(records, key=lambda item: item.created_at)
+            attempted = _parse(state.get("last_attempt_at"))
+            if attempted is None or latest.created_at > attempted:
+                state.update({
+                    "last_successful_backup": latest.created_at.isoformat(),
+                    "last_attempt_at": latest.created_at.isoformat(),
+                    "last_status": "backup_completed",
+                    "last_error": None,
+                    "last_path": str(latest.path),
+                })
         return {
-            **self._read_state(),
+            **state,
             "enabled": self.enabled,
             "schedule": self.schedule,
             "timezone": self.timezone,
             "next_run_at": croniter(self.schedule, self._now()).get_next(datetime).isoformat(),
         }
+
+    async def record_manual_success(self, created_at: datetime, path: Path) -> None:
+        """Make a verified manual snapshot the scheduler's latest success."""
+        self.last_error = None
+        await self._write_state_result(
+            created_at, "backup_completed", None, str(path),
+        )
 
     def _is_due(self) -> bool:
         now = self._now()

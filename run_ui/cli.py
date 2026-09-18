@@ -47,7 +47,7 @@ from skill import SkillInstallRequest
 from .approval import InteractiveApproval, active_live as _active_live
 from .chat_tui import YuanYeChatApp
 from .web import serve
-from backup import BackupService, EncryptedBackupArchive, RestoreService
+from backup import BackupService, EncryptedBackupArchive, RestoreService, read_manifest
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Yuan Ye Study Agent 本地入口")
 session_app = typer.Typer(help="列出、查看和恢复本地会话")
@@ -56,7 +56,7 @@ app.add_typer(session_app, name="session")
 app.add_typer(gateway_app, name="gateway")
 cron_app = typer.Typer(help="管理 Gateway 后台 Cron 与 Heartbeat")
 app.add_typer(cron_app, name="cron")
-backup_app = typer.Typer(help="创建、验证和恢复加密 Agent Home 快照")
+backup_app = typer.Typer(help="创建、验证和恢复去重的 Agent Home 快照")
 app.add_typer(backup_app, name="backup")
 console = Console()
 
@@ -693,10 +693,15 @@ async def _chat_gateway(
     client = _gateway_client()
     project = await _gateway_project(client)
     project_id = str(project["project_id"])
+    initial_notices: list[str] = []
     if continue_last:
         sessions = await client.sessions(project_id)
         if not sessions:
-            console.print("[dim]当前 workspace 还没有可恢复的 Session，将创建新会话。[/]")
+            message = "当前 workspace 还没有可恢复的 Session，将创建新会话。"
+            if use_tui:
+                initial_notices.append(message)
+            else:
+                console.print(f"[dim]{message}[/]")
         else:
             session_id = str(sessions[0]["session_id"])
     records: list[dict[str, Any]] = []
@@ -708,7 +713,11 @@ async def _chat_gateway(
         if not use_tui:
             console.print(f"[green]已恢复会话[/] {session_id}（{len(records)} 条记录）")
             _render_restored_history(records)
-            await _acknowledge_displayed_history(client, project_id, session_id, records)
+            warning = await _acknowledge_displayed_history(
+                client, project_id, session_id, records,
+            )
+            if warning:
+                console.print(f"[yellow]{warning}[/]")
     if use_tui:
         model_options = await client.model_options(session_id, project_id)
         selected_model = next(
@@ -720,48 +729,54 @@ async def _chat_gateway(
             await _latest_session_observer_status(client, project_id, session_id)
             if session_id else None
         )
+        tui: YuanYeChatApp | None = None
 
-        async def external_command(command: str, active_session_id: str | None) -> None:
-            if command == "/code":
-                await _code_mode(client, project_id, active_session_id)
-                return
-            if command == "/skill" or command.startswith("/skill "):
-                await _handle_gateway_skill_command(
-                    client, project_id, active_session_id, command,
-                )
-                return
-            if command == "/inbox" or command.startswith("/inbox "):
-                await _handle_inbox_command(client, command)
-                return
-            if command == "/tool-result" or command.startswith("/tool-result "):
-                await _handle_tool_result_command(
-                    client, project_id, active_session_id, command,
-                )
-                return
-            if command == "/cron" or command.startswith("/cron "):
-                await _handle_cron_command(client, project_id, command)
-                return
-            if command == "/dream" or command.startswith("/dream "):
-                await _handle_dream_command(client, command)
-                return
-            if command == "/harness" or command.startswith("/harness "):
-                await _handle_harness_command(client, command)
-                return
-            if command == "/extension" or command.startswith("/extension "):
-                await _handle_extension_command(client, command)
-                return
-            if command == "/reload" or command.startswith("/reload "):
-                await _handle_runtime_reload_command(client, command)
-                return
-            # /compress and /context refresh are Runtime commands and therefore
-            # intentionally travel through the ordinary Run API.
-            raise ValueError(f"未知本地命令：{command}")
+        async def external_command(
+            command: str, active_session_id: str | None,
+        ) -> str | None:
+            original_width = console._width
+            if tui is not None:
+                console.width = tui.command_output_width()
+            try:
+                with console.capture() as captured:
+                    if command == "/skill" or command.startswith("/skill "):
+                        await _handle_gateway_skill_command(
+                            client, project_id, active_session_id, command,
+                            confirm=tui.confirm if tui is not None else None,
+                        )
+                    elif command == "/inbox" or command.startswith("/inbox "):
+                        await _handle_inbox_command(client, command)
+                    elif command == "/tool-result" or command.startswith("/tool-result "):
+                        await _handle_tool_result_command(
+                            client, project_id, active_session_id, command,
+                        )
+                    elif command == "/cron" or command.startswith("/cron "):
+                        await _handle_cron_command(client, project_id, command)
+                    elif command == "/dream" or command.startswith("/dream "):
+                        await _handle_dream_command(client, command)
+                    elif command == "/harness" or command.startswith("/harness "):
+                        await _handle_harness_command(
+                            client, command,
+                            confirm=tui.confirm if tui is not None else None,
+                        )
+                    elif command == "/extension" or command.startswith("/extension "):
+                        await _handle_extension_command(client, command)
+                    elif command == "/reload" or command.startswith("/reload "):
+                        await _handle_runtime_reload_command(client, command)
+                    else:
+                        # /compress and /context refresh are Runtime commands and
+                        # intentionally travel through the ordinary Run API.
+                        raise ValueError(f"未知本地命令：{command}")
+            finally:
+                console._width = original_width
+            return Text.from_ansi(captured.get()).plain.strip() or None
 
-        async def history_displayed() -> None:
+        async def history_displayed() -> str | None:
             if session_id and records:
-                await _acknowledge_displayed_history(
+                return await _acknowledge_displayed_history(
                     client, project_id, session_id, records,
                 )
+            return None
 
         tui = YuanYeChatApp(
             client,
@@ -774,6 +789,7 @@ async def _chat_gateway(
             initial_observer_status=initial_observer_status,
             model_name=selected_model,
             model_options=model_options,
+            initial_notices=tuple(initial_notices),
         )
         await tui.run_async(mouse=True)
         return
@@ -1162,11 +1178,12 @@ async def _handle_tool_result_command(client, project_id: str, session_id: str |
 
 async def _acknowledge_displayed_history(
     client: GatewayClient, project_id: str, session_id: str, records: list[dict[str, object]],
-) -> None:
+) -> str | None:
     try:
         await client.acknowledge_session_history(project_id, session_id, records)
     except Exception:
-        console.print("[yellow]历史已恢复，但 Inbox 已读确认失败；未读记录已保留。[/]")
+        return "历史已恢复，但 Inbox 已读确认失败；未读记录已保留。"
+    return None
 
 
 def _render_restored_history(records: list[dict[str, object]]) -> None:
@@ -1216,12 +1233,17 @@ def _render_inbox_table(items: list[dict[str, object]], *, unread_only: bool) ->
     if not items:
         console.print("暂无未读后台结果。" if unread_only else "Inbox 暂无结果。")
         return
-    table = Table(title="未读 Inbox" if unread_only else "全部 Inbox")
+    table = Table(
+        title="未读 Inbox" if unread_only else "全部 Inbox",
+        box=box.HEAVY_HEAD,
+        show_lines=True,
+    )
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("状态")
     table.add_column("任务")
     table.add_column("结果摘要")
-    table.add_column("时间", style="dim")
+    # Timestamps are important metadata and must never be shortened.
+    table.add_column("时间", style="dim", min_width=25, no_wrap=True)
     table.add_column("已读", justify="center")
     for item in items:
         item_id = str(item.get("item_id", ""))
@@ -1236,6 +1258,22 @@ def _render_inbox_table(items: list[dict[str, object]], *, unread_only: bool) ->
         )
     console.print(table)
     console.print("[dim]可使用表格中的 ID 前缀执行 /inbox show 或 /inbox read。[/]")
+
+
+def _render_skill_catalog(rows: list[tuple[str, str, str]]) -> None:
+    """Render the full audited Skill catalog with Rich's native grid."""
+
+    table = Table(
+        title="已审核 Skill",
+        box=box.HEAVY_HEAD,
+        show_lines=True,
+    )
+    table.add_column("名称", style="cyan")
+    table.add_column("描述")
+    table.add_column("位置")
+    for name, description, location in rows:
+        table.add_row(name, description, location)
+    console.print(table)
 
 
 def _render_inbox_item(item: dict[str, object]) -> None:
@@ -1392,6 +1430,8 @@ async def _handle_gateway_skill_command(
     project_id: str,
     session_id: str | None,
     task: str,
+    *,
+    confirm=None,
 ) -> None:
     """通过 Gateway 管理 Skill，命令本身不进入 Session。"""
     try:
@@ -1404,13 +1444,10 @@ async def _handle_gateway_skill_command(
             if not catalog:
                 console.print("尚未安装可用 Skill。")
                 return
-            table = Table(title="已审核 Skill")
-            table.add_column("名称", style="cyan")
-            table.add_column("描述")
-            table.add_column("位置")
-            for item in catalog:
-                table.add_row(str(item["name"]), str(item["description"]), str(item["location"]))
-            console.print(table)
+            _render_skill_catalog([
+                (str(item["name"]), str(item["description"]), str(item["location"]))
+                for item in catalog
+            ])
             return
         if action == "refresh":
             if not session_id:
@@ -1446,6 +1483,13 @@ async def _handle_gateway_skill_command(
         if len(parts) <= position:
             raise ValueError(f"/skill {action} 缺少来源")
         options = _parse_skill_options(parts[position + 1 :])
+        update_confirmed = False
+        if action == "update":
+            update_confirmed = (
+                await confirm("更新 Skill", "将替换现有 Skill，是否继续？")
+                if confirm is not None
+                else typer.confirm("更新会替换现有 Skill，是否继续？", default=False)
+            )
         payload = {
             "project_id": project_id,
             "action": action,
@@ -1453,16 +1497,21 @@ async def _handle_gateway_skill_command(
             "name": name,
             "ref": options.get("ref"),
             "skill_path": options.get("skill_path"),
-            "confirmed": action == "update" and typer.confirm("更新会替换现有 Skill，是否继续？", default=False),
+            "confirmed": update_confirmed,
         }
         if action == "update" and not payload["confirmed"]:
             console.print("[yellow]已取消 Skill 更新。[/]")
             return
         result = await client.manage_skill(payload)
-        if result["status"] == "declined" and typer.confirm(
-            f"{result['message']} 是否接受审核报告中的风险并重新安装？",
-            default=False,
-        ):
+        accept_risk = False
+        if result["status"] == "declined":
+            message = f"{result['message']} 是否接受审核报告中的风险并重新安装？"
+            accept_risk = (
+                await confirm("Skill 风险确认", message)
+                if confirm is not None
+                else typer.confirm(message, default=False)
+            )
+        if accept_risk:
             payload["confirmed"] = True
             result = await client.manage_skill(payload)
         style = "green" if result["status"] == "installed" else "yellow"
@@ -1513,7 +1562,9 @@ async def _handle_dream_command(client: GatewayClient, task: str) -> None:
         console.print(f"[red]{str(exc) or type(exc).__name__}[/]")
 
 
-async def _handle_harness_command(client: GatewayClient, task: str) -> None:
+async def _handle_harness_command(
+    client: GatewayClient, task: str, *, confirm=None,
+) -> None:
     """Handle durable Harness Dream commands outside the chat transcript."""
     try:
         parts = shlex.split(task)
@@ -1525,7 +1576,15 @@ async def _handle_harness_command(client: GatewayClient, task: str) -> None:
             return
         if action == "run" and len(parts) in {3, 4}:
             selected = parts[3] if len(parts) == 4 else None
-            if not typer.confirm("Harness Dream 会修改 Yuan Ye 源码，确认运行？", default=False):
+            approved = (
+                await confirm(
+                    "Harness Dream",
+                    "将修改 Yuan Ye 源码并在隔离环境验证，是否运行？",
+                )
+                if confirm is not None
+                else typer.confirm("Harness Dream 会修改 Yuan Ye 源码，确认运行？", default=False)
+            )
+            if not approved:
                 console.print("[yellow]已取消[/]")
                 return
             console.print_json(data=await client.run_harness_dream(selected))
@@ -1538,7 +1597,15 @@ async def _handle_harness_command(client: GatewayClient, task: str) -> None:
             console.print_json(data=await client.unfreeze_harness_dream())
             return
         if action == "revert" and len(parts) == 4:
-            if not typer.confirm("仅生成回滚候选，不会立即合并。继续？", default=False):
+            approved = (
+                await confirm(
+                    "Harness Dream 回滚",
+                    "仅生成回滚候选，不会立即合并。是否继续？",
+                )
+                if confirm is not None
+                else typer.confirm("仅生成回滚候选，不会立即合并。继续？", default=False)
+            )
+            if not approved:
                 console.print("[yellow]已取消[/]")
                 return
             console.print_json(data=await client.create_harness_dream_revert(parts[3]))
@@ -1655,13 +1722,9 @@ async def _handle_skill_command(runtime: AgentRuntime, task: str) -> None:
             if not catalog:
                 console.print("尚未安装可用 Skill。")
                 return
-            table = Table(title="已审核 Skill")
-            table.add_column("名称", style="cyan")
-            table.add_column("描述")
-            table.add_column("位置")
-            for item in catalog:
-                table.add_row(item.name, item.description, item.location)
-            console.print(table)
+            _render_skill_catalog([
+                (item.name, item.description, item.location) for item in catalog
+            ])
             return
         if action == "refresh":
             if len(parts) != 2:
@@ -1793,7 +1856,11 @@ def session_show(session_id: str) -> None:
         for record in records:
             table.add_row(str(record.get("timestamp", "")), str(record.get("role", "")), str(record.get("content", "")))
         console.print(table)
-        await _acknowledge_displayed_history(client, project_id, session_id, records)
+        warning = await _acknowledge_displayed_history(
+            client, project_id, session_id, records,
+        )
+        if warning:
+            console.print(f"[yellow]{warning}[/]")
 
     asyncio.run(show())
 
@@ -1814,7 +1881,10 @@ def gateway_stop(port: int | None = typer.Option(None, "--port"),
     config = load_runtime_config()
     manager = GatewayProcessManager(config.agent_root, port or config.gateway_port)
     try:
-        stopped = manager.stop(timeout_seconds=timeout)
+        stopped = manager.stop(
+            timeout_seconds=timeout,
+            maintenance_wait_seconds=config.backup_drain_timeout_seconds,
+        )
     except RuntimeError as exc:
         console.print(f"[yellow]{exc}[/]")
         raise typer.Exit(code=1) from exc
@@ -2094,7 +2164,7 @@ def _cron_preview_local(preview) -> tuple[str, ...]:
 
 @backup_app.command("create")
 def backup_create(
-    output: Path | None = typer.Option(None, "--output", help="输出 .yybackup 路径"),
+    output: Path | None = typer.Option(None, "--output", help="输出 .manifest 路径"),
     manual_passphrase: bool = typer.Option(
         False,
         "--manual-passphrase",
@@ -2110,7 +2180,7 @@ def backup_create(
         if not first or first != second:
             raise typer.BadParameter("两次口令不一致或为空")
     record = asyncio.run(_gateway_client().create_backup(first, output))
-    console.print(f"[green]Backup 完成[/] {record.path}")
+    console.print(f"[green]Snapshot Backup 完成[/] {record.path}")
     console.print(
         f"backup_id={record.backup_id} size={record.size_bytes} "
         f"encryption={record.encryption_mode}",
@@ -2119,7 +2189,7 @@ def backup_create(
 
 @backup_app.command("list")
 def backup_list() -> None:
-    """列出当前备份目录中的已发布归档。"""
+    """列出当前备份目录中的已发布 Snapshot Manifest。"""
     records = asyncio.run(_gateway_client().backups())
     if not records:
         console.print("没有备份。")
@@ -2137,10 +2207,14 @@ def backup_status() -> None:
 
 @backup_app.command("verify")
 def backup_verify(archive: Path) -> None:
-    """解密并验证GCM、Manifest、文件哈希和SQLite一致性。"""
+    """验证Manifest、加密对象、文件哈希和SQLite一致性。"""
     service = BackupService(default_agent_root())
-    header = EncryptedBackupArchive.read_header(archive)
-    password = getpass.getpass("Backup 口令: ") if header.key_mode == "passphrase" else None
+    if archive.suffix == ".manifest":
+        manifest = read_manifest(archive)
+        password = getpass.getpass("Backup 口令: ") if manifest.encryption_mode == "passphrase" else None
+    else:
+        header = EncryptedBackupArchive.read_header(archive)
+        password = getpass.getpass("Backup 口令: ") if header.key_mode == "passphrase" else None
     result = service.verify(archive, password)
     console.print_json(data=result.model_dump(mode="json"))
     if not result.valid:
@@ -2157,8 +2231,12 @@ def backup_restore(
     """停止Gateway，创建救援备份，然后整体替换Agent Home。"""
     root = default_agent_root()
     service = BackupService(root)
-    header = EncryptedBackupArchive.read_header(archive)
-    entered = getpass.getpass("Backup 口令: ") if header.key_mode == "passphrase" else None
+    if archive.suffix == ".manifest":
+        manifest = read_manifest(archive)
+        entered = getpass.getpass("Backup 口令: ") if manifest.encryption_mode == "passphrase" else None
+    else:
+        header = EncryptedBackupArchive.read_header(archive)
+        entered = getpass.getpass("Backup 口令: ") if header.key_mode == "passphrase" else None
     password = service.resolve_archive_secret(archive, entered)
     mappings: dict[str, str] = {}
     for item in map_path:
@@ -2169,7 +2247,7 @@ def backup_restore(
             raise typer.BadParameter("--map-path 不能为空或重复")
         mappings[old] = new
     restore = RestoreService(root, service)
-    plan = restore.plan(archive, password.value, mappings)
+    plan = restore.plan(archive, password, mappings)
     console.print(
         f"backup_id={plan.backup_id}\ncreated={plan.created_at.isoformat()}\n"
         f"agent={plan.agent_version}\narchive={plan.archive_size} bytes\n"
@@ -2212,19 +2290,17 @@ def backup_rollback() -> None:
 
 @backup_app.command("prune")
 def backup_prune() -> None:
-    """按GFS策略仅清理可证明属于automatic的备份。"""
+    """清理超过27天的Manifest并回收没有Manifest引用的对象。"""
     config = load_runtime_config()
     service = BackupService(
         config.agent_root,
         backup_directory=config.backup_directory,
-        retention_daily=config.backup_retention_daily,
-        retention_weekly=config.backup_retention_weekly,
-        retention_monthly=config.backup_retention_monthly,
+        retention_days=config.backup_retention_days,
         min_free_space_bytes=config.backup_min_free_space_bytes,
         max_storage_bytes=config.backup_max_storage_bytes,
     )
     removed = service.apply_retention()
-    console.print(f"已清理 {len(removed)} 个automatic备份；手动、救援和最新有效备份未删除。")
+    console.print(f"已清理 {len(removed)} 个超过27天或超出空间上限的Snapshot Manifest，并回收无引用对象。")
 
 
 @app.command()

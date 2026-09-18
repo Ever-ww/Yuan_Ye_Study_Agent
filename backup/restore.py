@@ -12,7 +12,6 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from .archive import EncryptedBackupArchive
 from .catalog import AgentHomeDurabilityCatalog
 from .control import (
     ExternalControlLock,
@@ -47,10 +46,17 @@ class RestoreService:
     def plan(
         self,
         archive: Path,
-        passphrase: str,
+        passphrase: str | BackupSecret,
         path_mappings: dict[str, str] | None = None,
     ) -> RestorePlan:
-        manifest = EncryptedBackupArchive.inspect_manifest(archive, passphrase)
+        selected = (
+            passphrase
+            if isinstance(passphrase, BackupSecret)
+            else BackupSecret(passphrase, "passphrase")
+        )
+        manifest = self.backups.inspect_manifest(
+            archive, selected.value if selected.mode == "passphrase" else None,
+        )
         mappings = path_mappings or {}
         logical = manifest.agent_home_logical_size
         current = _directory_size(self.home)
@@ -61,6 +67,7 @@ class RestoreService:
         available = shutil.disk_usage(self.agent_root).free
         return RestorePlan(
             backup_id=manifest.backup_id,
+            backup_format_version=manifest.backup_format_version,
             archive_path=archive.resolve(),
             created_at=manifest.created_at,
             agent_version=manifest.agent_version,
@@ -92,7 +99,7 @@ class RestoreService:
             if isinstance(passphrase, BackupSecret)
             else BackupSecret(passphrase, "passphrase")
         )
-        plan = self.plan(archive, selected.value, mappings)
+        plan = self.plan(archive, selected, mappings)
         expected = plan.backup_id[:8]
         if confirmation != expected:
             raise RestoreConfirmationError(f"必须输入备份短ID {expected} 确认")
@@ -127,7 +134,7 @@ class RestoreService:
         fence = RestoreFence(
             restore_id=restore_id,
             journal_path=journal_path,
-            backup_format_version=1,
+            backup_format_version=plan.backup_format_version,
             target_agent_root_identity=_path_identity(self.agent_root),
             created_at=datetime.now().astimezone(),
         )
@@ -149,13 +156,17 @@ class RestoreService:
             elif lifecycle.snapshot.state != MaintenanceState.QUIESCED:
                 raise RestoreRecoveryRequired("Lifecycle is already in an unfinished maintenance operation")
             await lifecycle.begin_restore(lifecycle.snapshot.maintenance_epoch)
-            EncryptedBackupArchive.extract(archive, selected.value, staging)
+            self.backups.extract_backup(archive, selected, staging)
             journal.append("restore_state", {
                 "state": RestoreState.PREPARED.value,
                 "staging_fingerprint": _tree_identity(staging),
             })
-            rescue = await self.backups.create(resolved_secret=selected, kind="rescue")
-            if not self.backups.verify(rescue.path, selected.value).valid:
+            rescue_secret = self.backups.local_store_secret(selected)
+            rescue = await self.backups.create(resolved_secret=rescue_secret, kind="rescue")
+            if not self.backups.verify(
+                rescue.path,
+                rescue_secret.value if rescue_secret.mode == "passphrase" else None,
+            ).valid:
                 raise RuntimeError("救援备份验证失败")
             journal.append("rescue_backup", {
                 "path": str(rescue.path), "backup_id": rescue.backup_id,

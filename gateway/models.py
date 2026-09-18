@@ -242,6 +242,8 @@ class CodeTurnRequest(BaseModel):
 
     client_id: str = Field(min_length=1)
     task: str = Field(min_length=1)
+    model_profile_id: str = Field(default="default", min_length=1, max_length=80)
+    reasoning_effort: ReasoningEffort | None = None
 
 
 class CodeSessionRecord(BaseModel):
@@ -273,6 +275,7 @@ class CodeTurnResult(BaseModel):
     commit: str = ""
     diagnostic: str = ""
     grant_plan: dict[str, Any] = Field(default_factory=dict)
+    model_calls: tuple[dict[str, Any], ...] = ()
 
 
 class CodeFinalizeResult(BaseModel):

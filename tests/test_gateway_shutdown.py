@@ -14,8 +14,10 @@ from gateway.api import _subscription_events
 from gateway.application import GatewayApplication
 from backup import AgentHomeMaintenanceCoordinator, AgentHomeWriteGate
 from backup.lifecycle_store import LifecycleStore
+from backup.models import MaintenanceState
 from gateway.process import (
     GatewayProcessManager,
+    process_control_request,
     resume_completed_operator_stop,
     resume_completed_operator_stop_before_bootstrap,
 )
@@ -71,6 +73,33 @@ class WebSocketShutdownTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StopAcknowledgementTests(unittest.TestCase):
+    def test_stop_does_not_claim_an_active_backup_quiesce(self):
+        with tempfile.TemporaryDirectory() as value:
+            manager = GatewayProcessManager(Path(value))
+            manager.stop_request_path.write_text(json.dumps({
+                "request_id": "stop-request",
+                "instance_id": "owner",
+                "action": "stop",
+                "reason": "operator stop",
+                "requested_at": "2026-09-16T14:00:00+08:00",
+                "requested_by": "test",
+                "timeout_seconds": 30,
+            }), encoding="utf-8")
+            gateway = SimpleNamespace(
+                maintenance=SimpleNamespace(snapshot=SimpleNamespace(
+                    state=MaintenanceState.QUIESCED,
+                    reason="backup",
+                )),
+                write_gate=SimpleNamespace(state=MaintenanceState.QUIESCED),
+                quiesce=AsyncMock(),
+            )
+
+            self.assertFalse(asyncio.run(process_control_request(
+                manager, gateway, "owner",
+            )))
+            self.assertFalse(manager.stop_ack_path.exists())
+            gateway.quiesce.assert_not_awaited()
+
     def test_ensure_running_reports_control_only_maintenance_without_timeout(self):
         with tempfile.TemporaryDirectory() as value:
             manager = GatewayProcessManager(Path(value))
