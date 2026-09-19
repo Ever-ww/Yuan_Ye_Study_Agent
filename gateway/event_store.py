@@ -38,7 +38,7 @@ def sha256_text(value: str) -> str:
 
 
 def parse_canonical_event(raw: str) -> GatewayEventEnvelope:
-    """Strictly parse v1/v2 bytes without rewriting the stored representation."""
+    """Strictly parse canonical envelope bytes without rewriting storage."""
     return GatewayEventEnvelope.model_validate_json(raw, strict=True)
 
 
@@ -61,7 +61,7 @@ class GatewayEventSchemaRegistry:
 
     @staticmethod
     def upcast_envelope(event: GatewayEventEnvelope) -> GatewayEventEnvelope:
-        if event.version == 2:
+        if event.version >= 2:
             return event
         return event.model_copy(update={
             "stream_id": event.run_id,

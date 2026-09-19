@@ -59,6 +59,7 @@ class WorkloadKind(str, Enum):
     HARNESS_EVOLUTION = "harness_evolution"
     HARNESS_DREAM = "harness_dream"
     MAINTENANCE = "maintenance"
+    LATEX_COMPILATION = "latex_compilation"
 
 
 class PersistenceContract(str, Enum):
@@ -104,6 +105,7 @@ class OperationKind(str, Enum):
     FINALIZE = "finalize"
     SUBAGENT = "subagent"
     CRON_DISPATCH = "cron_dispatch"
+    LATEX = "latex"
 
 
 class ToolIdempotency(str, Enum):

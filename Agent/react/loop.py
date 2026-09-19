@@ -78,6 +78,7 @@ class ReactLoop:
         task: str,
         session_id: str,
         model: dict[str, Any],
+        turn_metadata: dict[str, Any] | None = None,
     ) -> AsyncIterator[RunEvent]:
         """重复模型调用，直到模型返回最终文本或达到调用上限。"""
         model_calls: list[dict[str, Any]] = []
@@ -95,13 +96,20 @@ class ReactLoop:
             while True:
                 attempt += 1
                 schemas = self.tools.schemas(context)
-                before = HookEvent(point=HookPoint.MODEL_BEFORE, session_id=session_id, data={
+                before_data: dict[str, Any] = {
                     "task": task,
                     "messages": messages,
                     "tools": schemas,
                     "model": model,
                     "first_model_call": not context_loaded,
-                })
+                }
+                if turn_metadata:
+                    before_data.update(turn_metadata)
+                before = HookEvent(
+                    point=HookPoint.MODEL_BEFORE,
+                    session_id=session_id,
+                    data=before_data,
+                )
                 try:
                     await self.hooks.emit(before)
                     compression_operation = before.data.pop("compression_operation", None)

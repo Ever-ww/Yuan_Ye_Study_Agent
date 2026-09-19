@@ -441,16 +441,6 @@ class CodeSessionController:
         worktree = (worktree_parent / code_id).resolve()
         if worktree_parent not in worktree.parents:
             raise ValueError("Coding worktree 路径越界")
-        existing = (
-            sorted(path for path in worktree_parent.iterdir() if path.is_dir())
-            if worktree_parent.is_dir()
-            else []
-        )
-        if existing:
-            raise RuntimeError(
-                "检测到该源码仓库尚未清理的 Coding worktree；为避免并发修改，"
-                f"请先检查或处理：{existing[0]}"
-            )
         worktree_parent.mkdir(parents=True, exist_ok=True)
         branch = f"harness-code/{code_id}"
         await self._git(root, "worktree", "add", "-b", branch, str(worktree), base)

@@ -34,6 +34,7 @@ from gateway.models import (
     RunCreateRequest,
 )
 from gateway.runtime_pool import RuntimeEntry, RuntimePool
+from gateway.security import GatewayCredentials
 from gateway.state_controller import StateController
 from gateway.store import GatewayStore
 from gateway.process import (
@@ -53,6 +54,7 @@ from bootstrap import (
     platform_agent_home,
 )
 from memory import MemoryStore
+from reference import PaperFile, PaperUpsert
 from tool import ToolContext
 from sandbox import SandboxStatus
 
@@ -208,17 +210,147 @@ class FakeCodeSessions:
             message="aborted",
         )
 
+    async def delete(self, session_id: str, client_id: str):
+        del client_id
+        return {"deleted": True, "code_session_id": session_id}
+
     def events(self, session_id: str, after_sequence: int = 0):
         del session_id
         return [
             {"version": 1, "sequence": 2, "record_type": "code_test"}
         ] if after_sequence < 2 else []
 
+    def summaries(self, *, project_id: str | None = None, status: str | None = None):
+        item = {
+            "code_session_id": "c" * 32,
+            "project_id": project_id or "project",
+            "status": "active",
+            "branch": "harness-code/test",
+            "base_commit": "a" * 40,
+            "verified_turns": 0,
+            "created_at": "2026-09-18T00:00:00Z",
+            "updated_at": "2026-09-18T00:00:00Z",
+            "logical_roots": {
+                "source": "YYAgentSource:\\",
+                "skills": "YYSkills:\\",
+                "hooks": "YYHooks:\\",
+            },
+        }
+        return [] if status and status != "active" else [item]
+
+    def summary(self, session_id: str):
+        items = self.summaries()
+        if session_id != items[0]["code_session_id"]:
+            raise KeyError(session_id)
+        return items[0]
+
     async def close(self) -> None:
         return None
 
 
 class GatewayTests(unittest.TestCase):
+    def test_library_api_hides_host_paths_and_enforces_note_cas(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            application = GatewayApplication(
+                load_runtime_config(root),
+                runtime_factory=lambda workspace, approval: FakeRuntime(workspace),
+            )
+            project = application.register_project(root)
+            pdf = root / "paper.pdf"
+            content = b"%PDF-1.4\n%%EOF\n"
+            pdf.write_bytes(content)
+            paper = application.reference_store.upsert_paper(PaperUpsert(
+                title="Gateway Paper", publication_year=2026,
+            ))
+            application.reference_store.add_file(paper.paper_id, PaperFile(
+                workspace_hash="a" * 16, workspace_root=str(root),
+                relative_path="paper.pdf", absolute_path=str(pdf),
+                sha256=hashlib.sha256(content).hexdigest(), size_bytes=len(content),
+            ))
+            headers = {"Authorization": "Bearer test-token"}
+            with TestClient(create_gateway_api(application, access_token="test-token")) as client:
+                listed = client.get("/api/v1/library/papers", headers=headers)
+                self.assertEqual(listed.status_code, 200)
+                self.assertEqual(listed.json()[0]["paper_id"], paper.paper_id)
+                self.assertNotIn(str(root), listed.text)
+                self.assertTrue(listed.json()[0]["has_pdf"])
+                loaded = client.get(
+                    f"/api/v1/library/papers/{paper.paper_id}/pdf", headers=headers,
+                )
+                self.assertEqual(loaded.status_code, 200)
+                self.assertEqual(loaded.content, content)
+                created = client.post(
+                    f"/api/v1/library/papers/{paper.paper_id}/notes", headers=headers,
+                    json={
+                        "page": 1, "selected_text": "result", "locator": {"page": 1},
+                        "note_markdown": "Useful result",
+                    },
+                )
+                self.assertEqual(created.status_code, 200)
+                note = created.json()
+                updated = client.patch(
+                    f"/api/v1/library/papers/{paper.paper_id}/notes/{note['note_id']}",
+                    headers=headers,
+                    json={
+                        "expected_revision": 1, "page": 1, "selected_text": "result",
+                        "locator": {"page": 1}, "note_markdown": "Revised",
+                    },
+                )
+                self.assertEqual(updated.json()["revision"], 2)
+                conflict = client.patch(
+                    f"/api/v1/library/papers/{paper.paper_id}/notes/{note['note_id']}",
+                    headers=headers,
+                    json={
+                        "expected_revision": 1, "page": 1, "selected_text": "result",
+                        "locator": {}, "note_markdown": "Stale",
+                    },
+                )
+                self.assertEqual(conflict.status_code, 409)
+                self.assertEqual(conflict.json()["error"]["code"], "note_conflict")
+                accepted_context = client.post(
+                    "/api/v1/runs", headers=headers,
+                    json={
+                        "project_id": project.project_id,
+                        "client_id": "reader-context",
+                        "task": "explain selection",
+                        "ui_context": {
+                            "source": "read",
+                            "resource": {
+                                "kind": "paper", "paper_id": paper.paper_id,
+                                "logical_path": None,
+                                "content_hash": hashlib.sha256(content).hexdigest(),
+                            },
+                            "selection": {
+                                "selected_text": "PDF", "page": 1,
+                                "start_line": None, "end_line": None,
+                            },
+                        },
+                    },
+                )
+                self.assertEqual(accepted_context.status_code, 200)
+                stale_context = client.post(
+                    "/api/v1/runs", headers=headers,
+                    json={
+                        "project_id": project.project_id,
+                        "client_id": "reader-context",
+                        "task": "explain stale selection",
+                        "ui_context": {
+                            "source": "read",
+                            "resource": {
+                                "kind": "paper", "paper_id": paper.paper_id,
+                                "logical_path": None, "content_hash": "0" * 64,
+                            },
+                            "selection": {
+                                "selected_text": "PDF", "page": 1,
+                                "start_line": None, "end_line": None,
+                            },
+                        },
+                    },
+                )
+                self.assertEqual(stale_context.status_code, 409)
+                self.assertEqual(stale_context.json()["error"]["code"], "ui_context_conflict")
+
     def test_skill_refresh_uses_long_request_timeout(self) -> None:
         async def check() -> None:
             client = object.__new__(GatewayClient)
@@ -234,6 +366,50 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(captured["timeout"], 3600)
 
         asyncio.run(check())
+
+    def test_model_options_accept_json_array_for_supported_efforts(self) -> None:
+        async def check() -> None:
+            client = object.__new__(GatewayClient)
+
+            async def request(method: str, path: str, **kwargs):
+                del method, path, kwargs
+                return [{
+                    "profile_id": "default",
+                    "provider": "openai",
+                    "model": "gpt-test",
+                    "selected": True,
+                    "reasoning_effort": "low",
+                    "supported_reasoning_efforts": [
+                        "none", "low", "medium", "high", "xhigh", "max",
+                    ],
+                    "default_reasoning_effort": "low",
+                    "effective_reasoning_effort": "low",
+                }]
+
+            client._request = request
+            options = await client.model_options()
+            self.assertEqual(
+                options[0].supported_reasoning_efforts,
+                ("none", "low", "medium", "high", "xhigh", "max"),
+            )
+
+        asyncio.run(check())
+
+    def test_runtime_pool_projects_workspace_paths_without_tool_arguments(self) -> None:
+        emitted: list[tuple[str, str, dict[str, object]]] = []
+        pool = object.__new__(RuntimePool)
+        pool.workspace_event_callback = lambda project_id, event_type, payload: emitted.append(
+            (project_id, event_type, payload),
+        )
+        run = Mock(project_id="project-1", run_id="run-1")
+        pool._record_tool_workspace_events(
+            run, "bash",
+            {"command": "secret command", "writable_paths": ["YYWorkspace:\\src"]},
+            "completed",
+        )
+        self.assertEqual(emitted[0][1], "workspace.file.changed")
+        self.assertEqual(emitted[0][2]["path"], "YYWorkspace:\\src")
+        self.assertNotIn("command", emitted[0][2])
 
     def test_terminal_subscription_closes_nested_event_generator(self) -> None:
         async def check() -> None:
@@ -489,6 +665,14 @@ class GatewayTests(unittest.TestCase):
                     [item["profile_id"] for item in serialized],
                     ["default", "flash"],
                 )
+                self.assertEqual(
+                    serialized[0]["supported_reasoning_efforts"],
+                    ["none", "low", "medium", "high", "xhigh", "max"],
+                )
+                self.assertEqual(
+                    serialized[0]["effective_reasoning_effort"],
+                    serialized[0]["reasoning_effort"],
+                )
                 self.assertNotIn("secret-never-returned", options.text)
                 created = client.post(
                     "/api/v1/runs", headers=headers,
@@ -498,6 +682,7 @@ class GatewayTests(unittest.TestCase):
                         "task": "use selected model",
                         "model_profile_id": "flash",
                         "reasoning_effort": "max",
+                        "ui_context": {"source": "agent"},
                     },
                 )
                 self.assertEqual(created.status_code, 200)
@@ -537,6 +722,103 @@ class GatewayTests(unittest.TestCase):
                     if item["profile_id"] == "flash"
                 ), "max")
 
+    def test_workspace_mutation_publishes_replayable_project_event_v3(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            application = GatewayApplication(
+                load_runtime_config(root),
+                runtime_factory=lambda workspace, approval: FakeRuntime(workspace),
+            )
+            project = application.register_project(root)
+            headers = {"Authorization": "Bearer test-token"}
+            with TestClient(create_gateway_api(application, access_token="test-token")) as client:
+                created = client.post(
+                    f"/api/v1/projects/{project.project_id}/workspace/entries",
+                    headers=headers,
+                    json={"path": "YYWorkspace:\\draft.md", "kind": "file"},
+                )
+                self.assertEqual(created.status_code, 200)
+                self.assertEqual(created.json()["workspace_revision"], 1)
+                replay = client.get(
+                    f"/api/v1/projects/{project.project_id}/workspace/events",
+                    headers=headers,
+                )
+                self.assertEqual(replay.status_code, 200)
+                event = replay.json()[0]
+                self.assertEqual(event["version"], 3)
+                self.assertIsNone(event["run_id"])
+                self.assertEqual(event["stream_id"], f"project:{project.project_id}:workspace")
+                self.assertEqual(event["type"], "workspace.file.created")
+                self.assertEqual(event["payload"]["path"], "YYWorkspace:\\draft.md")
+                stale_compile = client.post(
+                    f"/api/v1/projects/{project.project_id}/latex/compilations",
+                    headers=headers,
+                    json={
+                        "main_path": "YYWorkspace:\\main.tex",
+                        "engine": "auto",
+                        "expected_tree_revision": 0,
+                    },
+                )
+                self.assertEqual(stale_compile.status_code, 409)
+                self.assertEqual(
+                    stale_compile.json()["error"]["code"],
+                    "workspace_revision_conflict",
+                )
+
+    def test_write_ui_context_is_validated_and_persisted_on_run(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            document = root / "draft.md"
+            document.write_text("stable", encoding="utf-8")
+            digest = hashlib.sha256(b"stable").hexdigest()
+            application = GatewayApplication(
+                load_runtime_config(root),
+                runtime_factory=lambda workspace, approval: FakeRuntime(workspace),
+            )
+            project = application.register_project(root)
+            headers = {"Authorization": "Bearer test-token"}
+            with TestClient(create_gateway_api(application, access_token="test-token")) as client:
+                response = client.post(
+                    "/api/v1/runs", headers=headers,
+                    json={
+                        "project_id": project.project_id,
+                        "client_id": "write-context-client",
+                        "task": "review this file",
+                        "ui_context": {
+                            "source": "write",
+                            "resource": {
+                                "kind": "workspace_file",
+                                "logical_path": "YYWorkspace:\\draft.md",
+                                "content_hash": digest,
+                            },
+                            "selection": {
+                                "selected_text": "stable", "page": None,
+                                "start_line": 1, "end_line": 1,
+                            },
+                        },
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["ui_context"]["source"], "write")
+                stale = client.post(
+                    "/api/v1/runs", headers=headers,
+                    json={
+                        "project_id": project.project_id,
+                        "client_id": "write-context-client",
+                        "task": "review stale file",
+                        "ui_context": {
+                            "source": "write",
+                            "resource": {
+                                "kind": "workspace_file",
+                                "logical_path": "YYWorkspace:\\draft.md",
+                                "content_hash": "0" * 64,
+                            },
+                        },
+                    },
+                )
+                self.assertEqual(stale.status_code, 409)
+                self.assertEqual(stale.json()["error"]["code"], "file_conflict")
+
     def test_code_session_api_create_turn_events_and_finalize(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
@@ -555,6 +837,22 @@ class GatewayTests(unittest.TestCase):
                 )
                 self.assertEqual(created.status_code, 200)
                 session_id = created.json()["code_session_id"]
+                self.assertNotIn("source_root", created.json())
+                self.assertNotIn("worktree_path", created.json())
+                self.assertEqual(
+                    created.json()["logical_roots"]["source"], "YYAgentSource:\\",
+                )
+                listed = client.get(
+                    "/api/v1/code/sessions", headers=headers,
+                    params={"project_id": project.project_id},
+                )
+                self.assertEqual(listed.status_code, 200)
+                self.assertEqual(listed.json()[0]["code_session_id"], session_id)
+                detail = client.get(
+                    f"/api/v1/code/sessions/{session_id}", headers=headers,
+                )
+                self.assertEqual(detail.status_code, 200)
+                self.assertNotIn("worktree_path", detail.text)
                 start_items = [
                     item for item in application.store.list_inbox()
                     if application.store.run(item.run_id).workload_kind
@@ -588,6 +886,12 @@ class GatewayTests(unittest.TestCase):
                     params={"client_id": "code-client"},
                 )
                 self.assertTrue(finalized.json()["merged"])
+                deleted = client.delete(
+                    f"/api/v1/code/sessions/{session_id}", headers=headers,
+                    params={"client_id": "code-client"},
+                )
+                self.assertEqual(deleted.status_code, 200)
+                self.assertTrue(deleted.json()["deleted"])
 
     def test_failed_code_session_start_remains_unread_inbox(self) -> None:
         class FailingCodeSessions(FakeCodeSessions):
@@ -621,6 +925,24 @@ class GatewayTests(unittest.TestCase):
                 ]
                 self.assertEqual(len(failed), 1)
                 self.assertEqual(failed[0].status, "failed")
+                detail = client.get(
+                    f"/api/v1/inbox/{failed[0].item_id}", headers=headers,
+                )
+                self.assertEqual(detail.status_code, 200)
+                self.assertEqual(detail.json()["item_id"], failed[0].item_id)
+                read_all = client.post(
+                    "/api/v1/inbox/read-all", headers=headers,
+                    params={"project_id": project.project_id},
+                )
+                self.assertEqual(read_all.status_code, 200)
+                self.assertEqual(read_all.json()["updated"], 1)
+                self.assertEqual(
+                    client.get(
+                        "/api/v1/inbox", headers=headers,
+                        params={"unread_only": True},
+                    ).json(),
+                    [],
+                )
 
     def test_state_controller_persists_replayable_monotonic_events(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -818,7 +1140,11 @@ class GatewayTests(unittest.TestCase):
                 code = application.issue_browser_code()
                 exchange = client.post("/api/v1/browser/exchange", json={"code": code})
                 self.assertEqual(exchange.status_code, 200)
+                self.assertIn("Max-Age=2147483647", exchange.headers["set-cookie"])
                 csrf = exchange.json()["csrf"]
+                reopened = client.post("/api/v1/browser/exchange", json={"code": code})
+                self.assertEqual(reopened.status_code, 200)
+                self.assertEqual(reopened.json()["csrf"], csrf)
                 self.assertEqual(
                     client.post("/api/v1/projects", json={"path": str(root)}).status_code,
                     403,
@@ -835,6 +1161,17 @@ class GatewayTests(unittest.TestCase):
                     json={"path": str(root)},
                 )
                 self.assertEqual(rejected_origin.status_code, 403)
+
+    def test_gateway_credential_rotates_only_when_a_new_service_starts(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            credentials = GatewayCredentials(Path(value))
+            first = credentials.load_or_create()
+            self.assertEqual(credentials.load_or_create(), first)
+
+            restarted = credentials.rotate()
+
+            self.assertNotEqual(restarted, first)
+            self.assertEqual(credentials.load_or_create(), restarted)
 
     def test_same_session_is_rejected_while_running(self) -> None:
         async def check(root: Path) -> None:

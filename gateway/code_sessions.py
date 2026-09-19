@@ -51,7 +51,6 @@ class CodeSessionManager:
         self.runtime_resource_manager = runtime_resource_manager
         self.write_gate = getattr(grant_backend, "write_gate", None)
         self._sessions: dict[str, object] = {}
-        self._sources: dict[Path, str] = {}
         self._owners: dict[str, tuple[str, str]] = {}
         self._turn_locks: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
@@ -65,8 +64,6 @@ class CodeSessionManager:
     ) -> CodeSessionRecord:
         async with self._lock:
             self._require_available()
-            if self.source_root in self._sources:
-                raise RuntimeError("这个 Yuan Ye 源码仓库已经有活动的 Coding Session")
             try:
                 controller = self.module.CodeSessionController(
                     self.config,
@@ -104,7 +101,6 @@ class CodeSessionManager:
                 raw = await controller.start(self.source_root)
             session_id = raw.code_session_id
             self._sessions[session_id] = controller
-            self._sources[self.source_root] = session_id
             self._owners[session_id] = (project_id, client_id)
             self._turn_locks[session_id] = asyncio.Lock()
             return self._record(raw, project_id, client_id)
@@ -173,6 +169,39 @@ class CodeSessionManager:
         result = CodeFinalizeResult.model_validate(raw.model_dump(mode="json"))
         self._forget(session_id)
         return result
+
+    @lifecycle_work("run", continuation=True)
+    async def delete(self, session_id: str, client_id: str) -> dict[str, object]:
+        """Delete one Code session and its isolated candidate, never the source tree."""
+        if session_id in self._sessions:
+            await self.abort(session_id, client_id)
+        records = self.events(session_id)
+        first = records[0]
+        source = Path(str(first.get("source_root") or self.source_root)).resolve()
+        worktree = Path(str(first.get("worktree_path") or "")).resolve()
+        source_hash = hashlib.sha256(str(source).casefold().encode("utf-8")).hexdigest()[:16]
+        allowed_parent = (
+            self.config.agent_root / ".yy" / "harness-evolution" /
+            "worktrees" / source_hash
+        ).resolve()
+        if worktree.name != session_id or worktree.parent != allowed_parent:
+            raise RuntimeError("Coding Session worktree boundary is invalid")
+        branch = str(first.get("branch") or "")
+        if worktree.exists():
+            await self._git(source, "worktree", "remove", "--force", str(worktree), check=False)
+        await self._git(source, "worktree", "prune", check=False)
+        if branch:
+            await self._git(source, "branch", "-D", branch, check=False)
+        audit = (
+            self.config.agent_root / ".yy" / "harness-evolution" /
+            "code" / f"{session_id}.jsonl"
+        ).resolve()
+        expected = (self.config.agent_root / ".yy" / "harness-evolution" / "code").resolve()
+        if audit.parent != expected:
+            raise RuntimeError("Coding Session audit boundary is invalid")
+        audit.unlink(missing_ok=True)
+        self._forget(session_id)
+        return {"deleted": True, "code_session_id": session_id}
 
     async def quiesce(self, maintenance_epoch: int) -> QuiesceResult:
         async with self._lock:
@@ -258,6 +287,70 @@ class CodeSessionManager:
                 value["sequence"] = sequence
                 records.append(value)
         return records
+
+    def summaries(
+        self, *, project_id: str | None = None, status: str | None = None,
+    ) -> list[dict]:
+        """Return durable, host-path-free summaries for management clients."""
+        directory = self.config.agent_root / ".yy" / "harness-evolution" / "code"
+        summaries: list[dict] = []
+        if not directory.is_dir():
+            return summaries
+        for path in sorted(directory.glob("*.jsonl"), reverse=True):
+            session_id = path.stem
+            if not re.fullmatch(r"[0-9a-f]{32}", session_id):
+                continue
+            records = self.events(session_id)
+            if not records:
+                continue
+            first, last = records[0], records[-1]
+            origin = first.get("origin") if isinstance(first.get("origin"), dict) else {}
+            selected_project = str(origin.get("origin_project_id") or "")
+            if project_id is not None and selected_project != project_id:
+                continue
+            selected_status = self._summary_status(session_id, last)
+            if status is not None and selected_status != status:
+                continue
+            summaries.append({
+                "code_session_id": session_id,
+                "project_id": selected_project,
+                "status": selected_status,
+                "branch": str(first.get("branch") or ""),
+                "base_commit": str(first.get("base_commit") or ""),
+                "verified_turns": sum(
+                    1 for item in records if item.get("record_type") == "code_turn_verified"
+                ),
+                "created_at": str(first.get("timestamp") or ""),
+                "updated_at": str(last.get("timestamp") or first.get("timestamp") or ""),
+                "origin_session_id": origin.get("origin_session_id"),
+                "origin_run_id": origin.get("origin_run_id"),
+                "logical_roots": {
+                    "source": "YYAgentSource:\\",
+                    "skills": "YYSkills:\\",
+                    "hooks": "YYHooks:\\",
+                },
+            })
+        return summaries
+
+    def summary(self, session_id: str) -> dict:
+        for item in self.summaries():
+            if item["code_session_id"] == session_id:
+                return item
+        raise KeyError(f"Unknown Coding Session: {session_id}")
+
+    def _summary_status(self, session_id: str, last: dict) -> str:
+        if session_id in self._sessions:
+            controller = self._sessions[session_id]
+            record = getattr(controller, "record", None)
+            return str(getattr(record, "status", "active"))
+        record_type = str(last.get("record_type") or "")
+        if record_type == "code_session_aborted":
+            return "aborted"
+        if record_type in {"code_session_merged", "code_finalize_merged"}:
+            return "merged"
+        if record_type == "code_cleanup" and not bool(last.get("branch_preserved")):
+            return "closed"
+        return "interrupted"
 
     def owner(self, session_id: str) -> tuple[str, str]:
         owner = self._owners.get(session_id)
@@ -350,8 +443,6 @@ class CodeSessionManager:
         self._sessions.pop(session_id, None)
         self._owners.pop(session_id, None)
         self._turn_locks.pop(session_id, None)
-        if self._sources.get(self.source_root) == session_id:
-            self._sources.pop(self.source_root, None)
 
     @staticmethod
     def _record(raw, project_id: str, client_id: str) -> CodeSessionRecord:

@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import hashlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import uuid4
 
 from Agent import RuntimeFailure, load_runtime_config
 from Agent.state import WorkloadKind
 from gateway.harness_evolution import GatewayHarnessEvolutionService
+from gateway.code_sessions import CodeSessionManager
 from gateway.state_controller import StateController
 from gateway.store import GatewayStore
 from tool import default_tools
@@ -33,6 +37,47 @@ class _InteractiveOnlyTool:
 
 
 class HarnessArchitectureTests(unittest.TestCase):
+    def test_manual_code_sessions_are_independent_for_the_same_source(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            config = load_runtime_config(
+                root, workspace_root=workspace, coding_source_root=ROOT,
+            )
+            manager = CodeSessionManager(config)
+            created = iter(("1" * 32, "2" * 32))
+
+            class Controller:
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                async def start(self, source_root, *, origin):
+                    session_id = next(created)
+                    return SimpleNamespace(
+                        code_session_id=session_id,
+                        source_root=source_root,
+                        worktree_path=root / session_id,
+                        branch=f"harness-code/{session_id}",
+                        base_commit="a" * 40,
+                        status="active",
+                        verified_turns=0,
+                        origin=origin,
+                    )
+
+            async def scenario():
+                with patch.object(manager.module, "CodeSessionController", Controller):
+                    first = await manager.start(
+                        "project", "client", origin_run_id="run-1",
+                    )
+                    second = await manager.start(
+                        "project", "client", origin_run_id="run-2",
+                    )
+                self.assertNotEqual(first.code_session_id, second.code_session_id)
+                self.assertEqual(len(manager._sessions), 2)
+
+            asyncio.run(scenario())
+
     def test_facades_have_no_independent_repair_or_git_loop(self) -> None:
         tree = ast.parse((ROOT / "harness-evolution" / "harness.py").read_text(encoding="utf-8"))
         classes = {

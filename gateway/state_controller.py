@@ -111,7 +111,7 @@ class StateInvariantError(RuntimeError):
 class StateController:
     """以 SQLite 事务实现 command 幂等、CAS、FSM guard 和 Outbox。"""
 
-    SCHEMA_VERSION = 13
+    SCHEMA_VERSION = 15
     _PROCESSED_COMMAND_ENCODING_KEY = "__yy_processed_command_encoding__"
 
     def __init__(
@@ -619,6 +619,20 @@ class StateController:
                     created_at TEXT NOT NULL,
                     decided_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS latex_compilations (
+                    compilation_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL CHECK(status IN
+                        ('queued','running','completed','failed','cancelled','interrupted')),
+                    record_json TEXT NOT NULL,
+                    artifact_root TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+                );
+                CREATE INDEX IF NOT EXISTS latex_compilations_project_idx
+                    ON latex_compilations(project_id,created_at);
                 """
             )
             self._ensure_column(connection, "operation_ledger", "stable_key", "TEXT")
@@ -744,6 +758,12 @@ class StateController:
                 END;
                 """
             )
+            run_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+            }
+            if run_columns and "ui_context_json" not in run_columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN ui_context_json TEXT")
             connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
             foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
             if foreign_key_errors:
@@ -1218,6 +1238,7 @@ class StateController:
         runtime_generation_id: str | None = None,
         model_profile_id: str = "default",
         reasoning_effort: str = "none",
+        ui_context: dict[str, Any] | None = None,
     ) -> tuple[AgentState, bool]:
         """原子建立 Run、Event、Outbox及其可选Runtime Generation绑定。"""
         timestamp = now_iso()
@@ -1253,11 +1274,12 @@ class StateController:
             )
             connection.execute(
                 "INSERT INTO runs(run_id,project_id,session_id,client_id,task,status,created_at,"
-                "started_at,finished_at,answer,error,model_profile_id,reasoning_effort) "
-                "VALUES(?,?,?,?,?,'queued',?,NULL,NULL,NULL,NULL,?,?)",
+                "started_at,finished_at,answer,error,model_profile_id,reasoning_effort,ui_context_json) "
+                "VALUES(?,?,?,?,?,'queued',?,NULL,NULL,NULL,NULL,?,?,?)",
                 (
                     run_id, project_id, session_id, client_id, task, timestamp,
                     model_profile_id, reasoning_effort,
+                    json.dumps(ui_context, ensure_ascii=False, sort_keys=True) if ui_context else None,
                 ),
             )
             connection.execute(
@@ -1980,6 +2002,22 @@ class StateController:
         with self._connection() as connection:
             return self._approval_in(connection, approval_id)
 
+    def list_approvals(self, *, status: str | None = None) -> tuple[DurableApproval, ...]:
+        if status is not None and status not in {item.value for item in ApprovalStatus}:
+            raise ValueError(f"Unknown approval status: {status}")
+        query = "SELECT approval_json FROM durable_approvals"
+        parameters: tuple[str, ...] = ()
+        if status is not None:
+            query += " WHERE status=?"
+            parameters = (status,)
+        query += " ORDER BY updated_at DESC"
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple(
+            DurableApproval.model_validate_json(row["approval_json"], strict=True)
+            for row in rows
+        )
+
     def resolve_extension_grant(
         self, hook_id: str, stage: str, source_hash: str, manifest_hash: str,
     ) -> dict[str, Any] | None:
@@ -2395,6 +2433,172 @@ class StateController:
         return EventStore(self.database_path).read_projection_stream(
             run_id, after_sequence=after_sequence,
         )
+
+    def record_project_stream_event(
+        self,
+        *,
+        project_id: str,
+        stream_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        command_id: str,
+        correlation_id: str | None = None,
+    ) -> GatewayEventEnvelope:
+        """Append a non-Run project event through the canonical EventStore/outbox."""
+        if self.write_gate is not None:
+            self.write_gate.check_mutation_admission()
+        timestamp = now_iso()
+        sanitized_payload = AuditSanitizer.sanitize(payload)
+        payload_hash = sha256_text(canonical_json(sanitized_payload))
+        event_id = hashlib.sha256(
+            f"gateway-event:v3\n{command_id}\nprimary\n{stream_id}".encode("utf-8"),
+        ).hexdigest()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT canonical_event_json FROM gateway_events WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                connection.commit()
+                return GatewayEventEnvelope.model_validate_json(
+                    existing["canonical_event_json"], strict=True,
+                )
+            row = connection.execute(
+                "SELECT last_sequence FROM event_sequences WHERE run_id=?", (stream_id,),
+            ).fetchone()
+            sequence = int(row["last_sequence"]) + 1 if row is not None else 1
+            connection.execute(
+                "INSERT INTO event_sequences(run_id,last_sequence) VALUES(?,?) "
+                "ON CONFLICT(run_id) DO UPDATE SET last_sequence=excluded.last_sequence",
+                (stream_id, sequence),
+            )
+            event = GatewayEventEnvelope(
+                version=3,
+                event_id=event_id,
+                sequence=sequence,
+                timestamp=timestamp,
+                project_id=project_id,
+                run_id=None,
+                type=event_type,
+                payload=sanitized_payload,
+                command_id=command_id,
+                event_key="primary",
+                stream_id=stream_id,
+                stream_sequence=sequence,
+                event_type=event_type,
+                correlation_id=correlation_id or stream_id,
+                payload_hash=payload_hash,
+            )
+            canonical_event_json = canonical_json(event.model_dump(mode="json"))
+            connection.execute(
+                "INSERT INTO gateway_events(event_id,command_id,event_key,stream_id,stream_sequence,"
+                "event_type,envelope_version,schema_version,occurred_at,run_id,session_id,causation_id,"
+                "correlation_id,canonical_event_json,payload_hash,canonical_hash,storage_tier,archive_id,revision) "
+                "VALUES(?,?,?,?,?,?,3,1,?,?,NULL,NULL,?,?,?,?, 'hot',NULL,0)",
+                (
+                    event_id, command_id, "primary", stream_id, sequence, event_type,
+                    timestamp, stream_id, event.correlation_id, canonical_event_json,
+                    payload_hash, sha256_text(canonical_event_json),
+                ),
+            )
+            outbox_id = hashlib.sha256(
+                f"event-outbox:v3:{event_id}".encode("utf-8"),
+            ).hexdigest()
+            connection.execute(
+                "INSERT INTO event_outbox(outbox_id,event_id,created_at,completed_at,revision) "
+                "VALUES(?,?,?,NULL,0)",
+                (outbox_id, event_id, timestamp),
+            )
+            sinks = connection.execute(
+                "SELECT * FROM event_sinks WHERE enabled=1 ORDER BY sink_id",
+            ).fetchall()
+            for sink in sinks:
+                delivery_id = hashlib.sha256(
+                    f"event-delivery:v3:{event_id}:{sink['sink_id']}".encode("utf-8"),
+                ).hexdigest()
+                connection.execute(
+                    "INSERT INTO event_deliveries(delivery_id,outbox_id,event_id,sink_id,required,"
+                    "sink_config_version,sink_config_hash,status,attempt_count,next_retry_at,"
+                    "last_error_type,last_error,delivered_at,dead_lettered_at,revision) "
+                    "VALUES(?,?,?,?,?,?,?,'pending',0,NULL,NULL,NULL,NULL,NULL,0)",
+                    (
+                        delivery_id, outbox_id, event_id, sink["sink_id"],
+                        int(sink["required_by_default"]), int(sink["current_config_version"]),
+                        sink["current_config_hash"],
+                    ),
+                )
+            connection.execute(
+                "UPDATE event_outbox SET completed_at=?,revision=revision+1 WHERE outbox_id=? "
+                "AND NOT EXISTS (SELECT 1 FROM event_deliveries WHERE outbox_id=? AND required=1)",
+                (timestamp, outbox_id, outbox_id),
+            )
+            connection.commit()
+        return event
+
+    def create_latex_compilation(
+        self, record: dict[str, Any], *, artifact_root: str | None = None,
+    ) -> None:
+        timestamp = str(record["created_at"])
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO latex_compilations(compilation_id,project_id,run_id,status,"
+                "record_json,artifact_root,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    record["compilation_id"], record["project_id"], record["run_id"],
+                    record["status"], canonical_json(record), artifact_root,
+                    timestamp, str(record["updated_at"]),
+                ),
+            )
+
+    def update_latex_compilation(
+        self, compilation_id: str, record: dict[str, Any],
+        *, artifact_root: str | None = None,
+    ) -> None:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE latex_compilations SET status=?,record_json=?,"
+                "artifact_root=COALESCE(?,artifact_root),updated_at=? WHERE compilation_id=?",
+                (
+                    record["status"], canonical_json(record), artifact_root,
+                    record["updated_at"], compilation_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(compilation_id)
+
+    def latex_compilation(self, compilation_id: str) -> tuple[dict[str, Any], str | None]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT record_json,artifact_root FROM latex_compilations WHERE compilation_id=?",
+                (compilation_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(compilation_id)
+        return json.loads(str(row["record_json"])), (
+            str(row["artifact_root"]) if row["artifact_root"] else None
+        )
+
+    def interrupt_active_latex_compilations(self) -> int:
+        timestamp = now_iso()
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT compilation_id,record_json FROM latex_compilations "
+                "WHERE status IN ('queued','running')",
+            ).fetchall()
+            for row in rows:
+                record = json.loads(str(row["record_json"]))
+                record.update(
+                    status="interrupted",
+                    error="Gateway restarted before compilation completed",
+                    updated_at=timestamp,
+                )
+                connection.execute(
+                    "UPDATE latex_compilations SET status='interrupted',record_json=?,updated_at=? "
+                    "WHERE compilation_id=?",
+                    (canonical_json(record), timestamp, row["compilation_id"]),
+                )
+        return len(rows)
 
     def claim_harness_dream(
         self,

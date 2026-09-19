@@ -12,7 +12,7 @@ from gateway.models import GatewayEventEnvelope
 class EventSubscription:
     client_id: str
     queue: asyncio.Queue[GatewayEventEnvelope]
-    run_id: str | None = None
+    stream_ids: frozenset[str] = frozenset()
 
 
 class GatewayEventBus:
@@ -27,12 +27,21 @@ class GatewayEventBus:
         self._client_ready: dict[str, asyncio.Event] = {}
         self._published_ids: set[str] = set()
 
-    async def subscribe(self, client_id: str, run_id: str | None = None) -> tuple[int, asyncio.Queue[GatewayEventEnvelope]]:
+    async def subscribe(
+        self,
+        client_id: str,
+        run_id: str | None = None,
+        *,
+        stream_ids: set[str] | frozenset[str] | None = None,
+    ) -> tuple[int, asyncio.Queue[GatewayEventEnvelope]]:
         async with self._lock:
             self._next_id += 1
             subscription_id = self._next_id
             queue: asyncio.Queue[GatewayEventEnvelope] = asyncio.Queue(self.queue_size)
-            self._subscriptions[subscription_id] = EventSubscription(client_id, queue, run_id)
+            selected_streams = frozenset(stream_ids or ({run_id} if run_id else set()))
+            self._subscriptions[subscription_id] = EventSubscription(
+                client_id, queue, selected_streams,
+            )
             self._client_counts[client_id] = self._client_counts.get(client_id, 0) + 1
             self._client_ready.setdefault(client_id, asyncio.Event()).set()
             return subscription_id, queue
@@ -76,7 +85,8 @@ class GatewayEventBus:
                 self._published_ids = {event.event_id}
             subscriptions = tuple(self._subscriptions.values())
         for subscription in subscriptions:
-            if subscription.run_id and subscription.run_id != event.run_id:
+            event_stream = event.stream_id or event.run_id
+            if subscription.stream_ids and event_stream not in subscription.stream_ids:
                 continue
             try:
                 subscription.queue.put_nowait(event)

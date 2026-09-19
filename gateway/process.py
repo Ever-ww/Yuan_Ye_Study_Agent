@@ -444,7 +444,9 @@ def run_gateway(agent_root: Path, port: int) -> None:
             if manager._healthy():
                 return
             raise RuntimeError(f"端口 {port} 已被占用")
-        token = manager.token()
+        # The token belongs to this exact Gateway process. Clients can reuse it
+        # without a timer, while every successful service restart revokes it.
+        token = GatewayCredentials(manager.directory).rotate()
         instance_id = uuid4().hex
         metadata = {
             "pid": os.getpid(),

@@ -18,6 +18,10 @@ class GatewayCredentials:
             token = self.token_path.read_text(encoding="utf-8").strip()
             if len(token) >= 32:
                 return token
+        return self.rotate()
+
+    def rotate(self) -> str:
+        """Publish a fresh credential for one Gateway process lifetime."""
         token = secrets.token_urlsafe(48)
         temporary = self.token_path.with_suffix(".tmp")
         temporary.write_text(token + "\n", encoding="utf-8")

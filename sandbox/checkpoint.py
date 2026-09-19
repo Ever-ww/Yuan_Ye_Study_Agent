@@ -30,7 +30,7 @@ from .models import (
 
 
 _EXCLUDES = (
-    ".git/", ".yy/", ".env", ".env.*", ".venv/", ".agents/", ".codex/",
+    ".git/", ".yy/", ".yy-latex-build/", ".env", ".env.*", ".venv/", ".agents/", ".codex/",
     "__pycache__/", "*.py[cod]",
 )
 _ZERO_SHA = "0" * 40

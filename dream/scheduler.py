@@ -228,8 +228,8 @@ class DreamScheduler:
         # by one memoryless execution.  Explicit backfill remains date-based.
         if (
             due is not None
-            and state.last_status == "failed"
-            and state.last_attempted_date == due.isoformat()
+            and getattr(state, "last_status", None) == "failed"
+            and getattr(state, "last_attempted_date", None) == due.isoformat()
         ):
             return None
         return due

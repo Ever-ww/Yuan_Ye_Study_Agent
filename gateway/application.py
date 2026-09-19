@@ -7,13 +7,13 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import sqlite3
 from contextlib import suppress
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from time import monotonic
 from uuid import uuid4
 from backup.maintenance import lifecycle_work, lifecycle_mutation, validate_home_databases, MaintenanceBlockedError
 from backup.models import MaintenanceState
@@ -28,12 +28,14 @@ from Agent import (
     load_generation_tool_module,
 )
 from Agent.state import (
+    AbandonOperationAttemptCommand,
     CompleteOperationAttemptCommand,
     CreateOperationWithAttemptCommand,
     FailOperationAttemptCommand,
     MarkOperationAttemptUnknownCommand,
     OperationFailureKind,
     OperationKind,
+    OperationStatus,
     PersistenceContract,
     RecordRuntimeEventCommand,
     ReconcileOperationAttemptCommand,
@@ -86,9 +88,17 @@ from gateway.models import (
     SkillManageRequest,
     ExtensionGrantRequest,
     ExtensionReenableRequest,
+    LatexCompilationRecord,
+    LatexCompilationRequest,
 )
 from gateway.runtime_pool import RuntimeFactory, RuntimePool
 from gateway.store import GatewayStore
+from gateway.workspace_files import WorkspaceFileConflict, WorkspaceFileService
+from gateway.latex import (
+    LatexCompilationService,
+    LatexExecutionError,
+    LatexWorkspaceRevisionConflict,
+)
 from memory import MemoryEmbeddingWorker, MemoryStore, build_memory_embedding_provider
 from reference import (
     ReferenceEmbeddingWorker,
@@ -115,6 +125,10 @@ from backup import (
     assert_restore_inactive,
 )
 from sandbox import CheckpointDreamCoordinator
+
+
+class RunUIContextConflict(RuntimeError):
+    """A UI resource changed before its immutable Turn snapshot was accepted."""
 
 
 class GatewayApplication:
@@ -152,6 +166,7 @@ class GatewayApplication:
             database_warning_bytes=config.gateway_database_warning_bytes,
             database_critical_bytes=config.gateway_database_critical_bytes,
         )
+        self.state_controller.interrupt_active_latex_compilations()
         self.event_store = EventStore(self.store.database_path)
         self.event_archive = GatewayEventArchiveService(
             self.store.database_path,
@@ -174,6 +189,9 @@ class GatewayApplication:
             dead_letter_enabled=config.outbox_dead_letter_enabled,
         )
         source_root = config.coding_source_root or Path(__file__).resolve().parents[1]
+        self.workspace_files = WorkspaceFileService(config.agent_root, source_root)
+        self.latex = LatexCompilationService(config)
+        self._latex_tasks: dict[str, asyncio.Task[None]] = {}
         if self.write_gate.state == MaintenanceState.RUNNING:
             self._reconcile_extension_grant_intents(source_root)
         self.runtime_plugins = RuntimePluginManager(
@@ -240,6 +258,10 @@ class GatewayApplication:
             store=self.store,
             state_controller=self.state_controller,
             runtime_resource_manager=self.runtime_plugins,
+            observer_context_provider=(
+                self.observer.state_store.coding_context_summary
+                if self.observer is not None else None
+            ),
         )
         self._harness_dream_tick_lock = asyncio.Lock()
 
@@ -265,6 +287,7 @@ class GatewayApplication:
             cron_terminal_callback=self._settle_cron_terminal,
             runtime_resource_manager=self.runtime_plugins,
             observer_service=self.observer,
+            workspace_event_callback=self.record_workspace_event,
         )
         self.recovery = RecoveryCoordinator(
             self.state_controller,
@@ -302,7 +325,7 @@ class GatewayApplication:
             ),
             write_gate=self.write_gate,
         )
-        self._browser_codes: dict[str, float] = {}
+        self._browser_codes: set[str] = set()
         self.code_sessions = CodeSessionManager(
             config,
             grant_backend=self.state_controller,
@@ -417,6 +440,31 @@ class GatewayApplication:
             model=selected.model,
             selected=is_selected,
             reasoning_effort=selected.reasoning_effort,
+            default_reasoning_effort=selected.reasoning_effort,
+            effective_reasoning_effort=selected.reasoning_effort,
+        )
+
+    def pending_approvals(self, project_id: str | None = None):
+        """Return durable pending approvals visible to an interactive client."""
+
+        allowed_runs = None
+        if project_id is not None:
+            self.store.project(project_id)
+            allowed_runs = {item.run_id for item in self.store.list_runs(project_id)}
+        approvals = self.state_controller.list_approvals(status="pending")
+        return tuple(
+            {
+                "approval_id": item.approval_id,
+                "run_id": item.run_id,
+                "client_id": item.client_id,
+                "tool_name": item.tool_name,
+                "arguments": json.loads(item.arguments_json or "{}"),
+                "state": item.status.value,
+                "created_at": item.created_at,
+                "expires_at": item.expires_at,
+            }
+            for item in approvals
+            if allowed_runs is None or item.run_id in allowed_runs
         )
 
     async def quiesce(self, timeout: float = 30, reason: str = "maintenance"):
@@ -814,6 +862,12 @@ class GatewayApplication:
 
     async def close(self) -> None:
         try:
+            latex_tasks = tuple(self._latex_tasks.values())
+            for task in latex_tasks:
+                task.cancel()
+            if latex_tasks:
+                await asyncio.gather(*latex_tasks, return_exceptions=True)
+            self._latex_tasks.clear()
             if self._database_maintenance_task is not None:
                 self._database_maintenance_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -870,6 +924,7 @@ class GatewayApplication:
 
     def extension_status(self, hook_id: str | None = None) -> dict[str, object]:
         self.extensions = self._active_extension_catalog()
+        tool_registry = self._interactive_tool_registry()
         modules = [
             module for selected in self.extensions.modules.values() for module in selected
             if hook_id is None or module.hook_id == hook_id
@@ -885,6 +940,11 @@ class GatewayApplication:
                     "manifest_hash": module.manifest_hash,
                     "requested_capabilities": [item.value for item in module.manifest.capabilities],
                     "requested_tools": list(module.manifest.allowed_tools),
+                    "tool_contract_hashes": {
+                        name: tool_registry.tool_contract_hash(name)
+                        for name in module.manifest.allowed_tools
+                        if name in tool_registry.names()
+                    },
                     "timeout_seconds": module.manifest.timeout_seconds,
                     "grant": self.state_controller.resolve_extension_grant(
                         module.hook_id, module.stage.value,
@@ -1159,7 +1219,7 @@ class GatewayApplication:
         approved_plan_hash: str | None = None,
     ):
         project_id = self._code_project(session_id)
-        return await self._run_code_workload(
+        result = await self._run_code_workload(
             WorkloadKind.CODE_FINALIZE,
             project_id,
             client_id,
@@ -1169,6 +1229,13 @@ class GatewayApplication:
                 run_id=run_id,
             ),
         )
+        if result.merged:
+            self.record_workspace_event(project_id, "workspace.file.changed", {
+                "path": "YYAgentSource:\\",
+                "source": "harness_merge",
+                "code_session_id": session_id,
+            })
+        return result
 
     @lifecycle_work("request")
     async def abort_code_session(self, session_id: str, client_id: str):
@@ -1179,6 +1246,17 @@ class GatewayApplication:
             client_id,
             "放弃 Coding Session",
             lambda _run_id: self.harness_manual_tool.abort(session_id, client_id),
+        )
+
+    @lifecycle_work("request")
+    async def delete_code_session(self, session_id: str, client_id: str):
+        project_id = self._code_project(session_id)
+        return await self._run_code_workload(
+            WorkloadKind.CODE_ABORT,
+            project_id,
+            client_id,
+            "删除 Coding Session",
+            lambda _run_id: self.code_sessions.delete(session_id, client_id),
         )
 
     async def _run_code_workload(self, kind, project_id, client_id, task, operation):
@@ -1223,6 +1301,17 @@ class GatewayApplication:
         )
         records = list(memory.session_records(session_id)) if memory.has_session(session_id) else []
         canonical = json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        session_summary = "\n".join(
+            f"{record.get('role')}: {str(record.get('content') or '')[:1000]}"
+            for record in records[-8:] if record.get("role") in {"user", "assistant"}
+        )
+        observer_summary = (
+            self.observer.state_store.coding_context_summary()
+            if self.observer is not None else ""
+        )
+        combined_summary = session_summary
+        if observer_summary:
+            combined_summary += "\n\nOther isolated coding Observer summaries:\n" + observer_summary
         return {
             "origin_project_id": project_id,
             "origin_session_id": session_id,
@@ -1231,10 +1320,7 @@ class GatewayApplication:
                 str(record["record_id"]) for record in records if record.get("record_id")
             ),
             "session_records_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-            "context_summary": str(AuditSanitizer.sanitize("\n".join(
-                f"{record.get('role')}: {str(record.get('content') or '')[:1000]}"
-                for record in records[-8:] if record.get("role") in {"user", "assistant"}
-            )[-6000:])),
+            "context_summary": str(AuditSanitizer.sanitize(combined_summary[-6000:])),
             "trigger_evidence": {"entry": "/code"},
         }
 
@@ -1281,11 +1367,22 @@ class GatewayApplication:
     def _code_project(self, session_id: str) -> str:
         owner = getattr(self.code_sessions, "owner", None)
         if callable(owner):
-            return str(owner(session_id)[0])
+            try:
+                return str(owner(session_id)[0])
+            except KeyError:
+                return str(self.code_sessions.summary(session_id)["project_id"])
         return "code"
 
     def code_session_events(self, session_id: str, after_sequence: int = 0):
         return self.code_sessions.events(session_id, after_sequence)
+
+    def code_session_summaries(
+        self, *, project_id: str | None = None, status: str | None = None,
+    ) -> list[dict]:
+        return self.code_sessions.summaries(project_id=project_id, status=status)
+
+    def code_session_summary(self, session_id: str) -> dict:
+        return self.code_sessions.summary(session_id)
 
     def register_project(self, path: Path, name: str | None = None) -> ProjectRecord:
         return self.store.register_project(path, name)
@@ -2204,7 +2301,30 @@ class GatewayApplication:
 
     @lifecycle_work("request")
     async def start_run(self, request: RunCreateRequest) -> RunRecord:
-        self.store.project(request.project_id)
+        project = self.store.project(request.project_id)
+        if (
+            request.ui_context is not None
+            and request.ui_context.source == "write"
+            and request.ui_context.resource is not None
+        ):
+            document = await self.workspace_files.read(
+                Path(project.path), request.ui_context.resource.logical_path or "",
+            )
+            if document["etag"] != request.ui_context.resource.content_hash:
+                raise WorkspaceFileConflict(document)
+        if (
+            request.ui_context is not None
+            and request.ui_context.source == "read"
+            and request.ui_context.resource is not None
+        ):
+            paper = self.reference_store.get_paper(
+                request.ui_context.resource.paper_id or "",
+            )
+            current_hashes = {item.sha256 for item in paper.files if item.is_primary}
+            if request.ui_context.resource.content_hash not in current_hashes:
+                raise RunUIContextConflict(
+                    "Paper content changed or is no longer available; refresh the reader selection",
+                )
         # Resolve before creating durable state. Unknown or malformed choices
         # cannot produce a queued Run that later fails during Runtime loading.
         selected_config = self.config.select_model_profile(
@@ -2220,6 +2340,8 @@ class GatewayApplication:
             "session_id": request.session_id,
             "deadline_at": request.deadline_at,
         }
+        if request.ui_context is not None:
+            request_identity["ui_context"] = request.ui_context.model_dump(mode="json")
         # Preserve the pre-switching request hash for the default profile so
         # an idempotent request accepted before an upgrade still reconciles.
         if request.model_profile_id != "default":
@@ -2246,6 +2368,10 @@ class GatewayApplication:
             runtime_generation_id=resource_snapshot.generation_id,
             model_profile_id=request.model_profile_id,
             reasoning_effort=selected_config.reasoning_effort,
+            ui_context=(
+                request.ui_context.model_dump(mode="json")
+                if request.ui_context is not None else None
+            ),
         )
         run = self.store.run(state.run_id)
         if duplicate:
@@ -2424,6 +2550,258 @@ class GatewayApplication:
             run_id, after_sequence=after_sequence,
         )
 
+    def stream_events(self, stream_id: str, after_sequence: int = 0):
+        return self.event_store.read_projection_stream(
+            stream_id, after_sequence=after_sequence,
+        )
+
+    def record_workspace_event(
+        self, project_id: str, event_type: str, payload: dict[str, object],
+    ):
+        event = self.state_controller.record_project_stream_event(
+            project_id=project_id,
+            stream_id=f"project:{project_id}:workspace",
+            event_type=event_type,
+            payload=payload,
+            command_id=uuid4().hex,
+        )
+        self.outbox.wake()
+        return event
+
+    @lifecycle_work("request")
+    async def start_latex_compilation(
+        self,
+        project_id: str,
+        request: LatexCompilationRequest,
+        *,
+        client_id: str,
+    ) -> LatexCompilationRecord:
+        project = self.store.project(project_id)
+        workspace_stream = f"project:{project_id}:workspace"
+        current_revision = self.event_store.max_sequence(workspace_stream)
+        if (
+            request.expected_tree_revision is not None
+            and request.expected_tree_revision != current_revision
+        ):
+            raise LatexWorkspaceRevisionConflict(
+                f"Workspace revision changed from {request.expected_tree_revision} "
+                f"to {current_revision}",
+            )
+        compilation_id = uuid4().hex
+        prepared = await self.latex.prepare(
+            Path(project.path), compilation_id, request.main_path, request.engine,
+        )
+        run_id: str | None = None
+        try:
+            run_id = uuid4().hex
+            state = self._begin_workload_run(
+                run_id=run_id,
+                workload=WorkloadKind.LATEX_COMPILATION,
+                project_id=project_id,
+                client_id=client_id,
+                task=f"Compile {request.main_path} with {prepared.engine}",
+            )
+            operation_id = hashlib.sha256(f"latex:{compilation_id}:operation".encode()).hexdigest()
+            attempt_id = hashlib.sha256(f"{operation_id}:attempt:1".encode()).hexdigest()
+            request_hash = hashlib.sha256(
+                request.model_dump_json().encode("utf-8"),
+            ).hexdigest()
+            state = self.state_controller.apply(CreateOperationWithAttemptCommand(
+                command_id=uuid4().hex,
+                run_id=run_id,
+                expected_revision=state.revision,
+                gateway_epoch=self.gateway_epoch,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                turn_id=state.turn_id,
+                kind=OperationKind.LATEX,
+                name="latex_compile",
+                stable_key=f"latex:{compilation_id}",
+                request_hash=request_hash,
+                idempotency=ToolIdempotency.IDEMPOTENT,
+                side_effecting=True,
+                external_idempotency_key=compilation_id,
+                retry_policy_snapshot=RetryPolicySnapshot(
+                    max_attempts=1,
+                    base_seconds=0,
+                    max_seconds=0,
+                    automatic=False,
+                    requires_reconcile=False,
+                    requires_human_confirmation=False,
+                ),
+            )).state
+            state = self.state_controller.apply(StartOperationAttemptCommand(
+                command_id=uuid4().hex,
+                run_id=run_id,
+                expected_revision=state.revision,
+                gateway_epoch=self.gateway_epoch,
+                attempt_id=attempt_id,
+            )).state
+            timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+            record = LatexCompilationRecord(
+                compilation_id=compilation_id,
+                project_id=project_id,
+                run_id=run_id,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                main_path=request.main_path,
+                engine=prepared.engine,
+                status="queued",
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            self.state_controller.create_latex_compilation(record.model_dump(mode="json"))
+            event = self.record_workspace_event(project_id, "latex.compilation.started", {
+                "compilation_id": compilation_id,
+                "main_path": request.main_path,
+                "engine": prepared.engine,
+            })
+            task = asyncio.create_task(
+                self._execute_latex_compilation(record, prepared),
+                name=f"latex-{compilation_id}",
+            )
+            self._latex_tasks[compilation_id] = task
+            task.add_done_callback(lambda _: self._latex_tasks.pop(compilation_id, None))
+            return record.model_copy(update={"updated_at": event.timestamp})
+        except BaseException as exc:
+            await self.latex.discard(prepared)
+            if run_id is not None:
+                target = TerminalTarget.CANCELLED if isinstance(exc, asyncio.CancelledError) else TerminalTarget.FAILED
+                try:
+                    await self._finish_workload(run_id, target, str(exc) or type(exc).__name__)
+                except Exception:
+                    pass
+            raise
+
+    async def _execute_latex_compilation(self, record, prepared) -> None:
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        running = record.model_copy(update={"status": "running", "updated_at": timestamp})
+        self.state_controller.update_latex_compilation(
+            record.compilation_id, running.model_dump(mode="json"),
+        )
+        self.record_workspace_event(record.project_id, "latex.compilation.progress", {
+            "compilation_id": record.compilation_id, "status": "running",
+        })
+        try:
+            result = await self.latex.execute(prepared, record.compilation_id)
+            current = self.state_controller.state(record.run_id)
+            canonical = json.dumps({
+                "compilation_id": record.compilation_id,
+                "diagnostics": result.diagnostics,
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            self.state_controller.apply(CompleteOperationAttemptCommand(
+                command_id=uuid4().hex,
+                run_id=record.run_id,
+                expected_revision=current.revision,
+                gateway_epoch=self.gateway_epoch,
+                attempt_id=record.attempt_id,
+                result=canonical,
+                result_hash=hashlib.sha256(canonical.encode()).hexdigest(),
+                result_source="latex_sandbox",
+            ))
+            completed = running.model_copy(update={
+                "status": "completed",
+                "diagnostics": result.diagnostics,
+                "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            })
+            self.state_controller.update_latex_compilation(
+                record.compilation_id,
+                completed.model_dump(mode="json"),
+                artifact_root=str(result.artifact_root),
+            )
+            self.record_workspace_event(record.project_id, "latex.compilation.completed", {
+                "compilation_id": record.compilation_id,
+                "diagnostics": result.diagnostics,
+            })
+            await self._finish_workload(
+                record.run_id, TerminalTarget.SUCCEEDED, "LaTeX compilation completed",
+            )
+        except asyncio.CancelledError:
+            attempt = self.state_controller.current_attempt(record.operation_id)
+            if attempt.status is OperationStatus.COMPLETED:
+                await self._finish_workload(
+                    record.run_id, TerminalTarget.SUCCEEDED,
+                    "LaTeX compilation completed before cancellation was observed",
+                )
+                return
+            current = self.state_controller.state(record.run_id)
+            self.state_controller.apply(AbandonOperationAttemptCommand(
+                command_id=uuid4().hex,
+                run_id=record.run_id,
+                expected_revision=current.revision,
+                gateway_epoch=self.gateway_epoch,
+                attempt_id=record.attempt_id,
+                abandonment_reason="LaTeX compilation cancelled by client",
+            ))
+            cancelled = running.model_copy(update={
+                "status": "cancelled", "error": "Compilation cancelled",
+                "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            })
+            self.state_controller.update_latex_compilation(
+                record.compilation_id, cancelled.model_dump(mode="json"),
+            )
+            await self._finish_workload(
+                record.run_id, TerminalTarget.CANCELLED, "LaTeX compilation cancelled",
+            )
+            raise
+        except Exception as exc:
+            message = str(exc) or type(exc).__name__
+            current = self.state_controller.state(record.run_id)
+            self.state_controller.apply(FailOperationAttemptCommand(
+                command_id=uuid4().hex,
+                run_id=record.run_id,
+                expected_revision=current.revision,
+                gateway_epoch=self.gateway_epoch,
+                attempt_id=record.attempt_id,
+                failure_kind=OperationFailureKind.TERMINAL,
+                failure_reason=message,
+            ))
+            diagnostics = (
+                exc.diagnostics
+                if isinstance(exc, LatexExecutionError)
+                else self.latex.parse_diagnostics(message)
+            )
+            failed = running.model_copy(update={
+                "status": "failed", "error": message,
+                "diagnostics": diagnostics,
+                "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            })
+            self.state_controller.update_latex_compilation(
+                record.compilation_id, failed.model_dump(mode="json"),
+                artifact_root=(
+                    str(exc.artifact_root)
+                    if isinstance(exc, LatexExecutionError) else None
+                ),
+            )
+            self.record_workspace_event(record.project_id, "latex.compilation.failed", {
+                "compilation_id": record.compilation_id,
+                "message": message,
+                "diagnostics": diagnostics,
+            })
+            await self._finish_workload(record.run_id, TerminalTarget.FAILED, message)
+
+    def latex_compilation(self, compilation_id: str) -> LatexCompilationRecord:
+        record, _ = self.state_controller.latex_compilation(compilation_id)
+        return LatexCompilationRecord.model_validate(record, strict=True)
+
+    def latex_artifact(self, compilation_id: str, name: str) -> Path:
+        record, artifact_root = self.state_controller.latex_compilation(compilation_id)
+        if not artifact_root or (name == "pdf" and record["status"] != "completed"):
+            raise FileNotFoundError(compilation_id)
+        filename = {"log": "compile.log", "pdf": "output.pdf"}[name]
+        selected = (Path(artifact_root) / filename).resolve()
+        if not selected.is_file() or selected.parent != Path(artifact_root).resolve():
+            raise FileNotFoundError(compilation_id)
+        return selected
+
+    async def cancel_latex_compilation(self, compilation_id: str) -> LatexCompilationRecord:
+        task = self._latex_tasks.get(compilation_id)
+        if task is None or task.done():
+            return self.latex_compilation(compilation_id)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return self.latex_compilation(compilation_id)
+
     async def decide_approval(self, approval_id: str, decision: ApprovalDecision) -> bool:
         approval = self.state_controller.approval(approval_id)
         with self.write_gate.existing_work_control(approval.run_id):
@@ -2512,18 +2890,13 @@ class GatewayApplication:
         ))
         return result
 
-    def issue_browser_code(self, ttl_seconds: int = 60) -> str:
-        now = monotonic()
-        self._browser_codes = {
-            code: expires for code, expires in self._browser_codes.items() if expires > now
-        }
+    def issue_browser_code(self) -> str:
         code = secrets.token_urlsafe(32)
-        self._browser_codes[code] = now + ttl_seconds
+        self._browser_codes.add(code)
         return code
 
     def consume_browser_code(self, code: str) -> bool:
-        expires = self._browser_codes.pop(code, None)
-        return expires is not None and expires > monotonic()
+        return code in self._browser_codes
 
 
 def _now() -> str:

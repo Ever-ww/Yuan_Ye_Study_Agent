@@ -457,8 +457,12 @@ def _audit(event: HookEvent) -> dict[str, object]:
     value = event.data.get("durable_audit")
     if not isinstance(value, dict):
         return {}
-    return {
+    audit = {
         key: selected
         for key in ("run_id", "turn_id", "operation_id")
         if isinstance((selected := value.get(key)), str) and selected
     }
+    ui_context = event.data.get("ui_context")
+    if isinstance(ui_context, dict):
+        audit["ui_context"] = ui_context
+    return audit

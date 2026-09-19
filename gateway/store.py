@@ -7,6 +7,7 @@ project/client metadata and read-only Run/Inbox projections.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from backup.maintenance import lifecycle_mutation
@@ -53,7 +54,8 @@ class GatewayStore:
                     run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, session_id TEXT,
                     client_id TEXT NOT NULL, task TEXT NOT NULL, status TEXT NOT NULL,
                     created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
-                    answer TEXT, error TEXT, reasoning_effort TEXT NOT NULL DEFAULT 'none'
+                    answer TEXT, error TEXT, reasoning_effort TEXT NOT NULL DEFAULT 'none',
+                    ui_context_json TEXT
                 );
                 CREATE TABLE IF NOT EXISTS inbox (
                     item_id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE,
@@ -73,6 +75,10 @@ class GatewayStore:
                     client_id TEXT PRIMARY KEY, connected_at TEXT NOT NULL,
                     last_seen_at TEXT NOT NULL, disconnected_at TEXT
                 );
+                CREATE INDEX IF NOT EXISTS inbox_created_at_idx
+                    ON inbox(created_at DESC, item_id DESC);
+                CREATE INDEX IF NOT EXISTS inbox_project_read_created_idx
+                    ON inbox(project_id, is_read, created_at DESC);
                 """
             )
             self._ensure_run_columns(connection)
@@ -156,14 +162,59 @@ class GatewayStore:
             ).fetchall()
         return {str(row["session_id"]) for row in rows}
 
-    def list_inbox(self, *, unread_only: bool = False) -> list[InboxItem]:
-        query = "SELECT * FROM inbox"
+    def list_inbox(
+        self, *, unread_only: bool = False, cursor: str | None = None,
+        limit: int | None = None, read: bool | None = None,
+        status: str | None = None, source: str | None = None,
+        project_id: str | None = None,
+    ) -> list[InboxItem]:
+        conditions: list[str] = []
+        parameters: list[object] = []
         if unread_only:
-            query += " WHERE is_read=0"
-        query += " ORDER BY created_at DESC"
+            conditions.append("inbox.is_read=0")
+        elif read is not None:
+            conditions.append("inbox.is_read=?")
+            parameters.append(int(read))
+        if status is not None:
+            conditions.append("inbox.status=?")
+            parameters.append(status)
+        if project_id is not None:
+            conditions.append("inbox.project_id=?")
+            parameters.append(project_id)
+        if source is not None:
+            conditions.append(
+                "(runs.client_id=? OR runs.client_id LIKE ? OR runs.workload_kind=?)"
+            )
+            parameters.extend((source, f"{source}:%", source))
+        if cursor is not None:
+            conditions.append(
+                "(inbox.created_at, inbox.item_id) < "
+                "(SELECT created_at, item_id FROM inbox WHERE item_id=?)"
+            )
+            parameters.append(cursor)
+        query = "SELECT inbox.* FROM inbox JOIN runs ON runs.run_id=inbox.run_id"
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY inbox.created_at DESC, inbox.item_id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters.append(limit)
         with self._connect() as connection:
-            rows = connection.execute(query).fetchall()
+            if cursor is not None and connection.execute(
+                "SELECT 1 FROM inbox WHERE item_id=?", (cursor,),
+            ).fetchone() is None:
+                raise KeyError(f"Unknown Inbox cursor: {cursor}")
+            rows = connection.execute(query, tuple(parameters)).fetchall()
         return [_inbox_item(row) for row in rows]
+
+    def inbox_item(self, item_id: str) -> InboxItem:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM inbox WHERE item_id=?", (item_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown Inbox item: {item_id}")
+        return _inbox_item(row)
 
     @lifecycle_mutation
     def mark_inbox_read(self, item_id: str) -> InboxItem:
@@ -173,6 +224,17 @@ class GatewayStore:
         if cursor.rowcount == 0 or row is None:
             raise KeyError(f"Unknown Inbox item: {item_id}")
         return _inbox_item(row)
+
+    @lifecycle_mutation
+    def mark_all_inbox_read(self, *, project_id: str | None = None) -> int:
+        query = "UPDATE inbox SET is_read=1 WHERE is_read=0"
+        parameters: tuple[str, ...] = ()
+        if project_id is not None:
+            query += " AND project_id=?"
+            parameters = (project_id,)
+        with self._connect() as connection:
+            cursor = connection.execute(query, parameters)
+        return int(cursor.rowcount)
 
     @lifecycle_mutation
     def mark_run_inbox_read(self, run_id: str) -> InboxItem | None:
@@ -257,6 +319,7 @@ class GatewayStore:
             "recovery_required": "INTEGER NOT NULL DEFAULT 0", "terminal_target": "TEXT",
             "model_profile_id": "TEXT NOT NULL DEFAULT 'default'",
             "reasoning_effort": "TEXT NOT NULL DEFAULT 'none'",
+            "ui_context_json": "TEXT",
         }
         for name, declaration in additions.items():
             if name not in columns:
@@ -272,6 +335,8 @@ def _run_record(row: sqlite3.Row) -> RunRecord:
     payload = dict(row)
     if "recovery_required" in payload:
         payload["recovery_required"] = bool(payload["recovery_required"])
+    raw_ui_context = payload.pop("ui_context_json", None)
+    payload["ui_context"] = json.loads(raw_ui_context) if raw_ui_context else None
     return RunRecord(**payload)
 
 

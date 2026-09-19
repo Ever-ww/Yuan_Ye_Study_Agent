@@ -5,12 +5,15 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 RunStatus = Literal["queued", "running", "completed", "failed", "cancelled", "interrupted"]
 ApprovalState = Literal["pending", "approved", "denied"]
 ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
+REASONING_EFFORTS: tuple[ReasoningEffort, ...] = (
+    "none", "low", "medium", "high", "xhigh", "max",
+)
 
 
 class GatewayEventEnvelope(BaseModel):
@@ -18,13 +21,13 @@ class GatewayEventEnvelope(BaseModel):
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
-    version: Literal[1, 2] = 1
+    version: Literal[1, 2, 3] = 1
     event_id: str = Field(min_length=1)
     sequence: int = Field(ge=1)
     timestamp: str = Field(min_length=1)
     project_id: str = Field(min_length=1)
     session_id: str | None = None
-    run_id: str = Field(min_length=1)
+    run_id: str | None = None
     type: str = Field(min_length=1)
     payload: dict[str, Any] = Field(default_factory=dict)
     # v2 canonical identity/contract fields. 旧 v1 JSON 没有这些字段，读取时
@@ -78,6 +81,7 @@ class RunRecord(BaseModel):
     terminal_target: str | None = None
     model_profile_id: str = "default"
     reasoning_effort: ReasoningEffort = "none"
+    ui_context: dict[str, Any] | None = None
 
 
 class InboxItem(BaseModel):
@@ -127,6 +131,12 @@ class ProjectCreateRequest(BaseModel):
     name: str | None = None
 
 
+class PaperPatchRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    status: Literal["active", "archived"]
+
+
 class RunCreateRequest(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
@@ -138,6 +148,73 @@ class RunCreateRequest(BaseModel):
     deadline_at: str | None = None
     model_profile_id: str = Field(default="default", min_length=1, max_length=80)
     reasoning_effort: ReasoningEffort | None = None
+    ui_context: "RunUIContext | None" = None
+
+
+class UIResourceContext(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    kind: Literal["paper", "workspace_file"]
+    paper_id: str | None = Field(default=None, min_length=1)
+    logical_path: str | None = Field(default=None, min_length=1, max_length=4096)
+    content_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_resource(self) -> "UIResourceContext":
+        if self.kind == "paper":
+            if not self.paper_id or self.logical_path is not None or self.content_hash is None:
+                raise ValueError("Paper UI context requires paper_id and content hash")
+        elif (
+            self.paper_id is not None
+            or not self.logical_path
+            or not self.logical_path.casefold().startswith("yyworkspace:\\")
+            or self.content_hash is None
+        ):
+            raise ValueError(
+                "Workspace UI context requires a YYWorkspace logical path and content hash",
+            )
+        return self
+
+
+class UISelectionContext(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    selected_text: str = Field(default="", max_length=20_000)
+    page: int | None = Field(default=None, ge=1)
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_lines(self) -> "UISelectionContext":
+        if (self.start_line is None) != (self.end_line is None):
+            raise ValueError("Selection line range requires both start_line and end_line")
+        if self.start_line is not None and self.end_line is not None and self.end_line < self.start_line:
+            raise ValueError("Selection end_line must not precede start_line")
+        return self
+
+
+class RunUIContext(BaseModel):
+    """Structured, non-tool UI context frozen with one interactive Turn."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    source: Literal["agent", "read", "write"] = "agent"
+    resource: UIResourceContext | None = None
+    selection: UISelectionContext | None = None
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "RunUIContext":
+        if self.source == "agent" and (self.resource is not None or self.selection is not None):
+            raise ValueError("Agent UI context cannot contain a resource selection")
+        if self.source == "read" and (self.resource is None or self.selection is None):
+            raise ValueError("Read UI context requires a paper resource and selection")
+        if self.source == "read" and self.resource is not None and self.resource.kind != "paper":
+            raise ValueError("Read UI context requires a paper resource")
+        if self.source == "write" and (
+            self.resource is None or self.resource.kind != "workspace_file"
+        ):
+            raise ValueError("Write UI context requires a workspace_file resource")
+        return self
 
 
 class ModelOption(BaseModel):
@@ -150,6 +227,65 @@ class ModelOption(BaseModel):
     model: str = Field(min_length=1)
     selected: bool = False
     reasoning_effort: ReasoningEffort = "low"
+    supported_reasoning_efforts: tuple[ReasoningEffort, ...] = REASONING_EFFORTS
+    default_reasoning_effort: ReasoningEffort = "low"
+    effective_reasoning_effort: ReasoningEffort = "low"
+
+    @field_validator("supported_reasoning_efforts", mode="before")
+    @classmethod
+    def normalize_supported_reasoning_efforts(cls, value: object) -> object:
+        # JSON has no tuple type, so the Gateway wire response is necessarily
+        # decoded as a list. Keep the public model immutable after validation.
+        if isinstance(value, list):
+            return tuple(value)
+        return value
+
+
+class WorkspaceFileWriteRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    path: str = Field(min_length=1, max_length=4096)
+    content: str = Field(max_length=5 * 1024 * 1024)
+    expected_etag: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class WorkspaceEntryCreateRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    path: str = Field(min_length=1, max_length=4096)
+    kind: Literal["file", "directory"]
+
+
+class WorkspaceMoveRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    source: str = Field(min_length=1, max_length=4096)
+    destination: str = Field(min_length=1, max_length=4096)
+
+
+class LatexCompilationRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    main_path: str = Field(min_length=1, max_length=4096)
+    engine: Literal["auto", "tectonic", "xelatex"] = "auto"
+    expected_tree_revision: int | None = Field(default=None, ge=0)
+
+
+class LatexCompilationRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    compilation_id: str = Field(min_length=1)
+    project_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    operation_id: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1)
+    main_path: str = Field(min_length=1)
+    engine: Literal["tectonic", "xelatex"]
+    status: Literal["queued", "running", "completed", "failed", "cancelled", "interrupted"]
+    diagnostics: tuple[dict[str, Any], ...] = ()
+    error: str | None = None
+    created_at: str = Field(min_length=1)
+    updated_at: str = Field(min_length=1)
 
 
 class RecoveryDecisionRequest(BaseModel):

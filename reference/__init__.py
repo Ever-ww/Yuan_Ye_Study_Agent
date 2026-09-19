@@ -8,6 +8,9 @@ from .models import (
     Paper,
     PaperFile,
     PaperIdentifier,
+    PaperNote,
+    PaperNoteCreate,
+    PaperNoteUpdate,
     PaperUpsert,
     ReferenceSearchHit,
     ReferenceSearchRequest,
@@ -29,7 +32,8 @@ from .factory import build_embedding_provider
 
 __all__ = [
     "Author", "CitationExample", "CitationExampleCreate", "EmbeddingJob", "Paper",
-    "PaperFile", "PaperIdentifier", "PaperUpsert", "ReferenceSearchHit",
+    "PaperFile", "PaperIdentifier", "PaperNote", "PaperNoteCreate", "PaperNoteUpdate",
+    "PaperUpsert", "ReferenceSearchHit",
     "ReferenceSearchRequest", "ReferenceSearchResult", "ReferenceStore", "ReferenceService",
     "SourcePassage", "SourcePassageCreate",
     "EmbeddingProvider", "OpenAIEmbeddingProvider", "ReferenceEmbeddingWorker",

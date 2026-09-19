@@ -50,6 +50,7 @@ from backup.maintenance import lifecycle_work
 
 RuntimeFactory = Callable[[Path, GatewayApprovalBroker], AgentRuntime]
 CronTerminalCallback = Callable[[RunRecord], Awaitable[None]]
+WorkspaceEventCallback = Callable[[str, str, dict[str, object]], object]
 
 
 @dataclass
@@ -91,6 +92,7 @@ class RuntimePool:
         cron_terminal_callback: CronTerminalCallback | None = None,
         runtime_resource_manager=None,
         observer_service=None,
+        workspace_event_callback: WorkspaceEventCallback | None = None,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.store = store
@@ -131,6 +133,7 @@ class RuntimePool:
         self.cron_terminal_callback = cron_terminal_callback
         self.runtime_resource_manager = runtime_resource_manager
         self.observer_service = observer_service
+        self.workspace_event_callback = workspace_event_callback
         self._pending_profile_refresh: set[tuple[str, str]] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._observer_tasks: set[asyncio.Task[None]] = set()
@@ -515,11 +518,15 @@ class RuntimePool:
                 )
                 token = self.approvals.bind_run(current.run_id, current.client_id)
                 try:
+                    bind_turn_ui_context = getattr(runtime, "bind_turn_ui_context", None)
+                    if callable(bind_turn_ui_context):
+                        bind_turn_ui_context(current.ui_context)
                     pending_stream_parts: list[str] = []
                     pending_stream_payload: dict[str, object] | None = None
                     pending_stream_type: EventType | None = None
                     pending_stream_length = 0
                     last_stream_flush = monotonic()
+                    tool_requests: dict[str, tuple[str, dict[str, object]]] = {}
 
                     async def flush_stream() -> None:
                         nonlocal pending_stream_payload, pending_stream_type
@@ -607,6 +614,25 @@ class RuntimePool:
                             event.type.value,
                             dict(event.payload),
                         )
+                        if event.type is EventType.TOOL_REQUESTED:
+                            tool_call_id = str(event.payload.get("tool_call_id", ""))
+                            arguments = event.payload.get("arguments")
+                            if tool_call_id and isinstance(arguments, dict):
+                                tool_requests[tool_call_id] = (
+                                    str(event.payload.get("name", "")), dict(arguments),
+                                )
+                        elif (
+                            event.type is EventType.TOOL_COMPLETED
+                            and event.payload.get("status") == "success"
+                            and self.workspace_event_callback is not None
+                        ):
+                            tool_call_id = str(event.payload.get("tool_call_id", ""))
+                            requested = tool_requests.pop(tool_call_id, None)
+                            if requested is not None:
+                                self._record_tool_workspace_events(
+                                    current, requested[0], requested[1],
+                                    str(event.payload.get("content", "")),
+                                )
                     await flush_stream()
                     await self._finish_run(current.run_id, ExecutionOutcome.SUCCESS, answer or "任务完成")
                     current = self.store.run(current.run_id)
@@ -693,6 +719,38 @@ class RuntimePool:
                             entry.runtime.invalidate_context_cache()
                         self._pending_profile_refresh.discard(session_key)
             self._tasks.pop(original.run_id, None)
+
+    def _record_tool_workspace_events(
+        self, run: RunRecord, name: str, arguments: dict[str, object], result: str,
+    ) -> None:
+        callback = self.workspace_event_callback
+        if callback is None or "未变化" in result or "无文件变化" in result:
+            return
+        paths: list[str] = []
+        source = "agent_tool"
+        if name in {"write", "edit"} and isinstance(arguments.get("path"), str):
+            paths = [str(arguments["path"])]
+        elif name == "bash":
+            requested = arguments.get("writable_paths")
+            paths = (
+                [str(item) for item in requested if isinstance(item, str)]
+                if isinstance(requested, list) else ["YYWorkspace:\\"]
+            )
+        elif name == "sandbox_rollback":
+            paths = ["YYWorkspace:\\"]
+            source = "checkpoint_restore"
+        for path in paths:
+            try:
+                callback(run.project_id, "workspace.file.changed", {
+                    "path": path,
+                    "source": source,
+                    "run_id": run.run_id,
+                    "tool": name,
+                })
+            except Exception:
+                # The Tool result is already durable. Projection notification
+                # failure must not replay an external side effect.
+                continue
 
     async def _transition(
         self,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from typing import Any, Literal, Mapping
 from uuid import uuid4
@@ -468,6 +469,7 @@ class AgentRuntime:
         self._session_id: str | None = None
         self._session_open = False
         self._sandbox_fallback_notified: set[str] = set()
+        self._next_turn_ui_context: dict[str, object] | None = None
 
     @property
     def active_session_id(self) -> str | None:
@@ -567,9 +569,15 @@ class AgentRuntime:
         if self._extension_services is not None:
             self._extension_services.tool_context = self.tool_context
 
+    def bind_turn_ui_context(self, ui_context: dict[str, object] | None) -> None:
+        """Freeze one Gateway-owned UI context for the next Turn only."""
+        self._next_turn_ui_context = dict(ui_context) if ui_context is not None else None
+
     async def run_task(self, task: str, session_id: str | None = None) -> AsyncIterator[RunEvent]:
         """处理一次用户输入；一个 Turn 覆盖完整的用户任务。"""
         self.last_failure = None
+        ui_context = self._next_turn_ui_context
+        self._next_turn_ui_context = None
         if task.strip() == "/compress":
             async for event in self._compress_command(session_id):
                 yield event
@@ -640,9 +648,22 @@ class AgentRuntime:
         )
         final_payload: dict[str, object] | None = None
         failure: BaseException | None = None
+        dynamic = getattr(self.prompts, "dynamic_context", None)
+        fragments = getattr(dynamic, "fragments", None)
+        if ui_context is not None and fragments is not None:
+            fragments.set(
+                active_id,
+                "ui_context",
+                '<ui_context ephemeral="true">\n'
+                + json.dumps(ui_context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                + "\n</ui_context>",
+            )
         try:
             turn_tool_context = self.tool_context.model_copy(update={"session_id": active_id})
-            async for event in loop.run(messages, turn_tool_context, task=task, session_id=active_id, model=model):
+            async for event in loop.run(
+                messages, turn_tool_context, task=task, session_id=active_id, model=model,
+                turn_metadata={"ui_context": ui_context} if ui_context is not None else None,
+            ):
                 if event.type is EventType.FINAL:
                     final_payload = dict(event.payload)
                 yield event
@@ -668,6 +689,8 @@ class AgentRuntime:
                 if final_payload is not None:
                     payload.update(final_payload)
                 await self.hooks.emit(HookEvent(point=HookPoint.TURN_END, session_id=active_id, data=payload))
+            if fragments is not None:
+                fragments.remove(active_id, "ui_context")
 
     async def _refresh_context_command(self, session_id: str | None) -> AsyncIterator[RunEvent]:
         """显式重新读取当前 Session 的文件上下文，不写入 JSONL。"""

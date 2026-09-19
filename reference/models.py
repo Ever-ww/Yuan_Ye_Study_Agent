@@ -160,6 +160,34 @@ class ReferenceSearchResult(ReferenceModel):
     semantic_results: tuple[ReferenceSearchHit, ...] = ()
 
 
+class PaperNote(ReferenceModel):
+    note_id: str
+    paper_id: str
+    page: int | None = Field(default=None, ge=1)
+    selected_text: str = ""
+    selected_text_hash: str
+    locator: dict[str, Any] = Field(default_factory=dict)
+    note_markdown: str
+    revision: int = Field(ge=1)
+    created_at: str
+    updated_at: str
+
+
+class PaperNoteCreate(ReferenceModel):
+    page: int | None = Field(default=None, ge=1)
+    selected_text: str = Field(default="", max_length=20_000)
+    locator: dict[str, Any] = Field(default_factory=dict)
+    note_markdown: str = Field(min_length=1, max_length=100_000)
+
+
+class PaperNoteUpdate(ReferenceModel):
+    expected_revision: int = Field(ge=1)
+    page: int | None = Field(default=None, ge=1)
+    selected_text: str = Field(default="", max_length=20_000)
+    locator: dict[str, Any] = Field(default_factory=dict)
+    note_markdown: str = Field(min_length=1, max_length=100_000)
+
+
 class EmbeddingJob(ReferenceModel):
     job_id: str
     document_id: str

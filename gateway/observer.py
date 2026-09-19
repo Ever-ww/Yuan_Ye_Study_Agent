@@ -561,6 +561,28 @@ class ObserverStateStore:
                 for row in connection.execute(sql).fetchall()
             )
 
+    def coding_context_summary(self, *, limit: int = 12) -> str:
+        """Return a bounded, visible-only summary for a new isolated coding session."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT evidence_json FROM observer_evidence "
+                "WHERE runtime_profile LIKE 'harness:%' "
+                "ORDER BY finalized_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        items: list[str] = []
+        for row in reversed(rows):
+            evidence = ObserverEvidence.model_validate_json(
+                row["evidence_json"], strict=True,
+            )
+            completed = "; ".join(evidence.completed_tasks[-5:])
+            summary = completed or evidence.visible_execution_summary or "no visible result"
+            items.append(
+                f"[{evidence.runtime_profile}/{evidence.trigger}] "
+                f"{evidence.user_problem[:500]} -> {summary[:1000]}"
+            )
+        return "\n".join(items)[-6000:]
+
     def create_skill_candidates(self, *, minimum_evidence: int = 3) -> tuple[dict[str, Any], ...]:
         evidence = self.finalized_evidence(unconsumed_only=True)
         grouped: dict[tuple[str, str], list[ObserverEvidence]] = {}

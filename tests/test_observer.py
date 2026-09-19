@@ -13,7 +13,7 @@ import pytest
 from Agent.config import load_runtime_config
 from Agent.contracts import ModelReply
 from Agent.observer import (
-    IntentAlignment, IntentAlignmentStatus, ObserverState,
+    IntentAlignment, IntentAlignmentStatus, ObserverEvidence, ObserverState,
     render_observer_progress,
 )
 from backup.maintenance import AgentHomeWriteGate, MaintenanceBlockedError
@@ -185,6 +185,34 @@ def test_terminal_event_finalizes_profile_scoped_evidence(tmp_path: Path) -> Non
     # Evidence is durable Observer state, not another item appended after the
     # normal Run terminal event in the chat timeline.
     assert outputs == ()
+
+
+def test_coding_context_uses_only_bounded_harness_evidence(tmp_path: Path) -> None:
+    _, _, _, state, observer_store, _ = _setup(tmp_path)
+    evidence = ObserverEvidence(
+        evidence_id="evidence-code", run_id=state.run_id, generation_id="generation",
+        observer_plugin_id="observer", observer_plugin_version="1",
+        state_schema_version=1, runtime_role="harness", agent_role="harness:manual",
+        runtime_profile="harness:manual", trigger="manual",
+        user_problem="修复命令面板", completed_tasks=("已补充搜索输入",),
+        visible_execution_summary="已补充搜索输入", final_intent_alignment=IntentAlignment(),
+        finalized_at="2026-09-19T00:00:00+08:00",
+    )
+    with observer_store._write_connection() as connection:
+        connection.execute(
+            "INSERT INTO observer_evidence(evidence_id,run_id,runtime_profile,trigger_name,"
+            "evidence_json,finalized_at) VALUES(?,?,?,?,?,?)",
+            (
+                evidence.evidence_id, evidence.run_id, evidence.runtime_profile,
+                evidence.trigger, evidence.model_dump_json(), evidence.finalized_at,
+            ),
+        )
+
+    summary = observer_store.coding_context_summary()
+
+    assert "修复命令面板" in summary
+    assert "已补充搜索输入" in summary
+    assert "harness:manual/manual" in summary
 
 
 def test_streaming_text_is_evidence_not_an_observer_model_milestone(tmp_path: Path) -> None:

@@ -19,6 +19,8 @@ from reference import (
     OpenAIEmbeddingProvider,
     PaperFile,
     PaperIdentifier,
+    PaperNoteCreate,
+    PaperNoteUpdate,
     PaperUpsert,
     ReferenceSearchRequest,
     ReferenceEmbeddingWorker,
@@ -40,6 +42,29 @@ class FakeEmbeddingProvider:
 
 
 class ReferenceTests(unittest.TestCase):
+    def test_paper_notes_use_revision_cas_in_reference_database(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            store = ReferenceStore(Path(value) / "reference.sqlite3")
+            paper = store.upsert_paper(PaperUpsert(title="Annotated Paper"))
+            note = store.create_note(paper.paper_id, PaperNoteCreate(
+                page=7, selected_text="important result",
+                locator={"page": 7, "rect": [1, 2, 3, 4]},
+                note_markdown="Initial note",
+            ))
+            self.assertEqual(note.revision, 1)
+            self.assertEqual(len(store.list_notes(paper.paper_id)), 1)
+            updated = store.update_note(paper.paper_id, note.note_id, PaperNoteUpdate(
+                expected_revision=1, page=7, selected_text="important result",
+                locator={"page": 7}, note_markdown="Revised note",
+            ))
+            self.assertEqual(updated.revision, 2)
+            with self.assertRaisesRegex(RuntimeError, "note_conflict:2"):
+                store.update_note(paper.paper_id, note.note_id, PaperNoteUpdate(
+                    expected_revision=1, page=7, selected_text="stale",
+                    note_markdown="Stale update",
+                ))
+            self.assertTrue(store.delete_note(paper.paper_id, note.note_id))
+
     def test_v1_papers_schema_is_backed_up_and_migrated(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             database = Path(value) / "reference.sqlite3"
@@ -78,7 +103,7 @@ class ReferenceTests(unittest.TestCase):
                 connection.close()
             self.assertIn("source_session_id", columns)
             self.assertIn("source_workspace", columns)
-            self.assertEqual(version, 2)
+            self.assertEqual(version, 3)
             self.assertIsNotNone(store.migration_backup_path)
             self.assertTrue(store.migration_backup_path.is_file())
             self.assertEqual(store.get_paper("legacy").title, "Legacy Paper")
@@ -102,7 +127,7 @@ class ReferenceTests(unittest.TestCase):
             self.assertEqual(ReferenceStore(database).get_paper(paper.paper_id).title, "Preserved")
             connection = sqlite3.connect(database)
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
             finally:
                 connection.close()
 

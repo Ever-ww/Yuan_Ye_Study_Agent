@@ -20,6 +20,9 @@ from .models import (
     Paper,
     PaperFile,
     PaperIdentifier,
+    PaperNote,
+    PaperNoteCreate,
+    PaperNoteUpdate,
     PaperUpsert,
     ReferenceSearchHit,
     ReferenceSearchRequest,
@@ -28,7 +31,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def now_iso() -> str:
@@ -300,6 +303,93 @@ class ReferenceStore:
             identifiers=identifiers, authors=authors, files=files, tags=tags,
             source_session_id=row["source_session_id"], source_workspace=row["source_workspace"],
             created_at=row["created_at"], updated_at=row["updated_at"],
+        )
+
+    def list_papers(
+        self, *, include_archived: bool = False, cursor: str | None = None, limit: int = 100,
+    ) -> tuple[Paper, ...]:
+        if limit < 1 or limit > 200:
+            raise ValueError("Paper list limit must be between 1 and 200")
+        query = "SELECT paper_id FROM papers"
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if not include_archived:
+            conditions.append("status='active'")
+        if cursor:
+            conditions.append("paper_id>?")
+            parameters.append(cursor)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY paper_id LIMIT ?"
+        parameters.append(limit)
+        with self._connect() as connection:
+            ids = [str(row[0]) for row in connection.execute(query, tuple(parameters))]
+        return tuple(self.get_paper(paper_id) for paper_id in ids)
+
+    def list_notes(self, paper_id: str) -> tuple[PaperNote, ...]:
+        with self._connect() as connection:
+            self._require_paper(connection, paper_id)
+            rows = connection.execute(
+                "SELECT * FROM paper_notes WHERE paper_id=? ORDER BY page,created_at", (paper_id,),
+            ).fetchall()
+        return tuple(self._paper_note(row) for row in rows)
+
+    def create_note(self, paper_id: str, value: PaperNoteCreate) -> PaperNote:
+        timestamp = now_iso()
+        note_id = uuid4().hex
+        selected_hash = hashlib.sha256(value.selected_text.encode("utf-8")).hexdigest()
+        with self._lock, self._connect() as connection:
+            self._require_paper(connection, paper_id)
+            connection.execute(
+                "INSERT INTO paper_notes VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (note_id, paper_id, value.page, value.selected_text, selected_hash,
+                 _json(value.locator), value.note_markdown, 1, timestamp, timestamp),
+            )
+        return self.note(note_id)
+
+    def note(self, note_id: str) -> PaperNote:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM paper_notes WHERE note_id=?", (note_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown paper note: {note_id}")
+        return self._paper_note(row)
+
+    def update_note(self, paper_id: str, note_id: str, value: PaperNoteUpdate) -> PaperNote:
+        selected_hash = hashlib.sha256(value.selected_text.encode("utf-8")).hexdigest()
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE paper_notes SET page=?,selected_text=?,selected_text_hash=?,locator_json=?,"
+                "note_markdown=?,revision=revision+1,updated_at=? WHERE note_id=? AND paper_id=? AND revision=?",
+                (value.page, value.selected_text, selected_hash, _json(value.locator),
+                 value.note_markdown, now_iso(), note_id, paper_id, value.expected_revision),
+            )
+            if cursor.rowcount == 0:
+                exists = connection.execute(
+                    "SELECT revision FROM paper_notes WHERE note_id=? AND paper_id=?", (note_id, paper_id),
+                ).fetchone()
+                if exists is None:
+                    raise KeyError(f"Unknown paper note: {note_id}")
+                raise RuntimeError(f"note_conflict:{int(exists['revision'])}")
+        return self.note(note_id)
+
+    def delete_note(self, paper_id: str, note_id: str) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM paper_notes WHERE note_id=? AND paper_id=?", (note_id, paper_id),
+            )
+        if cursor.rowcount == 0:
+            raise KeyError(f"Unknown paper note: {note_id}")
+        return True
+
+    @staticmethod
+    def _paper_note(row: sqlite3.Row) -> PaperNote:
+        return PaperNote(
+            note_id=row["note_id"], paper_id=row["paper_id"], page=row["page"],
+            selected_text=row["selected_text"], selected_text_hash=row["selected_text_hash"],
+            locator=json.loads(row["locator_json"]), note_markdown=row["note_markdown"],
+            revision=row["revision"], created_at=row["created_at"], updated_at=row["updated_at"],
         )
 
     def get_passage(self, passage_id: str) -> SourcePassage:
@@ -656,6 +746,12 @@ CREATE TABLE IF NOT EXISTS citation_example_sources(example_id TEXT NOT NULL REF
 CREATE TABLE IF NOT EXISTS tags(tag_id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS paper_tags(paper_id TEXT NOT NULL REFERENCES papers ON DELETE CASCADE,
  tag_id TEXT NOT NULL REFERENCES tags ON DELETE CASCADE,PRIMARY KEY(paper_id,tag_id));
+CREATE TABLE IF NOT EXISTS paper_notes(
+ note_id TEXT PRIMARY KEY,paper_id TEXT NOT NULL REFERENCES papers ON DELETE CASCADE,page INTEGER,
+ selected_text TEXT NOT NULL DEFAULT '',selected_text_hash TEXT NOT NULL,locator_json TEXT NOT NULL DEFAULT '{}',
+ note_markdown TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_paper_notes_paper ON paper_notes(paper_id,page,created_at);
 CREATE TABLE IF NOT EXISTS search_documents(rowid INTEGER PRIMARY KEY AUTOINCREMENT,document_id TEXT NOT NULL UNIQUE,
  entity_type TEXT NOT NULL CHECK(entity_type IN ('paper','passage','citation_example')),entity_id TEXT NOT NULL,
  paper_id TEXT NOT NULL REFERENCES papers ON DELETE CASCADE,title TEXT NOT NULL,abstract TEXT NOT NULL,authors TEXT NOT NULL,

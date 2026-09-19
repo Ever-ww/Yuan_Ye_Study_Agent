@@ -248,12 +248,15 @@ class UiTests(unittest.TestCase):
             self.assertIn(session_id, continued.stdout)
 
     def test_web_client_handles_compression_events(self) -> None:
-        script = (Path(__file__).parents[1] / "run_ui" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn('data.type==="compression_started"', script)
-        self.assertIn('data.type==="context_compressed"', script)
-        self.assertIn('data.type==="compression_fallback"', script)
-        self.assertIn('data.type==="model_retry"', script)
-        self.assertIn('data.type==="model_reconnected"', script)
+        script = (
+            Path(__file__).parents[1] / "ui" / "src" / "features" / "agent" /
+            "AgentTimeline.tsx"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"compression_started"', script)
+        self.assertIn('"context_compressed"', script)
+        self.assertIn('"compression_fallback"', script)
+        self.assertIn('"model_retry"', script)
+        self.assertIn('"model_reconnected"', script)
 
     def test_continue_restores_latest_available_observer_for_session(self) -> None:
         class Run:

@@ -45,12 +45,13 @@ class GatewayHarnessEvolutionService:
 
     def __init__(
         self, config: RuntimeConfig, *, store=None, state_controller=None,
-        runtime_resource_manager=None,
+        runtime_resource_manager=None, observer_context_provider=None,
     ) -> None:
         self.config = config
         self.store = store
         self.state_controller = state_controller
         self.runtime_resource_manager = runtime_resource_manager
+        self.observer_context_provider = observer_context_provider
         self.write_gate = getattr(state_controller, "write_gate", None)
         self.source_root = (config.coding_source_root or Path(__file__).resolve().parents[1]).resolve()
         self.module = _load_harness(self.source_root)
@@ -124,7 +125,7 @@ class GatewayHarnessEvolutionService:
             "origin_run_id": run.run_id,
             "session_record_ids": record_ids,
             "session_records_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-            "context_summary": str(AuditSanitizer.sanitize("\n".join(summary_lines)[-6000:])),
+            "context_summary": self._coding_context("\n".join(summary_lines)),
             "trigger_evidence": AuditSanitizer.sanitize(trigger_evidence),
         }
 
@@ -389,12 +390,19 @@ class GatewayHarnessEvolutionService:
                 str(item["record_id"]) for item in records if item.get("record_id")
             ),
             "session_records_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-            "context_summary": str(AuditSanitizer.sanitize("\n".join(
+            "context_summary": self._coding_context("\n".join(
                 f"{item.get('role')}: {str(item.get('content') or '')[:1000]}"
                 for item in records[-8:] if item.get("role") in {"user", "assistant"}
-            )[-6000:])),
+            )),
             "trigger_evidence": AuditSanitizer.sanitize(trigger_evidence),
         }
+
+    def _coding_context(self, origin_summary: str) -> str:
+        shared = str(self.observer_context_provider() or "") if self.observer_context_provider else ""
+        combined = origin_summary
+        if shared:
+            combined += "\n\nOther isolated coding Observer summaries:\n" + shared
+        return str(AuditSanitizer.sanitize(combined[-6000:]))
 
     def _write_proposal(self, proposal: dict[str, Any]) -> None:
         self.proposals_root.mkdir(parents=True, exist_ok=True)
