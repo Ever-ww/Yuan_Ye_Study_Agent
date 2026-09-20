@@ -62,6 +62,7 @@ class SessionIndexEntry(BaseModel):
     model_config = ConfigDict(strict=True)
 
     created_at: str = Field(min_length=1)
+    workspace_id: str | None = Field(default=None, min_length=1)
     latest_file: str = Field(min_length=1)
     files: list[str] = Field(min_length=1)
     state: Literal["pending", "active"] = "active"

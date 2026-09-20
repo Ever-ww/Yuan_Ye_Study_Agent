@@ -187,8 +187,8 @@ def test_terminal_event_finalizes_profile_scoped_evidence(tmp_path: Path) -> Non
     assert outputs == ()
 
 
-def test_coding_context_uses_only_bounded_harness_evidence(tmp_path: Path) -> None:
-    _, _, _, state, observer_store, _ = _setup(tmp_path)
+def test_coding_context_uses_only_bounded_workspace_harness_evidence(tmp_path: Path) -> None:
+    store, _, _, state, observer_store, _ = _setup(tmp_path)
     evidence = ObserverEvidence(
         evidence_id="evidence-code", run_id=state.run_id, generation_id="generation",
         observer_plugin_id="observer", observer_plugin_version="1",
@@ -213,6 +213,9 @@ def test_coding_context_uses_only_bounded_harness_evidence(tmp_path: Path) -> No
     assert "修复命令面板" in summary
     assert "已补充搜索输入" in summary
     assert "harness:manual/manual" in summary
+    project_id = store.run(state.run_id).project_id
+    assert observer_store.coding_context_summary(project_id=project_id) == summary
+    assert observer_store.coding_context_summary(project_id="another-workspace") == ""
 
 
 def test_streaming_text_is_evidence_not_an_observer_model_milestone(tmp_path: Path) -> None:

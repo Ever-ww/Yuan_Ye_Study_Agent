@@ -43,10 +43,140 @@ from backup.archive import sha256_file
 from backup.snapshot import write_manifest
 from backup.scheduler import BackupScheduler
 from Agent import load_runtime_config
+from bootstrap import ensure_project_initialized, ensure_workspace_initialized, workspace_id
 from gateway.application import GatewayApplication
 
 
 class BackupTests(unittest.TestCase):
+    def test_missed_backup_waits_for_startup_grace_and_idle_gateway(self) -> None:
+        class Record:
+            created_at = datetime.now().astimezone()
+            path = Path("backup.manifest")
+
+            def model_dump(self, *, mode: str):
+                del mode
+                return {"path": str(self.path)}
+
+        class Service:
+            def __init__(self, root: Path) -> None:
+                self.agent_root = root
+                self.calls = 0
+                self.pending = False
+                self.finish_calls = 0
+
+            def list(self):
+                return ()
+
+            def has_pending_completion(self) -> bool:
+                return self.pending
+
+            def has_deferred_cleanup(self) -> bool:
+                return False
+
+            async def cleanup_deferred(self) -> None:
+                return None
+
+            async def finish_pending(self):
+                self.pending = False
+                self.finish_calls += 1
+                return Record()
+
+            async def create(self, **kwargs):
+                del kwargs
+                self.calls += 1
+                return Record()
+
+        async def scenario(root: Path) -> None:
+            service = Service(root)
+            idle = False
+            scheduler = BackupScheduler(
+                service,  # type: ignore[arg-type]
+                AgentHomeWriteGate(),
+                enabled=True,
+                schedule="* * * * *",
+                timezone="local",
+                drain_timeout_seconds=30,
+                heartbeat_seconds=0.02,  # type: ignore[arg-type]
+                is_idle=lambda: idle,
+            )
+            scheduler.state_path.parent.mkdir(parents=True)
+            scheduler.state_path.write_text(json.dumps({
+                "version": 1,
+                "initialized_at": "2020-01-01T00:00:00+00:00",
+                "last_successful_backup": None,
+                "last_attempt_at": None,
+                "last_status": None,
+                "last_error": None,
+            }), encoding="utf-8")
+            await scheduler.start()
+            try:
+                await asyncio.sleep(0.06)
+                state = json.loads(scheduler.state_path.read_text(encoding="utf-8"))
+                self.assertEqual(state["last_status"], "backup_pending")
+                self.assertIsNone(state["last_attempt_at"])
+                self.assertEqual(service.calls, 0)
+
+                idle = True
+                scheduler.wake()
+                for _ in range(50):
+                    if service.calls:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(service.calls, 1)
+                self.assertEqual(scheduler.status()["last_status"], "backup_completed")
+
+                idle = False
+                service.pending = True
+                scheduler.wake()
+                await asyncio.sleep(0.04)
+                self.assertEqual(service.finish_calls, 0)
+                self.assertEqual(scheduler.status()["last_status"], "backup_pending")
+
+                idle = True
+                scheduler.wake()
+                for _ in range(50):
+                    if service.finish_calls:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(service.finish_calls, 1)
+                self.assertEqual(service.calls, 1)
+            finally:
+                await scheduler.close()
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(scenario(Path(value)))
+
+    def test_workspace_state_is_manifested_and_can_be_restored_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            root = base / "agent"
+            workspace = base / "project"
+            root.mkdir()
+            workspace.mkdir()
+            ensure_project_initialized(root)
+            ensure_workspace_initialized(workspace, agent_root=root, name="Research")
+            profile = workspace / ".yy" / "memory" / "profile" / "USER.md"
+            profile.write_text("workspace preference", encoding="utf-8")
+            service = BackupService(root)
+
+            record = asyncio.run(service.create(passphrase="secret"))
+            manifest = read_manifest(record.path)
+            identifier = workspace_id(workspace)
+
+            self.assertEqual([item.workspace_id for item in manifest.workspaces], [identifier])
+            self.assertIn(
+                f"workspace-data/{identifier}/memory/profile/USER.md",
+                {item.path for item in manifest.files},
+            )
+            profile.write_text("changed after backup", encoding="utf-8")
+            asyncio.run(RestoreService(root, service).restore_workspace(
+                record.path,
+                "secret",
+                workspace_id=identifier,
+                confirmation=record.backup_id[:8],
+            ))
+            self.assertEqual(profile.read_text(encoding="utf-8"), "workspace preference")
+
     def test_catalog_paths_are_relative_to_dot_yy_root(self) -> None:
         catalog = AgentHomeDurabilityCatalog()
         self.assertEqual(
@@ -272,6 +402,109 @@ class BackupTests(unittest.TestCase):
 
             asyncio.run(scenario())
 
+    def test_unchanged_files_are_copied_before_freeze_and_changed_files_refresh(self) -> None:
+        class Coordinator:
+            def __init__(self, changing: Path) -> None:
+                self.changing = changing
+                self.service: BackupService | None = None
+                self.snapshot_manifest_published = False
+                self.snapshot_manifest_duplicated = True
+                self.snapshot = MaintenanceSnapshot(
+                    state=MaintenanceState.RUNNING, maintenance_epoch=0,
+                )
+
+            async def freeze(self, reason: str, timeout_seconds: float):
+                del timeout_seconds
+                self.changing.write_text("changed before snapshot", encoding="utf-8")
+                self.snapshot = MaintenanceSnapshot(
+                    state=MaintenanceState.QUIESCED,
+                    maintenance_epoch=1,
+                    reason=reason,
+                    operation_id="lifecycle-operation",
+                )
+                return self.snapshot
+
+            async def fail(self, reason: str) -> None:
+                self.snapshot = self.snapshot.model_copy(update={
+                    "state": MaintenanceState.FAILED, "failure_reason": reason,
+                })
+
+            async def resume(self, epoch: int) -> None:
+                assert epoch == 1
+                assert self.service is not None
+                operation = self.service.operation_store.active()
+                assert operation is not None
+                self.snapshot_manifest_published = (
+                    operation.staging_path / ".snapshot-manifest.json"
+                ).is_file()
+                self.snapshot_manifest_duplicated = operation.manifest_json is not None
+                self.snapshot = self.snapshot.model_copy(update={
+                    "state": MaintenanceState.RUNNING,
+                })
+
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            home = root / ".yy"
+            home.mkdir()
+            stable = home / "stable.txt"
+            changing = home / "changing.txt"
+            database = home / "state.sqlite3"
+            stable.write_text("stable", encoding="utf-8")
+            changing.write_text("initial", encoding="utf-8")
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE facts(value TEXT NOT NULL)")
+                connection.execute("INSERT INTO facts VALUES('stable database')")
+            connection.close()
+            coordinator = Coordinator(changing)
+            service = BackupService(root, coordinator=coordinator)  # type: ignore[arg-type]
+            coordinator.service = service
+            copied: list[tuple[str, MaintenanceState]] = []
+            sqlite_snapshots: list[MaintenanceState] = []
+            original_copy = service._copy_and_fsync
+            original_snapshot = service._snapshot_sqlite
+
+            def tracked_copy(source: Path, target: Path):
+                if source in {stable, changing}:
+                    copied.append((source.name, coordinator.snapshot.state))
+                return original_copy(source, target)
+
+            def tracked_snapshot(source: Path, target: Path):
+                if source == database:
+                    sqlite_snapshots.append(coordinator.snapshot.state)
+                return original_snapshot(source, target)
+
+            service._copy_and_fsync = tracked_copy  # type: ignore[method-assign]
+            service._snapshot_sqlite = tracked_snapshot  # type: ignore[method-assign]
+            record = asyncio.run(service.create(passphrase="secret"))
+
+            self.assertEqual(
+                [state for name, state in copied if name == "stable.txt"],
+                [MaintenanceState.RUNNING],
+            )
+            self.assertEqual(
+                [state for name, state in copied if name == "changing.txt"],
+                [MaintenanceState.RUNNING, MaintenanceState.QUIESCED],
+            )
+            self.assertEqual(sqlite_snapshots, [MaintenanceState.RUNNING])
+            self.assertTrue(coordinator.snapshot_manifest_published)
+            self.assertFalse(coordinator.snapshot_manifest_duplicated)
+            restored = root / "restored"
+            service.extract_backup(
+                record.path,
+                BackupSecret("secret", "passphrase"),
+                restored,
+            )
+            self.assertEqual(
+                (restored / "changing.txt").read_text(encoding="utf-8"),
+                "changed before snapshot",
+            )
+            with sqlite3.connect(restored / "state.sqlite3") as connection:
+                self.assertEqual(
+                    connection.execute("SELECT value FROM facts").fetchone()[0],
+                    "stable database",
+                )
+            connection.close()
+
     def test_startup_reuses_frozen_members_instead_of_rescanning_agent_home(self) -> None:
         class FakeSystemKeyStore:
             key_id = "b" * 64
@@ -381,11 +614,10 @@ class BackupTests(unittest.TestCase):
             )
 
             async def scenario() -> None:
-                await recovered.reconcile_startup()
-                for _ in range(100):
-                    if recovered.operation_store.active() is None:
-                        break
-                    await asyncio.sleep(0.02)
+                await recovered.reconcile_startup(defer_completion=True)
+                self.assertIsNotNone(recovered.operation_store.active())
+                self.assertTrue(recovered.has_pending_completion())
+                await recovered.finish_pending()
                 self.assertIsNone(recovered.operation_store.active())
 
             asyncio.run(scenario())
@@ -394,6 +626,23 @@ class BackupTests(unittest.TestCase):
             restored = root / "restored-recovery"
             recovered.extract_backup(manifest_path, selected, restored)
             self.assertEqual((restored / "fact.txt").read_text(encoding="utf-8"), "old frozen value")
+
+    def test_startup_defers_orphan_staging_cleanup_until_idle_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            (root / ".yy").mkdir()
+            service = BackupService(root)
+            orphan = service.staging_root / "interrupted.partial"
+            orphan.mkdir(parents=True)
+            (orphan / "large-member").write_bytes(b"frozen")
+
+            asyncio.run(service.reconcile_startup(defer_completion=True))
+
+            self.assertTrue(orphan.is_dir())
+            self.assertTrue(service.has_deferred_cleanup())
+            asyncio.run(service.cleanup_deferred())
+            self.assertFalse(orphan.exists())
+            self.assertFalse(service.has_deferred_cleanup())
 
     def test_system_managed_backup_uses_key_reference_and_restores_without_prompt(self) -> None:
         class FakeSystemKeyStore:

@@ -138,7 +138,7 @@ class WorkspaceFileService:
             raise PermissionError("Workspace root cannot be deleted")
         if not path.exists():
             raise FileNotFoundError(logical_path)
-        checkpoints = CheckpointStore(mapper.workspace_root, state_root=self.agent_root)
+        checkpoints = CheckpointStore(mapper.workspace_root, state_root=mapper.workspace_root)
         checkpoints.open("web-workspace")
         async with locks.write(path):
             before = checkpoints.create("web_delete_baseline", {"path": logical_path}, force=True)
@@ -179,7 +179,7 @@ class WorkspaceFileService:
     def _context(self, workspace_root: Path) -> tuple[PathMappingSnapshot, WorkspaceLockManager]:
         root = workspace_root.resolve()
         mapper = PathMappingSnapshot(workspace_root=root, agent_source_root=self.agent_source_root)
-        return mapper, WorkspaceLockManager(root, state_root=self.agent_root)
+        return mapper, WorkspaceLockManager(root, state_root=root)
 
     def _resolve(self, mapper: PathMappingSnapshot, logical_path: str) -> Path:
         path = mapper.resolve_workspace_path(logical_path)

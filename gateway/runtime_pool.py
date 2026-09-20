@@ -50,7 +50,9 @@ from backup.maintenance import lifecycle_work
 
 RuntimeFactory = Callable[[Path, GatewayApprovalBroker], AgentRuntime]
 CronTerminalCallback = Callable[[RunRecord], Awaitable[None]]
+RunTerminalCallback = Callable[[RunRecord], Awaitable[None]]
 WorkspaceEventCallback = Callable[[str, str, dict[str, object]], object]
+ReferenceServiceFactory = Callable[[Path], ReferenceService]
 
 
 @dataclass
@@ -79,6 +81,7 @@ class RuntimePool:
         extensions: ExtensionCatalog | None = None,
         cron_service=None,
         reference_service: ReferenceService | None = None,
+        reference_service_factory: ReferenceServiceFactory | None = None,
         state_controller: StateController,
         outbox: OutboxDispatcher | None = None,
         tool_retry_max_attempts: int = 3,
@@ -90,6 +93,7 @@ class RuntimePool:
         harness_evolution_service=None,
         cron_tool_authorizer=None,
         cron_terminal_callback: CronTerminalCallback | None = None,
+        run_terminal_callback: RunTerminalCallback | None = None,
         runtime_resource_manager=None,
         observer_service=None,
         workspace_event_callback: WorkspaceEventCallback | None = None,
@@ -103,6 +107,7 @@ class RuntimePool:
         self.extensions = extensions
         self.cron_service = cron_service
         self.reference_service = reference_service
+        self.reference_service_factory = reference_service_factory
         self.state_controller = state_controller
         self.outbox = outbox
         self.write_gate = write_gate
@@ -131,6 +136,7 @@ class RuntimePool:
         )
         self.harness_evolution_service = harness_evolution_service
         self.cron_terminal_callback = cron_terminal_callback
+        self.run_terminal_callback = run_terminal_callback
         self.runtime_resource_manager = runtime_resource_manager
         self.observer_service = observer_service
         self.workspace_event_callback = workspace_event_callback
@@ -390,10 +396,12 @@ class RuntimePool:
             if entry is None:
                 project = self.store.project(project_id)
                 workspace = Path(project.path)
+                config = load_runtime_config(self.agent_root, workspace_root=workspace)
                 memory = MemoryStore(
-                    self.agent_root / ".yy" / "memory",
+                    config.memory_dir,
                     workspace_root=workspace,
                     agent_root=self.agent_root,
+                    partition_by_workspace=False,
                 )
                 if not memory.has_session(session_id):
                     raise RuntimeError(f"项目中不存在 Session：{session_id}")
@@ -817,8 +825,15 @@ class RuntimePool:
             self.runtime_resource_manager.release_reference(
                 owner_kind="run", owner_id=run_id,
             )
+        final_run = self.store.run(run_id)
+        if self.run_terminal_callback is not None:
+            try:
+                await self.run_terminal_callback(final_run)
+            except Exception:
+                # Artifact projection is recoverable from the durable Run on
+                # the next read. It must never change a finalized Run outcome.
+                pass
         if self.cron_terminal_callback is not None:
-            final_run = self.store.run(run_id)
             if final_run.client_id.startswith("cron:"):
                 await self.cron_terminal_callback(final_run)
         if self.outbox:
@@ -971,6 +986,11 @@ class RuntimePool:
             run.reasoning_effort,
         )
         scheduled = run.client_id.startswith("cron:")
+        references = (
+            self.reference_service_factory(workspace)
+            if self.reference_service_factory is not None
+            else self.reference_service
+        )
         auxiliary_snapshots = {}
         if self.runtime_resource_manager is not None and resource_snapshot is not None:
             for name, profile in (
@@ -1006,8 +1026,8 @@ class RuntimePool:
                 extensions=self.extensions,
                 enable_cron=False,
                 session_origin="cron",
-                references=self.reference_service,
-                enable_references=self.reference_service is not None,
+                references=references,
+                enable_references=references is not None,
                 runtime_profile="cron",
                 resource_snapshot=resource_snapshot,
                 auxiliary_resource_snapshots=auxiliary_snapshots,
@@ -1025,8 +1045,8 @@ class RuntimePool:
             cron_project_id=run.project_id,
             enable_cron=not scheduled,
             session_origin="cron" if scheduled else "interactive",
-            references=self.reference_service,
-            enable_references=self.reference_service is not None,
+            references=references,
+            enable_references=references is not None,
             runtime_profile="interactive",
             extension_state=self.state_controller,
             resource_snapshot=resource_snapshot,

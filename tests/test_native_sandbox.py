@@ -91,8 +91,12 @@ class NativeSandboxTests(unittest.TestCase):
     def test_factory_defaults_to_os_and_docker_requires_selection(self):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
-            config = RuntimeConfig(agent_root=root, workspace_root=root)
-            self.assertIsInstance(create_sandbox_session(config), NativeSandboxSession)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            config = RuntimeConfig(agent_root=root, workspace_root=workspace)
+            session = create_sandbox_session(config)
+            self.assertIsInstance(session, NativeSandboxSession)
+            self.assertEqual(session.state_root, workspace.resolve())
             self.assertIsInstance(create_sandbox_session(config.model_copy(update={"sandbox_backend": "docker"})), DockerSandboxSession)
             with self.assertRaises(ValueError):
                 RuntimeConfig(agent_root=root, workspace_root=root, sandbox_backend="host")

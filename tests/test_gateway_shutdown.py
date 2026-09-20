@@ -120,6 +120,21 @@ class StopAcknowledgementTests(unittest.TestCase):
                 ):
                     manager.ensure_running(timeout_seconds=30)
 
+    def test_control_plane_client_can_connect_during_maintenance(self):
+        with tempfile.TemporaryDirectory() as value:
+            manager = GatewayProcessManager(Path(value))
+            health = {
+                "status": "ok",
+                "service": "yuan-ye-agent-gateway",
+                "accepting_work": False,
+                "maintenance": {"state": "quiesced", "reason": "backup"},
+            }
+            with patch.object(manager, "_health_payload", return_value=health), \
+                 patch("gateway.process.subprocess.Popen") as popen:
+                status = manager.ensure_running(require_accepting_work=False)
+            self.assertTrue(status["running"])
+            popen.assert_not_called()
+
     def test_clean_stop_resumes_before_mutable_gateway_bootstrap(self):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)

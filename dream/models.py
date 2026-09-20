@@ -167,6 +167,7 @@ class DreamRunRequest(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    project_id: str | None = Field(default=None, min_length=1)
 
 
 class DreamBackfillRequest(BaseModel):
@@ -174,9 +175,11 @@ class DreamBackfillRequest(BaseModel):
 
     start: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     end: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    project_id: str | None = Field(default=None, min_length=1)
 
 
 class DreamRollbackRequest(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     run_id: str | None = Field(default=None, min_length=1)
+    project_id: str | None = Field(default=None, min_length=1)

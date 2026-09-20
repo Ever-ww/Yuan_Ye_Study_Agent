@@ -147,7 +147,7 @@ class HarnessArchitectureTests(unittest.TestCase):
 
             self.assertIsNotNone(proposal)
             snapshot = Path(proposal["snapshot_path"])
-            self.assertIn(agent_root / ".yy" / "harness-evolution", snapshot.parents)
+            self.assertIn(workspace / ".yy" / "harness-evolution", snapshot.parents)
             records = [json.loads(line) for line in snapshot.read_text(encoding="utf-8").splitlines()]
             incident = next(item for item in records if item["record_type"] == "incident")
             self.assertEqual(incident["model"]["model"], "test-model")

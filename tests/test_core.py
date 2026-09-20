@@ -20,7 +20,13 @@ from Agent.models.providers import (
     build_provider,
 )
 from Agent.runtime.subagent import RuntimeSubagentRunner
-from bootstrap import ensure_project_initialized, is_project_initialized
+from bootstrap import (
+    default_workspace_root,
+    ensure_project_initialized,
+    ensure_workspace_initialized,
+    is_project_initialized,
+    workspace_id,
+)
 from context_process import ContextProcessor
 from memory import HarnessLongTermMemory, MemoryScope, MemoryStore
 from prompt import PromptComposer
@@ -273,21 +279,13 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(is_project_initialized(root))
             local = yy / "settings.local.json"
             self.assertTrue(local.exists())
-            self.assertTrue((yy / "memory" / "session" / "index.json").exists())
-            self.assertTrue((yy / "memory" / "profile" / "index.json").exists())
-            self.assertTrue((yy / "skills" / "index.json").exists())
-            self.assertTrue((yy / "skills" / "review").is_dir())
-            self.assertFalse((yy / "skills" / "installed").exists())
-            for name in ("USER.md", "RESEARCH.md", "OTHERS.md"):
-                self.assertTrue((yy / "memory" / "profile" / name).exists())
+            self.assertFalse((yy / "skills").exists())
             local.write_text("用户配置", encoding="utf-8")
             second = ensure_project_initialized(root)
             self.assertFalse(second.initialized)
             self.assertEqual(local.read_text(encoding="utf-8"), "用户配置")
-            (yy / "memory" / "profile" / "OTHERS.md").unlink()
-            repaired = ensure_project_initialized(root)
-            self.assertTrue(repaired.initialized)
-            self.assertTrue((yy / "memory" / "profile" / "OTHERS.md").exists())
+            self.assertFalse((yy / "memory").exists())
+            self.assertFalse((yy / "reference").exists())
 
     def test_config_uses_local_override(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -448,7 +446,7 @@ class CoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "只支持 http"):
                 load_runtime_config(root)
 
-    def test_config_keeps_memory_in_agent_root_and_workspace_clean(self) -> None:
+    def test_config_keeps_project_memory_in_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             base = Path(value)
             agent_root = base / "agent"
@@ -460,11 +458,24 @@ class CoreTests(unittest.TestCase):
 
             self.assertEqual(config.agent_root, agent_root.resolve())
             self.assertEqual(config.workspace_root, workspace.resolve())
-            self.assertEqual(config.memory_dir, agent_root / ".yy" / "memory")
+            self.assertEqual(config.memory_dir, workspace / ".yy" / "memory")
             self.assertTrue((agent_root / ".yy" / "settings.local.json").exists())
             self.assertFalse((workspace / ".yy").exists())
 
-    def test_sessions_are_workspace_scoped_but_profiles_are_shared(self) -> None:
+    def test_default_workspace_uses_recent_manifest_not_launch_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            agent_root, workspace, launch = base / "agent", base / "research", base / "launch"
+            for path in (agent_root, workspace, launch):
+                path.mkdir()
+            ensure_project_initialized(agent_root)
+            ensure_workspace_initialized(
+                workspace, agent_root=agent_root, name="Research", touch_recent=True,
+            )
+
+            self.assertEqual(default_workspace_root(agent_root, launch), workspace.resolve())
+
+    def test_sessions_and_profiles_are_workspace_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             base = Path(value)
             agent_root = base / "agent"
@@ -472,16 +483,20 @@ class CoreTests(unittest.TestCase):
             second_workspace = base / "second"
             for path in (agent_root, first_workspace, second_workspace):
                 path.mkdir()
-            memory_root = agent_root / ".yy" / "memory"
+            ensure_project_initialized(agent_root)
+            ensure_workspace_initialized(first_workspace, agent_root=agent_root)
+            ensure_workspace_initialized(second_workspace, agent_root=agent_root)
             first = MemoryStore(
-                memory_root,
+                first_workspace / ".yy" / "memory",
                 workspace_root=first_workspace,
                 agent_root=agent_root,
+                partition_by_workspace=False,
             )
             second = MemoryStore(
-                memory_root,
+                second_workspace / ".yy" / "memory",
                 workspace_root=second_workspace,
                 agent_root=agent_root,
+                partition_by_workspace=False,
             )
 
             session_id = first.create_session("第一工作区问题")
@@ -496,14 +511,86 @@ class CoreTests(unittest.TestCase):
             with self.assertRaises(KeyError):
                 second.restore_messages(session_id)
             self.assertNotIn(session_id, {item["session_id"] for item in second.list_sessions()})
-            self.assertIn("用户偏好中文回答", second.profile_context())
-            session_indexes = list((memory_root / "session").glob("*/index.json"))
-            self.assertEqual(len(session_indexes), 2)
-            self.assertFalse((first_workspace / ".yy").exists())
-            self.assertFalse((second_workspace / ".yy").exists())
+            self.assertNotIn("用户偏好中文回答", second.profile_context())
+            self.assertEqual(
+                first.sessions.index_entry(session_id)["workspace_id"],
+                workspace_id(first_workspace),
+            )
             config = load_runtime_config(agent_root, workspace_root=first_workspace)
             with self.assertRaisesRegex(ValueError, "MemoryStore.workspace_root"):
                 AgentRuntime(config, memory=second, enable_sandbox=False)
+
+    def test_legacy_workspace_memory_migrates_once_to_registered_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            agent_root = base / "agent"
+            workspace = base / "workspace"
+            second_workspace = base / "second"
+            for path in (agent_root, workspace, second_workspace):
+                path.mkdir()
+            ensure_project_initialized(agent_root)
+            legacy = MemoryStore(
+                agent_root / ".yy" / "memory",
+                workspace_root=workspace,
+                agent_root=agent_root,
+            )
+            session_id = legacy.create_session("legacy")
+            legacy.record_user(session_id, "legacy")
+            legacy.profiles.directory.joinpath("USER.md").write_text(
+                "legacy workspace preference", encoding="utf-8",
+            )
+            for name in ("dream", "harness-evolution", "sandbox"):
+                directory = agent_root / ".yy" / name
+                directory.mkdir()
+                (directory / "evidence.json").write_text("{}", encoding="utf-8")
+
+            ensure_workspace_initialized(workspace, agent_root=agent_root, name="Migrated")
+            migrated = MemoryStore(
+                workspace / ".yy" / "memory",
+                workspace_root=workspace,
+                agent_root=agent_root,
+                partition_by_workspace=False,
+            )
+            self.assertTrue(migrated.has_session(session_id))
+            self.assertIn("legacy workspace preference", migrated.profile_context())
+            self.assertFalse((agent_root / ".yy" / "memory" / "profile").exists())
+
+            for name in ("dream", "harness-evolution", "sandbox"):
+                self.assertFalse((agent_root / ".yy" / name).exists())
+                self.assertTrue((workspace / ".yy" / name / "evidence.json").is_file())
+
+            ensure_workspace_initialized(second_workspace, agent_root=agent_root, name="Second")
+            second = MemoryStore(
+                second_workspace / ".yy" / "memory",
+                workspace_root=second_workspace,
+                agent_root=agent_root,
+                partition_by_workspace=False,
+            )
+            self.assertNotIn("legacy workspace preference", second.profile_context())
+            ensure_workspace_initialized(workspace, agent_root=agent_root, name="Migrated")
+            self.assertTrue(migrated.has_session(session_id))
+
+    def test_workspace_migration_keeps_all_sources_when_copy_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            agent_root, workspace = base / "agent", base / "workspace"
+            agent_root.mkdir(); workspace.mkdir()
+            ensure_project_initialized(agent_root)
+            profile = agent_root / ".yy" / "memory" / "profile"
+            profile.mkdir(parents=True)
+            (profile / "USER.md").write_text("keep me", encoding="utf-8")
+            papers = agent_root / ".yy" / "papers"
+            papers.mkdir()
+            (papers / "conflict.pdf").write_bytes(b"old")
+            target = workspace / ".yy" / "papers"
+            target.mkdir(parents=True)
+            (target / "conflict.pdf").write_bytes(b"new")
+
+            with self.assertRaisesRegex(RuntimeError, "migration conflict"):
+                ensure_workspace_initialized(workspace, agent_root=agent_root)
+
+            self.assertEqual((profile / "USER.md").read_text(encoding="utf-8"), "keep me")
+            self.assertEqual((papers / "conflict.pdf").read_bytes(), b"old")
 
     def test_shared_configuration_rejects_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -1526,8 +1613,11 @@ class CoreTests(unittest.TestCase):
             runner = RuntimeSubagentRunner(config, default_tools(root))
             result = await runner("独立分析", "保持简洁", [], context)
             self.assertIn("独立分析", result)
-            index = json.loads((config.memory_dir / "session" / "index.json").read_text(encoding="utf-8"))
-            self.assertEqual(index["sessions"], {})
+            index_path = config.memory_dir / "session" / "index.json"
+            if index_path.exists():
+                self.assertEqual(
+                    json.loads(index_path.read_text(encoding="utf-8"))["sessions"], {},
+                )
 
             runtime = AgentRuntime(
                 config,

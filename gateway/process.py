@@ -74,7 +74,12 @@ class GatewayProcessManager:
                             if (self.directory / "lifecycle.sqlite3").exists() else None),
         }
 
-    def ensure_running(self, timeout_seconds: float = 45.0) -> dict[str, object]:
+    def ensure_running(
+        self,
+        timeout_seconds: float = 45.0,
+        *,
+        require_accepting_work: bool = True,
+    ) -> dict[str, object]:
         """Return a healthy Gateway, allowing bounded time for cold recovery.
 
         A production Agent Home may need to verify a sizeable SQLite store,
@@ -84,35 +89,39 @@ class GatewayProcessManager:
         """
         assert_restore_inactive(self.agent_root)
         health = self._health_payload()
-        if self._accepts_work(health):
+        if self._ready(health, require_accepting_work):
             return self._status_payload(True)
-        self._raise_if_control_only(health)
+        if require_accepting_work:
+            self._raise_if_control_only(health)
         deadline = time.monotonic() + timeout_seconds
         startup_lock = InstanceLock(self.startup_lock_path, timeout_seconds=timeout_seconds)
         try:
             startup_lock.acquire()
         except RuntimeError as exc:
             health = self._health_payload()
-            if self._accepts_work(health):
+            if self._ready(health, require_accepting_work):
                 return self._status_payload(True)
-            self._raise_if_control_only(health)
+            if require_accepting_work:
+                self._raise_if_control_only(health)
             raise RuntimeError("等待 Gateway 启动协调锁超时") from exc
         try:
             # 拿到跨进程启动锁后必须重新探测，避免前一个客户端刚刚完成启动。
             assert_restore_inactive(self.agent_root)
             health = self._health_payload()
-            if self._accepts_work(health):
+            if self._ready(health, require_accepting_work):
                 return self._status_payload(True)
-            self._raise_if_control_only(health)
+            if require_accepting_work:
+                self._raise_if_control_only(health)
             self._remove_stale_metadata()
             if self._instance_lock_held():
                 owner = self._instance_owner_pid()
                 suffix = f" PID={owner}" if owner is not None else ""
                 while time.monotonic() < deadline:
                     health = self._health_payload()
-                    if self._accepts_work(health):
+                    if self._ready(health, require_accepting_work):
                         return self._status_payload(True)
-                    self._raise_if_control_only(health)
+                    if require_accepting_work:
+                        self._raise_if_control_only(health)
                     time.sleep(0.15)
                 raise RuntimeError(
                     f"已有 Gateway 实例{suffix}持有状态锁，但健康接口不可用；"
@@ -120,9 +129,10 @@ class GatewayProcessManager:
                 )
             if not _port_available(self.port):
                 health = self._health_payload()
-                if self._accepts_work(health):
+                if self._ready(health, require_accepting_work):
                     return self._status_payload(True)
-                self._raise_if_control_only(health)
+                if require_accepting_work:
+                    self._raise_if_control_only(health)
                 raise RuntimeError(f"端口 {self.port} 已被其他程序占用，Gateway 无法启动")
             self._rotate_logs()
             command = _gateway_command(self.agent_root, self.port)
@@ -148,16 +158,24 @@ class GatewayProcessManager:
                     creationflags=creationflags,
                     env=child_environment,
                 )
-            return self._wait_until_healthy(deadline)
+            return self._wait_until_healthy(
+                deadline, require_accepting_work=require_accepting_work,
+            )
         finally:
             startup_lock.close()
 
-    def _wait_until_healthy(self, deadline: float) -> dict[str, object]:
+    def _wait_until_healthy(
+        self,
+        deadline: float,
+        *,
+        require_accepting_work: bool = True,
+    ) -> dict[str, object]:
         while time.monotonic() < deadline:
             health = self._health_payload()
-            if self._accepts_work(health):
+            if self._ready(health, require_accepting_work):
                 return self._status_payload(True)
-            self._raise_if_control_only(health)
+            if require_accepting_work:
+                self._raise_if_control_only(health)
             time.sleep(0.15)
         raise RuntimeError(f"Gateway 启动超时；请查看日志：{self.log_path}")
 
@@ -263,6 +281,16 @@ class GatewayProcessManager:
     @staticmethod
     def _accepts_work(payload: dict[str, object] | None) -> bool:
         return payload is not None and payload.get("accepting_work") is True
+
+    @classmethod
+    def _ready(
+        cls,
+        payload: dict[str, object] | None,
+        require_accepting_work: bool,
+    ) -> bool:
+        return payload is not None and (
+            not require_accepting_work or cls._accepts_work(payload)
+        )
 
     @staticmethod
     def _raise_if_control_only(payload: dict[str, object] | None) -> None:
@@ -404,20 +432,19 @@ class InstanceLock:
 
 
 def _load_gateway_runtime_config(agent_root: Path, port: int):
-    """Load maintenance Runtime against Agent source, never the Agent Home."""
+    """Load Gateway Core against the selected Workspace, not the Agent source tree."""
     from Agent import load_runtime_config
+    from bootstrap import default_workspace_root, workspace_manifest
 
     source_root = Path(__file__).resolve().parents[1]
-    config = load_runtime_config(
-        agent_root, workspace_root=source_root, gateway_port=port,
+    if not workspace_manifest(agent_root):
+        raise RuntimeError(
+            "No Workspace is registered; run `yy-agent workspace add PATH` first",
+        )
+    workspace = default_workspace_root(agent_root, source_root)
+    return load_runtime_config(
+        agent_root, workspace_root=workspace, gateway_port=port,
     )
-    if config.coding_source_root is not None:
-        configured_source = config.coding_source_root.resolve()
-        if configured_source != config.workspace_root:
-            config = load_runtime_config(
-                agent_root, workspace_root=configured_source, gateway_port=port,
-            )
-    return config
 
 
 def run_gateway(agent_root: Path, port: int) -> None:

@@ -41,10 +41,23 @@ class ProviderContextRecord(BaseModel):
 
     @classmethod
     def create(cls, query: str, epoch: str, fragments: dict[str, str], origin_refs=None):
+        normalized_origin_refs = {
+            str(key): (
+                value
+                if isinstance(value, str)
+                else json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            for key, value in (origin_refs or {}).items()
+        }
         return cls(
             context_epoch=epoch, query_hash=digest(query), fragments=fragments,
             fragment_hashes={key: digest(value) for key, value in fragments.items()},
-            content_hash=cls.compute_hash(fragments), origin_refs=origin_refs or {},
+            content_hash=cls.compute_hash(fragments), origin_refs=normalized_origin_refs,
         )
 
     def render(self, query: str) -> str:

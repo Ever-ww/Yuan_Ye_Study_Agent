@@ -23,6 +23,8 @@ from .models import (
     PaperNote,
     PaperNoteCreate,
     PaperNoteUpdate,
+    PaperInlineAnswer,
+    PaperInlineQuestionCreate,
     PaperUpsert,
     ReferenceSearchHit,
     ReferenceSearchRequest,
@@ -31,7 +33,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def now_iso() -> str:
@@ -87,11 +89,14 @@ class ReferenceStore:
             if foreign_key_errors:
                 raise RuntimeError("Reference SQLite foreign_key_check 失败")
 
-    def upsert_paper(self, value: PaperUpsert) -> Paper:
+    def upsert_paper(self, value: PaperUpsert, *, deduplicate: bool = True) -> Paper:
         timestamp = now_iso()
         normalized_title = _normalize_text(value.title)
         with self._lock, self._connect() as connection:
-            paper_id = self._find_paper_id(connection, value, normalized_title)
+            paper_id = (
+                self._find_paper_id(connection, value, normalized_title)
+                if deduplicate else None
+            )
             if paper_id is None:
                 paper_id = uuid4().hex
                 connection.execute(
@@ -146,6 +151,14 @@ class ReferenceStore:
             self._refresh_paper_document(connection, paper_id)
         return self.get_paper(paper_id)
 
+    def paper_by_file_hash(self, sha256: str) -> Paper | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT paper_id FROM paper_files WHERE sha256=? ORDER BY added_at LIMIT 1",
+                (sha256,),
+            ).fetchone()
+        return self.get_paper(str(row["paper_id"])) if row is not None else None
+
     def _backup_before_migration(self) -> None:
         """在修改旧 Reference 库前创建 SQLite 一致性备份。"""
         if not self.database_path.is_file() or self.database_path.stat().st_size == 0:
@@ -160,9 +173,14 @@ class ReferenceStore:
             paper_columns = {
                 str(row[1]) for row in source.execute("PRAGMA table_info(papers)").fetchall()
             }
+            paper_file_columns = {
+                str(row[1]) for row in source.execute("PRAGMA table_info(paper_files)").fetchall()
+            }
             needs_migration = version < SCHEMA_VERSION or not {
                 "source_session_id", "source_workspace",
-            }.issubset(paper_columns)
+            }.issubset(paper_columns) or (
+                paper_file_columns and "source_session_id" not in paper_file_columns
+            )
             if not needs_migration:
                 return
             check = str(source.execute("PRAGMA quick_check").fetchone()[0])
@@ -187,6 +205,11 @@ class ReferenceStore:
             connection.execute("ALTER TABLE papers ADD COLUMN source_session_id TEXT")
         if "source_workspace" not in columns:
             connection.execute("ALTER TABLE papers ADD COLUMN source_workspace TEXT")
+        paper_file_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(paper_files)").fetchall()
+        }
+        if paper_file_columns and "source_session_id" not in paper_file_columns:
+            connection.execute("ALTER TABLE paper_files ADD COLUMN source_session_id TEXT")
 
     def add_file(self, paper_id: str, value: PaperFile) -> PaperFile:
         with self._lock, self._connect() as connection:
@@ -194,7 +217,9 @@ class ReferenceStore:
             if value.is_primary:
                 connection.execute("UPDATE paper_files SET is_primary=0 WHERE paper_id=?", (paper_id,))
             connection.execute(
-                "INSERT INTO paper_files VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
+                "INSERT INTO paper_files(file_id,paper_id,workspace_hash,workspace_root,"
+                "relative_path,absolute_path,sha256,mime_type,size_bytes,is_primary,"
+                "source_session_id,added_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(paper_id,sha256) DO UPDATE SET workspace_hash=excluded.workspace_hash,"
                 "workspace_root=excluded.workspace_root,relative_path=excluded.relative_path,"
                 "absolute_path=excluded.absolute_path,mime_type=excluded.mime_type,"
@@ -271,6 +296,13 @@ class ReferenceStore:
                 raise KeyError(f"未知论文：{paper_id}")
         return self.get_paper(paper_id)
 
+    def delete_paper(self, paper_id: str) -> bool:
+        """Permanently remove a paper and its dependent reference records."""
+        with self._lock, self._connect() as connection:
+            self._require_paper(connection, paper_id)
+            cursor = connection.execute("DELETE FROM papers WHERE paper_id=?", (paper_id,))
+        return cursor.rowcount > 0
+
     def get_paper(self, paper_id: str) -> Paper:
         with self._connect() as connection:
             row = self._require_paper(connection, paper_id)
@@ -308,8 +340,10 @@ class ReferenceStore:
     def list_papers(
         self, *, include_archived: bool = False, cursor: str | None = None, limit: int = 100,
     ) -> tuple[Paper, ...]:
-        if limit < 1 or limit > 200:
-            raise ValueError("Paper list limit must be between 1 and 200")
+        # The public API fetches one sentinel row to determine whether a next
+        # cursor exists, so its documented 200-row page requires 201 here.
+        if limit < 1 or limit > 201:
+            raise ValueError("Paper list limit must be between 1 and 201")
         query = "SELECT paper_id FROM papers"
         conditions: list[str] = []
         parameters: list[Any] = []
@@ -383,6 +417,88 @@ class ReferenceStore:
             raise KeyError(f"Unknown paper note: {note_id}")
         return True
 
+    def patch_paper_metadata(self, paper_id: str, values: dict[str, Any]) -> Paper:
+        """Atomically merge Web workflow state without rewriting paper identity."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM papers WHERE paper_id=?", (paper_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown paper: {paper_id}")
+            metadata = json.loads(row["metadata_json"] or "{}")
+            metadata.update(values)
+            connection.execute(
+                "UPDATE papers SET metadata_json=?,updated_at=? WHERE paper_id=?",
+                (_json(metadata), now_iso(), paper_id),
+            )
+        return self.get_paper(paper_id)
+
+    def create_inline_question(
+        self, paper_id: str, value: PaperInlineQuestionCreate,
+    ) -> PaperInlineAnswer:
+        timestamp = now_iso()
+        answer_id = uuid4().hex
+        selected_hash = hashlib.sha256(value.selected_text.encode("utf-8")).hexdigest()
+        with self._lock, self._connect() as connection:
+            self._require_paper(connection, paper_id)
+            existing = connection.execute(
+                "SELECT answer_id FROM paper_inline_answers WHERE run_id=?", (value.run_id,),
+            ).fetchone()
+            if existing is not None:
+                answer_id = str(existing["answer_id"])
+            else:
+                connection.execute(
+                    "INSERT INTO paper_inline_answers VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        answer_id, paper_id, value.run_id, value.page, value.selected_text,
+                        selected_hash, value.nearby_context, _json(value.locator), value.question,
+                        "", "pending", None, timestamp, None,
+                    ),
+                )
+        return self.inline_answer(answer_id)
+
+    def inline_answers(self, paper_id: str) -> tuple[PaperInlineAnswer, ...]:
+        with self._connect() as connection:
+            self._require_paper(connection, paper_id)
+            rows = connection.execute(
+                "SELECT * FROM paper_inline_answers WHERE paper_id=? ORDER BY created_at",
+                (paper_id,),
+            ).fetchall()
+        return tuple(self._inline_answer(row) for row in rows)
+
+    def inline_answer(self, answer_id: str) -> PaperInlineAnswer:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM paper_inline_answers WHERE answer_id=?", (answer_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown inline answer: {answer_id}")
+        return self._inline_answer(row)
+
+    def inline_answer_for_run(self, run_id: str) -> PaperInlineAnswer | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM paper_inline_answers WHERE run_id=?", (run_id,),
+            ).fetchone()
+        return self._inline_answer(row) if row is not None else None
+
+    def settle_inline_answer(
+        self, run_id: str, *, answer: str = "", error: str | None = None,
+    ) -> PaperInlineAnswer:
+        status = "failed" if error else "completed"
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "UPDATE paper_inline_answers SET answer=?,status=?,error=?,answered_at=? "
+                "WHERE run_id=? AND status='pending'",
+                (answer, status, error, now_iso(), run_id),
+            )
+            row = connection.execute(
+                "SELECT answer_id FROM paper_inline_answers WHERE run_id=?", (run_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown inline answer Run: {run_id}")
+        return self.inline_answer(str(row["answer_id"]))
+
     @staticmethod
     def _paper_note(row: sqlite3.Row) -> PaperNote:
         return PaperNote(
@@ -390,6 +506,17 @@ class ReferenceStore:
             selected_text=row["selected_text"], selected_text_hash=row["selected_text_hash"],
             locator=json.loads(row["locator_json"]), note_markdown=row["note_markdown"],
             revision=row["revision"], created_at=row["created_at"], updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _inline_answer(row: sqlite3.Row) -> PaperInlineAnswer:
+        return PaperInlineAnswer(
+            answer_id=row["answer_id"], paper_id=row["paper_id"], run_id=row["run_id"],
+            page=row["page"], selected_text=row["selected_text"],
+            selected_text_hash=row["selected_text_hash"], nearby_context=row["nearby_context"],
+            locator=json.loads(row["locator_json"]), question=row["question"],
+            answer=row["answer"], status=row["status"], error=row["error"],
+            created_at=row["created_at"], answered_at=row["answered_at"],
         )
 
     def get_passage(self, passage_id: str) -> SourcePassage:
@@ -752,6 +879,15 @@ CREATE TABLE IF NOT EXISTS paper_notes(
  note_markdown TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_paper_notes_paper ON paper_notes(paper_id,page,created_at);
+CREATE TABLE IF NOT EXISTS paper_inline_answers(
+ answer_id TEXT PRIMARY KEY,paper_id TEXT NOT NULL REFERENCES papers ON DELETE CASCADE,
+ run_id TEXT NOT NULL UNIQUE,page INTEGER NOT NULL,selected_text TEXT NOT NULL,
+ selected_text_hash TEXT NOT NULL,nearby_context TEXT NOT NULL DEFAULT '',
+ locator_json TEXT NOT NULL DEFAULT '{}',question TEXT NOT NULL,answer TEXT NOT NULL DEFAULT '',
+ status TEXT NOT NULL CHECK(status IN ('pending','completed','failed')),error TEXT,
+ created_at TEXT NOT NULL,answered_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_inline_answers_paper ON paper_inline_answers(paper_id,page,created_at);
 CREATE TABLE IF NOT EXISTS search_documents(rowid INTEGER PRIMARY KEY AUTOINCREMENT,document_id TEXT NOT NULL UNIQUE,
  entity_type TEXT NOT NULL CHECK(entity_type IN ('paper','passage','citation_example')),entity_id TEXT NOT NULL,
  paper_id TEXT NOT NULL REFERENCES papers ON DELETE CASCADE,title TEXT NOT NULL,abstract TEXT NOT NULL,authors TEXT NOT NULL,

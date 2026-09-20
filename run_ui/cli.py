@@ -32,7 +32,7 @@ from Agent import (
     load_runtime_config,
     prepare_default_agent_root,
 )
-from bootstrap import ensure_project_initialized, initialize_project
+from bootstrap import ensure_project_initialized, ensure_workspace_initialized, initialize_project
 from memory import MemoryStore
 from gateway import GatewayClient, GatewayProcessManager
 from gateway.models import GatewayEventEnvelope
@@ -58,6 +58,8 @@ cron_app = typer.Typer(help="管理 Gateway 后台 Cron 与 Heartbeat")
 app.add_typer(cron_app, name="cron")
 backup_app = typer.Typer(help="创建、验证和恢复去重的 Agent Home 快照")
 app.add_typer(backup_app, name="backup")
+workspace_app = typer.Typer(help="注册、列出和选择隔离 Workspace")
+app.add_typer(workspace_app, name="workspace")
 console = Console()
 
 
@@ -97,7 +99,7 @@ class ChatInterruptController:
 
 @app.command()
 def init() -> None:
-    """初始化本机 `.yy` 配置、会话索引和长期记忆文件。"""
+    """初始化全局 `.yy` 控制配置；项目数据在 Workspace 打开时创建。"""
     yy = initialize_project(prepare_default_agent_root())
     console.print(f"[green]初始化完成[/] {yy}")
     console.print(f"请编辑 {yy / 'settings.local.json'} 配置模型；已有文件不会被覆盖。")
@@ -109,10 +111,14 @@ def init() -> None:
 def _memory() -> MemoryStore:
     """从当前项目配置创建 Memory 门面。"""
     config = load_runtime_config()
+    ensure_workspace_initialized(
+        config.workspace_root, agent_root=config.agent_root, touch_recent=True,
+    )
     return MemoryStore(
         config.memory_dir,
         workspace_root=config.workspace_root,
         agent_root=config.agent_root,
+        partition_by_workspace=False,
     )
 
 
@@ -125,9 +131,66 @@ def _gateway_client(*, port: int | None = None) -> GatewayClient:
     )
 
 
-async def _gateway_project(client: GatewayClient) -> dict[str, object]:
-    """把当前启动目录注册为 Gateway 项目。"""
-    return await client.register_project(Path.cwd())
+@workspace_app.command("list")
+def list_workspaces() -> None:
+    """按最近打开时间列出全部 Workspace。"""
+    values = asyncio.run(_gateway_client().projects())
+    table = Table(title="Workspaces", box=box.SIMPLE_HEAVY)
+    table.add_column("名称")
+    table.add_column("Workspace ID")
+    table.add_column("版本")
+    table.add_column("最近打开")
+    table.add_column("路径")
+    for item in values:
+        table.add_row(
+            str(item["name"]), str(item.get("workspace_id") or item["project_id"]),
+            str(item.get("version", 1)), str(item["last_opened_at"]), str(item["path"]),
+        )
+    console.print(table)
+
+
+@workspace_app.command("add")
+def add_workspace(
+    path: Path = typer.Argument(..., exists=True, file_okay=False, resolve_path=True),
+    name: str | None = typer.Option(None, "--name", "-n"),
+) -> None:
+    """注册目录并初始化 Workspace Profile、论文库和 Memory。"""
+    config = load_runtime_config(workspace_root=path)
+    ensure_workspace_initialized(
+        path, agent_root=config.agent_root, name=name, touch_recent=True,
+    )
+    value = asyncio.run(_gateway_client().register_project(path, name))
+    console.print(
+        f"[green]Workspace 已注册[/] {value['name']}  "
+        f"[dim]{value.get('workspace_id') or value['project_id']}[/]",
+    )
+
+
+@workspace_app.command("open")
+def open_workspace(identifier: str = typer.Argument(..., help="Workspace ID 或唯一前缀")) -> None:
+    """将已注册 Workspace 标记为最近使用。"""
+    client = _gateway_client()
+    values = asyncio.run(client.projects())
+    matches = [
+        item for item in values
+        if str(item.get("workspace_id") or item["project_id"]).startswith(identifier)
+    ]
+    if len(matches) != 1:
+        raise typer.BadParameter("Workspace ID 不存在或前缀不唯一")
+    value = asyncio.run(client.open_project(str(matches[0]["project_id"])))
+    console.print(f"[green]当前 Workspace[/] {value['name']}  [dim]{value['path']}[/]")
+
+
+async def _gateway_project(
+    client: GatewayClient,
+    path: Path | None = None,
+    name: str | None = None,
+) -> dict[str, object]:
+    """Register the selected directory as one isolated Workspace."""
+    selected_path = path or load_runtime_config().workspace_root
+    if name is None:
+        return await client.register_project(selected_path)
+    return await client.register_project(selected_path, name)
 
 
 async def _create_initial_paper_research_cron(
@@ -628,6 +691,12 @@ def chat(
     classic: bool = typer.Option(
         False, "--classic", help="使用兼容性的逐行终端界面",
     ),
+    workspace: Path | None = typer.Option(
+        None, "--workspace", "-w", help="选择 Workspace 目录；默认使用当前目录",
+    ),
+    workspace_name: str | None = typer.Option(
+        None, "--workspace-name", help="首次注册时使用的 Workspace 名称",
+    ),
 ) -> None:
     """连接 Gateway 并启动连续交互会话。"""
     if session_id and continue_last:
@@ -643,6 +712,8 @@ def chat(
             continue_last=continue_last,
             interrupt_controller=interrupts,
             use_tui=use_tui,
+            workspace=workspace,
+            workspace_name=workspace_name,
         ))
     except KeyboardInterrupt:
         console.print("\n[dim]已退出会话。[/]")
@@ -684,14 +755,22 @@ async def _chat_gateway(
     continue_last: bool = False,
     interrupt_controller: ChatInterruptController,
     use_tui: bool = False,
+    workspace: Path | None = None,
+    workspace_name: str | None = None,
 ) -> None:
     if not use_tui:
         console.print(
             "[bold cyan]Yuan Ye Gateway[/]  输入 /help 查看命令，/exit 退出；"
             "运行中按 Ctrl+C 终止当前回答。"
         )
+    if workspace is not None:
+        config = load_runtime_config(workspace_root=workspace)
+        ensure_workspace_initialized(
+            workspace, agent_root=config.agent_root, name=workspace_name,
+            touch_recent=True,
+        )
     client = _gateway_client()
-    project = await _gateway_project(client)
+    project = await _gateway_project(client, workspace, workspace_name)
     project_id = str(project["project_id"])
     initial_notices: list[str] = []
     if continue_last:
@@ -753,7 +832,7 @@ async def _chat_gateway(
                     elif command == "/cron" or command.startswith("/cron "):
                         await _handle_cron_command(client, project_id, command)
                     elif command == "/dream" or command.startswith("/dream "):
-                        await _handle_dream_command(client, command)
+                        await _handle_dream_command(client, project_id, command)
                     elif command == "/harness" or command.startswith("/harness "):
                         await _handle_harness_command(
                             client, command,
@@ -832,7 +911,7 @@ async def _chat_gateway(
             await _handle_cron_command(client, project_id, task)
             continue
         if task == "/dream" or task.startswith("/dream "):
-            await _handle_dream_command(client, task)
+            await _handle_dream_command(client, project_id, task)
             continue
         if task == "/harness" or task.startswith("/harness "):
             await _handle_harness_command(client, task)
@@ -1522,13 +1601,15 @@ async def _handle_gateway_skill_command(
         console.print(f"[red]{str(exc) or type(exc).__name__}[/]")
 
 
-async def _handle_dream_command(client: GatewayClient, task: str) -> None:
+async def _handle_dream_command(
+    client: GatewayClient, project_id: str, task: str,
+) -> None:
     """管理每日全局 Profile 巩固，不写入普通 Session。"""
     try:
         parts = shlex.split(task)
         action = parts[1].lower() if len(parts) > 1 else "status"
         if action == "status" and len(parts) in {1, 2}:
-            status = await client.dream_status()
+            status = await client.dream_status(project_id)
             console.print(Panel(
                 f"启用：{'是' if status.enabled else '否'}\n"
                 f"运行中：{'是' if status.running else '否'}\n"
@@ -1541,16 +1622,24 @@ async def _handle_dream_command(client: GatewayClient, task: str) -> None:
             ))
             return
         if action == "run" and len(parts) in {2, 3}:
-            result = await client.run_dream(parts[2] if len(parts) == 3 else None)
+            result = await client.run_dream(
+                parts[2] if len(parts) == 3 else None,
+                project_id=project_id,
+            )
             _render_dream_result(result)
             return
         if action == "backfill" and len(parts) == 4:
-            results = await client.backfill_dream(parts[2], parts[3])
+            results = await client.backfill_dream(
+                parts[2], parts[3], project_id=project_id,
+            )
             for result in results:
                 _render_dream_result(result)
             return
         if action == "rollback" and len(parts) in {2, 3}:
-            result = await client.rollback_dream(parts[2] if len(parts) == 3 else None)
+            result = await client.rollback_dream(
+                parts[2] if len(parts) == 3 else None,
+                project_id=project_id,
+            )
             style = "green" if result.restored else "yellow"
             console.print(f"[{style}]{result.message}[/]")
             return
@@ -2225,6 +2314,12 @@ def backup_verify(archive: Path) -> None:
 def backup_restore(
     archive: Path,
     map_path: list[str] = typer.Option([], "--map-path", help="仅映射Manifest外部依赖：OLD=NEW"),
+    workspace_id: str | None = typer.Option(
+        None, "--workspace-id", help="仅恢复指定 Workspace；省略时执行整体恢复",
+    ),
+    workspace_target: Path | None = typer.Option(
+        None, "--workspace-target", help="单 Workspace 恢复到的新目录",
+    ),
     non_interactive: bool = typer.Option(False, "--non-interactive"),
     confirm_backup_id: str | None = typer.Option(None, "--confirm-backup-id"),
 ) -> None:
@@ -2263,12 +2358,23 @@ def backup_restore(
     manager = GatewayProcessManager(root)
     if manager.status().get("running"):
         manager.stop()
-    restore_id = asyncio.run(restore.restore(
-        archive, password,
-        confirmation=confirmation,
-        non_interactive=non_interactive,
-        path_mappings=mappings,
-    ))
+    if workspace_target is not None and workspace_id is None:
+        raise typer.BadParameter("--workspace-target 必须与 --workspace-id 一起使用")
+    if workspace_id is None:
+        restore_id = asyncio.run(restore.restore(
+            archive, password,
+            confirmation=confirmation,
+            non_interactive=non_interactive,
+            path_mappings=mappings,
+        ))
+    else:
+        restore_id = asyncio.run(restore.restore_workspace(
+            archive, password,
+            workspace_id=workspace_id,
+            confirmation=confirmation,
+            non_interactive=non_interactive,
+            target_path=workspace_target,
+        ))
     console.print(f"[green]Restore 已提交[/] restore_id={restore_id}")
 
 

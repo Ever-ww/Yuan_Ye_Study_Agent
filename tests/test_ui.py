@@ -7,7 +7,7 @@ import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import typer
 from rich.console import Console
@@ -31,8 +31,9 @@ from run_ui.cli import (
     app,
 )
 from run_ui.approval import InteractiveApproval, _arguments_preview
-from run_ui.web import create_app
+from run_ui.web import create_app, serve
 from tool import ToolContext
+from gateway.api import _frontend_asset_media_type
 
 
 class UiTests(unittest.TestCase):
@@ -42,6 +43,27 @@ class UiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             app = create_app("test-token", agent_root=Path(value))
             self.assertEqual(app.state.access_token, "test-token")
+
+    def test_vite_module_assets_use_javascript_mime_type(self) -> None:
+        self.assertEqual(_frontend_asset_media_type(Path("pdf.worker.mjs")), "text/javascript")
+        self.assertEqual(_frontend_asset_media_type(Path("app.js")), "text/javascript")
+
+    def test_serve_ui_uses_selected_workspace_without_registering_cwd(self) -> None:
+        client = SimpleNamespace(browser_url=AsyncMock(return_value="http://127.0.0.1:8765/"))
+        config = SimpleNamespace(
+            agent_root=Path("C:/agent"),
+            workspace_root=Path("D:/workspace"),
+            gateway_port=8765,
+        )
+        with patch("run_ui.web.load_runtime_config", return_value=config), \
+             patch("run_ui.web.GatewayClient", return_value=client) as gateway_client, \
+             patch("run_ui.web.webbrowser.open"):
+            serve()
+        gateway_client.assert_called_once_with(
+            config.agent_root,
+            port=8765,
+            require_accepting_work=False,
+        )
 
     def test_sessions_are_ordered_by_latest_durable_activity(self) -> None:
         with tempfile.TemporaryDirectory() as value:

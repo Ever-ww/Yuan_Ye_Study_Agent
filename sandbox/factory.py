@@ -11,7 +11,7 @@ from .session import SandboxUnavailableError
 
 
 def create_sandbox_session(config, *, project_root: Path | None = None, file_locks=None, path_mapping=None):
-    options = dict(state_root=config.agent_root, checkpoint_limit=config.sandbox_checkpoint_limit,
+    options = dict(state_root=config.workspace_root, checkpoint_limit=config.sandbox_checkpoint_limit,
                    file_locks=file_locks)
     root = project_root or config.workspace_root
     if config.sandbox_backend == "docker":

@@ -5,7 +5,7 @@ import { useSearchParams } from "react-router-dom";
 import { WorkbenchShell } from "../../app/WorkbenchShell";
 import { useTheme } from "../../app/ThemeProvider";
 import { terminalEventTypes } from "../../events";
-import type { GatewayEvent, ObserverStatus, PendingApproval, Project, ReasoningEffort, RunCreate } from "../../types";
+import type { GatewayEvent, ObserverStatus, PendingApproval, Project, ReasoningEffort, RunCreate, TemporaryAttachment } from "../../types";
 import { useGatewayApi } from "../../shared/api/context";
 import { CommandPalette } from "../../shared/ui/CommandPalette";
 import { ProjectDialog } from "../../shared/ui/ProjectDialog";
@@ -22,13 +22,15 @@ export function AgentPage() {
   const queryClient = useQueryClient();
   const { setPreference } = useTheme();
   const [searchParams, setSearchParams] = useSearchParams();
-  const projectId = searchParams.get("project") || undefined;
+  const projectId = searchParams.get("project") || window.localStorage.getItem("yyagent.web.selected-project") || undefined;
   const sessionId = searchParams.get("session") || undefined;
   const [runId, setRunId] = useState<string | null>(null);
   const [displayRunId, setDisplayRunId] = useState<string | null>(null);
   const [optimisticQuestion, setOptimisticQuestion] = useState("");
   const [task, setTask] = useState("");
   const [uiContext, setUiContext] = useState<RunCreate["uiContext"]>({ source: "agent" });
+  const [attachments, setAttachments] = useState<TemporaryAttachment[]>([]);
+  const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
   const [observer, setObserver] = useState<ObserverStatus | null>(null);
   const [handledApprovals, setHandledApprovals] = useState(() => new Set<string>());
@@ -136,8 +138,10 @@ export function AgentPage() {
   }
 
   function selectProject(project: Project) {
+    window.localStorage.setItem("yyagent.web.selected-project", project.project_id);
     setSearchParams({ project: project.project_id });
     clearDisplayedRun();
+    void api.openProject(project.project_id).then(() => projectsQuery.refetch());
   }
 
   function selectSession(nextSessionId?: string) {
@@ -161,9 +165,10 @@ export function AgentPage() {
         sessionId,
         modelProfileId: profileId,
         reasoningEffort: effort,
-        uiContext,
+        uiContext: uiContext?.source === "agent" ? { source: "agent", attachments } : uiContext,
       });
       setUiContext({ source: "agent" });
+      setAttachments([]);
       setDisplayRunId(created.run_id);
       setRunId(created.run_id);
     } catch (reason) {
@@ -171,6 +176,19 @@ export function AgentPage() {
       setTask(question);
       setError(errorMessage(reason));
     }
+  }
+
+  async function uploadAttachments(files: File[]) {
+    if (!selectedProject || !files.length) return;
+    setUploading(true); setError("");
+    try {
+      for (const file of files) {
+        const uploaded = await api.uploadAgentAttachment(selectedProject.project_id, file);
+        setAttachments((current) => current.some((item) => item.content_hash === uploaded.content_hash)
+          ? current : [...current, uploaded]);
+      }
+    } catch (reason) { setError(errorMessage(reason)); }
+    finally { setUploading(false); }
   }
 
   async function decideApproval(approvalId: string, approved: boolean) {
@@ -223,7 +241,7 @@ export function AgentPage() {
             return typeof value.content === "string" ? value.content : JSON.stringify(value, null, 2);
           }}
         />
-        <AgentComposer value={task} disabled={!selectedProject} running={Boolean(runId)} approval={approval} error={error || queryError(projectsQuery.error || statusQuery.error)} onChange={setTask} onSend={() => void send()} onCancel={() => runId && void api.cancelRun(runId).catch((reason) => setError(errorMessage(reason)))} onApproval={(id, approved) => void decideApproval(id, approved)} />
+        <AgentComposer value={task} disabled={!selectedProject} running={Boolean(runId)} approval={approval} error={error || queryError(projectsQuery.error || statusQuery.error)} attachments={attachments} uploading={uploading} onChange={setTask} onSend={() => void send()} onCancel={() => runId && void api.cancelRun(runId).catch((reason) => setError(errorMessage(reason)))} onApproval={(id, approved) => void decideApproval(id, approved)} onFiles={(files) => void uploadAttachments(files)} onRemoveAttachment={(id) => setAttachments((current) => current.filter((item) => item.attachment_id !== id))} />
         {stream.connection === "reconnecting" && <div className="connection-banner"><CloudOff aria-hidden="true" />连接暂时中断。任务继续在 Gateway 运行，正在补齐事件。</div>}
       </WorkbenchShell>
       <CommandPalette open={commandsOpen} onClose={() => setCommandsOpen(false)} onNewSession={() => selectSession()} onAddProject={() => void beginAddProject()} onTheme={setPreference} />

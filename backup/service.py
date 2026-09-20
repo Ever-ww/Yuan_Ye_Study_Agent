@@ -14,13 +14,14 @@ import tempfile
 import json
 import threading
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 from tzlocal import get_localzone_name
 
-from .archive import ArchiveSource, EncryptedBackupArchive, build_sources, sha256_file
+from .archive import ArchiveSource, EncryptedBackupArchive, sha256_file
 from .catalog import AgentHomeDurabilityCatalog
 from .maintenance import AgentHomeMaintenanceCoordinator
 from .models import (
@@ -32,6 +33,7 @@ from .models import (
     BackupVerificationResult,
     DurabilityClass,
     ExternalDependency,
+    WorkspaceBackupDescriptor,
 )
 from .object_store import BackupObjectStore
 from .operations import BackupOperationConflict, BackupOperationStore
@@ -45,6 +47,21 @@ _REQUIRED_SQLITE_PATHS = {
     "gateway/gateway.sqlite3",
     "reference/reference.sqlite3",
 }
+
+
+@dataclass(frozen=True)
+class _PreStagedSource:
+    source: Path
+    archive_path: str
+    durability: DurabilityClass
+    is_sqlite: bool
+    staged_path: Path
+    fingerprint: tuple[
+        tuple[int, int, int, int, int],
+        tuple[int, int, int, int, int] | None,
+    ]
+    size: int
+    sha256: str
 
 
 class BackupService:
@@ -89,6 +106,7 @@ class BackupService:
         self.object_store = BackupObjectStore(self.backup_root)
         self.staging_root = self.control_root / "control" / "backup" / "staging"
         self._background_tasks: set[asyncio.Task[BackupRecord]] = set()
+        self._deferred_cleanup: set[Path] = set()
 
     async def create(
         self,
@@ -118,7 +136,7 @@ class BackupService:
             backup_id=backup_id,
             kind=kind,
             phase=BackupOperationPhase.PREPARING,
-            staging_path=staging_ready,
+            staging_path=staging_partial,
             manifest_path=manifest_path,
             encryption_mode=selected.mode,
             key_id=selected.key_id,
@@ -129,6 +147,16 @@ class BackupService:
         maintenance: Path | None = None
         frozen = False
         try:
+            # Copy the normally immutable bulk while Agent work is still
+            # admitted. The frozen section below reuses only unchanged files.
+            prestage_worker = asyncio.create_task(asyncio.to_thread(
+                self._prestage_sources, staging_partial,
+            ))
+            try:
+                prestaged = await asyncio.shield(prestage_worker)
+            except asyncio.CancelledError:
+                await prestage_worker
+                raise
             if self.coordinator is not None:
                 lifecycle = await self.coordinator.freeze("backup", drain_timeout_seconds)
                 epoch = lifecycle.maintenance_epoch
@@ -152,19 +180,31 @@ class BackupService:
                     maintenance_epoch=epoch,
                 )
             maintenance.mkdir(parents=True, exist_ok=True)
-            sources, logical_size = self._stage_consistent_sources(maintenance, staging_partial)
+            snapshot_worker = asyncio.create_task(asyncio.to_thread(
+                self._stage_consistent_sources,
+                maintenance,
+                staging_partial,
+                prestaged,
+                frozen,
+            ))
+            try:
+                sources, logical_size, schema_versions = await asyncio.shield(snapshot_worker)
+            except asyncio.CancelledError:
+                await snapshot_worker
+                raise
             manifest = BackupManifest(
                 backup_id=backup_id,
                 created_at=created_at,
                 kind=kind,
                 agent_version=_agent_version(),
                 backup_format_version=2,
-                schema_versions=self._schema_versions(sources),
+                schema_versions=schema_versions,
                 maintenance_epoch=epoch,
                 source_platform=f"{platform.system()} {platform.release()} {platform.machine()}",
                 source_timezone=get_localzone_name(),
                 agent_home_logical_size=logical_size,
                 files=tuple(item.record for item in sources),
+                workspaces=self._workspace_descriptors(),
                 external_dependencies=self._external_dependencies(maintenance),
                 skill_manifest_hashes=self._skill_hashes(),
                 harness_snapshots=tuple(
@@ -176,7 +216,9 @@ class BackupService:
                 object_store_salt=context.metadata.salt,
                 key_verifier=context.metadata.key_verifier,
             )
-            self._write_staging_manifest(staging_partial / ".snapshot-manifest.json", manifest)
+            manifest = self._write_staging_manifest(
+                staging_partial / ".snapshot-manifest.json", manifest,
+            )
             staging_ready.parent.mkdir(parents=True, exist_ok=True)
             if staging_ready.exists():
                 raise FileExistsError(staging_ready)
@@ -186,7 +228,7 @@ class BackupService:
                 expected_revision=operation.revision,
                 expected_phases=(BackupOperationPhase.SNAPSHOTTING,),
                 phase=BackupOperationPhase.SNAPSHOT_READY,
-                manifest_json=manifest.model_dump_json(),
+                staging_path=staging_ready,
             )
         except BaseException as exc:
             current = self.operation_store.get(operation_id)
@@ -388,7 +430,7 @@ class BackupService:
             )
         return self.system_key_store.get_or_create()
 
-    async def reconcile_startup(self) -> None:
+    async def reconcile_startup(self, *, defer_completion: bool = False) -> None:
         """Resume or safely abandon the exact durable backup operation."""
         self.object_store.cleanup_interrupted_partials()
         if self.manifests_directory.is_dir():
@@ -399,7 +441,10 @@ class BackupService:
             if self.staging_root.is_dir():
                 for orphan in self.staging_root.iterdir():
                     if orphan.is_dir() and orphan.name.endswith((".partial", ".ready")):
-                        shutil.rmtree(orphan, ignore_errors=True)
+                        if defer_completion:
+                            self._deferred_cleanup.add(orphan)
+                        else:
+                            shutil.rmtree(orphan, ignore_errors=True)
             if (
                 self.coordinator is not None
                 and self.coordinator.snapshot.reason == "backup"
@@ -419,21 +464,22 @@ class BackupService:
                 BackupOperationPhase.FAILED,
                 RuntimeError("Gateway stopped before an immutable snapshot was published"),
             )
-            shutil.rmtree(operation.staging_path, ignore_errors=True)
+            cleanup = {operation.staging_path}
+            if operation.staging_path.name.endswith(".partial"):
+                cleanup.add(operation.staging_path.with_name(
+                    operation.staging_path.name.removesuffix(".partial") + ".ready",
+                ))
+            if defer_completion:
+                self._deferred_cleanup.update(cleanup)
+            else:
+                for path in cleanup:
+                    shutil.rmtree(path, ignore_errors=True)
             await self._resume_interrupted_backup(operation)
             return
 
         await self._resume_interrupted_backup(operation)
         try:
-            if operation.encryption_mode == "os_managed":
-                selected = self.system_key_store.get(operation.key_id)
-                if selected is None:
-                    raise RuntimeError("System-managed backup key is unavailable")
-            else:
-                # Manual passphrases are never persisted.  An interrupted
-                # manual backup can be retried explicitly, but cannot be
-                # guessed by startup recovery.
-                raise RuntimeError("Interrupted manual-passphrase backup requires an explicit retry")
+            selected = self._recovery_secret(operation)
         except Exception as exc:
             current = self.operation_store.get(operation.operation_id)
             if current is not None and current.phase not in {
@@ -442,7 +488,13 @@ class BackupService:
                 BackupOperationPhase.RECOVERY_REQUIRED,
             }:
                 self._terminal_transition(current, BackupOperationPhase.FAILED, exc)
-            shutil.rmtree(operation.staging_path, ignore_errors=True)
+            if defer_completion:
+                self._deferred_cleanup.add(operation.staging_path)
+            else:
+                shutil.rmtree(operation.staging_path, ignore_errors=True)
+            return
+
+        if defer_completion:
             return
 
         task = asyncio.create_task(
@@ -450,6 +502,52 @@ class BackupService:
             name=f"backup-recovery-{operation.operation_id[:12]}",
         )
         self._track_background(task)
+
+    def has_pending_completion(self) -> bool:
+        operation = self.operation_store.active()
+        return operation is not None and operation.phase in {
+            BackupOperationPhase.SNAPSHOT_READY,
+            BackupOperationPhase.STORING_OBJECTS,
+            BackupOperationPhase.VERIFYING,
+        }
+
+    def has_deferred_cleanup(self) -> bool:
+        return bool(self._deferred_cleanup)
+
+    async def cleanup_deferred(self) -> None:
+        paths = tuple(self._deferred_cleanup)
+        if not paths:
+            return
+
+        def remove() -> None:
+            for path in paths:
+                shutil.rmtree(path, ignore_errors=True)
+
+        worker = asyncio.create_task(asyncio.to_thread(remove))
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            await worker
+            raise
+        self._deferred_cleanup.difference_update(paths)
+
+    async def finish_pending(self) -> BackupRecord | None:
+        operation = self.operation_store.active()
+        if operation is None or not self.has_pending_completion():
+            return None
+        return await self._finish_in_daemon(
+            operation.operation_id, self._recovery_secret(operation),
+        )
+
+    def _recovery_secret(self, operation: BackupOperation) -> BackupSecret:
+        if operation.encryption_mode == "os_managed":
+            selected = self.system_key_store.get(operation.key_id)
+            if selected is None:
+                raise RuntimeError("System-managed backup key is unavailable")
+            return selected
+        # Manual passphrases are never persisted. An interrupted manual backup
+        # can be retried explicitly, but cannot be guessed by startup recovery.
+        raise RuntimeError("Interrupted manual-passphrase backup requires an explicit retry")
 
     async def _finish_in_daemon(
         self,
@@ -535,9 +633,15 @@ class BackupService:
                 last_error_type=None,
                 last_error=None,
             )
-            if not operation.manifest_json:
+            snapshot_manifest = operation.staging_path / ".snapshot-manifest.json"
+            if snapshot_manifest.is_file():
+                seed = read_manifest(snapshot_manifest)
+            elif operation.manifest_json:
+                # Compatibility for operations frozen before staging manifests
+                # became the single source of recovery state.
+                seed = BackupManifest.model_validate_json(operation.manifest_json, strict=True)
+            else:
                 raise RuntimeError("Backup operation is missing its frozen member manifest")
-            seed = BackupManifest.model_validate_json(operation.manifest_json, strict=True)
             context = self.object_store.prepare(selected)
             records: list[BackupFileRecord] = []
             for member in seed.files:
@@ -726,13 +830,8 @@ class BackupService:
         task.add_done_callback(done)
 
     @staticmethod
-    def _write_staging_manifest(path: Path, manifest: BackupManifest) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("x", encoding="utf-8", newline="\n") as handle:
-            handle.write(manifest.model_dump_json(indent=2))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+    def _write_staging_manifest(path: Path, manifest: BackupManifest) -> BackupManifest:
+        return write_manifest(path, manifest)
 
     def _manifest_target(self, output: Path | None, created_at: datetime, backup_id: str) -> Path:
         if output is not None:
@@ -845,100 +944,240 @@ class BackupService:
             if path.is_file()
         )
 
+    def _prestage_sources(
+        self,
+        staging: Path,
+    ) -> dict[str, _PreStagedSource]:
+        if staging.exists():
+            raise FileExistsError(staging)
+        root = staging / "prestage"
+        files_root = staging / "files"
+        root.mkdir(parents=True)
+        files_root.mkdir()
+        staged: dict[str, _PreStagedSource] = {}
+        for source, archive_path, durability in self._live_source_entries():
+            if archive_path in staged:
+                raise RuntimeError(f"Duplicate backup member: {archive_path}")
+            AgentHomeDurabilityCatalog.validate_member_name(archive_path)
+            is_sqlite = _is_sqlite_source(source, archive_path)
+            target = root / hashlib.sha256(archive_path.encode("utf-8")).hexdigest()
+            try:
+                before = self._source_fingerprint(source, sqlite=is_sqlite)
+                if is_sqlite:
+                    self._snapshot_sqlite(source, target)
+                    size, digest = target.stat().st_size, sha256_file(target)
+                else:
+                    size, digest = self._copy_and_fsync(source, target)
+                after = self._source_fingerprint(source, sqlite=is_sqlite)
+            except FileNotFoundError:
+                target.unlink(missing_ok=True)
+                continue
+            if before != after or size != after[0][2]:
+                target.unlink(missing_ok=True)
+                continue
+            stored = files_root / digest
+            if stored.exists():
+                target.unlink()
+            else:
+                os.replace(target, stored)
+            staged[archive_path] = _PreStagedSource(
+                source=source,
+                archive_path=archive_path,
+                durability=durability,
+                is_sqlite=is_sqlite,
+                staged_path=stored,
+                fingerprint=after,
+                size=size,
+                sha256=digest,
+            )
+        return staged
+
     def _stage_consistent_sources(
         self,
         maintenance: Path,
         staging: Path,
-    ) -> tuple[tuple[ArchiveSource, ...], int]:
-        if staging.exists():
-            raise FileExistsError(staging)
-        staging.mkdir(parents=True)
-        frozen_sources, _ = self._consistent_sources(maintenance)
+        prestaged: dict[str, _PreStagedSource] | None = None,
+        frozen: bool = False,
+    ) -> tuple[tuple[ArchiveSource, ...], int, dict[str, int | str]]:
+        staging.mkdir(parents=True, exist_ok=True)
+        prestaged = prestaged or {}
         staged: list[ArchiveSource] = []
         total = 0
+        schema_versions: dict[str, int | str] = {}
         seen: set[str] = set()
         try:
             files_root = staging / "files"
-            files_root.mkdir()
-            for item in frozen_sources:
-                if item.archive_path in seen:
-                    raise RuntimeError(f"Duplicate backup member: {item.archive_path}")
-                seen.add(item.archive_path)
-                AgentHomeDurabilityCatalog.validate_member_name(item.archive_path)
-                target = (files_root / item.record.sha256).resolve()
-                if staging.resolve() not in target.parents:
-                    raise RuntimeError(f"Backup member escapes staging: {item.archive_path}")
-                if not target.exists():
-                    self._copy_and_fsync(item.source, target)
-                staged_hash = sha256_file(target)
-                if target.stat().st_size != item.record.size or staged_hash != item.record.sha256:
-                    raise RuntimeError(f"Backup source changed during snapshot: {item.archive_path}")
-                record = item.record.model_copy(update={
-                    "size": target.stat().st_size,
-                    "sha256": staged_hash,
-                    "object_id": item.record.sha256,
-                    "stored_size": None,
-                })
-                staged.append(ArchiveSource(target, item.archive_path, record))
+            files_root.mkdir(exist_ok=True)
+            refresh_root = staging / "refresh"
+            refresh_root.mkdir(exist_ok=True)
+
+            def add(source: Path, archive_path: str, durability: DurabilityClass) -> None:
+                nonlocal total
+                if archive_path in seen:
+                    raise RuntimeError(f"Duplicate backup member: {archive_path}")
+                seen.add(archive_path)
+                AgentHomeDurabilityCatalog.validate_member_name(archive_path)
+                cached = prestaged.get(archive_path)
+                cache_matches = (
+                    cached is not None
+                    and cached.source == source
+                    and cached.durability == durability
+                )
+                is_sqlite = (
+                    cached.is_sqlite
+                    if cache_matches
+                    else _is_sqlite_source(source, archive_path)
+                )
+                if (
+                    cache_matches
+                    and self._source_fingerprint(source, sqlite=is_sqlite)
+                    == cached.fingerprint
+                ):
+                    temporary = cached.staged_path
+                    size, digest = cached.size, cached.sha256
+                else:
+                    temporary = refresh_root / hashlib.sha256(
+                        archive_path.encode("utf-8"),
+                    ).hexdigest()
+                    if is_sqlite:
+                        if frozen and self._sqlite_wal_is_empty(source):
+                            size, digest = self._copy_and_fsync(source, temporary)
+                        else:
+                            self._snapshot_sqlite(source, temporary)
+                            size, digest = temporary.stat().st_size, sha256_file(temporary)
+                    else:
+                        size, digest = self._copy_and_fsync(source, temporary)
+                # digest is generated locally, so it cannot escape files_root.
+                target = files_root / digest
+                if temporary == target:
+                    if not target.is_file():
+                        raise RuntimeError(f"Frozen backup member is missing: {archive_path}")
+                elif target.exists():
+                    temporary.unlink(missing_ok=True)
+                else:
+                    os.replace(temporary, target)
+                record = BackupFileRecord(
+                    path=archive_path,
+                    size=size,
+                    sha256=digest,
+                    durability=durability,
+                    object_id=digest,
+                    stored_size=None,
+                )
+                staged.append(ArchiveSource(target, archive_path, record))
                 total += record.size
-            return tuple(staged), total
+                if is_sqlite:
+                    schema_versions[PurePosixPath(archive_path).name] = "sqlite"
+
+            for source, archive_path, durability in self._live_source_entries():
+                add(source, archive_path, durability)
+
+            candidate_dir = maintenance / "participants" / "harness"
+            if candidate_dir.is_dir():
+                for source in sorted(candidate_dir.rglob("*")):
+                    if not source.is_file() or source.is_symlink():
+                        continue
+                    relative = source.relative_to(candidate_dir).as_posix()
+                    add(
+                        source,
+                        f"harness-evolution/candidates/{relative}",
+                        DurabilityClass.CANONICAL,
+                    )
+            shutil.rmtree(staging / "prestage", ignore_errors=True)
+            shutil.rmtree(refresh_root, ignore_errors=True)
+            return tuple(staged), total, schema_versions
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
             raise
 
     @staticmethod
-    def _copy_and_fsync(source: Path, target: Path) -> None:
-        """Copy bytes without inheriting a source read-only bit or ACL."""
+    def _copy_and_fsync(source: Path, target: Path) -> tuple[int, str]:
+        """Copy and hash once without inheriting a source read-only bit or ACL."""
+        digest = hashlib.sha256()
+        size = 0
         with source.open("rb") as incoming, target.open("xb") as outgoing:
-            shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
+            while chunk := incoming.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+                outgoing.write(chunk)
             outgoing.flush()
             os.fsync(outgoing.fileno())
+        return size, digest.hexdigest()
 
-    def _consistent_sources(self, maintenance: Path) -> tuple[tuple[ArchiveSource, ...], int]:
-        sources, _ = build_sources(self.home, self.catalog)
-        sqlite_dir = maintenance / "sqlite"
-        candidate_dir = maintenance / "participants" / "harness"
-        selected: list[ArchiveSource] = []
-        logical_size = 0
-        for item in sources:
-            source = item.source
-            record = item.record
-            if _is_sqlite_source(source, item.archive_path):
-                snapshot = sqlite_dir / Path(*PurePosixPath(item.archive_path).parts)
-                snapshot.parent.mkdir(parents=True, exist_ok=True)
-                self._snapshot_sqlite(source, snapshot)
-                record = record.model_copy(update={
-                    "size": snapshot.stat().st_size,
-                    "sha256": sha256_file(snapshot),
-                })
-                source = snapshot
-            selected.append(ArchiveSource(source, item.archive_path, record))
-            logical_size += record.size
-        if candidate_dir.is_dir():
-            for source in sorted(candidate_dir.rglob("*")):
-                if not source.is_file() or source.is_symlink():
-                    continue
-                relative = source.relative_to(candidate_dir).as_posix()
-                archive_path = f"harness-evolution/candidates/{relative}"
-                record = BackupFileRecord(
-                    path=archive_path,
-                    size=source.stat().st_size,
-                    sha256=sha256_file(source),
-                    durability=DurabilityClass.CANONICAL,
-                )
-                selected.append(ArchiveSource(source, archive_path, record))
-                logical_size += record.size
-        return tuple(selected), logical_size
+    def _live_source_entries(
+        self,
+    ) -> tuple[tuple[Path, str, DurabilityClass], ...]:
+        values = [
+            (source, relative.as_posix(), durability)
+            for source, relative, durability in self.catalog.iter_files(self.home)
+        ]
+        for descriptor in self._workspace_descriptors():
+            state = Path(descriptor.path).expanduser().resolve() / ".yy"
+            if not state.is_dir() or state.resolve() == self.home.resolve():
+                continue
+            for source, relative, durability in self.catalog.iter_files(state):
+                values.append((
+                    source,
+                    f"workspace-data/{descriptor.workspace_id}/{relative.as_posix()}",
+                    durability,
+                ))
+        return tuple(values)
+
+    @staticmethod
+    def _file_fingerprint(path: Path) -> tuple[int, int, int, int, int]:
+        value = path.stat()
+        return (
+            int(value.st_dev),
+            int(value.st_ino),
+            int(value.st_size),
+            int(value.st_mtime_ns),
+            int(value.st_ctime_ns),
+        )
+
+    @classmethod
+    def _source_fingerprint(
+        cls,
+        path: Path,
+        *,
+        sqlite: bool,
+    ) -> tuple[
+        tuple[int, int, int, int, int],
+        tuple[int, int, int, int, int] | None,
+    ]:
+        wal = Path(f"{path}-wal")
+        wal_fingerprint = None
+        if sqlite:
+            try:
+                wal_fingerprint = cls._file_fingerprint(wal)
+            except FileNotFoundError:
+                pass
+        return cls._file_fingerprint(path), wal_fingerprint
+
+    @staticmethod
+    def _sqlite_wal_is_empty(path: Path) -> bool:
+        wal = Path(f"{path}-wal")
+        try:
+            return wal.stat().st_size == 0
+        except FileNotFoundError:
+            return True
+
+    def _workspace_descriptors(self) -> tuple[WorkspaceBackupDescriptor, ...]:
+        values: list[WorkspaceBackupDescriptor] = []
+        for item in _workspace_manifest(self.agent_root):
+            try:
+                descriptor = WorkspaceBackupDescriptor.model_validate(item)
+            except Exception:
+                continue
+            state = Path(descriptor.path).expanduser().resolve() / ".yy"
+            if state.is_dir():
+                values.append(descriptor)
+        return tuple(values)
 
     @staticmethod
     def _snapshot_sqlite(source: Path, target: Path) -> None:
         incoming = sqlite3.connect(f"file:{source.as_posix()}?mode=ro", uri=True)
         outgoing: sqlite3.Connection | None = None
         try:
-            if incoming.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                raise RuntimeError(f"SQLite quick_check失败：{source}")
-            if incoming.execute("PRAGMA foreign_key_check").fetchall():
-                raise RuntimeError(f"SQLite foreign_key_check失败：{source}")
             outgoing = sqlite3.connect(target)
             incoming.backup(outgoing)
             outgoing.commit()
@@ -946,12 +1185,6 @@ class BackupService:
             if outgoing is not None:
                 outgoing.close()
             incoming.close()
-        check = sqlite3.connect(target)
-        try:
-            if check.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                raise RuntimeError(f"SQLite Backup API快照无效：{source}")
-        finally:
-            check.close()
 
     def _external_dependencies(self, maintenance: Path) -> tuple[ExternalDependency, ...]:
         values: list[ExternalDependency] = []
@@ -990,6 +1223,15 @@ class BackupService:
                 # between directory enumeration and stat. They are not stable
                 # snapshot members and must not abort admission estimation.
                 continue
+        for descriptor in self._workspace_descriptors():
+            state = Path(descriptor.path).expanduser().resolve() / ".yy"
+            if not state.is_dir() or state.resolve() == self.home.resolve():
+                continue
+            for path, _relative, _durability in self.catalog.iter_files(state):
+                try:
+                    logical += path.stat().st_size
+                except FileNotFoundError:
+                    continue
         # Peak usage includes one immutable staging copy plus newly created
         # objects.  Existing identical objects are reused, but admission must
         # remain safe for a completely changed home.
@@ -1045,15 +1287,6 @@ class BackupService:
                 result[skill.name] = sha256_file(main)
         return result
 
-    @staticmethod
-    def _schema_versions(sources: tuple[ArchiveSource, ...]) -> dict[str, int | str]:
-        return {
-            PurePosixPath(item.archive_path).name: "sqlite"
-            for item in sources
-            if _is_sqlite_source(item.source, item.archive_path)
-        }
-
-
 def _is_sqlite_source(path: Path, archive_path: str) -> bool:
     """Recognize actual SQLite data without misclassifying unknown canonical files."""
     normalized = PurePosixPath(archive_path).as_posix().lstrip("./")
@@ -1091,6 +1324,23 @@ def _id_from_name(path: Path) -> str:
     stem = path.stem
     tail = stem.rsplit("_", 1)[-1]
     return tail if len(tail) >= 8 else hashlib.sha256(str(path).encode()).hexdigest()[:12]
+
+
+def _workspace_manifest(agent_root: Path) -> tuple[dict[str, object], ...]:
+    """Read global Workspace discovery metadata without importing bootstrap.
+
+    Backup is imported by bootstrap through the maintenance scheduler, so a
+    dependency back to the bootstrap package would create an import cycle.
+    """
+
+    try:
+        value = json.loads(
+            (agent_root.resolve() / ".yy" / "workspaces.json").read_text(encoding="utf-8"),
+        )
+    except (OSError, json.JSONDecodeError):
+        return ()
+    items = value.get("workspaces", []) if isinstance(value, dict) else []
+    return tuple(item for item in items if isinstance(item, dict))
 
 
 __all__ = ["BackupService", "SecretProvider"]

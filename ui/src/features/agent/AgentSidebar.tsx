@@ -17,7 +17,7 @@ export function AgentSidebar({
     <div className="sidebar-layout">
       <div className="sidebar-heading">
         <div><span>Agent</span><h2>会话</h2></div>
-        <button type="button" className="icon-button" onClick={onNewSession} aria-label="开始新会话"><MessageSquarePlus aria-hidden="true" /></button>
+        <button type="button" className="icon-button" onClick={onNewSession} aria-label="开始新会话" title="开始新会话"><MessageSquarePlus aria-hidden="true" /></button>
       </div>
 
       <label className="compact-label" htmlFor="project-select">当前项目</label>

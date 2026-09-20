@@ -1,9 +1,13 @@
 """FastAPI 本机 API、WebSocket 事件桥和共享 Web 入口。"""
 
 import asyncio
+import hashlib
 import json
 import mimetypes
+import os
 import secrets
+import httpx
+import time
 from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -30,6 +34,8 @@ from gateway.models import (
     HarnessEvolutionDecision,
     ProjectCreateRequest,
     PaperPatchRequest,
+    PaperSummaryRequest,
+    TranslationRequest,
     RunCreateRequest,
     RecoveryDecisionRequest,
     SkillManageRequest,
@@ -48,9 +54,18 @@ from gateway.security import GatewayCredentials, bearer_value
 from sandbox import probe_sandbox_status
 from backup import BackupCreateRequest, MaintenanceBlockedError, external_control_root
 from backup.models import MaintenanceQuiesceRequest, MaintenanceResumeRequest
-from reference import PaperNoteCreate, PaperNoteUpdate, ReferenceSearchRequest
+from reference import (
+    PaperInlineQuestionCreate,
+    PaperNoteCreate,
+    PaperNoteUpdate,
+    ReferenceSearchRequest,
+)
 from gateway.workspace_files import WorkspaceFileConflict
 from gateway.latex import LatexEngineUnavailable, LatexWorkspaceRevisionConflict
+
+
+def translation_label(engine: str) -> str:
+    return {"baidu": "百度翻译", "google": "Google 翻译", "youdao": "有道翻译", "360": "360 翻译"}.get(engine, engine)
 
 
 def create_gateway_api(
@@ -166,11 +181,12 @@ def create_gateway_api(
         raw["content_hash"] = next(
             (item.get("sha256") for item in raw["files"] if item.get("is_primary")), None,
         )
+        raw["summary_status"] = raw.get("metadata", {}).get("summary_status", "missing")
         raw.pop("source_workspace", None)
         return raw
 
-    def paper_file(paper_id: str) -> tuple[Path, dict[str, Any]]:
-        paper = gateway.reference_store.get_paper(paper_id)
+    def paper_file(paper_id: str, project_id: str | None) -> tuple[Path, dict[str, Any]]:
+        paper = gateway.reference_store_for_project(project_id).get_paper(paper_id)
         selected = next((item for item in paper.files if item.is_primary), None)
         if selected is None:
             raise HTTPException(404, "Paper does not have a local PDF")
@@ -491,6 +507,10 @@ def create_gateway_api(
     async def list_projects():
         return gateway.store.list_projects()
 
+    @app.post("/api/v1/projects/{project_id}/open", dependencies=[Depends(authorize_write)])
+    async def open_project(project_id: str):
+        return gateway.open_project(project_id)
+
     @app.delete("/api/v1/projects/{project_id}", dependencies=[Depends(authorize_write)])
     async def delete_project(project_id: str):
         await gateway.remove_project(project_id)
@@ -657,9 +677,11 @@ def create_gateway_api(
     @app.get("/api/v1/library/papers", dependencies=[Depends(authorize)])
     async def library_papers(
         response: Response, cursor: str | None = None, limit: int = 100,
-        include_archived: bool = False,
+        include_archived: bool = False, project_id: str | None = None,
     ):
-        papers = gateway.reference_store.list_papers(
+        if project_id is not None:
+            gateway.paper_web_for_project(project_id)
+        papers = gateway.reference_store_for_project(project_id).list_papers(
             include_archived=include_archived, cursor=cursor, limit=limit + 1,
         )
         page = papers[:limit]
@@ -667,19 +689,56 @@ def create_gateway_api(
             response.headers["X-Next-Cursor"] = page[-1].paper_id
         return [public_paper(paper) for paper in page]
 
+    @app.post("/api/v1/projects/{project_id}/attachments", dependencies=[Depends(authorize_write)])
+    async def upload_agent_attachment(
+        project_id: str, request: Request, filename: str = "attachment.pdf",
+    ):
+        return gateway.upload_agent_attachment(project_id, await request.body(), filename)
+
+    @app.post("/api/v1/library/papers/import", dependencies=[Depends(authorize_write)])
+    async def import_library_paper(
+        request: Request, project_id: str, filename: str = "paper.pdf",
+        auto_summarize: bool = True, client_id: str = "read-web",
+        model_profile_id: str = "default", reasoning_effort: str | None = None,
+    ):
+        result = gateway.import_read_pdf(project_id, await request.body(), filename)
+        paper = result["paper"]
+        summary = gateway.paper_summary(project_id, paper.paper_id)
+        if auto_summarize and result.get("created") is True and summary["status"] == "missing":
+            summary = gateway.queue_paper_summary(
+                paper.paper_id,
+                PaperSummaryRequest.model_validate({
+                    "project_id": project_id,
+                    "client_id": client_id,
+                    "model_profile_id": model_profile_id,
+                    "reasoning_effort": reasoning_effort,
+                }),
+            )
+        return {
+            **{key: value for key, value in result.items() if key != "paper"},
+            "paper": public_paper(paper),
+            "summary": summary,
+        }
+
     @app.get("/api/v1/library/papers/{paper_id}", dependencies=[Depends(authorize)])
-    async def library_paper(paper_id: str):
-        return public_paper(gateway.reference_store.get_paper(paper_id))
+    async def library_paper(paper_id: str, project_id: str | None = None):
+        return public_paper(gateway.reference_store_for_project(project_id).get_paper(paper_id))
 
     @app.patch("/api/v1/library/papers/{paper_id}", dependencies=[Depends(authorize_write)])
-    async def update_library_paper(paper_id: str, payload: PaperPatchRequest):
-        return public_paper(gateway.reference_store.archive(
+    async def update_library_paper(
+        paper_id: str, payload: PaperPatchRequest, project_id: str | None = None,
+    ):
+        return public_paper(gateway.reference_store_for_project(project_id).archive(
             paper_id, archived=payload.status == "archived",
         ))
 
+    @app.delete("/api/v1/library/papers/{paper_id}", dependencies=[Depends(authorize_write)])
+    async def delete_library_paper(paper_id: str, project_id: str):
+        return public_paper(gateway.paper_web_for_project(project_id).trash_paper(paper_id))
+
     @app.get("/api/v1/library/papers/{paper_id}/pdf", dependencies=[Depends(authorize)])
-    async def library_paper_pdf(paper_id: str):
-        path, metadata = paper_file(paper_id)
+    async def library_paper_pdf(paper_id: str, project_id: str | None = None):
+        path, metadata = paper_file(paper_id, project_id)
         return FileResponse(
             path, media_type=metadata["mime_type"] or "application/pdf",
             headers={"ETag": f'"{metadata["sha256"]}"', "Accept-Ranges": "bytes"},
@@ -689,10 +748,11 @@ def create_gateway_api(
     async def library_paper_text(
         paper_id: str, start_page: int | None = None, end_page: int | None = None,
         offset_chars: int = 0, max_chars: int = 30_000,
+        project_id: str | None = None,
     ):
         if max_chars < 1 or max_chars > 100_000:
             raise HTTPException(400, "max_chars must be between 1 and 100000")
-        path, metadata = paper_file(paper_id)
+        path, metadata = paper_file(paper_id, project_id)
         from tools.read_file import DocumentReader
         content = await DocumentReader().read_path(
             path,
@@ -705,30 +765,136 @@ def create_gateway_api(
         return {"paper_id": paper_id, "content": content, "content_hash": metadata["sha256"]}
 
     @app.get("/api/v1/library/papers/{paper_id}/references", dependencies=[Depends(authorize)])
-    async def library_paper_references(paper_id: str):
-        bundle = gateway.reference_store.get_bundle("paper", paper_id)
-        bundle["paper"] = public_paper(gateway.reference_store.get_paper(paper_id))
+    async def library_paper_references(paper_id: str, project_id: str | None = None):
+        store = gateway.reference_store_for_project(project_id)
+        bundle = store.get_bundle("paper", paper_id)
+        bundle["paper"] = public_paper(store.get_paper(paper_id))
         return bundle
 
+    @app.get("/api/v1/library/papers/{paper_id}/summary", dependencies=[Depends(authorize)])
+    async def paper_summary(paper_id: str, project_id: str):
+        return gateway.paper_summary(project_id, paper_id)
+
+    @app.post(
+        "/api/v1/library/papers/{paper_id}/summary",
+        dependencies=[Depends(authorize_write)],
+    )
+    async def start_paper_summary(paper_id: str, payload: PaperSummaryRequest):
+        return await gateway.start_paper_summary(paper_id, payload)
+
+    @app.get(
+        "/api/v1/library/papers/{paper_id}/inline-questions",
+        dependencies=[Depends(authorize)],
+    )
+    async def paper_inline_questions(paper_id: str, project_id: str):
+        return gateway.paper_inline_answers(project_id, paper_id)
+
+    @app.post(
+        "/api/v1/library/papers/{paper_id}/inline-questions",
+        dependencies=[Depends(authorize_write)],
+    )
+    async def create_paper_inline_question(
+        paper_id: str, payload: PaperInlineQuestionCreate, project_id: str,
+    ):
+        return gateway.register_inline_question(project_id, paper_id, payload)
+
     @app.post("/api/v1/library/search", dependencies=[Depends(authorize)])
-    async def library_search(payload: ReferenceSearchRequest):
-        return await gateway.reference_service.search(payload)
+    async def library_search(payload: ReferenceSearchRequest, project_id: str | None = None):
+        return await gateway.reference_service_for_project(project_id).search(payload)
+
+    @app.post("/api/v1/translate", dependencies=[Depends(authorize)])
+    async def translate(payload: TranslationRequest):
+        """通过 Gateway 代理可选翻译服务，凭证不暴露给浏览器。"""
+        query = payload.text[:5_000]
+        target = "zh" if payload.target_language.startswith("zh") else payload.target_language
+        try:
+            async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
+                if payload.engine == "google":
+                    response = await client.get(
+                        "https://translate.googleapis.com/translate_a/single",
+                        params={"client": "gtx", "sl": "auto", "tl": target, "dt": "t", "q": query},
+                    )
+                    response.raise_for_status()
+                    value = response.json()
+                    segments = value[0] if isinstance(value, list) and value and isinstance(value[0], list) else []
+                    translated = "".join(str(item[0] or "") for item in segments if isinstance(item, list)).strip()
+                elif payload.engine == "baidu":
+                    app_id = os.environ.get("YY_BAIDU_TRANSLATE_APP_ID") or os.environ.get("BAIDU_TRANSLATE_APP_ID")
+                    secret = os.environ.get("YY_BAIDU_TRANSLATE_SECRET") or os.environ.get("BAIDU_TRANSLATE_SECRET")
+                    if not app_id or not secret:
+                        raise HTTPException(503, "未配置百度翻译凭证，请设置 YY_BAIDU_TRANSLATE_APP_ID 和 YY_BAIDU_TRANSLATE_SECRET")
+                    salt = uuid4().hex[:16]
+                    sign = hashlib.md5(f"{app_id}{query}{salt}{secret}".encode("utf-8")).hexdigest()
+                    response = await client.get(
+                        "https://fanyi-api.baidu.com/api/trans/vip/translate",
+                        params={"q": query, "from": "auto", "to": target, "appid": app_id, "salt": salt, "sign": sign},
+                    )
+                    response.raise_for_status()
+                    value = response.json()
+                    if not isinstance(value, dict) or value.get("error_code"):
+                        raise HTTPException(502, str(value.get("error_msg") or "百度翻译没有返回结果") if isinstance(value, dict) else "百度翻译没有返回结果")
+                    translated = "\n".join(str(item.get("dst") or "") for item in value.get("trans_result", []) if isinstance(item, dict)).strip()
+                elif payload.engine == "youdao":
+                    app_key = os.environ.get("YY_YOUDAO_TRANSLATE_APP_KEY") or os.environ.get("YOUDAO_TRANSLATE_APP_KEY")
+                    secret = os.environ.get("YY_YOUDAO_TRANSLATE_SECRET") or os.environ.get("YOUDAO_TRANSLATE_SECRET")
+                    if not app_key or not secret:
+                        raise HTTPException(503, "未配置有道翻译凭证，请设置 YY_YOUDAO_TRANSLATE_APP_KEY 和 YY_YOUDAO_TRANSLATE_SECRET")
+                    salt, curtime = uuid4().hex[:16], str(int(time.time()))
+                    input_text = query if len(query) <= 20 else f"{query[:10]}{len(query)}{query[-10:]}"
+                    sign = hashlib.sha256(f"{app_key}{input_text}{salt}{curtime}{secret}".encode("utf-8")).hexdigest()
+                    response = await client.get(
+                        "https://openapi.youdao.com/api",
+                        params={"q": query, "from": "auto", "to": "zh-CHS", "appKey": app_key, "salt": salt, "signType": "v3", "curtime": curtime, "sign": sign},
+                    )
+                    response.raise_for_status()
+                    value = response.json()
+                    if not isinstance(value, dict) or str(value.get("errorCode", "0")) != "0":
+                        raise HTTPException(502, str(value.get("errorCode") or "有道翻译没有返回结果"))
+                    translated = "\n".join(str(item) for item in value.get("translation", [])).strip()
+                else:
+                    api_key = os.environ.get("YY_360_TRANSLATE_API_KEY") or os.environ.get("360_TRANSLATE_API_KEY")
+                    if not api_key:
+                        raise HTTPException(503, "未配置 360 翻译凭证，请设置 YY_360_TRANSLATE_API_KEY")
+                    response = await client.post(
+                        "https://api.360.cn/v1/translate",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json={"input": [query], "sl": "auto", "tl": target, "language_detect": True},
+                    )
+                    response.raise_for_status()
+                    value = response.json()
+                    if not isinstance(value, dict) or int(value.get("code", 0) or 0) != 0:
+                        raise HTTPException(502, str(value.get("message") or "360 翻译没有返回结果"))
+                    translated = "\n".join(str(item) for item in value.get("output", [])).strip()
+        except HTTPException:
+            raise
+        except (httpx.HTTPError, ValueError) as exc:
+            raise HTTPException(503, f"{translation_label(payload.engine)}服务暂时不可用") from exc
+        if not translated:
+            raise HTTPException(502, f"{translation_label(payload.engine)}没有返回结果")
+        return {"text": translated, "engine": payload.engine, "target_language": payload.target_language}
 
     @app.get("/api/v1/library/papers/{paper_id}/notes", dependencies=[Depends(authorize)])
-    async def paper_notes(paper_id: str):
-        return gateway.reference_store.list_notes(paper_id)
+    async def paper_notes(paper_id: str, project_id: str | None = None):
+        return gateway.reference_store_for_project(project_id).list_notes(paper_id)
 
     @app.post("/api/v1/library/papers/{paper_id}/notes", dependencies=[Depends(authorize_write)])
-    async def create_paper_note(paper_id: str, payload: PaperNoteCreate):
-        return gateway.reference_store.create_note(paper_id, payload)
+    async def create_paper_note(
+        paper_id: str, payload: PaperNoteCreate, project_id: str | None = None,
+    ):
+        return gateway.reference_store_for_project(project_id).create_note(paper_id, payload)
 
     @app.patch(
         "/api/v1/library/papers/{paper_id}/notes/{note_id}",
         dependencies=[Depends(authorize_write)],
     )
-    async def update_paper_note(paper_id: str, note_id: str, payload: PaperNoteUpdate):
+    async def update_paper_note(
+        paper_id: str, note_id: str, payload: PaperNoteUpdate,
+        project_id: str | None = None,
+    ):
         try:
-            return gateway.reference_store.update_note(paper_id, note_id, payload)
+            return gateway.reference_store_for_project(project_id).update_note(
+                paper_id, note_id, payload,
+            )
         except RuntimeError as exc:
             if not str(exc).startswith("note_conflict:"):
                 raise
@@ -742,8 +908,12 @@ def create_gateway_api(
         "/api/v1/library/papers/{paper_id}/notes/{note_id}",
         dependencies=[Depends(authorize_write)],
     )
-    async def delete_paper_note(paper_id: str, note_id: str):
-        return {"deleted": gateway.reference_store.delete_note(paper_id, note_id)}
+    async def delete_paper_note(
+        paper_id: str, note_id: str, project_id: str | None = None,
+    ):
+        return {"deleted": gateway.reference_store_for_project(project_id).delete_note(
+            paper_id, note_id,
+        )}
 
     @app.get("/api/v1/cron/jobs", dependencies=[Depends(authorize)])
     async def list_cron(project_id: str | None = None):
@@ -798,20 +968,24 @@ def create_gateway_api(
         return await gateway.remove_cron(job_id)
 
     @app.get("/api/v1/dream/status", dependencies=[Depends(authorize)])
-    async def dream_status():
-        return gateway.dream_status()
+    async def dream_status(project_id: str | None = None):
+        return gateway.dream_status(project_id)
 
     @app.post("/api/v1/dream/run", dependencies=[Depends(authorize_write)])
     async def run_dream(payload: DreamRunRequest):
-        return await gateway.run_dream(payload.date)
+        return await gateway.run_dream(payload.date, project_id=payload.project_id)
 
     @app.post("/api/v1/dream/backfill", dependencies=[Depends(authorize_write)])
     async def backfill_dream(payload: DreamBackfillRequest):
-        return await gateway.backfill_dream(payload.start, payload.end)
+        return await gateway.backfill_dream(
+            payload.start, payload.end, project_id=payload.project_id,
+        )
 
     @app.post("/api/v1/dream/rollback", dependencies=[Depends(authorize_write)])
     async def rollback_dream(payload: DreamRollbackRequest):
-        return await gateway.rollback_dream(payload.run_id)
+        return await gateway.rollback_dream(
+            payload.run_id, project_id=payload.project_id,
+        )
 
     @app.get("/api/v1/harness/dream/status", dependencies=[Depends(authorize)])
     async def harness_dream_status():
@@ -1049,7 +1223,7 @@ def create_gateway_api(
     async def manage_skill(payload: SkillManageRequest):
         return await gateway.manage_skill(payload)
 
-    @app.post("/api/v1/browser/code", dependencies=[Depends(authorize_write)])
+    @app.post("/api/v1/browser/code", dependencies=[Depends(authorize_control)])
     async def browser_code():
         code = gateway.issue_browser_code()
         return {"url": f"http://127.0.0.1:{config.gateway_port}/?bootstrap={code}"}
@@ -1205,7 +1379,7 @@ def create_gateway_api(
         target = (ui_dist / "assets" / asset_path).resolve()
         assets_root = (ui_dist / "assets").resolve()
         if assets_root in target.parents and target.is_file():
-            return FileResponse(target)
+            return FileResponse(target, media_type=_frontend_asset_media_type(target))
         raise HTTPException(404, "Frontend asset does not exist")
 
     @app.get("/{client_path:path}")
@@ -1218,6 +1392,20 @@ def create_gateway_api(
     app.state.access_token = token
     app.state.csrf_token = csrf_token
     return app
+
+
+def _frontend_asset_media_type(path: Path) -> str:
+    """Return browser-safe MIME types for Vite assets on Windows and Unix."""
+
+    explicit = {
+        ".js": "text/javascript",
+        ".mjs": "text/javascript",
+        ".css": "text/css",
+        ".json": "application/json",
+        ".wasm": "application/wasm",
+        ".svg": "image/svg+xml",
+    }
+    return explicit.get(path.suffix.casefold()) or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
 
 
 async def _subscription_events(socket, queue):

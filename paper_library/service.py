@@ -1,4 +1,4 @@
-"""Agent Home 全局论文库：索引、受控下载、解析与原子总结写入。"""
+"""Workspace 论文库：索引、受控下载、解析与原子总结写入。"""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ _RESERVED_WINDOWS = {
 
 
 class PaperLibraryService:
-    """只允许访问 `<Agent Home>/.yy/papers` 的论文资料服务。"""
+    """只允许访问当前 `<Workspace>/.yy/papers` 的论文资料服务。"""
 
     def __init__(
         self,

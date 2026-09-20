@@ -36,7 +36,7 @@ def _make_skill(
 
 
 class SkillTests(unittest.TestCase):
-    def test_catalog_uses_repository_and_ignores_agent_home_installed(self) -> None:
+    def test_catalog_uses_workspace_install_and_ignores_agent_home_legacy(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             base = Path(value)
             agent_root, workspace, source_root = base / "home", base / "workspace", base / "repo"
@@ -45,11 +45,14 @@ class SkillTests(unittest.TestCase):
             _make_skill(agent_root / ".yy" / "skills" / "installed", "legacy-skill")
 
             service = SkillService(agent_root, workspace, source_root)
+            service.install_builtin(
+                source_root / "skills" / "repository-skill", repository_root=source_root,
+            )
 
             self.assertEqual([item.name for item in service.catalog()], ["repository-skill"])
-            self.assertEqual(service.skills_root, source_root / "skills")
+            self.assertEqual(service.skills_root, workspace / ".yy" / "skills" / "installed")
 
-    def test_install_audits_in_agent_home_and_publishes_to_repository(self) -> None:
+    def test_install_audits_and_publishes_inside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             base = Path(value)
             agent_root, workspace, source_root = base / "home", base / "workspace", base / "repo"
@@ -59,31 +62,26 @@ class SkillTests(unittest.TestCase):
             result = asyncio.run(service.install(SkillInstallRequest(source=str(source))))
 
             self.assertEqual(result.status, "installed")
-            self.assertTrue((source_root / "skills" / "published-skill" / "SKILL.md").is_file())
-            self.assertFalse((agent_root / ".yy" / "skills" / "installed").exists())
+            self.assertTrue((workspace / ".yy" / "skills" / "installed" / "published-skill" / "SKILL.md").is_file())
+            self.assertFalse((source_root / "skills" / "published-skill").exists())
+            self.assertFalse((agent_root / ".yy" / "skills").exists())
             self.assertFalse(any(service.review_root.iterdir()))
             self.assertTrue((service.audit_root / f"{result.review_id}.json").is_file())
             self.assertIn("/skill refresh", result.message)
 
-    def test_repository_skill_is_source_of_truth_and_legacy_install_is_ignored(self) -> None:
+    def test_repository_skill_is_copied_into_workspace_without_overwriting_source(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
-            legacy = _make_skill(root / "skills", "legacy-skill", body="旧版内容")
-            installed = root / ".yy" / "skills" / "installed" / "legacy-skill"
-            installed.mkdir(parents=True)
-            (installed / "SKILL.md").write_text("保留目标内容", encoding="utf-8")
+            source = _make_skill(root / "skills", "legacy-skill", body="源码内容")
 
             service = SkillService(root, root)
+            service.install_builtin(source, repository_root=root)
 
             self.assertIn(
-                "旧版内容",
+                "源码内容",
                 (service.skills_root / "legacy-skill" / "SKILL.md").read_text(encoding="utf-8"),
             )
-            self.assertEqual(
-                (installed / "SKILL.md").read_text(encoding="utf-8"),
-                "保留目标内容",
-            )
-            self.assertTrue(legacy.is_dir())
+            self.assertTrue(source.is_dir())
 
     def test_parse_and_prompt_only_expose_xml_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as value:

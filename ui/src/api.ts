@@ -1,7 +1,7 @@
 import type {
   GatewayErrorBody, GatewayEvent, GatewayStatus, InboxItem, ModelOption,
   CodeSessionEvent, CodeSessionSummary, JsonObject, ObserverStatus, PendingApproval,
-  CronJobInput, PaperListItem, PaperNote, Project, ReasoningEffort, RunCreate, Session, SessionRecord, ToolResult,
+  CronJobInput, PaperInlineAnswer, PaperListItem, PaperNote, PaperSummary, Project, ReasoningEffort, RunCreate, Session, SessionRecord, TemporaryAttachment, ToolResult,
   WorkspaceDocument, WorkspaceEntry, WorkspaceTree, LatexCompilation,
 } from "./types";
 
@@ -68,6 +68,9 @@ export class GatewayApi {
 
   status(): Promise<GatewayStatus> { return this.request("/api/v1/status"); }
   projects(): Promise<Project[]> { return this.request("/api/v1/projects"); }
+  openProject(projectId: string): Promise<Project> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/open`, { method: "POST" });
+  }
   models(projectId?: string, sessionId?: string): Promise<ModelOption[]> {
     const query = new URLSearchParams();
     if (projectId) query.set("project_id", projectId);
@@ -125,20 +128,23 @@ export class GatewayApi {
   setCronPaused(jobId: string, paused: boolean): Promise<JsonObject> {
     return this.request(`/api/v1/cron/jobs/${encodeURIComponent(jobId)}/${paused ? "pause" : "resume"}`, { method: "POST" });
   }
-  dreamStatus(): Promise<JsonObject> { return this.request("/api/v1/dream/status"); }
-  runDream(date?: string): Promise<JsonObject> {
+  dreamStatus(projectId?: string): Promise<JsonObject> {
+    const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+    return this.request(`/api/v1/dream/status${query}`);
+  }
+  runDream(date?: string, projectId?: string): Promise<JsonObject> {
     return this.request("/api/v1/dream/run", {
-      method: "POST", body: JSON.stringify({ date: date || null }),
+      method: "POST", body: JSON.stringify({ date: date || null, project_id: projectId || null }),
     });
   }
-  backfillDream(start: string, end: string): Promise<JsonObject> {
+  backfillDream(start: string, end: string, projectId?: string): Promise<JsonObject> {
     return this.request("/api/v1/dream/backfill", {
-      method: "POST", body: JSON.stringify({ start, end }),
+      method: "POST", body: JSON.stringify({ start, end, project_id: projectId || null }),
     });
   }
-  rollbackDream(runId?: string): Promise<JsonObject> {
+  rollbackDream(runId?: string, projectId?: string): Promise<JsonObject> {
     return this.request("/api/v1/dream/rollback", {
-      method: "POST", body: JSON.stringify({ run_id: runId || null }),
+      method: "POST", body: JSON.stringify({ run_id: runId || null, project_id: projectId || null }),
     });
   }
   harnessDreamStatus(): Promise<JsonObject> { return this.request("/api/v1/harness/dream/status"); }
@@ -249,12 +255,52 @@ export class GatewayApi {
   deleteCodeSession(sessionId: string): Promise<JsonObject> {
     return this.request(`/api/v1/code/sessions/${encodeURIComponent(sessionId)}?client_id=${encodeURIComponent(this.clientId)}`, { method: "DELETE" });
   }
-  papers(): Promise<PaperListItem[]> { return this.request("/api/v1/library/papers?limit=200"); }
-  paper(paperId: string): Promise<PaperListItem & JsonObject> {
-    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}`);
+  papers(projectId: string): Promise<PaperListItem[]> {
+    return this.request(`/api/v1/library/papers?${new URLSearchParams({ limit: "200", project_id: projectId })}`);
   }
-  async paperPdfUrl(paperId: string): Promise<string> {
-    const url = `${this.connection.baseUrl}/api/v1/library/papers/${encodeURIComponent(paperId)}/pdf`;
+  uploadAgentAttachment(projectId: string, file: File): Promise<TemporaryAttachment> {
+    const query = new URLSearchParams({ filename: file.name });
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/attachments?${query}`, {
+      method: "POST", headers: { "Content-Type": "application/pdf" }, body: file,
+    });
+  }
+  importPaper(file: File, projectId: string, autoSummarize: boolean, modelProfileId: string, reasoningEffort: ReasoningEffort): Promise<{ paper: PaperListItem; summary: PaperSummary; filename: string }> {
+    const query = new URLSearchParams({
+      project_id: projectId, filename: file.name, auto_summarize: String(autoSummarize),
+      client_id: this.clientId, model_profile_id: modelProfileId,
+      reasoning_effort: reasoningEffort,
+    });
+    return this.request(`/api/v1/library/papers/import?${query}`, {
+      method: "POST", headers: { "Content-Type": "application/pdf" }, body: file,
+    });
+  }
+  paperSummary(paperId: string, projectId: string): Promise<PaperSummary> {
+    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}/summary?project_id=${encodeURIComponent(projectId)}`);
+  }
+  startPaperSummary(paperId: string, projectId: string, modelProfileId: string, reasoningEffort: ReasoningEffort): Promise<PaperSummary> {
+    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}/summary`, {
+      method: "POST", body: JSON.stringify({
+        project_id: projectId, client_id: this.clientId,
+        model_profile_id: modelProfileId, reasoning_effort: reasoningEffort,
+      }),
+    });
+  }
+  paperInlineAnswers(paperId: string, projectId: string): Promise<PaperInlineAnswer[]> {
+    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}/inline-questions?project_id=${encodeURIComponent(projectId)}`);
+  }
+  createPaperInlineQuestion(paperId: string, projectId: string, value: { run_id: string; page: number; selected_text: string; nearby_context: string; locator: JsonObject; question: string }): Promise<PaperInlineAnswer> {
+    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}/inline-questions?project_id=${encodeURIComponent(projectId)}`, {
+      method: "POST", body: JSON.stringify(value),
+    });
+  }
+  paper(paperId: string, projectId: string): Promise<PaperListItem & JsonObject> {
+    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}?project_id=${encodeURIComponent(projectId)}`);
+  }
+  deletePaper(paperId: string, projectId: string): Promise<PaperListItem> {
+    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}?project_id=${encodeURIComponent(projectId)}`, { method: "DELETE" });
+  }
+  async paperPdfUrl(paperId: string, projectId: string): Promise<string> {
+    const url = `${this.connection.baseUrl}/api/v1/library/papers/${encodeURIComponent(paperId)}/pdf?project_id=${encodeURIComponent(projectId)}`;
     if (!this.connection.token) return url;
     const response = await fetch(url, {
       headers: { Authorization: `Bearer ${this.connection.token}` },
@@ -263,21 +309,21 @@ export class GatewayApi {
     if (!response.ok) throw new GatewayRequestError("PDF could not be loaded", response.status);
     return URL.createObjectURL(await response.blob());
   }
-  paperNotes(paperId: string): Promise<PaperNote[]> {
-    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}/notes`);
+  paperNotes(paperId: string, projectId: string): Promise<PaperNote[]> {
+    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}/notes?project_id=${encodeURIComponent(projectId)}`);
   }
-  deletePaperNote(paperId: string, noteId: string): Promise<{ deleted: boolean }> {
-    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}/notes/${encodeURIComponent(noteId)}`, {
+  deletePaperNote(paperId: string, noteId: string, projectId: string): Promise<{ deleted: boolean }> {
+    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}/notes/${encodeURIComponent(noteId)}?project_id=${encodeURIComponent(projectId)}`, {
       method: "DELETE",
     });
   }
-  createPaperNote(paperId: string, value: { page: number | null; selected_text: string; locator: JsonObject; note_markdown: string }): Promise<PaperNote> {
-    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}/notes`, {
+  createPaperNote(paperId: string, value: { page: number | null; selected_text: string; locator: JsonObject; note_markdown: string }, projectId: string): Promise<PaperNote> {
+    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}/notes?project_id=${encodeURIComponent(projectId)}`, {
       method: "POST", body: JSON.stringify(value),
     });
   }
-  updatePaperNote(paperId: string, note: PaperNote): Promise<PaperNote> {
-    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}/notes/${encodeURIComponent(note.note_id)}`, {
+  updatePaperNote(paperId: string, note: PaperNote, projectId: string): Promise<PaperNote> {
+    return this.request(`/api/v1/library/papers/${encodeURIComponent(paperId)}/notes/${encodeURIComponent(note.note_id)}?project_id=${encodeURIComponent(projectId)}`, {
       method: "PATCH",
       body: JSON.stringify({
         expected_revision: note.revision,
@@ -288,10 +334,16 @@ export class GatewayApi {
       }),
     });
   }
-  searchLibrary(query: string): Promise<JsonObject> {
-    return this.request("/api/v1/library/search", {
+  searchLibrary(query: string, projectId: string): Promise<JsonObject> {
+    return this.request(`/api/v1/library/search?project_id=${encodeURIComponent(projectId)}`, {
       method: "POST",
       body: JSON.stringify({ query, mode: "rrf", entity_types: [], top_k: 50 }),
+    });
+  }
+  translate(text: string, engine: "baidu" | "google" | "youdao" | "360", targetLanguage = "zh-CN"): Promise<{ text: string; engine: string; target_language: string }> {
+    return this.request("/api/v1/translate", {
+      method: "POST",
+      body: JSON.stringify({ text, target_language: targetLanguage, engine }),
     });
   }
   workspaceTree(projectId: string, path = "YYWorkspace:\\", cursor?: string): Promise<WorkspaceTree> {
@@ -472,7 +524,7 @@ export class GatewayApi {
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const headers = new Headers(init.headers);
-    if (init.body) headers.set("Content-Type", "application/json");
+    if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
     if (this.connection.token) headers.set("Authorization", `Bearer ${this.connection.token}`);
     if (this.connection.csrf) headers.set("X-CSRF-Token", this.connection.csrf);
     const response = await fetch(`${this.connection.baseUrl}${path}`, {

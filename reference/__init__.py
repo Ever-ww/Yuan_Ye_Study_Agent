@@ -11,6 +11,8 @@ from .models import (
     PaperNote,
     PaperNoteCreate,
     PaperNoteUpdate,
+    PaperInlineAnswer,
+    PaperInlineQuestionCreate,
     PaperUpsert,
     ReferenceSearchHit,
     ReferenceSearchRequest,
@@ -33,6 +35,7 @@ from .factory import build_embedding_provider
 __all__ = [
     "Author", "CitationExample", "CitationExampleCreate", "EmbeddingJob", "Paper",
     "PaperFile", "PaperIdentifier", "PaperNote", "PaperNoteCreate", "PaperNoteUpdate",
+    "PaperInlineAnswer", "PaperInlineQuestionCreate",
     "PaperUpsert", "ReferenceSearchHit",
     "ReferenceSearchRequest", "ReferenceSearchResult", "ReferenceStore", "ReferenceService",
     "SourcePassage", "SourcePassageCreate",

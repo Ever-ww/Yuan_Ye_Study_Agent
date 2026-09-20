@@ -12,7 +12,7 @@ import zipfile
 from pathlib import Path
 from types import ModuleType
 
-from Agent import RuntimeConfig
+from Agent import RuntimeConfig, load_runtime_config
 from backup import QuiesceResult, SensitiveEnvSanitizer
 from backup.maintenance import lifecycle_work
 from gateway.models import CodeFinalizeResult, CodeSessionRecord, CodeTurnResult
@@ -40,7 +40,7 @@ class CodeSessionManager:
 
     def __init__(
         self, config: RuntimeConfig, *, grant_backend=None,
-        runtime_resource_manager=None,
+        runtime_resource_manager=None, store=None,
     ) -> None:
         self.config = config
         self.source_root = (
@@ -49,6 +49,7 @@ class CodeSessionManager:
         self.module = _load_harness(self.source_root)
         self.grant_backend = grant_backend
         self.runtime_resource_manager = runtime_resource_manager
+        self.store = store
         self.write_gate = getattr(grant_backend, "write_gate", None)
         self._sessions: dict[str, object] = {}
         self._owners: dict[str, tuple[str, str]] = {}
@@ -60,13 +61,19 @@ class CodeSessionManager:
     async def start(
         self, project_id: str, client_id: str, *,
         origin_session_id: str | None = None, origin_run_id: str,
-        origin_context: dict | None = None,
+        origin_context: dict | None = None, workspace_root: Path | None = None,
     ) -> CodeSessionRecord:
         async with self._lock:
             self._require_available()
+            selected_workspace = (
+                workspace_root or self._workspace_root_for_project(project_id)
+            ).resolve()
+            selected_config = load_runtime_config(
+                self.config.agent_root, workspace_root=selected_workspace,
+            )
             try:
                 controller = self.module.CodeSessionController(
-                    self.config,
+                    selected_config,
                     grant_backend=self.grant_backend,
                     runtime_resource_manager=self.runtime_resource_manager,
                 )
@@ -78,10 +85,10 @@ class CodeSessionManager:
                     raise
                 try:
                     controller = self.module.CodeSessionController(
-                        self.config, grant_backend=self.grant_backend,
+                        selected_config, grant_backend=self.grant_backend,
                     )
                 except TypeError:
-                    controller = self.module.CodeSessionController(self.config)
+                    controller = self.module.CodeSessionController(selected_config)
             origin = self.module.HarnessOriginContext.model_validate(
                 origin_context or {
                     "origin_project_id": project_id,
@@ -178,10 +185,17 @@ class CodeSessionManager:
         records = self.events(session_id)
         first = records[0]
         source = Path(str(first.get("source_root") or self.source_root)).resolve()
-        worktree = Path(str(first.get("worktree_path") or "")).resolve()
+        location = next(
+            (item for item in reversed(records) if item.get("record_type") == "code_session_relocated"),
+            {},
+        )
+        worktree = Path(str(location.get("worktree_path") or first.get("worktree_path") or "")).resolve()
         source_hash = hashlib.sha256(str(source).casefold().encode("utf-8")).hexdigest()[:16]
+        origin = first.get("origin") if isinstance(first.get("origin"), dict) else {}
+        project_id = str(location.get("project_id") or origin.get("origin_project_id") or "")
+        workspace = self._workspace_root_for_project(project_id)
         allowed_parent = (
-            self.config.agent_root / ".yy" / "harness-evolution" /
+            workspace / ".yy" / "harness-evolution" /
             "worktrees" / source_hash
         ).resolve()
         if worktree.name != session_id or worktree.parent != allowed_parent:
@@ -193,10 +207,10 @@ class CodeSessionManager:
         if branch:
             await self._git(source, "branch", "-D", branch, check=False)
         audit = (
-            self.config.agent_root / ".yy" / "harness-evolution" /
+            workspace / ".yy" / "harness-evolution" /
             "code" / f"{session_id}.jsonl"
         ).resolve()
-        expected = (self.config.agent_root / ".yy" / "harness-evolution" / "code").resolve()
+        expected = (workspace / ".yy" / "harness-evolution" / "code").resolve()
         if audit.parent != expected:
             raise RuntimeError("Coding Session audit boundary is invalid")
         audit.unlink(missing_ok=True)
@@ -264,14 +278,12 @@ class CodeSessionManager:
     def events(self, session_id: str, after_sequence: int = 0) -> list[dict]:
         if not re.fullmatch(r"[0-9a-f]{32}", session_id):
             raise ValueError("Coding Session ID 非法")
-        path = (
-            self.config.agent_root / ".yy" / "harness-evolution" / "code" /
-            f"{session_id}.jsonl"
-        ).resolve()
-        expected = (
-            self.config.agent_root / ".yy" / "harness-evolution" / "code"
-        ).resolve()
-        if path.parent != expected or not path.is_file():
+        path = next((
+            directory / f"{session_id}.jsonl"
+            for directory in self._code_directories()
+            if (directory / f"{session_id}.jsonl").is_file()
+        ), None)
+        if path is None:
             raise KeyError(f"未知 Coding Session：{session_id}")
         records: list[dict] = []
         for position, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -292,11 +304,12 @@ class CodeSessionManager:
         self, *, project_id: str | None = None, status: str | None = None,
     ) -> list[dict]:
         """Return durable, host-path-free summaries for management clients."""
-        directory = self.config.agent_root / ".yy" / "harness-evolution" / "code"
         summaries: list[dict] = []
-        if not directory.is_dir():
-            return summaries
-        for path in sorted(directory.glob("*.jsonl"), reverse=True):
+        paths = sorted(
+            (path for directory in self._code_directories() for path in directory.glob("*.jsonl")),
+            reverse=True,
+        )
+        for path in paths:
             session_id = path.stem
             if not re.fullmatch(r"[0-9a-f]{32}", session_id):
                 continue
@@ -305,7 +318,13 @@ class CodeSessionManager:
                 continue
             first, last = records[0], records[-1]
             origin = first.get("origin") if isinstance(first.get("origin"), dict) else {}
-            selected_project = str(origin.get("origin_project_id") or "")
+            location = next(
+                (item for item in reversed(records) if item.get("record_type") == "code_session_relocated"),
+                {},
+            )
+            selected_project = str(
+                location.get("project_id") or origin.get("origin_project_id") or "",
+            )
             if project_id is not None and selected_project != project_id:
                 continue
             selected_status = self._summary_status(session_id, last)
@@ -361,6 +380,19 @@ class CodeSessionManager:
     def _require_available(self) -> None:
         if self._maintenance_epoch is not None:
             raise RuntimeError("Agent Home 正在维护，Coding Session 暂停接收新操作")
+
+    def _workspace_root_for_project(self, project_id: str) -> Path:
+        if self.store is not None and project_id:
+            return Path(self.store.project(project_id).path).resolve()
+        return self.config.workspace_root.resolve()
+
+    def _code_directories(self) -> tuple[Path, ...]:
+        roots = (
+            tuple(Path(item.path).resolve() for item in self.store.list_projects())
+            if self.store is not None
+            else (self.config.workspace_root.resolve(),)
+        )
+        return tuple(root / ".yy" / "harness-evolution" / "code" for root in roots)
 
     async def _export_candidate(self, session_id: str, controller, destination: Path) -> None:
         record = getattr(controller, "record", None)

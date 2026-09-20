@@ -25,6 +25,7 @@ from Agent import (
     RuntimePluginManager,
     RuntimePluginWatcher,
     RuntimeProfile,
+    load_runtime_config,
     load_generation_tool_module,
 )
 from Agent.state import (
@@ -82,6 +83,7 @@ from gateway.models import (
     HarnessDreamRevertRequest,
     ProjectRecord,
     ModelOption,
+    PaperSummaryRequest,
     RunCreateRequest,
     RecoveryDecisionRequest,
     RunRecord,
@@ -90,10 +92,13 @@ from gateway.models import (
     ExtensionReenableRequest,
     LatexCompilationRecord,
     LatexCompilationRequest,
+    UIAttachmentContext,
+    UIPaperContext,
 )
 from gateway.runtime_pool import RuntimeFactory, RuntimePool
 from gateway.store import GatewayStore
 from gateway.workspace_files import WorkspaceFileConflict, WorkspaceFileService
+from gateway.paper_web import PaperWebService
 from gateway.latex import (
     LatexCompilationService,
     LatexExecutionError,
@@ -121,14 +126,77 @@ from backup import (
     AgentHomeWriteGate,
     BackupScheduler,
     BackupService,
+    QuiesceResult,
     SensitiveEnvSanitizer,
     assert_restore_inactive,
 )
 from sandbox import CheckpointDreamCoordinator
+from bootstrap import (
+    ensure_workspace_initialized,
+    unregister_workspace,
+    workspace_id,
+    workspace_manifest,
+)
 
 
 class RunUIContextConflict(RuntimeError):
     """A UI resource changed before its immutable Turn snapshot was accepted."""
+
+
+class _WorkspaceWorkerGroup:
+    """Quiesce every currently materialized Workspace background worker."""
+
+    def __init__(self, name: str, workers: dict[str, object]) -> None:
+        self.name = name
+        self.workers = workers
+
+    async def quiesce(self, maintenance_epoch: int) -> QuiesceResult:
+        values = tuple(self.workers.values())
+        results = await asyncio.gather(
+            *(worker.quiesce(maintenance_epoch) for worker in values),
+        ) if values else ()
+        return QuiesceResult(
+            participant=self.name,
+            maintenance_epoch=maintenance_epoch,
+            acknowledged=all(item.acknowledged for item in results),
+            safe_boundary="all_workspace_jobs_persisted",
+        )
+
+    async def resume(self, maintenance_epoch: int) -> None:
+        await asyncio.gather(*(
+            worker.resume(maintenance_epoch) for worker in tuple(self.workers.values())
+        ))
+
+
+class _WorkspaceDreamGroup:
+    """Expose all Workspace Dream schedulers as one maintenance participant."""
+
+    def __init__(self, schedulers: dict[str, DreamScheduler]) -> None:
+        self.schedulers = schedulers
+
+    async def prepare_quiesce(self, maintenance_epoch: int) -> None:
+        await asyncio.gather(*(
+            scheduler.prepare_quiesce(maintenance_epoch)
+            for scheduler in tuple(self.schedulers.values())
+        ))
+
+    async def quiesce(self, maintenance_epoch: int) -> QuiesceResult:
+        values = tuple(self.schedulers.values())
+        results = await asyncio.gather(*(
+            scheduler.quiesce(maintenance_epoch) for scheduler in values
+        )) if values else ()
+        return QuiesceResult(
+            participant="dream",
+            maintenance_epoch=maintenance_epoch,
+            acknowledged=all(item.acknowledged for item in results),
+            safe_boundary="all_workspace_dream_runs_persisted",
+        )
+
+    async def resume(self, maintenance_epoch: int) -> None:
+        await asyncio.gather(*(
+            scheduler.resume(maintenance_epoch)
+            for scheduler in tuple(self.schedulers.values())
+        ))
 
 
 class GatewayApplication:
@@ -151,6 +219,18 @@ class GatewayApplication:
         self._backup_passphrase = SensitiveEnvSanitizer.consume_backup_passphrase()
         self.store = store or GatewayStore(config.agent_root / ".yy" / "gateway")
         self.store.write_gate = self.write_gate
+        registered_projects = self.store.list_projects()
+        # The most recently opened registered Workspace owns legacy shared
+        # state.  Initializing the launch cwd first could otherwise migrate
+        # old Profile/Paper data into an unrelated directory.
+        for registered in registered_projects:
+            ensure_workspace_initialized(
+                Path(registered.path), agent_root=config.agent_root, name=registered.name,
+                last_opened_at=registered.last_opened_at,
+            )
+        ensure_workspace_initialized(
+            config.workspace_root, agent_root=config.agent_root,
+        )
         self.events = GatewayEventBus()
         self.gateway_epoch = uuid4().hex
         self.state_controller = StateController(
@@ -192,6 +272,7 @@ class GatewayApplication:
         self.workspace_files = WorkspaceFileService(config.agent_root, source_root)
         self.latex = LatexCompilationService(config)
         self._latex_tasks: dict[str, asyncio.Task[None]] = {}
+        self._paper_summary_tasks: dict[str, asyncio.Task[None]] = {}
         if self.write_gate.state == MaintenanceState.RUNNING:
             self._reconcile_extension_grant_intents(source_root)
         self.runtime_plugins = RuntimePluginManager(
@@ -227,31 +308,22 @@ class GatewayApplication:
             heartbeat_seconds=config.cron_heartbeat_seconds,
         )
         self.cron_service = CronService(self.cron_store, CronScheduleCalculator())
-        self.memory_store = MemoryStore(
-            config.memory_dir,
-            workspace_root=config.workspace_root,
-            agent_root=config.agent_root,
-        )
-        self.memory_store.configure_long_term_retrieval(config)
         self.memory_embedding_provider = build_memory_embedding_provider(config)
-        self.memory_embedding_worker = MemoryEmbeddingWorker(
-            self.memory_store.structured,
-            self.memory_embedding_provider,
-            version=config.memory_embedding_version,
-        ) if self.memory_store.structured is not None else None
-        self.reference_store = ReferenceStore(config.reference_database_path)
+        self._memory_stores: dict[str, MemoryStore] = {}
+        self._memory_workers: dict[str, MemoryEmbeddingWorker] = {}
+        self.memory_store = self.memory_for_workspace(config.workspace_root)
+        self.memory_embedding_worker = self._memory_workers.get(
+            self._workspace_cache_key(config.workspace_root),
+        )
         self.reference_embedding_provider = build_embedding_provider(config)
-        self.reference_embedding_worker = ReferenceEmbeddingWorker(
-            self.reference_store,
-            self.reference_embedding_provider,
-        )
-        self.reference_service = ReferenceService(
-            self.reference_store,
-            self.reference_embedding_provider,
-            keyword_weight=config.reference_keyword_weight,
-            semantic_weight=config.reference_semantic_weight,
-            worker=self.reference_embedding_worker,
-        )
+        self._reference_services: dict[str, ReferenceService] = {}
+        self._reference_workers: dict[str, ReferenceEmbeddingWorker] = {}
+        self._paper_web_services: dict[str, PaperWebService] = {}
+        self.reference_service = self.reference_service_for_workspace(config.workspace_root)
+        self.reference_store = self.reference_service.store
+        self.reference_embedding_worker = self._reference_workers[
+            self._workspace_cache_key(config.workspace_root)
+        ]
         from gateway.harness_evolution import GatewayHarnessEvolutionService
         self.harness_evolution = GatewayHarnessEvolutionService(
             config,
@@ -275,7 +347,7 @@ class GatewayApplication:
             runtime_factory=runtime_factory,
             extensions=self.extensions,
             cron_service=self.cron_service,
-            reference_service=self.reference_service,
+            reference_service_factory=self.reference_service_for_workspace,
             state_controller=self.state_controller,
             outbox=self.outbox,
             tool_retry_max_attempts=config.tool_retry_max_attempts,
@@ -285,6 +357,7 @@ class GatewayApplication:
             harness_evolution_service=self.harness_evolution,
             cron_tool_authorizer=self.cron_service.tool_preapproved,
             cron_terminal_callback=self._settle_cron_terminal,
+            run_terminal_callback=self._settle_read_artifacts,
             runtime_resource_manager=self.runtime_plugins,
             observer_service=self.observer,
             workspace_event_callback=self.record_workspace_event,
@@ -302,34 +375,27 @@ class GatewayApplication:
             write_gate=self.write_gate,
         )
         self.cron_service.set_waker(self.cron_scheduler.wake)
-        self.dream_service = DreamService(
-            config,
-            excluded_sessions=self.store.automated_session_ids,
-        )
-        self.checkpoint_dream = CheckpointDreamCoordinator(
+        self._dream_services: dict[str, DreamService] = {}
+        self._checkpoint_dreams: dict[str, CheckpointDreamCoordinator] = {}
+        self._dream_schedulers: dict[str, DreamScheduler] = {}
+        self._default_dream_project_id = self._project_id_for_workspace(config.workspace_root)
+        self.dream_scheduler = self._dream_scheduler_for_workspace(
             config.workspace_root,
-            config.agent_root,
-            checkpoint_limit=config.sandbox_checkpoint_limit,
-            merged_ref_retention_days=config.sandbox_checkpoint_merged_branch_retention_days,
-            model_runner=self.dream_service.run_stateless_model,
+            project_id=self._default_dream_project_id,
+            include_harness=True,
         )
-        self.dream_scheduler = DreamScheduler(
-            self.dream_service,
-            self.pool.is_idle,
-            self._record_dream_result,
-            heartbeat_seconds=config.cron_heartbeat_seconds,
-            run_day=lambda selected: self._execute_dream_day(selected, automatic=True),
-            run_checkpoint_day=self.checkpoint_dream.process_due,
-            run_harness_day=lambda selected: self.run_harness_dream(
-                selected.isoformat(), automatic=True, actor="dream:scheduler",
-            ),
-            write_gate=self.write_gate,
-        )
+        self.dream_service = self._dream_services[self._default_dream_project_id]
+        self.checkpoint_dream = self._checkpoint_dreams[self._default_dream_project_id]
+        for project in self.store.list_projects():
+            self._dream_scheduler_for_workspace(
+                Path(project.path), project_id=project.project_id,
+            )
         self._browser_codes: set[str] = set()
         self.code_sessions = CodeSessionManager(
             config,
             grant_backend=self.state_controller,
             runtime_resource_manager=self.runtime_plugins,
+            store=self.store,
         )
         from tools import HarnessDreamTool, HarnessErrorTool, HarnessManualTool
         self.harness_manual_tool = HarnessManualTool(lambda: self.code_sessions)
@@ -337,11 +403,18 @@ class GatewayApplication:
         self.harness_dream_tool = HarnessDreamTool(self)
         self.maintenance.register("runtime_pool", self.pool)
         self.maintenance.register("cron", self.cron_scheduler)
-        self.maintenance.register("dream", self.dream_scheduler)
+        self.maintenance.register("dream", _WorkspaceDreamGroup(self._dream_schedulers))
         self.maintenance.register("outbox", self.outbox)
-        self.maintenance.register("reference_embedding", self.reference_embedding_worker)
-        if self.memory_embedding_worker is not None:
-            self.maintenance.register("memory_embedding", self.memory_embedding_worker)
+        self.maintenance.register(
+            "reference_embedding", _WorkspaceWorkerGroup(
+                "reference_embedding", self._reference_workers,
+            ),
+        )
+        self.maintenance.register(
+            "memory_embedding", _WorkspaceWorkerGroup(
+                "memory_embedding", self._memory_workers,
+            ),
+        )
         self.maintenance.register("harness", self.code_sessions)
         self.maintenance.register("runtime_plugins", self.runtime_plugin_watcher)
         if self.observer is not None:
@@ -376,6 +449,7 @@ class GatewayApplication:
             drain_timeout_seconds=config.backup_drain_timeout_seconds,
             on_result=self._record_backup_result,
             heartbeat_seconds=config.cron_heartbeat_seconds,
+            is_idle=self._backup_idle,
         )
         self._services_started = False
         self._database_maintenance_task: asyncio.Task[None] | None = None
@@ -486,9 +560,22 @@ class GatewayApplication:
         # Backlog is durable and need not be delivered to offline clients.
         def flush():
             validate_home_databases(self.config.agent_root)
-            for path in (self.config.agent_root / ".yy").rglob("*.sqlite3"):
+            state_roots = {self.config.agent_root.resolve() / ".yy"}
+            state_roots.update(
+                Path(item["path"]).resolve() / ".yy"
+                for item in workspace_manifest(self.config.agent_root)
+                if isinstance(item.get("path"), str)
+            )
+            database_paths = {
+                path.resolve()
+                for root in state_roots if root.is_dir()
+                for path in root.rglob("*.sqlite3")
+            }
+            for path in sorted(database_paths):
                 db = sqlite3.connect(path, timeout=5)
                 try:
+                    if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                        raise RuntimeError(f"Workspace database check failed: {path.name}")
                     busy, _, _ = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
                     if busy:
                         raise RuntimeError(f"Database remains busy: {path.name}")
@@ -572,12 +659,12 @@ class GatewayApplication:
                 self.state_controller.mark_extension_grant_recovery_required(plan_hash)
 
     async def start(self) -> None:
-        if self._services_started:
+        if getattr(self, "_services_started", False):
             return
         # Backup operations live outside .yy and can outlive the process.
         # Reconcile their exact frozen snapshot before deciding whether this
         # Gateway is control-only due to an interrupted maintenance state.
-        await self.backup_service.reconcile_startup()
+        await self.backup_service.reconcile_startup(defer_completion=True)
         if self.write_gate.state != MaintenanceState.RUNNING:
             if self.write_gate.state in {MaintenanceState.QUIESCING, MaintenanceState.RESUMING}:
                 await self.maintenance.fail(f"Interrupted {self.write_gate.state.value} at Gateway startup")
@@ -595,9 +682,10 @@ class GatewayApplication:
         # may append new events.  The dispatcher itself starts only after recovery.
         self.outbox.reconcile_startup()
         self.event_archive.recover_preparing()
-        await self.reference_embedding_worker.start()
-        if self.memory_embedding_worker is not None:
-            await self.memory_embedding_worker.start()
+        for worker in self._reference_workers.values():
+            await worker.start()
+        for worker in self._memory_workers.values():
+            await worker.start()
         try:
             await self.pool.start()
             if self.observer is not None:
@@ -617,7 +705,8 @@ class GatewayApplication:
             if self.config.gateway_event_archive_enabled:
                 await self.event_archive_scheduler.start()
             await self.cron_scheduler.start()
-            await self.dream_scheduler.start()
+            for scheduler in self._dream_schedulers.values():
+                await scheduler.start()
             await self.backup_scheduler.start()
             self._services_started = True
             self._database_maintenance_task = asyncio.create_task(
@@ -627,9 +716,10 @@ class GatewayApplication:
         except Exception:
             await self.outbox.close()
             self.maintenance.close()
-            await self.reference_embedding_worker.close()
-            if self.memory_embedding_worker is not None:
-                await self.memory_embedding_worker.close()
+            for worker in self._reference_workers.values():
+                await worker.close()
+            for worker in self._memory_workers.values():
+                await worker.close()
             raise
 
     async def _database_maintenance_loop(self) -> None:
@@ -678,6 +768,13 @@ class GatewayApplication:
                 # Maintenance is observable but never allowed to take the normal
                 # Agent runtime down.  The next cadence retries the bounded work.
                 self.state_controller.record_database_maintenance_error(exc)
+
+    def _backup_idle(self) -> bool:
+        return (
+            self.pool.is_idle()
+            and not any(not task.done() for task in self._paper_summary_tasks.values())
+            and not any(not task.done() for task in self._latex_tasks.values())
+        )
 
     @staticmethod
     async def _database_maintenance_call(function, /, **kwargs):
@@ -862,6 +959,12 @@ class GatewayApplication:
 
     async def close(self) -> None:
         try:
+            summary_tasks = tuple(self._paper_summary_tasks.values())
+            for task in summary_tasks:
+                task.cancel()
+            if summary_tasks:
+                await asyncio.gather(*summary_tasks, return_exceptions=True)
+            self._paper_summary_tasks.clear()
             latex_tasks = tuple(self._latex_tasks.values())
             for task in latex_tasks:
                 task.cancel()
@@ -877,16 +980,18 @@ class GatewayApplication:
             await self.event_archive_scheduler.close()
             await self.restart_coordinator.close()
             await self.backup_scheduler.close()
-            await self.dream_scheduler.close()
+            for scheduler in self._dream_schedulers.values():
+                await scheduler.close()
             await self.cron_scheduler.close()
             await self.code_sessions.close()
             await self.pool.close()
             if self.observer is not None:
                 await self.observer.close()
         finally:
-            if self.memory_embedding_worker is not None:
-                await self.memory_embedding_worker.close()
-            await self.reference_embedding_worker.close()
+            for worker in self._memory_workers.values():
+                await worker.close()
+            for worker in self._reference_workers.values():
+                await worker.close()
             await self.outbox.close()
             self.maintenance.close()
             self._services_started = False
@@ -896,30 +1001,39 @@ class GatewayApplication:
         project = self.store.project(request.project_id)
         origin_session_id = request.origin_session_id
         if origin_session_id is None:
-            memory = MemoryStore(
-                self.config.memory_dir,
-                workspace_root=Path(project.path),
-                agent_root=self.config.agent_root,
-            )
+            memory = self.memory_for_project(request.project_id)
             origin_session_id = memory.create_session("")
+
+        async def start_session(run_id: str):
+            latest_run_id = self._latest_origin_run_id(
+                request.project_id, origin_session_id, fallback=run_id,
+            )
+            kwargs = {
+                "origin_session_id": origin_session_id,
+                "origin_run_id": latest_run_id,
+                "origin_context": self._code_origin_context(
+                    request.project_id, origin_session_id, latest_run_id,
+                ),
+                "workspace_root": Path(project.path),
+            }
+            try:
+                return await self.harness_manual_tool.start(
+                    request.project_id, request.client_id, **kwargs,
+                )
+            except TypeError as exc:
+                if "workspace_root" not in str(exc):
+                    raise
+                kwargs.pop("workspace_root")
+                return await self.harness_manual_tool.start(
+                    request.project_id, request.client_id, **kwargs,
+                )
+
         return await self._run_code_workload(
             WorkloadKind.CODE_SESSION_START,
             request.project_id,
             request.client_id,
             "启动 Coding Session",
-            lambda run_id: self.harness_manual_tool.start(
-                request.project_id, request.client_id,
-                origin_session_id=origin_session_id,
-                origin_run_id=self._latest_origin_run_id(
-                    request.project_id, origin_session_id, fallback=run_id,
-                ),
-                origin_context=self._code_origin_context(
-                    request.project_id, origin_session_id,
-                    self._latest_origin_run_id(
-                        request.project_id, origin_session_id, fallback=run_id,
-                    ),
-                ),
-            ),
+            start_session,
         )
 
     def extension_status(self, hook_id: str | None = None) -> dict[str, object]:
@@ -1295,10 +1409,7 @@ class GatewayApplication:
         self, project_id: str, session_id: str, origin_run_id: str,
     ) -> dict[str, object]:
         project = self.store.project(project_id)
-        memory = MemoryStore(
-            self.config.memory_dir, workspace_root=Path(project.path),
-            agent_root=self.config.agent_root,
-        )
+        memory = self.memory_for_project(project_id)
         records = list(memory.session_records(session_id)) if memory.has_session(session_id) else []
         canonical = json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         session_summary = "\n".join(
@@ -1306,7 +1417,7 @@ class GatewayApplication:
             for record in records[-8:] if record.get("role") in {"user", "assistant"}
         )
         observer_summary = (
-            self.observer.state_store.coding_context_summary()
+            self.observer.state_store.coding_context_summary(project_id=project_id)
             if self.observer is not None else ""
         )
         combined_summary = session_summary
@@ -1385,13 +1496,385 @@ class GatewayApplication:
         return self.code_sessions.summary(session_id)
 
     def register_project(self, path: Path, name: str | None = None) -> ProjectRecord:
-        return self.store.register_project(path, name)
+        project = self.store.register_project(path, name)
+        ensure_workspace_initialized(
+            Path(project.path), agent_root=self.config.agent_root, name=project.name,
+            touch_recent=True,
+        )
+        self.reference_service_for_workspace(Path(project.path))
+        self.memory_for_workspace(Path(project.path))
+        self._dream_scheduler_for_workspace(
+            Path(project.path), project_id=project.project_id,
+        )
+        return project
+
+    def open_project(self, project_id: str) -> ProjectRecord:
+        project = self.store.open_project(project_id)
+        ensure_workspace_initialized(
+            Path(project.path), agent_root=self.config.agent_root, name=project.name,
+            touch_recent=True,
+        )
+        self._dream_scheduler_for_workspace(
+            Path(project.path), project_id=project.project_id,
+        )
+        return project
+
+    @staticmethod
+    def _workspace_cache_key(path: Path) -> str:
+        return str(path.resolve()).casefold()
+
+    def _project_id_for_workspace(self, workspace: Path) -> str:
+        selected = self._workspace_cache_key(workspace)
+        for project in self.store.list_projects():
+            if self._workspace_cache_key(Path(project.path)) == selected:
+                return project.project_id
+        return workspace_id(workspace)
+
+    def _dream_scheduler_for_workspace(
+        self,
+        workspace: Path,
+        *,
+        project_id: str | None = None,
+        include_harness: bool = False,
+    ) -> DreamScheduler:
+        selected = workspace.resolve()
+        owner = project_id or self._project_id_for_workspace(selected)
+        existing = self._dream_schedulers.get(owner)
+        if existing is not None:
+            return existing
+        config = (
+            self.config
+            if selected == self.config.workspace_root.resolve()
+            else load_runtime_config(self.config.agent_root, workspace_root=selected)
+        )
+        service = DreamService(
+            config,
+            excluded_sessions=self.store.automated_session_ids,
+        )
+        checkpoint = CheckpointDreamCoordinator(
+            selected,
+            self.config.agent_root,
+            checkpoint_limit=config.sandbox_checkpoint_limit,
+            merged_ref_retention_days=config.sandbox_checkpoint_merged_branch_retention_days,
+            model_runner=service.run_stateless_model,
+        )
+        scheduler = DreamScheduler(
+            service,
+            self.pool.is_idle,
+            lambda result, automatic, owner=owner: self._record_dream_result(
+                result, automatic, owner,
+            ),
+            heartbeat_seconds=config.cron_heartbeat_seconds,
+            run_day=lambda selected_date, owner=owner: self._execute_dream_day(
+                selected_date, automatic=True, project_id=owner,
+            ),
+            run_checkpoint_day=checkpoint.process_due,
+            run_harness_day=(
+                lambda selected_date: self.run_harness_dream(
+                    selected_date.isoformat(), automatic=True, actor="dream:scheduler",
+                )
+                if include_harness else None
+            ),
+            write_gate=self.write_gate,
+        )
+        self._dream_services[owner] = service
+        self._checkpoint_dreams[owner] = checkpoint
+        self._dream_schedulers[owner] = scheduler
+        if getattr(self, "_services_started", False):
+            try:
+                asyncio.get_running_loop().create_task(scheduler.start())
+            except RuntimeError:
+                pass
+        return scheduler
+
+    def _dream_project(self, project_id: str | None) -> tuple[str, ProjectRecord | None]:
+        owner = project_id or self._default_dream_project_id
+        try:
+            return owner, self.store.project(owner)
+        except KeyError:
+            if owner != self._default_dream_project_id:
+                raise
+            return owner, None
+
+    def dream_service_for_project(self, project_id: str | None) -> DreamService:
+        owner, project = self._dream_project(project_id)
+        workspace = Path(project.path) if project is not None else self.config.workspace_root
+        self._dream_scheduler_for_workspace(workspace, project_id=owner)
+        return self._dream_services[owner]
+
+    def reference_service_for_workspace(self, workspace: Path) -> ReferenceService:
+        selected = workspace.resolve()
+        key = self._workspace_cache_key(selected)
+        existing = self._reference_services.get(key)
+        if existing is not None:
+            return existing
+        config = load_runtime_config(self.config.agent_root, workspace_root=selected)
+        store = ReferenceStore(config.reference_database_path)
+        worker = ReferenceEmbeddingWorker(store, self.reference_embedding_provider)
+        worker.write_gate = self.write_gate
+        service = ReferenceService(
+            store,
+            self.reference_embedding_provider,
+            keyword_weight=config.reference_keyword_weight,
+            semantic_weight=config.reference_semantic_weight,
+            worker=worker,
+        )
+        self._reference_services[key] = service
+        self._reference_workers[key] = worker
+        if getattr(self, "_services_started", False):
+            try:
+                asyncio.get_running_loop().create_task(worker.start())
+            except RuntimeError:
+                pass
+        return service
+
+    def reference_service_for_project(self, project_id: str | None) -> ReferenceService:
+        if project_id is None:
+            return self.reference_service
+        project = self.store.project(project_id)
+        return self.reference_service_for_workspace(Path(project.path))
+
+    def reference_store_for_project(self, project_id: str | None) -> ReferenceStore:
+        return self.reference_service_for_project(project_id).store
+
+    def paper_web_for_project(self, project_id: str) -> PaperWebService:
+        project = self.store.project(project_id)
+        workspace = Path(project.path).resolve()
+        key = self._workspace_cache_key(workspace)
+        service = self._paper_web_services.get(key)
+        if service is None:
+            service = PaperWebService(workspace, self.reference_store_for_project(project_id))
+            self._paper_web_services[key] = service
+        service.purge_expired_papers()
+        return service
+
+    def import_read_pdf(
+        self, project_id: str, body: bytes, filename: str,
+    ) -> dict[str, object]:
+        self.store.project(project_id)
+        return self.paper_web_for_project(project_id).import_pdf(body, filename)
+
+    def upload_agent_attachment(
+        self, project_id: str, body: bytes, filename: str,
+    ) -> dict[str, object]:
+        self.store.project(project_id)
+        return self.paper_web_for_project(project_id).upload_attachment(body, filename)
+
+    async def start_paper_summary(
+        self, paper_id: str, request: PaperSummaryRequest,
+    ) -> dict[str, object]:
+        service = self.paper_web_for_project(request.project_id)
+        current = self.paper_summary(request.project_id, paper_id)
+        if current["status"] == "running" or (
+            current["status"] == "queued" and current.get("run_id")
+        ):
+            return current
+        paper = self.reference_store_for_project(request.project_id).get_paper(paper_id)
+        primary = next((item for item in paper.files if item.is_primary), None)
+        if primary is None:
+            raise FileNotFoundError("Paper does not have a local PDF")
+        text = await asyncio.to_thread(service.extracted_text, paper_id)
+        if not text.strip():
+            service.mark_summary(
+                paper_id, status="failed", error="PDF has no extractable text; OCR may be required",
+            )
+            return service.summary(paper_id)
+        run = await self.start_run(RunCreateRequest(
+            project_id=request.project_id,
+            client_id=f"paper-summary:{request.client_id}",
+            task=(
+                "请为这篇论文生成结构清晰、忠于原文的 Markdown 总结，覆盖研究问题、方法、"
+                "数据或实验、关键结果、局限和可引用结论。不要虚构原文没有的信息。"
+            ),
+            model_profile_id=request.model_profile_id,
+            reasoning_effort=request.reasoning_effort,
+            ui_context={
+                "source": "read",
+                "resource": {
+                    "kind": "paper", "paper_id": paper_id,
+                    "logical_path": None, "content_hash": primary.sha256,
+                },
+                "selection": {
+                    "selected_text": text[:20_000], "page": 1,
+                    "start_line": None, "end_line": None,
+                    "nearby_context": text[20_000:], "locator": {"scope": "document"},
+                },
+            },
+        ))
+        service.mark_summary(paper_id, status="running", run_id=run.run_id)
+        return self.paper_summary(request.project_id, paper_id)
+
+    def queue_paper_summary(
+        self, paper_id: str, request: PaperSummaryRequest,
+    ) -> dict[str, object]:
+        """Queue extraction and the summary Run without delaying PDF import."""
+        service = self.paper_web_for_project(request.project_id)
+        current = self.paper_summary(request.project_id, paper_id)
+        if current["status"] in {"queued", "running", "completed"}:
+            return current
+        service.mark_summary(paper_id, status="queued")
+
+        async def begin() -> None:
+            try:
+                await self.start_paper_summary(paper_id, request)
+            except asyncio.CancelledError:
+                service.mark_summary(
+                    paper_id, status="failed",
+                    error="Summary scheduling was interrupted; start it again when ready",
+                )
+                raise
+            except Exception as exc:
+                service.mark_summary(
+                    paper_id, status="failed", error=str(exc) or type(exc).__name__,
+                )
+
+        task = asyncio.create_task(begin(), name=f"paper-summary-{paper_id}")
+        self._paper_summary_tasks[paper_id] = task
+        task.add_done_callback(
+            lambda selected, key=paper_id: (
+                self._paper_summary_tasks.pop(key, None)
+                if self._paper_summary_tasks.get(key) is selected else None
+            ),
+        )
+        return service.summary(paper_id)
+
+    def paper_summary(self, project_id: str, paper_id: str) -> dict[str, object]:
+        service = self.paper_web_for_project(project_id)
+        value = service.summary(paper_id)
+        run_id = value.get("run_id")
+        if (
+            value["status"] == "queued" and not run_id
+            and paper_id not in self._paper_summary_tasks
+        ):
+            service.mark_summary(
+                paper_id, status="failed",
+                error="Summary scheduling was interrupted; start it again when ready",
+            )
+            return service.summary(paper_id)
+        if value["status"] in {"queued", "running"} and isinstance(run_id, str):
+            try:
+                run = self.store.run(run_id)
+            except KeyError:
+                service.mark_summary(
+                    paper_id, status="failed", run_id=run_id,
+                    error="Summary Run is no longer available",
+                )
+                return service.summary(paper_id)
+            if run.status == "completed":
+                value = service.write_summary(paper_id, run.answer or "", run_id=run_id)
+                self.store.mark_run_inbox_read(run_id)
+            elif run.status in {"failed", "cancelled", "interrupted"}:
+                service.mark_summary(
+                    paper_id, status="failed", run_id=run_id,
+                    error=run.error or f"Summary Run {run.status}",
+                )
+                value = service.summary(paper_id)
+        return value
+
+    def register_inline_question(self, project_id: str, paper_id: str, payload):
+        run = self.store.run(payload.run_id)
+        if run.project_id != project_id:
+            raise ValueError("Inline question Run belongs to another Workspace")
+        context = run.ui_context or {}
+        resource = context.get("resource") if isinstance(context, dict) else None
+        if not isinstance(resource, dict) or resource.get("paper_id") != paper_id:
+            raise ValueError("Inline question Run is not bound to this paper")
+        return self.reference_store_for_project(project_id).create_inline_question(
+            paper_id, payload,
+        )
+
+    def paper_inline_answers(self, project_id: str, paper_id: str):
+        store = self.reference_store_for_project(project_id)
+        values = list(store.inline_answers(paper_id))
+        for value in values:
+            if value.status != "pending":
+                continue
+            try:
+                run = self.store.run(value.run_id)
+            except KeyError:
+                store.settle_inline_answer(
+                    value.run_id, error="Question Run is no longer available",
+                )
+                continue
+            if run.status == "completed":
+                store.settle_inline_answer(value.run_id, answer=run.answer or "")
+                self.store.mark_run_inbox_read(run.run_id)
+            elif run.status in {"failed", "cancelled", "interrupted"}:
+                store.settle_inline_answer(
+                    value.run_id, error=run.error or f"Question Run {run.status}",
+                )
+        return store.inline_answers(paper_id)
+
+    async def _settle_read_artifacts(self, run) -> None:
+        """Project finalized Read artifacts without requiring an open browser."""
+        store = self.reference_store_for_project(run.project_id)
+        inline = store.inline_answer_for_run(run.run_id)
+        if inline is not None and inline.status == "pending":
+            if run.status == "completed":
+                store.settle_inline_answer(run.run_id, answer=run.answer or "")
+            elif run.status in {"failed", "cancelled", "interrupted"}:
+                store.settle_inline_answer(
+                    run.run_id, error=run.error or f"Question Run {run.status}",
+                )
+            self.store.mark_run_inbox_read(run.run_id)
+
+        if not run.client_id.startswith("paper-summary:"):
+            return
+        context = run.ui_context if isinstance(run.ui_context, dict) else {}
+        resource = context.get("resource") if isinstance(context, dict) else None
+        paper_id = resource.get("paper_id") if isinstance(resource, dict) else None
+        if not isinstance(paper_id, str) or not paper_id:
+            return
+        service = self.paper_web_for_project(run.project_id)
+        if run.status == "completed":
+            service.write_summary(paper_id, run.answer or "", run_id=run.run_id)
+        elif run.status in {"failed", "cancelled", "interrupted"}:
+            service.mark_summary(
+                paper_id, status="failed", run_id=run.run_id,
+                error=run.error or f"Summary Run {run.status}",
+            )
+        self.store.mark_run_inbox_read(run.run_id)
+
+    def memory_for_workspace(self, workspace: Path) -> MemoryStore:
+        selected = workspace.resolve()
+        key = self._workspace_cache_key(selected)
+        existing = self._memory_stores.get(key)
+        if existing is not None:
+            return existing
+        config = load_runtime_config(self.config.agent_root, workspace_root=selected)
+        store = MemoryStore(
+            config.memory_dir,
+            workspace_root=selected,
+            agent_root=self.config.agent_root,
+            partition_by_workspace=False,
+        )
+        store.configure_long_term_retrieval(config)
+        self._memory_stores[key] = store
+        if store.structured is not None:
+            worker = MemoryEmbeddingWorker(
+                store.structured,
+                self.memory_embedding_provider,
+                version=config.memory_embedding_version,
+            )
+            worker.write_gate = self.write_gate
+            self._memory_workers[key] = worker
+            if getattr(self, "_services_started", False):
+                try:
+                    asyncio.get_running_loop().create_task(worker.start())
+                except RuntimeError:
+                    pass
+        return store
+
+    def memory_for_project(self, project_id: str) -> MemoryStore:
+        project = self.store.project(project_id)
+        return self.memory_for_workspace(Path(project.path))
 
     @lifecycle_work("request")
     async def remove_project(self, project_id: str) -> None:
         if await self.cron_service.project_has_jobs(project_id):
             raise RuntimeError("项目仍有关联 Cron Job，必须先删除计划任务")
         self.store.remove_project(project_id)
+        unregister_workspace(self.config.agent_root, project_id)
 
     @lifecycle_work("request")
     async def create_cron(self, request: CronJobCreateRequest) -> CronJob:
@@ -1458,8 +1941,12 @@ class GatewayApplication:
     async def cron_status(self):
         return await self.cron_service.status(error=self.cron_scheduler.last_error)
 
-    def dream_status(self):
-        return self.dream_scheduler.status()
+    def dream_status(self, project_id: str | None = None):
+        owner, project = self._dream_project(project_id)
+        workspace = Path(project.path) if project is not None else self.config.workspace_root
+        return self._dream_scheduler_for_workspace(
+            workspace, project_id=owner,
+        ).status()
 
     def harness_dream_status(self) -> HarnessDreamStatus:
         scanner = self.harness_evolution.dream_scanner
@@ -1855,7 +2342,7 @@ class GatewayApplication:
             return {**existing, "proposal": json.loads(str(existing["proposal_json"]))}
         source_identity = self.harness_evolution.dream_scanner.source_identity
         worktree = (
-            self.config.agent_root / ".yy" / "harness-evolution" / "reverts"
+            self.config.workspace_state_dir / "harness-evolution" / "reverts"
             / source_identity / proposal_id
         )
         placeholder = HarnessRevertProposal(
@@ -1917,7 +2404,7 @@ class GatewayApplication:
             raise RuntimeError("Merged Dream commit is not an ancestor of current HEAD")
         source_identity = self.harness_evolution.dream_scanner.source_identity
         worktree = (
-            self.config.agent_root / ".yy" / "harness-evolution" / "reverts"
+            self.config.workspace_state_dir / "harness-evolution" / "reverts"
             / source_identity / proposal_id
         )
         branch = f"harness-dream-revert/{proposal_id[:12]}"
@@ -2040,38 +2527,58 @@ class GatewayApplication:
         return proposal.model_copy(update={"status": "merged"})
 
     @lifecycle_work("request")
-    async def run_dream(self, selected: str | None = None):
+    async def run_dream(
+        self, selected: str | None = None, *, project_id: str | None = None,
+    ):
         if not self.pool.is_idle():
             raise RuntimeError("普通 Agent 任务仍在运行，Dream 将在任务结束后执行")
         target = date.fromisoformat(selected) if selected else datetime.now().astimezone().date() - timedelta(days=1)
-        result = await self._execute_dream_day(target, automatic=False)
-        await self._record_dream_result(result, False)
-        await self.checkpoint_dream.process_due(target)
+        owner, _ = self._dream_project(project_id)
+        self.dream_service_for_project(owner)
+        result = await self._execute_dream_day(
+            target, automatic=False, project_id=owner,
+        )
+        await self._record_dream_result(result, False, owner)
+        await self._checkpoint_dreams[owner].process_due(target)
         return result
 
     @lifecycle_work("request")
-    async def backfill_dream(self, start: str, end: str):
+    async def backfill_dream(
+        self, start: str, end: str, *, project_id: str | None = None,
+    ):
         if not self.pool.is_idle():
             raise RuntimeError("普通 Agent 任务仍在运行，不能开始 Dream backfill")
         first, last = date.fromisoformat(start), date.fromisoformat(end)
         if last < first or (last - first).days >= 31:
             raise ValueError("Dream backfill 日期无效或超过 31 天")
+        owner, _ = self._dream_project(project_id)
+        self.dream_service_for_project(owner)
         collected = []
         current = first
         while current <= last:
-            collected.append(await self._execute_dream_day(current, automatic=False))
+            collected.append(await self._execute_dream_day(
+                current, automatic=False, project_id=owner,
+            ))
             current = date.fromordinal(current.toordinal() + 1)
         results = tuple(collected)
         for result in results:
-            await self._record_dream_result(result, False)
+            await self._record_dream_result(result, False, owner)
         return results
 
-    async def _execute_dream_day(self, selected: date, *, automatic: bool) -> DreamRunResult:
+    async def _execute_dream_day(
+        self,
+        selected: date,
+        *,
+        automatic: bool,
+        project_id: str | None = None,
+    ) -> DreamRunResult:
+        owner, _ = self._dream_project(project_id)
+        service = self.dream_service_for_project(owner)
         run_id = uuid4().hex
         state = self._begin_workload_run(
             run_id=run_id,
             workload=WorkloadKind.DREAM,
-            project_id="dream",
+            project_id=owner,
             client_id="dream:scheduler" if automatic else "dream:manual",
             task=f"Dream {selected.isoformat()}",
         )
@@ -2079,19 +2586,19 @@ class GatewayApplication:
             raise RuntimeError(f"Dream workload 不可调度：{state.task_state.value}")
         try:
             operation = (
-                self.dream_service.process_pending(selected, run_id=run_id)
+                service.process_pending(selected, run_id=run_id)
                 if automatic
-                else self.dream_service.process_day(selected, run_id=run_id)
+                else service.process_day(selected, run_id=run_id)
             )
             return await asyncio.wait_for(
                 operation,
-                timeout=float(self.config.dream_run_timeout_seconds),
+                timeout=float(service.config.dream_run_timeout_seconds),
             )
         except asyncio.TimeoutError:
-            seconds = float(self.config.dream_run_timeout_seconds)
+            seconds = float(service.config.dream_run_timeout_seconds)
             error = f"Dream run exceeded {seconds:g} seconds"
             try:
-                return await self.dream_service.record_external_failure(
+                return await service.record_external_failure(
                     selected,
                     run_id=run_id,
                     error=error,
@@ -2182,10 +2689,13 @@ class GatewayApplication:
         return state
 
     @lifecycle_work("request")
-    async def rollback_dream(self, run_id: str | None = None):
+    async def rollback_dream(
+        self, run_id: str | None = None, *, project_id: str | None = None,
+    ):
         if not self.pool.is_idle():
             raise RuntimeError("普通 Agent 任务仍在运行，不能回滚 Dream")
-        result = await self.dream_service.rollback(run_id)
+        owner, _ = self._dream_project(project_id)
+        result = await self.dream_service_for_project(owner).rollback(run_id)
         if result.restored:
             await self.pool.invalidate_profile_context(after_active_turn=True)
             try:
@@ -2204,7 +2714,12 @@ class GatewayApplication:
                 pass
         return result
 
-    async def _record_dream_result(self, result: DreamRunResult, automatic: bool) -> None:
+    async def _record_dream_result(
+        self,
+        result: DreamRunResult,
+        automatic: bool,
+        project_id: str | None = None,
+    ) -> None:
         """把维护运行转换为可重放 Gateway 事件；仅自动任务进入 Inbox。"""
         try:
             state = self.state_controller.state(result.run_id)
@@ -2212,7 +2727,7 @@ class GatewayApplication:
             state = self._begin_workload_run(
                 run_id=result.run_id,
                 workload=WorkloadKind.DREAM,
-                project_id="dream",
+                project_id=project_id or self._default_dream_project_id,
                 client_id="dream:scheduler" if automatic else "dream:manual",
                 task=f"Dream {result.date}",
             )
@@ -2302,6 +2817,28 @@ class GatewayApplication:
     @lifecycle_work("request")
     async def start_run(self, request: RunCreateRequest) -> RunRecord:
         project = self.store.project(request.project_id)
+        if request.session_id is not None and not self.memory_for_project(
+            request.project_id,
+        ).has_session(request.session_id):
+            raise ValueError(
+                "Session does not belong to the selected Workspace",
+            )
+        if request.ui_context is not None and request.ui_context.attachments:
+            resolved = self.paper_web_for_project(request.project_id).resolve_attachments(
+                tuple(item.attachment_id for item in request.ui_context.attachments),
+            )
+            by_id = {item.attachment_id: item for item in request.ui_context.attachments}
+            attachments: list[UIAttachmentContext] = []
+            for item in resolved:
+                supplied = by_id[str(item["attachment_id"])]
+                if supplied.content_hash != item["content_hash"]:
+                    raise RunUIContextConflict("Temporary attachment content changed; upload it again")
+                attachments.append(UIAttachmentContext.model_validate(item, strict=True))
+            request = request.model_copy(update={
+                "ui_context": request.ui_context.model_copy(update={
+                    "attachments": tuple(attachments),
+                }),
+            })
         if (
             request.ui_context is not None
             and request.ui_context.source == "write"
@@ -2315,9 +2852,10 @@ class GatewayApplication:
         if (
             request.ui_context is not None
             and request.ui_context.source == "read"
+            and not request.ui_context.translation
             and request.ui_context.resource is not None
         ):
-            paper = self.reference_store.get_paper(
+            paper = self.reference_store_for_project(request.project_id).get_paper(
                 request.ui_context.resource.paper_id or "",
             )
             current_hashes = {item.sha256 for item in paper.files if item.is_primary}
@@ -2325,6 +2863,20 @@ class GatewayApplication:
                 raise RunUIContextConflict(
                     "Paper content changed or is no longer available; refresh the reader selection",
                 )
+            summary = self.paper_summary(request.project_id, paper.paper_id)
+            request = request.model_copy(update={
+                "ui_context": request.ui_context.model_copy(update={
+                    "paper_context": UIPaperContext(
+                        title=paper.title,
+                        abstract=paper.abstract,
+                        authors=tuple(author.display_name for author in paper.authors),
+                        summary=(
+                            str(summary["content"])
+                            if summary["status"] == "completed" else ""
+                        ),
+                    ),
+                }),
+            })
         # Resolve before creating durable state. Unknown or malformed choices
         # cannot produce a queued Run that later fails during Runtime loading.
         selected_config = self.config.select_model_profile(
@@ -2436,11 +2988,7 @@ class GatewayApplication:
         # pre-bound identity as a missing interactive Session.  A crash here is
         # safe: reconcile reuses the same deterministic id and the orphan has no
         # execution side effect.
-        memory = MemoryStore(
-            self.config.memory_dir,
-            workspace_root=Path(project.path),
-            agent_root=self.config.agent_root,
-        )
+        memory = self.memory_for_project(job.project_id)
         if not memory.has_session(session_id):
             memory.create_session("", session_id=session_id)
         state, duplicate = self.state_controller.create_run(
@@ -2818,21 +3366,13 @@ class GatewayApplication:
     @lifecycle_mutation
     def sessions(self, project_id: str) -> list[dict[str, object]]:
         project = self.store.project(project_id)
-        memory = MemoryStore(
-            self.config.memory_dir,
-            workspace_root=Path(project.path),
-            agent_root=self.config.agent_root,
-        )
+        memory = self.memory_for_project(project_id)
         return memory.list_sessions()
 
     @lifecycle_mutation
     def session_records(self, project_id: str, session_id: str) -> list[dict[str, object]]:
         project = self.store.project(project_id)
-        memory = MemoryStore(
-            self.config.memory_dir,
-            workspace_root=Path(project.path),
-            agent_root=self.config.agent_root,
-        )
+        memory = self.memory_for_project(project_id)
         return memory.session_records(session_id)
 
     @lifecycle_work()
@@ -2847,7 +3387,7 @@ class GatewayApplication:
         if not record_id and not tool_call_id:
             raise ValueError("record_id or tool_call_id is required")
         project = self.store.project(project_id)
-        memory = MemoryStore(self.config.memory_dir, workspace_root=Path(project.path), agent_root=self.config.agent_root)
+        memory = self.memory_for_project(project_id)
         if not memory.has_session(session_id):
             raise KeyError(session_id)
         arguments = {key: value for key, value in {

@@ -7,18 +7,20 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 import httpx
 
 from Agent import AgentRuntime, load_runtime_config
-from bootstrap import ensure_project_initialized, is_project_initialized
+from bootstrap import ensure_project_initialized, ensure_workspace_initialized, is_project_initialized
 from reference import (
     Author,
     CitationExampleCreate,
     OpenAIEmbeddingProvider,
     PaperFile,
     PaperIdentifier,
+    PaperInlineQuestionCreate,
     PaperNoteCreate,
     PaperNoteUpdate,
     PaperUpsert,
@@ -42,6 +44,34 @@ class FakeEmbeddingProvider:
 
 
 class ReferenceTests(unittest.TestCase):
+    def test_inline_questions_persist_each_question_and_settle_by_run(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            store = ReferenceStore(Path(value) / "reference.sqlite3")
+            paper = store.upsert_paper(PaperUpsert(title="Interactive Paper"))
+            first = store.create_inline_question(paper.paper_id, PaperInlineQuestionCreate(
+                run_id="run-one", page=3, selected_text="same selection",
+                nearby_context="nearby text", locator={"page": 3, "x": 0.2, "y": 0.4},
+                question="What does this mean?",
+            ))
+            second = store.create_inline_question(paper.paper_id, PaperInlineQuestionCreate(
+                run_id="run-two", page=3, selected_text="same selection",
+                nearby_context="nearby text", locator={"page": 3, "x": 0.2, "y": 0.4},
+                question="Why is it important?",
+            ))
+
+            self.assertNotEqual(first.answer_id, second.answer_id)
+            self.assertEqual(first.selected_text_hash, second.selected_text_hash)
+            completed = store.settle_inline_answer("run-one", answer="Explanation")
+            failed = store.settle_inline_answer("run-two", error="Provider unavailable")
+            self.assertEqual(completed.status, "completed")
+            self.assertEqual(completed.answer, "Explanation")
+            self.assertEqual(failed.status, "failed")
+            self.assertEqual(failed.error, "Provider unavailable")
+            restored = store.inline_answers(paper.paper_id)
+            self.assertEqual([item.question for item in restored], [
+                "What does this mean?", "Why is it important?",
+            ])
+
     def test_paper_notes_use_revision_cas_in_reference_database(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             store = ReferenceStore(Path(value) / "reference.sqlite3")
@@ -103,7 +133,7 @@ class ReferenceTests(unittest.TestCase):
                 connection.close()
             self.assertIn("source_session_id", columns)
             self.assertIn("source_workspace", columns)
-            self.assertEqual(version, 3)
+            self.assertEqual(version, 4)
             self.assertIsNotNone(store.migration_backup_path)
             self.assertTrue(store.migration_backup_path.is_file())
             self.assertEqual(store.get_paper("legacy").title, "Legacy Paper")
@@ -114,22 +144,55 @@ class ReferenceTests(unittest.TestCase):
             ))
             self.assertEqual(created.source_session_id, "session")
 
-    def test_initializer_creates_global_reference_database_idempotently(self) -> None:
+    def test_initializer_creates_workspace_reference_database_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as value:
-            root = Path(value)
-            result = ensure_project_initialized(root)
-            database = result.yy_dir / "reference" / "reference.sqlite3"
+            root = Path(value) / "agent"
+            workspace = Path(value) / "workspace"
+            root.mkdir()
+            workspace.mkdir()
+            ensure_project_initialized(root)
+            ensure_workspace_initialized(workspace, agent_root=root)
+            database = workspace / ".yy" / "reference" / "reference.sqlite3"
             self.assertTrue(database.is_file())
             self.assertTrue(is_project_initialized(root))
             store = ReferenceStore(database)
             paper = store.upsert_paper(PaperUpsert(title="Preserved", publication_year=2024))
-            ensure_project_initialized(root)
+            ensure_workspace_initialized(workspace, agent_root=root)
             self.assertEqual(ReferenceStore(database).get_paper(paper.paper_id).title, "Preserved")
             connection = sqlite3.connect(database)
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
             finally:
                 connection.close()
+
+    def test_current_database_repairs_legacy_paper_files_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            database = Path(value) / "reference.sqlite3"
+            ReferenceStore(database)
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute("ALTER TABLE paper_files RENAME TO old_paper_files")
+                connection.execute("""
+                    CREATE TABLE paper_files(
+                        file_id TEXT PRIMARY KEY,paper_id TEXT NOT NULL,
+                        workspace_hash TEXT NOT NULL,workspace_root TEXT NOT NULL,
+                        relative_path TEXT NOT NULL,absolute_path TEXT NOT NULL,
+                        sha256 TEXT NOT NULL,mime_type TEXT NOT NULL,size_bytes INTEGER NOT NULL,
+                        is_primary INTEGER NOT NULL,added_at TEXT NOT NULL
+                    )
+                """)
+                connection.execute("DROP TABLE old_paper_files")
+                connection.execute("PRAGMA user_version=4")
+                connection.commit()
+
+            store = ReferenceStore(database)
+            with closing(sqlite3.connect(database)) as connection:
+                columns = {
+                    row[1] for row in connection.execute(
+                        "PRAGMA table_info(paper_files)",
+                    ).fetchall()
+                }
+            self.assertIn("source_session_id", columns)
+            self.assertIsNotNone(store.migration_backup_path)
 
     def test_schema_normalizes_papers_passages_examples_and_file_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -294,13 +357,21 @@ class ReferenceTests(unittest.TestCase):
             self.assertEqual(registry.risk_of("reference_search"), "read")
             self.assertEqual(registry.risk_of("reference_write"), "write")
 
-    def test_runtime_config_and_default_tools_use_global_reference(self) -> None:
+    def test_runtime_config_and_default_tools_use_workspace_reference(self) -> None:
         with tempfile.TemporaryDirectory() as value:
-            root = Path(value)
-            config = load_runtime_config(root, reference_search_mode="separate")
+            root = Path(value) / "agent"
+            workspace = Path(value) / "workspace"
+            root.mkdir()
+            workspace.mkdir()
+            config = load_runtime_config(
+                root, workspace_root=workspace, reference_search_mode="separate",
+            )
             runtime = AgentRuntime(config, enable_sandbox=False, enable_subagent=False)
             try:
-                self.assertEqual(config.reference_database_path, root / ".yy" / "reference" / "reference.sqlite3")
+                self.assertEqual(
+                    config.reference_database_path,
+                    workspace / ".yy" / "reference" / "reference.sqlite3",
+                )
                 self.assertIn("reference_search", runtime.tools.names(runtime.tool_context))
                 self.assertIn("reference_get", runtime.tools.names(runtime.tool_context))
                 self.assertIn("reference_write", runtime.tools.names(runtime.tool_context))

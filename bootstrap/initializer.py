@@ -9,11 +9,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
-from memory import MemoryStore
 from cron import CronState, HeartbeatState
-from paper_library import PaperIndex
-from reference import ReferenceStore
-from skill import SkillService
 
 
 class InitializationResult(BaseModel):
@@ -27,18 +23,8 @@ class InitializationResult(BaseModel):
 
 _REQUIRED_PATHS = (
     "settings.local.json",
-    "memory/session/index.json",
-    "memory/profile/USER.md",
-    "memory/profile/RESEARCH.md",
-    "memory/profile/OTHERS.md",
-    "memory/profile/index.json",
     "agents/SOUL.md",
     "agents/AGENT.md",
-    "skills/index.json",
-    "reference/reference.sqlite3",
-    "papers/index.json",
-    "dream/state.json",
-    "dream/memories.json",
     ".initialized.json",
 )
 
@@ -51,21 +37,6 @@ def initialize_project(project_root: Path) -> Path:
     if not local.exists():
         template = Path(__file__).parent / "templates" / "settings.local.json.example"
         local.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
-    memory_required = (
-        yy / "memory" / "session" / "index.json",
-        yy / "memory" / "profile" / "USER.md",
-        yy / "memory" / "profile" / "RESEARCH.md",
-        yy / "memory" / "profile" / "OTHERS.md",
-        yy / "memory" / "profile" / "index.json",
-    )
-    if not all(path.exists() for path in memory_required):
-        MemoryStore(yy / "memory")
-    ReferenceStore(yy / "reference" / "reference.sqlite3")
-    papers = yy / "papers"
-    papers.mkdir(parents=True, exist_ok=True)
-    paper_index = papers / "index.json"
-    if not paper_index.exists():
-        paper_index.write_text(PaperIndex().model_dump_json(indent=2) + "\n", encoding="utf-8")
     agents = yy / "agents"
     agents.mkdir(parents=True, exist_ok=True)
     templates = {
@@ -76,8 +47,6 @@ def initialize_project(project_root: Path) -> Path:
         target = agents / name
         if not target.exists():
             target.write_text(content, encoding="utf-8")
-    for directory in ("review", "audit", "backups"):
-        (yy / "skills" / directory).mkdir(parents=True, exist_ok=True)
     for directory in ("runs",):
         (yy / "gateway" / directory).mkdir(parents=True, exist_ok=True)
     cron_directory = yy / "cron"
@@ -88,39 +57,6 @@ def initialize_project(project_root: Path) -> Path:
             CronState(heartbeat=HeartbeatState()).model_dump_json(indent=2) + "\n",
             encoding="utf-8",
         )
-    dream_directory = yy / "dream"
-    for directory in ("runs", "backups", "transactions"):
-        (dream_directory / directory).mkdir(parents=True, exist_ok=True)
-    dream_state = dream_directory / "state.json"
-    if not dream_state.exists():
-        dream_state.write_text(json.dumps({
-            "version": 1,
-            "initialized_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "last_completed_date": None,
-            "processed_evidence": {},
-            "successful_runs": [],
-            "last_run_id": None,
-            "last_status": None,
-            "last_error": None,
-        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    dream_memories = dream_directory / "memories.json"
-    if not dream_memories.exists():
-        dream_memories.write_text(
-            json.dumps({"version": 1, "memories": {}}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    skill_index = yy / "skills" / "index.json"
-    if not skill_index.exists():
-        skill_index.write_text(
-            json.dumps({"version": 1, "skills": {}}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    bundled_skills = _bundled_skills_root()
-    if bundled_skills.is_dir():
-        service = SkillService(project_root, project_root, bundled_skills.parent)
-        repository_root = bundled_skills.parent
-        for source in sorted(path for path in bundled_skills.iterdir() if path.is_dir()):
-            service.install_builtin(source, repository_root=repository_root)
     marker = yy / ".initialized.json"
     if not marker.exists():
         marker.write_text(

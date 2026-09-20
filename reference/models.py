@@ -188,6 +188,32 @@ class PaperNoteUpdate(ReferenceModel):
     note_markdown: str = Field(min_length=1, max_length=100_000)
 
 
+class PaperInlineQuestionCreate(ReferenceModel):
+    run_id: str = Field(min_length=1, max_length=128)
+    page: int = Field(ge=1)
+    selected_text: str = Field(min_length=1, max_length=20_000)
+    nearby_context: str = Field(default="", max_length=80_000)
+    locator: dict[str, Any] = Field(default_factory=dict)
+    question: str = Field(min_length=1, max_length=20_000)
+
+
+class PaperInlineAnswer(ReferenceModel):
+    answer_id: str
+    paper_id: str
+    run_id: str
+    page: int
+    selected_text: str
+    selected_text_hash: str
+    nearby_context: str = ""
+    locator: dict[str, Any] = Field(default_factory=dict)
+    question: str
+    answer: str = ""
+    status: Literal["pending", "completed", "failed"] = "pending"
+    error: str | None = None
+    created_at: str
+    answered_at: str | None = None
+
+
 class EmbeddingJob(ReferenceModel):
     job_id: str
     document_id: str

@@ -123,6 +123,16 @@ class BackupFileRecord(BaseModel):
     stored_size: int | None = Field(default=None, ge=0)
 
 
+class WorkspaceBackupDescriptor(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    workspace_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+    version: int = Field(default=1, ge=1)
+    migration_version: int = Field(default=1, ge=1)
+
+
 class BackupManifest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -137,6 +147,7 @@ class BackupManifest(BaseModel):
     source_timezone: str
     agent_home_logical_size: int = Field(ge=0)
     files: tuple[BackupFileRecord, ...]
+    workspaces: tuple[WorkspaceBackupDescriptor, ...] = ()
     external_dependencies: tuple[ExternalDependency, ...] = ()
     skill_manifest_hashes: dict[str, str] = Field(default_factory=dict)
     harness_snapshots: tuple[str, ...] = ()
@@ -282,6 +293,7 @@ __all__ = [
     "BackupManifest",
     "BackupRecord",
     "BackupVerificationResult",
+    "WorkspaceBackupDescriptor",
     "DurabilityClass",
     "ExternalDependency",
     "MaintenanceSnapshot",

@@ -19,15 +19,32 @@ from .models import SessionIndex, SessionRecord
 class SessionStore:
     """以日期加会话哈希命名 JSONL，并维护最新分段索引。"""
 
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, *, workspace_id: str | None = None) -> None:
         self.directory = directory
         self.index_path = directory / "index.json"
+        self.workspace_id = workspace_id
 
     def initialize(self) -> None:
         """创建会话目录及可审计索引文件。"""
         self.directory.mkdir(parents=True, exist_ok=True)
         if not self.index_path.exists():
             self._write_index({"version": 1, "sessions": {}})
+        if self.workspace_id is not None:
+            index = SessionIndex.model_validate_json(
+                self.index_path.read_text(encoding="utf-8"), strict=True,
+            ).model_dump(mode="python")
+            changed = False
+            for session_id, entry in index["sessions"].items():
+                bound = entry.get("workspace_id")
+                if bound not in {None, self.workspace_id}:
+                    raise ValueError(
+                        f"Session {session_id} belongs to another Workspace: {bound}",
+                    )
+                if bound is None:
+                    entry["workspace_id"] = self.workspace_id
+                    changed = True
+            if changed:
+                self._write_index(index)
 
     def create(self, first_message: str, session_id: str | None = None) -> str:
         """预登记会话；第一条真实记录写入时才物化 JSONL。"""
@@ -42,6 +59,7 @@ class SessionStore:
         index = self._read_index()
         index["sessions"][session_id] = {
             "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "workspace_id": self.workspace_id,
             "latest_file": filename,
             "files": [filename],
             "state": "pending",

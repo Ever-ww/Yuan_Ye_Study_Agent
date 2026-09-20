@@ -252,6 +252,22 @@ def test_context_corruption_and_query_binding_fail_closed(tmp_path):
     assert memory.session_records(sid) == []
 
 
+def test_provider_context_serializes_structured_origin_refs():
+    packet = ProviderContextRecord.create(
+        "current time",
+        "epoch",
+        {"agent": "runtime context"},
+        origin_refs={
+            "run_id": "run-1",
+            "ui_context": {"attachments": [], "source": "agent"},
+        },
+    )
+
+    assert packet.origin_refs["run_id"] == "run-1"
+    assert packet.origin_refs["ui_context"] == '{"attachments":[],"source":"agent"}'
+    assert ProviderContextRecord.model_validate(packet.model_dump(mode="json")) == packet
+
+
 def test_emergency_compression_amendment_replays_and_does_not_leak(tmp_path):
     config = config_for(tmp_path)
     memory = MemoryStore(config.memory_dir)

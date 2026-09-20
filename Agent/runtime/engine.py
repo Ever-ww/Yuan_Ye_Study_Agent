@@ -307,7 +307,7 @@ class AgentRuntime:
             )
             if enable_paper_library:
                 self.paper_library = self.paper_library or PaperLibraryService(
-                    self.config.agent_root,
+                    self.config.workspace_root,
                     self.references.store if self.references is not None else None,
                     downloader=paper_download,
                 )
@@ -734,6 +734,8 @@ class AgentRuntime:
             if persisted is not None
             else None
         )
+        if self.skill_management is not None:
+            self.skill_management.sync_builtins()
         candidate = self.skills.catalog_snapshot()
         self.skills.catalog_xml(candidate)
         old_digest = current.digest if current is not None else None

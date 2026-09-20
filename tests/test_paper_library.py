@@ -12,7 +12,7 @@ from pathlib import Path
 import httpx
 from pypdf import PdfWriter
 
-from bootstrap import ensure_project_initialized
+from bootstrap import ensure_project_initialized, ensure_workspace_initialized
 from paper_library import (
     PaperCandidate,
     PaperLibraryService,
@@ -278,13 +278,20 @@ class PaperLibraryTests(unittest.TestCase):
     def test_initializer_registers_repository_skill_and_paper_index(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
-            result = ensure_project_initialized(root)
-            self.assertTrue((result.yy_dir / "papers" / "index.json").is_file())
+            ensure_project_initialized(root)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            ensure_workspace_initialized(workspace, agent_root=root)
+            workspace_state = workspace / ".yy"
+            self.assertTrue((workspace_state / "papers" / "index.json").is_file())
             repository_root = Path(__file__).resolve().parents[1]
-            service = SkillService(root, root, repository_root)
+            service = SkillService(workspace, root, repository_root)
             metadata = {item.name: item for item in service.catalog()}
             self.assertIn("search-summary-paper", metadata)
             self.assertIn("download", metadata["search-summary-paper"].description.casefold())
+            self.assertTrue(
+                (workspace_state / "skills" / "installed" / "search-summary-paper" / "SKILL.md").is_file()
+            )
             skill_root = repository_root / "skills" / "search-summary-paper"
             instructions = (skill_root / "SKILL.md").read_text(encoding="utf-8")
             template = (skill_root / "references" / "summary-template.md").read_text(

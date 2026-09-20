@@ -19,6 +19,7 @@ from .service import BackupService
 
 
 BackupCallback = Callable[[str, dict[str, object]], Awaitable[None]]
+IdleCheck = Callable[[], bool]
 
 
 class BackupScheduler:
@@ -33,6 +34,7 @@ class BackupScheduler:
         drain_timeout_seconds: int,
         on_result: BackupCallback | None = None,
         heartbeat_seconds: int = 60,
+        is_idle: IdleCheck | None = None,
     ) -> None:
         self.service = service
         self.write_gate = write_gate
@@ -42,6 +44,7 @@ class BackupScheduler:
         self.drain_timeout_seconds = drain_timeout_seconds
         self.on_result = on_result
         self.heartbeat_seconds = heartbeat_seconds
+        self.is_idle = is_idle or (lambda: True)
         self.state_path = service.agent_root / ".yy" / "backup" / "state.json"
         self._task: asyncio.Task[None] | None = None
         self._wake = asyncio.Event()
@@ -83,14 +86,32 @@ class BackupScheduler:
             from .models import MaintenanceState
             if self.write_gate.state != MaintenanceState.RUNNING:
                 return None
-            if not self.enabled or not self._is_due():
+            pending_completion = self.service.has_pending_completion()
+            due = self.enabled and self._is_due()
+            cleanup = self.service.has_deferred_cleanup()
+            if not pending_completion and not due and not cleanup:
+                return None
+            if not self.is_idle() or self.write_gate.get_lifecycle_state().active_work:
+                if pending_completion or due:
+                    await self._mark_pending()
+                    return "backup_pending"
+                return None
+            if cleanup:
+                await self.service.cleanup_deferred()
+            if not pending_completion and not due:
                 return None
             now = self._now()
             try:
-                record = await self.service.create(
-                    kind="automatic",
-                    drain_timeout_seconds=self.drain_timeout_seconds,
-                )
+                if pending_completion:
+                    record = await self.service.finish_pending()
+                    if record is None:
+                        await self._mark_pending()
+                        return "backup_pending"
+                else:
+                    record = await self.service.create(
+                        kind="automatic",
+                        drain_timeout_seconds=self.drain_timeout_seconds,
+                    )
             except ValueError as exc:
                 status = "backup_skipped"
                 self.last_error = str(exc)
@@ -117,7 +138,7 @@ class BackupScheduler:
         # catch-up cursor remains unchanged: a manual backup does not silently
         # suppress the next scheduled automatic run.
         records = self.service.list()
-        if records:
+        if records and state.get("last_status") != "backup_pending":
             latest = max(records, key=lambda item: item.created_at)
             attempted = _parse(state.get("last_attempt_at"))
             if attempted is None or latest.created_at > attempted:
@@ -155,19 +176,40 @@ class BackupScheduler:
         # At most one catch-up attempt for a missed scheduled point.
         return (successful is None or successful < previous) and (attempted is None or attempted < previous)
 
+    def _needs_backup(self) -> bool:
+        return self.service.has_pending_completion() or (self.enabled and self._is_due())
+
     async def _run(self) -> None:
+        try:
+            if self._needs_backup():
+                await self._mark_pending()
+        except Exception as exc:
+            self.last_error = type(exc).__name__
         while not self._closing:
+            self._wake.clear()
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=self.heartbeat_seconds)
+            except asyncio.TimeoutError:
+                pass
+            if self._closing:
+                break
             try:
                 await self.tick()
             except Exception as exc:
                 # Lifecycle failure remains canonical; do not write .yy to report
                 # a backup error after maintenance has closed the write gate.
                 self.last_error = type(exc).__name__
-            self._wake.clear()
-            try:
-                await asyncio.wait_for(self._wake.wait(), timeout=self.heartbeat_seconds)
-            except asyncio.TimeoutError:
-                pass
+
+    async def _mark_pending(self) -> None:
+        state = self._read_state()
+        if state.get("last_status") == "backup_pending":
+            return
+        state.update({
+            "last_status": "backup_pending",
+            "last_error": None,
+            "pending_since": self._now().isoformat(),
+        })
+        await self._write_state(state)
 
     async def _write_state_result(
         self,
@@ -183,6 +225,7 @@ class BackupScheduler:
             "last_error": error,
             "last_path": path,
         })
+        state.pop("pending_since", None)
         if status == "backup_completed":
             state["last_successful_backup"] = now.isoformat()
         await self._write_state(state)

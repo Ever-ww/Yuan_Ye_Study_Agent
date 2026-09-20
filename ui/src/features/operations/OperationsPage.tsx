@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Archive, Bot, CalendarClock, CheckCheck, DatabaseBackup, Inbox, Pencil, Plus, ShieldCheck, Trash2 } from "lucide-react";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -36,12 +36,18 @@ export function OperationsPage() {
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
+  const [dreamProjectId, setDreamProjectId] = useState("");
 
   const projects = useQuery({ queryKey: ["projects"], queryFn: () => api.projects() });
+  useEffect(() => {
+    if (!dreamProjectId && projects.data?.length) {
+      setDreamProjectId(window.localStorage.getItem("yyagent.web.selected-project") || projects.data[0].project_id);
+    }
+  }, [dreamProjectId, projects.data]);
   const inbox = useQuery({ queryKey: ["operations", "inbox"], queryFn: () => api.inbox(false), enabled: selected === "inbox" });
   const cron = useQuery({ queryKey: ["operations", "cron"], queryFn: async () => { const [status, jobs] = await Promise.all([api.cronStatus(), api.cronJobs()]); return { status, jobs }; }, enabled: selected === "cron" });
   const cronHistory = useQuery({ queryKey: ["operations", "cron-history", selectedCron?.job_id], queryFn: () => api.cronHistory(String(selectedCron!.job_id)), enabled: selected === "cron" && Boolean(selectedCron?.job_id) });
-  const dream = useQuery({ queryKey: ["operations", "dream"], queryFn: async () => { const [dreamStatus, harness] = await Promise.all([api.dreamStatus(), api.harnessDreamStatus()]); return { dream: dreamStatus, harness }; }, enabled: selected === "dream" });
+  const dream = useQuery({ queryKey: ["operations", "dream", dreamProjectId], queryFn: async () => { const [dreamStatus, harness] = await Promise.all([api.dreamStatus(dreamProjectId), api.harnessDreamStatus()]); return { dream: dreamStatus, harness }; }, enabled: selected === "dream" && Boolean(dreamProjectId) });
   const backup = useQuery({ queryKey: ["operations", "backup"], queryFn: async () => { const [status, items] = await Promise.all([api.backupStatus(), api.backups()]); return { status, items }; }, enabled: selected === "backup" });
   const maintenance = useQuery({ queryKey: ["operations", "maintenance"], queryFn: () => api.maintenanceStatus(), enabled: selected === "maintenance" });
   const activeQuery = { inbox, cron, dream, backup, maintenance }[selected];
@@ -85,9 +91,9 @@ export function OperationsPage() {
         {activeQuery.isLoading && <div className="page-state">正在读取持久状态…</div>}
         {activeQuery.isError && <div className="page-state error">{activeQuery.error.message}</div>}
         {selected === "inbox" && inbox.data && <InboxTable items={inbox.data} selected={selectedInbox?.item_id} onSelect={(item) => { setSelectedInbox(item); setInspectorOpen(true); if (!item.read) void action(`read-${item.item_id}`, () => api.markRead(item.item_id)); }} />}
-        {selected === "cron" && cronEditor !== undefined && <CronEditor job={cronEditor} projects={projects.data || []} busy={Boolean(busy)} onClose={() => setCronEditor(undefined)} onSave={saveCron} />}
+        {selected === "cron" && cronEditor !== undefined && <CronEditor job={cronEditor} projectId={dreamProjectId} busy={Boolean(busy)} onClose={() => setCronEditor(undefined)} onSave={saveCron} />}
         {selected === "cron" && cron.data && <CronTable jobs={cron.data.jobs} selected={String(selectedCron?.job_id || "")} busy={busy} onSelect={(job) => { setSelectedCron(job); setInspectorOpen(true); }} onEdit={setCronEditor} onDelete={(job) => void action(`delete-${String(job.job_id)}`, () => api.removeCron(String(job.job_id))).then((ok) => { if (ok && selectedCron?.job_id === job.job_id) setSelectedCron(null); })} onAction={(id, kind) => void action(`${kind}-${id}`, () => kind === "run" ? api.runCron(id) : api.setCronPaused(id, kind === "pause"))} />}
-        {selected === "dream" && dream.data && <><DreamControls dream={dream.data.dream} harness={dream.data.harness} busy={Boolean(busy)} onRun={(date) => action("dream", () => api.runDream(date)).then(() => undefined)} onBackfill={(start, end) => action("dream-backfill", () => api.backfillDream(start, end)).then(() => undefined)} onRollback={(runId) => action("dream-rollback", () => api.rollbackDream(runId)).then(() => undefined)} onHarnessRun={(value) => action("harness-dream", () => api.runHarnessDream(value)).then(() => undefined)} onHarnessFreeze={(frozen, reason) => action("harness-freeze", () => api.setHarnessDreamFrozen(frozen, reason)).then(() => undefined)} /><StatusGrid entries={[["Daily Dream", dream.data.dream], ["Harness Dream", dream.data.harness]]} /></>}
+        {selected === "dream" && dream.data && <><DreamControls dream={dream.data.dream} harness={dream.data.harness} busy={Boolean(busy)} onRun={(date) => action("dream", () => api.runDream(date, dreamProjectId)).then(() => undefined)} onBackfill={(start, end) => action("dream-backfill", () => api.backfillDream(start, end, dreamProjectId)).then(() => undefined)} onRollback={(runId) => action("dream-rollback", () => api.rollbackDream(runId, dreamProjectId)).then(() => undefined)} onHarnessRun={(value) => action("harness-dream", () => api.runHarnessDream(value)).then(() => undefined)} onHarnessFreeze={(frozen, reason) => action("harness-freeze", () => api.setHarnessDreamFrozen(frozen, reason)).then(() => undefined)} /><StatusGrid entries={[["Daily Dream", dream.data.dream], ["Harness Dream", dream.data.harness]]} /></>}
         {selected === "backup" && backup.data && <><StatusGrid entries={[["Backup Store", backup.data.status]]} /><RecordTable rows={backup.data.items} empty="还没有备份记录。" /></>}
         {selected === "maintenance" && maintenance.data && <StatusGrid entries={[["Maintenance Gate", maintenance.data]]} />}
       </div>

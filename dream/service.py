@@ -81,7 +81,7 @@ class DreamService:
         excluded_sessions: Callable[[], set[str]] | None = None,
     ) -> None:
         self.config = config
-        self.root = config.agent_root / ".yy" / "dream"
+        self.root = config.workspace_state_dir / "dream"
         self.profile_root = config.memory_dir / "profile"
         self.state_path = self.root / "state.json"
         self.memories_path = self.root / "memories.json"
@@ -94,7 +94,7 @@ class DreamService:
         self.model_runner = model_runner
         self.excluded_sessions = excluded_sessions or (lambda: set())
         self._lock = asyncio.Lock()
-        self.file_locks = WorkspaceLockManager(config.agent_root, state_root=config.agent_root)
+        self.file_locks = WorkspaceLockManager(config.workspace_root)
         self._running = False
         self._input_tokens = 0
         self._output_tokens = 0

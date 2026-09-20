@@ -15,7 +15,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from Agent import RuntimeConfig, RuntimeFailure
+from Agent import RuntimeConfig, RuntimeFailure, load_runtime_config
 from gateway.audit import AuditSanitizer
 from memory import MemoryStore
 from backup.maintenance import lifecycle_work
@@ -56,10 +56,25 @@ class GatewayHarnessEvolutionService:
         self.source_root = (config.coding_source_root or Path(__file__).resolve().parents[1]).resolve()
         self.module = _load_harness(self.source_root)
         self.proposals_root = (
-            config.agent_root / ".yy" / "harness-evolution" / "proposals"
+            config.workspace_state_dir / "harness-evolution" / "proposals"
         ).resolve()
         self.dream_scanner = HarnessDreamChangeScanner(
-            config.agent_root, self.source_root, config.dream_timezone,
+            config.workspace_root, self.source_root, config.dream_timezone,
+        )
+
+    def _config_for_project(self, project_id: str) -> RuntimeConfig:
+        if self.store is None:
+            return self.config
+        project = self.store.project(project_id)
+        workspace = Path(project.path).resolve()
+        if workspace == self.config.workspace_root.resolve():
+            return self.config
+        return load_runtime_config(self.config.agent_root, workspace_root=workspace)
+
+    def _proposal_root(self, project_id: str) -> Path:
+        return (
+            self._config_for_project(project_id).workspace_state_dir
+            / "harness-evolution" / "proposals"
         )
 
     @lifecycle_work("run")
@@ -69,9 +84,10 @@ class GatewayHarnessEvolutionService:
         origin = self._origin_for_operation(operation_id, trigger_evidence={
             "capability_gap": capability_gap,
         })
+        selected_config = self._config_for_project(str(origin["origin_project_id"]))
         request = self.module.HarnessEvolutionRequest(
             task=task,
-            config=self.config,
+            config=selected_config,
             trigger="capability",
             target="tool",
             source_root=self.source_root,
@@ -87,7 +103,7 @@ class GatewayHarnessEvolutionService:
             merge_policy="immediate",
         )
         result = await self.module.HarnessEvolutionEngine.for_config(
-            self.config, runtime_resource_manager=self.runtime_resource_manager,
+            selected_config, runtime_resource_manager=self.runtime_resource_manager,
         ).run(request)
         return result.model_dump(mode="json")
 
@@ -101,10 +117,14 @@ class GatewayHarnessEvolutionService:
         records: list[dict[str, Any]] = []
         if run.session_id:
             project = self.store.project(run.project_id)
+            config = load_runtime_config(
+                self.config.agent_root, workspace_root=Path(project.path),
+            )
             memory = MemoryStore(
-                self.config.memory_dir,
+                config.memory_dir,
                 workspace_root=Path(project.path),
                 agent_root=self.config.agent_root,
+                partition_by_workspace=False,
             )
             if memory.has_session(run.session_id):
                 records = list(memory.session_records(run.session_id))
@@ -125,14 +145,19 @@ class GatewayHarnessEvolutionService:
             "origin_run_id": run.run_id,
             "session_record_ids": record_ids,
             "session_records_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-            "context_summary": self._coding_context("\n".join(summary_lines)),
+            "context_summary": self._coding_context(
+                "\n".join(summary_lines), project_id=run.project_id,
+            ),
             "trigger_evidence": AuditSanitizer.sanitize(trigger_evidence),
         }
 
     async def reconcile_capability(self, operation_id: str) -> dict[str, Any]:
         invocation_id = __import__("hashlib").sha256(f"capability:{operation_id}".encode("utf-8")).hexdigest()[:32]
         identity = __import__("hashlib").sha256(str(self.source_root).casefold().encode("utf-8")).hexdigest()[:16]
-        path = self.config.agent_root / ".yy" / "harness-evolution" / "invocations" / identity / f"{invocation_id}.jsonl"
+        operation = self.state_controller.operation(operation_id)
+        run = self.store.run(operation.run_id)
+        selected_config = self._config_for_project(run.project_id)
+        path = selected_config.workspace_state_dir / "harness-evolution" / "invocations" / identity / f"{invocation_id}.jsonl"
         if not path.is_file():
             return {"status": "NOT_APPLIED", "evidence": "no invocation audit"}
         records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -225,7 +250,7 @@ class GatewayHarnessEvolutionService:
             f"dream:{changeset.stable_key}:g{generation}".encode("utf-8"),
         ).hexdigest()[:32]
         path = (
-            self.config.agent_root / ".yy" / "harness-evolution" / "invocations" /
+            self.config.workspace_state_dir / "harness-evolution" / "invocations" /
             changeset.source_identity / f"{invocation_id}.jsonl"
         )
         if not path.is_file():
@@ -267,22 +292,25 @@ class GatewayHarnessEvolutionService:
             return None
         run = self.store.run(run_id)
         project = self.store.project(run.project_id)
+        selected_config = self._config_for_project(run.project_id)
         records: list[dict[str, Any]] = []
         session_file = ""
         if run.session_id:
+            config = selected_config
             memory = MemoryStore(
-                self.config.memory_dir, workspace_root=Path(project.path),
+                config.memory_dir, workspace_root=Path(project.path),
                 agent_root=self.config.agent_root,
+                partition_by_workspace=False,
             )
             if memory.has_session(run.session_id):
                 records = list(memory.session_records(run.session_id))
                 session_file = memory.active_filename(run.session_id)
         writer = self.module.ErrorSnapshotWriter(
-            self.config.agent_root / ".yy" / "harness-evolution",
+            selected_config.workspace_state_dir / "harness-evolution",
             secrets=tuple(filter(None, (
-                self.config.api_key, self.config.web_search_api_key,
-                self.config.reference_embedding_api_key,
-                self.config.compression_api_key,
+                selected_config.api_key, selected_config.web_search_api_key,
+                selected_config.reference_embedding_api_key,
+                selected_config.compression_api_key,
             ))),
         )
         snapshot = writer.capture(
@@ -331,8 +359,9 @@ class GatewayHarnessEvolutionService:
         proposal["status"] = "running"
         self._write_proposal(proposal)
         snapshot = Path(proposal["snapshot_path"])
+        selected_config = self._config_for_project(str(proposal["origin_project_id"]))
         writer = self.module.ErrorSnapshotWriter(
-            self.config.agent_root / ".yy" / "harness-evolution",
+            selected_config.workspace_state_dir / "harness-evolution",
         )
         origin = self._origin_for_run(
             proposal["origin_run_id"],
@@ -343,7 +372,7 @@ class GatewayHarnessEvolutionService:
             },
         )
         request = self.module.HarnessEvolutionRequest(
-            task=proposal["task"], config=self.config,
+            task=proposal["task"], config=selected_config,
             project_root=self.source_root, incident_id=snapshot.stem,
             snapshot_path=snapshot, trigger="error", target="source_repair",
             source_root=self.source_root, agent_root=self.config.agent_root,
@@ -361,10 +390,17 @@ class GatewayHarnessEvolutionService:
     def proposal(self, proposal_id: str) -> dict[str, Any]:
         if not __import__("re").fullmatch(r"[0-9a-f]{32}", proposal_id):
             raise ValueError("Invalid Harness proposal ID")
-        path = self.proposals_root / f"{proposal_id}.json"
-        if not path.is_file():
-            raise KeyError(f"Unknown Harness proposal: {proposal_id}")
-        return dict(json.loads(path.read_text(encoding="utf-8")))
+        roots = [self.proposals_root]
+        if self.store is not None:
+            roots.extend(
+                self._proposal_root(project.project_id)
+                for project in self.store.list_projects()
+            )
+        for root in dict.fromkeys(roots):
+            path = root / f"{proposal_id}.json"
+            if path.is_file():
+                return dict(json.loads(path.read_text(encoding="utf-8")))
+        raise KeyError(f"Unknown Harness proposal: {proposal_id}")
 
     def _origin_for_run(
         self, run_id: str, *, trigger_evidence: dict[str, Any],
@@ -375,9 +411,13 @@ class GatewayHarnessEvolutionService:
         records: list[dict[str, Any]] = []
         if run.session_id:
             project = self.store.project(run.project_id)
+            config = load_runtime_config(
+                self.config.agent_root, workspace_root=Path(project.path),
+            )
             memory = MemoryStore(
-                self.config.memory_dir, workspace_root=Path(project.path),
+                config.memory_dir, workspace_root=Path(project.path),
                 agent_root=self.config.agent_root,
+                partition_by_workspace=False,
             )
             if memory.has_session(run.session_id):
                 records = list(memory.session_records(run.session_id))
@@ -393,20 +433,28 @@ class GatewayHarnessEvolutionService:
             "context_summary": self._coding_context("\n".join(
                 f"{item.get('role')}: {str(item.get('content') or '')[:1000]}"
                 for item in records[-8:] if item.get("role") in {"user", "assistant"}
-            )),
+            ), project_id=run.project_id),
             "trigger_evidence": AuditSanitizer.sanitize(trigger_evidence),
         }
 
-    def _coding_context(self, origin_summary: str) -> str:
-        shared = str(self.observer_context_provider() or "") if self.observer_context_provider else ""
+    def _coding_context(self, origin_summary: str, *, project_id: str) -> str:
+        shared = ""
+        if self.observer_context_provider:
+            try:
+                shared = str(
+                    self.observer_context_provider(project_id=project_id) or "",
+                )
+            except TypeError:
+                shared = str(self.observer_context_provider() or "")
         combined = origin_summary
         if shared:
             combined += "\n\nOther isolated coding Observer summaries:\n" + shared
         return str(AuditSanitizer.sanitize(combined[-6000:]))
 
     def _write_proposal(self, proposal: dict[str, Any]) -> None:
-        self.proposals_root.mkdir(parents=True, exist_ok=True)
-        path = self.proposals_root / f"{proposal['proposal_id']}.json"
+        root = self._proposal_root(str(proposal["origin_project_id"]))
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"{proposal['proposal_id']}.json"
         temporary = path.with_suffix(".json.tmp")
         temporary.write_text(
             json.dumps(proposal, ensure_ascii=False, sort_keys=True, indent=2) + "\n",

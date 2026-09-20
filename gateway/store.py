@@ -48,7 +48,9 @@ class GatewayStore:
                 """
                 CREATE TABLE IF NOT EXISTS projects (
                     project_id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL, last_opened_at TEXT NOT NULL
+                    created_at TEXT NOT NULL, last_opened_at TEXT NOT NULL,
+                    workspace_id TEXT, version INTEGER NOT NULL DEFAULT 1,
+                    migration_version INTEGER NOT NULL DEFAULT 1
                 );
                 CREATE TABLE IF NOT EXISTS runs (
                     run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, session_id TEXT,
@@ -82,6 +84,19 @@ class GatewayStore:
                 """
             )
             self._ensure_run_columns(connection)
+            project_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(projects)")
+            }
+            for name, declaration in {
+                "workspace_id": "TEXT",
+                "version": "INTEGER NOT NULL DEFAULT 1",
+                "migration_version": "INTEGER NOT NULL DEFAULT 1",
+            }.items():
+                if name not in project_columns:
+                    connection.execute(f"ALTER TABLE projects ADD COLUMN {name} {declaration}")
+            connection.execute(
+                "UPDATE projects SET workspace_id=project_id WHERE workspace_id IS NULL"
+            )
 
     @lifecycle_mutation
     def register_project(self, path: Path, name: str | None = None) -> ProjectRecord:
@@ -97,13 +112,17 @@ class GatewayStore:
             ).fetchone()
             created_at = str(existing["created_at"]) if existing else timestamp
             connection.execute(
-                "INSERT INTO projects(project_id,name,path,created_at,last_opened_at) VALUES(?,?,?,?,?) "
+                "INSERT INTO projects(project_id,name,path,created_at,last_opened_at,workspace_id,version,migration_version) "
+                "VALUES(?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(project_id) DO UPDATE SET name=excluded.name,path=excluded.path,"
-                "last_opened_at=excluded.last_opened_at",
-                (project_id, selected_name, str(resolved), created_at, timestamp),
+                "last_opened_at=excluded.last_opened_at,workspace_id=excluded.workspace_id,"
+                "version=excluded.version,migration_version=excluded.migration_version",
+                (project_id, selected_name, str(resolved), created_at, timestamp,
+                 project_id, 1, 1),
             )
         return ProjectRecord(
-            project_id=project_id, name=selected_name, path=str(resolved),
+            project_id=project_id, workspace_id=project_id, name=selected_name,
+            path=str(resolved), version=1, migration_version=1,
             created_at=created_at, last_opened_at=timestamp,
         )
 
@@ -124,6 +143,18 @@ class GatewayStore:
         return ProjectRecord(**dict(row))
 
     @lifecycle_mutation
+    def open_project(self, project_id: str) -> ProjectRecord:
+        timestamp = now_iso()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE projects SET last_opened_at=? WHERE project_id=?",
+                (timestamp, project_id),
+            )
+        if cursor.rowcount == 0:
+            raise KeyError(f"Unknown project: {project_id}")
+        return self.project(project_id)
+
+    @lifecycle_mutation
     def remove_project(self, project_id: str) -> None:
         with self._connect() as connection:
             active = connection.execute(
@@ -135,6 +166,61 @@ class GatewayStore:
             cursor = connection.execute("DELETE FROM projects WHERE project_id=?", (project_id,))
         if cursor.rowcount == 0:
             raise KeyError(f"Unknown project: {project_id}")
+
+    @lifecycle_mutation
+    def relocate_project(
+        self, project_id: str, path: Path, *, name: str | None = None,
+    ) -> ProjectRecord:
+        """Atomically rebind one registered Workspace and its durable projections."""
+
+        resolved = path.resolve()
+        if not resolved.is_dir():
+            raise ValueError(f"Workspace is not a directory: {resolved}")
+        new_id = _project_id(resolved)
+        timestamp = now_iso()
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM projects WHERE project_id=?", (project_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown project: {project_id}")
+            conflict = connection.execute(
+                "SELECT 1 FROM projects WHERE project_id=? AND project_id<>?", (new_id, project_id),
+            ).fetchone()
+            if conflict is not None:
+                raise RuntimeError(f"Destination Workspace is already registered: {resolved}")
+            tables = {
+                str(item["name"]) for item in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'",
+                )
+            }
+            for table in ("runs", "inbox", "cron_jobs", "latex_compilations"):
+                if table not in tables:
+                    continue
+                connection.execute(
+                    f"UPDATE {table} SET project_id=? WHERE project_id=?", (new_id, project_id),
+                )
+            for table, column in (("cron_jobs", "job_json"), ("latex_compilations", "record_json")):
+                if table not in tables:
+                    continue
+                records = connection.execute(
+                    f"SELECT rowid,{column} FROM {table} WHERE project_id=?", (new_id,),
+                ).fetchall()
+                for record in records:
+                    payload = json.loads(str(record[column]))
+                    if isinstance(payload, dict):
+                        payload["project_id"] = new_id
+                        connection.execute(
+                            f"UPDATE {table} SET {column}=? WHERE rowid=?",
+                            (json.dumps(payload, ensure_ascii=False, sort_keys=True), record["rowid"]),
+                        )
+            selected_name = (name or str(row["name"])).strip()
+            connection.execute(
+                "UPDATE projects SET project_id=?,workspace_id=?,name=?,path=?,"
+                "last_opened_at=?,migration_version=? WHERE project_id=?",
+                (new_id, new_id, selected_name, str(resolved), timestamp, 2, project_id),
+            )
+        return self.project(new_id)
 
     def run(self, run_id: str) -> RunRecord:
         with self._connect() as connection:

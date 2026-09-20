@@ -25,10 +25,11 @@ def create_app(token: str | None = None, *, agent_root: Path | None = None) -> A
 def serve(port: int | None = None) -> None:
     """确保 Gateway 已启动并使用一次性地址打开浏览器。"""
     config = load_runtime_config(default_agent_root(), gateway_port=port)
-    client = GatewayClient(config.agent_root, port=config.gateway_port)
-    async def prepare() -> str:
-        await client.register_project(Path.cwd())
-        return await client.browser_url()
-    url = asyncio.run(prepare())
+    client = GatewayClient(
+        config.agent_root,
+        port=config.gateway_port,
+        require_accepting_work=False,
+    )
+    url = asyncio.run(client.browser_url())
     print(f"本机工作台：{url}")
     webbrowser.open(url)

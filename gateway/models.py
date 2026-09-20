@@ -49,10 +49,22 @@ class ProjectRecord(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True)
 
     project_id: str = Field(min_length=1)
+    workspace_id: str = Field(min_length=1)
     name: str = Field(min_length=1)
     path: str = Field(min_length=1)
+    version: int = Field(default=1, ge=1)
+    migration_version: int = Field(default=1, ge=1)
     created_at: str = Field(min_length=1)
     last_opened_at: str = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_workspace_id(cls, value: Any) -> Any:
+        """Keep older callers compatible while making Workspace identity explicit."""
+
+        if isinstance(value, dict) and not value.get("workspace_id"):
+            value = {**value, "workspace_id": value.get("project_id")}
+        return value
 
 
 class RunRecord(BaseModel):
@@ -183,6 +195,8 @@ class UISelectionContext(BaseModel):
     page: int | None = Field(default=None, ge=1)
     start_line: int | None = Field(default=None, ge=1)
     end_line: int | None = Field(default=None, ge=1)
+    nearby_context: str = Field(default="", max_length=80_000)
+    locator: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_lines(self) -> "UISelectionContext":
@@ -199,12 +213,23 @@ class RunUIContext(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     source: Literal["agent", "read", "write"] = "agent"
+    translation: bool = False
     resource: UIResourceContext | None = None
     selection: UISelectionContext | None = None
+    attachments: tuple["UIAttachmentContext", ...] = ()
+    paper_context: "UIPaperContext | None" = None
+
+    @field_validator("attachments", mode="before")
+    @classmethod
+    def normalize_attachments(cls, value: object) -> object:
+        # JSON arrays are the wire representation of this immutable tuple.
+        return tuple(value) if isinstance(value, list) else value
 
     @model_validator(mode="after")
     def validate_source(self) -> "RunUIContext":
-        if self.source == "agent" and (self.resource is not None or self.selection is not None):
+        if self.source == "agent" and (
+            self.resource is not None or self.selection is not None or self.paper_context is not None
+        ):
             raise ValueError("Agent UI context cannot contain a resource selection")
         if self.source == "read" and (self.resource is None or self.selection is None):
             raise ValueError("Read UI context requires a paper resource and selection")
@@ -214,7 +239,45 @@ class RunUIContext(BaseModel):
             self.resource is None or self.resource.kind != "workspace_file"
         ):
             raise ValueError("Write UI context requires a workspace_file resource")
+        if self.source != "agent" and self.attachments:
+            raise ValueError("Temporary attachments are only valid for Agent UI context")
         return self
+
+
+class UIAttachmentContext(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    attachment_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    filename: str = Field(min_length=1, max_length=512)
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    created_at: str = Field(min_length=1)
+    text: str = Field(default="", max_length=60_000)
+
+
+class UIPaperContext(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    title: str = Field(min_length=1, max_length=2000)
+    abstract: str = Field(default="", max_length=20_000)
+    authors: tuple[str, ...] = ()
+    summary: str = Field(default="", max_length=100_000)
+
+
+class PaperSummaryRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    project_id: str = Field(min_length=1)
+    client_id: str = Field(min_length=1)
+    model_profile_id: str = Field(default="default", min_length=1, max_length=80)
+    reasoning_effort: ReasoningEffort | None = None
+
+
+class TranslationRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    text: str = Field(min_length=1, max_length=20_000)
+    target_language: str = Field(default="zh-CN", min_length=2, max_length=16)
+    engine: Literal["baidu", "google", "youdao", "360"] = "baidu"
 
 
 class ModelOption(BaseModel):
@@ -483,6 +546,10 @@ class ObserverSkillCandidateDecisionRequest(BaseModel):
     expected_revision: int = Field(ge=0)
     approved: bool
     actor: str = Field(min_length=1)
+
+
+RunUIContext.model_rebuild()
+RunCreateRequest.model_rebuild()
 
 
 def now_iso() -> str:

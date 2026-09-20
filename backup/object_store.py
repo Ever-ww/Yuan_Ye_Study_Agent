@@ -231,7 +231,10 @@ class BackupObjectStore:
         context: ObjectStoreContext,
     ) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.partial")
+        # Do not repeat a potentially long manifest filename in the temporary
+        # name. Workspace Skill/audit paths can otherwise cross Windows' legacy
+        # path limit even when the final destination itself is valid.
+        temporary = destination.parent / f".r-{uuid4().hex[:12]}.tmp"
         try:
             with temporary.open("xb") as output:
                 self._decrypt(self.object_path(object_id), context, output)

@@ -11,11 +11,13 @@ import subprocess
 import tempfile
 import time
 import unittest
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
+from pypdf import PdfWriter
 
 from Agent import EventType, RunEvent, load_runtime_config
 from Agent.hook import HookEvent, HookPoint, HookRegistry
@@ -48,6 +50,7 @@ from gateway.process import (
     run_gateway,
 )
 from bootstrap import (
+    ensure_workspace_initialized,
     initialize_project,
     legacy_gateway_active,
     migrate_source_home,
@@ -249,6 +252,171 @@ class FakeCodeSessions:
 
 
 class GatewayTests(unittest.TestCase):
+    def test_agent_attachment_and_read_import_use_separate_storage_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            application = GatewayApplication(
+                load_runtime_config(root),
+                runtime_factory=lambda workspace, approval: FakeRuntime(workspace),
+            )
+            try:
+                project = application.register_project(root)
+                output = BytesIO()
+                writer = PdfWriter()
+                writer.add_blank_page(width=612, height=792)
+                writer.add_metadata({"/Title": "Gateway Imported Paper"})
+                writer.write(output)
+                content = output.getvalue()
+                headers = {
+                    "Authorization": "Bearer test-token",
+                    "Content-Type": "application/pdf",
+                }
+                with TestClient(
+                    create_gateway_api(application, access_token="test-token"),
+                ) as client:
+                    attachment = client.post(
+                        f"/api/v1/projects/{project.project_id}/attachments?filename=context.pdf",
+                        headers=headers, content=content,
+                    )
+                    self.assertEqual(attachment.status_code, 200)
+                    self.assertNotIn("text", attachment.json())
+                    started = client.post(
+                        "/api/v1/runs",
+                        headers={"Authorization": "Bearer test-token"},
+                        json={
+                            "project_id": project.project_id,
+                            "client_id": "attachment-test",
+                            "task": "Read this temporary PDF",
+                            "ui_context": {
+                                "source": "agent",
+                                "attachments": [attachment.json()],
+                            },
+                        },
+                    )
+                    self.assertEqual(started.status_code, 200, started.text)
+                    stored_run = application.store.run(started.json()["run_id"])
+                    self.assertEqual(
+                        stored_run.ui_context["attachments"][0]["filename"], "context.pdf",
+                    )
+                    empty_library = client.get(
+                        f"/api/v1/library/papers?project_id={project.project_id}",
+                        headers={"Authorization": "Bearer test-token"},
+                    )
+                    self.assertEqual(empty_library.json(), [])
+
+                    imported = client.post(
+                        "/api/v1/library/papers/import",
+                        params={
+                            "project_id": project.project_id,
+                            "filename": "opaque-id.pdf",
+                            "auto_summarize": "false",
+                        },
+                        headers=headers, content=content,
+                    )
+                    self.assertEqual(imported.status_code, 200, imported.text)
+                    payload = imported.json()
+                    self.assertEqual(payload["paper"]["title"], "Gateway Imported Paper")
+                    self.assertEqual(payload["filename"], "Gateway Imported Paper.pdf")
+                    self.assertEqual(payload["summary"]["status"], "missing")
+                    self.assertNotIn(str(root), imported.text)
+                    service = application.paper_web_for_project(project.project_id)
+                    service.extracted_text = lambda paper_id: "Extracted research content"
+                    summary_started = client.post(
+                        f"/api/v1/library/papers/{payload['paper']['paper_id']}/summary",
+                        headers={"Authorization": "Bearer test-token"},
+                        json={
+                            "project_id": project.project_id,
+                            "client_id": "summary-test",
+                            "model_profile_id": "default",
+                            "reasoning_effort": "low",
+                        },
+                    )
+                    self.assertEqual(summary_started.status_code, 200, summary_started.text)
+                    deadline = time.monotonic() + 5
+                    while (
+                        service.summary(payload["paper"]["paper_id"])["status"] != "completed"
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.02)
+                    persisted_summary = service.summary(payload["paper"]["paper_id"])
+                    self.assertEqual(persisted_summary["status"], "completed")
+                    self.assertTrue(persisted_summary["content"].strip())
+
+                    auto_output = BytesIO()
+                    auto_writer = PdfWriter()
+                    auto_writer.add_blank_page(width=600, height=792)
+                    auto_writer.add_metadata({"/Title": "Automatically Summarized Paper"})
+                    auto_writer.write(auto_output)
+                    auto_import = client.post(
+                        "/api/v1/library/papers/import",
+                        params={
+                            "project_id": project.project_id,
+                            "filename": "second.pdf",
+                        },
+                        headers=headers, content=auto_output.getvalue(),
+                    )
+                    self.assertEqual(auto_import.status_code, 200, auto_import.text)
+                    auto_payload = auto_import.json()
+                    self.assertIn(
+                        auto_payload["summary"]["status"],
+                        {"queued", "running", "completed"},
+                    )
+                    auto_paper_id = auto_payload["paper"]["paper_id"]
+                    deadline = time.monotonic() + 5
+                    while (
+                        service.summary(auto_paper_id)["status"] != "completed"
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.02)
+                    self.assertEqual(service.summary(auto_paper_id)["status"], "completed")
+                    listed = client.get(
+                        f"/api/v1/library/papers?project_id={project.project_id}",
+                        headers={"Authorization": "Bearer test-token"},
+                    )
+                    self.assertEqual(len(listed.json()), 2)
+            finally:
+                asyncio.run(application.close())
+
+    def test_workspace_memory_reference_and_session_identity_are_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            agent_root = base / "agent"
+            first_root = base / "first"
+            second_root = base / "second"
+            for path in (agent_root, first_root, second_root):
+                path.mkdir()
+            application = GatewayApplication(
+                load_runtime_config(agent_root, workspace_root=first_root),
+                runtime_factory=lambda workspace, approval: FakeRuntime(workspace),
+            )
+            try:
+                first = application.register_project(first_root, "First")
+                second = application.register_project(second_root, "Second")
+                paper = application.reference_store_for_project(first.project_id).upsert_paper(
+                    PaperUpsert(title="First only"),
+                )
+                self.assertEqual(
+                    application.reference_store_for_project(first.project_id)
+                    .get_paper(paper.paper_id).title,
+                    "First only",
+                )
+                with self.assertRaises(KeyError):
+                    application.reference_store_for_project(second.project_id).get_paper(
+                        paper.paper_id,
+                    )
+                session_id = application.memory_for_project(first.project_id).create_session(
+                    "first workspace",
+                )
+                with self.assertRaisesRegex(ValueError, "selected Workspace"):
+                    asyncio.run(application.start_run(RunCreateRequest(
+                        project_id=second.project_id,
+                        client_id="isolation-test",
+                        task="continue",
+                        session_id=session_id,
+                    )))
+            finally:
+                asyncio.run(application.close())
+
     def test_library_api_hides_host_paths_and_enforces_note_cas(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
@@ -610,11 +778,23 @@ class GatewayTests(unittest.TestCase):
             with patch.object(InstanceLock, "acquire", side_effect=RuntimeError("held")):
                 self.assertIsNone(run_gateway(Path(value), 18770))
 
-    def test_background_gateway_uses_agent_source_as_maintenance_workspace(self) -> None:
+    def test_background_gateway_uses_recent_workspace_not_agent_source(self) -> None:
         with tempfile.TemporaryDirectory() as value:
-            config = _load_gateway_runtime_config(Path(value), 18770)
-            self.assertEqual(config.workspace_root, config.coding_source_root.resolve())
+            root = Path(value)
+            workspace = root / "research"
+            workspace.mkdir()
+            ensure_workspace_initialized(
+                workspace, agent_root=root, name="Research", touch_recent=True,
+            )
+            config = _load_gateway_runtime_config(root, 18770)
+            self.assertEqual(config.workspace_root, workspace.resolve())
+            self.assertNotEqual(config.workspace_root, config.coding_source_root.resolve())
             self.assertNotEqual(config.workspace_root, config.agent_root)
+
+    def test_background_gateway_requires_registered_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            with self.assertRaisesRegex(RuntimeError, "workspace add"):
+                _load_gateway_runtime_config(Path(value), 18770)
 
     def test_gateway_status_reports_checkpoint_only_capabilities(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -980,6 +1160,28 @@ class GatewayTests(unittest.TestCase):
             replay = StateController(restarted.database_path, gateway_epoch="next")
             self.assertEqual(restarted.run(state.run_id).status, "queued")
             self.assertEqual(replay.events(state.run_id)[-1].type, "state_created")
+
+    def test_store_relocates_project_without_losing_run_history(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            old, new = base / "old", base / "research"
+            old.mkdir(); new.mkdir()
+            store = GatewayStore(base / ".yy" / "gateway")
+            project = store.register_project(old, "Old")
+            controller = StateController(store.database_path, gateway_epoch="relocate")
+            state, _ = controller.create_run(
+                run_id=uuid4().hex, workload_kind=WorkloadKind.CHAT,
+                project_id=project.project_id, client_id="client", task="history",
+                idempotency_key=uuid4().hex,
+                request_hash=hashlib.sha256(b"history").hexdigest(),
+            )
+
+            relocated = store.relocate_project(project.project_id, new, name="Research")
+
+            self.assertEqual(relocated.name, "Research")
+            self.assertEqual(Path(relocated.path), new.resolve())
+            self.assertEqual(store.run(state.run_id).project_id, relocated.project_id)
+            self.assertEqual([item.project_id for item in store.list_projects()], [relocated.project_id])
 
     def test_api_runs_through_gateway_and_replays_events(self) -> None:
         with tempfile.TemporaryDirectory() as value:

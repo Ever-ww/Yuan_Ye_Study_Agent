@@ -97,4 +97,23 @@ describe("GatewayApi", () => {
     expect(url).toContain("/api/v1/code/sessions/code-session?client_id=");
     expect(init.method).toBe("DELETE");
   });
+
+  it("uploads PDF bytes without replacing their content type with JSON", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      attachment_id: "a".repeat(32),
+      filename: "context.pdf",
+      content_hash: "b".repeat(64),
+      created_at: "2026-09-19T00:00:00+00:00",
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new GatewayApi();
+    const file = new File(["%PDF-1.7"], "context.pdf", { type: "application/pdf" });
+
+    await api.uploadAgentAttachment("project", file);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("/api/v1/projects/project/attachments?filename=context.pdf");
+    expect(new Headers(init.headers).get("Content-Type")).toBe("application/pdf");
+    expect(init.body).toBe(file);
+  });
 });

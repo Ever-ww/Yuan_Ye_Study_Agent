@@ -139,6 +139,7 @@ class RestoreService:
             created_at=datetime.now().astimezone(),
         )
         lifecycle = None
+        workspace_rollbacks: list[tuple[Path, Path]] = []
         try:
             lifecycle = AgentHomeMaintenanceCoordinator(self.agent_root, AgentHomeWriteGate())
             create_restore_fence(self.agent_root, fence)
@@ -177,6 +178,12 @@ class RestoreService:
             journal.append("restore_state", {"state": RestoreState.OLD_HOME_RENAMED.value})
             self._rename_action(journal, "install-new-home", staging, self.home)
             journal.append("restore_state", {"state": RestoreState.NEW_HOME_INSTALLED.value})
+            manifest = self.backups.inspect_manifest(
+                archive, selected.value if selected.mode == "passphrase" else None,
+            )
+            workspace_rollbacks = self._restore_workspace_payloads(
+                manifest, restore_id, mappings, journal,
+            )
             self._restore_harness_candidates(mappings)
             self._validate_installed_home()
             journal.append("restore_state", {"state": RestoreState.MIGRATED.value})
@@ -184,6 +191,8 @@ class RestoreService:
             journal.append("restore_state", {"state": RestoreState.COMMITTED.value})
             remove_restore_fence(self.agent_root, restore_id)
             shutil.rmtree(rollback, ignore_errors=True)
+            for _target, workspace_rollback in workspace_rollbacks:
+                shutil.rmtree(workspace_rollback, ignore_errors=True)
             restore_lock.close()
             lifecycle.close()
             # Remain RESTORING until the next Gateway validates registries/stores
@@ -193,11 +202,127 @@ class RestoreService:
             try:
                 await lifecycle.fail(f"Offline restore failed: {type(exc).__name__}")
                 journal.append("restore_failure", {"message": str(exc) or type(exc).__name__})
+                self._rollback_workspaces(workspace_rollbacks)
                 await self._rollback(journal, restore_id, staging, rollback)
             finally:
                 restore_lock.close()
                 lifecycle.close()
             raise
+
+    async def restore_workspace(
+        self,
+        archive: Path,
+        passphrase: str | BackupSecret,
+        *,
+        workspace_id: str,
+        confirmation: str,
+        non_interactive: bool = False,
+        target_path: Path | None = None,
+    ) -> str:
+        """Atomically restore one Workspace-owned ``.yy`` tree.
+
+        The Gateway instance lock prevents a Runtime from observing the
+        replacement halfway through.  Global control state is left intact;
+        only the selected Workspace registration is refreshed.
+        """
+
+        if read_restore_fence(self.agent_root) is not None:
+            raise RestoreRecoveryRequired("存在未完成 Restore，请先执行 backup recover/rollback")
+        selected = (
+            passphrase
+            if isinstance(passphrase, BackupSecret)
+            else BackupSecret(passphrase, "passphrase")
+        )
+        manifest = self.backups.inspect_manifest(
+            archive, selected.value if selected.mode == "passphrase" else None,
+        )
+        descriptor = next(
+            (item for item in manifest.workspaces if item.workspace_id == workspace_id), None,
+        )
+        if descriptor is None:
+            raise KeyError(f"Backup does not contain Workspace: {workspace_id}")
+        expected = manifest.backup_id[:8]
+        if confirmation != expected:
+            raise RestoreConfirmationError(f"必须输入备份短 ID {expected} 确认")
+        if non_interactive and not selected.value:
+            raise RestoreConfirmationError("non-interactive Restore 必须提供 Secret Provider")
+
+        workspace = (target_path or Path(descriptor.path)).expanduser().resolve()
+        if not workspace.is_dir():
+            raise FileNotFoundError(f"Workspace restore target is unavailable: {workspace_id}")
+        target = workspace / ".yy"
+        if target.is_symlink():
+            raise PermissionError("Workspace state directory cannot be a symlink")
+
+        restore_lock = ExternalControlLock(self.control_root / "locks" / "restore.lock")
+        restore_lock.acquire()
+        gateway_lock = ExternalControlLock(
+            self.control_root / "control" / "gateway" / "instance.lock",
+        )
+        try:
+            gateway_lock.acquire()
+        except Exception:
+            restore_lock.close()
+            raise RuntimeError("Gateway 仍在运行；恢复 Workspace 前必须先停止 Gateway")
+
+        restore_id = uuid4().hex
+        extracted = self.agent_root / f".yy.workspace-extract.{restore_id}"
+        staged = workspace / f".yy.restore.{restore_id}"
+        rollback = workspace / f".yy.rollback.{restore_id}"
+        installed = False
+        try:
+            self.backups.extract_backup(archive, selected, extracted)
+            payload = extracted / "workspace-data" / workspace_id
+            if not payload.is_dir():
+                raise FileNotFoundError(f"Workspace payload is missing: {workspace_id}")
+            shutil.copytree(payload, staged)
+            metadata = _read_json(staged / "workspace.json")
+            if metadata.get("workspace_id") not in {None, workspace_id}:
+                raise RuntimeError("Workspace payload identity mismatch")
+            if target.exists():
+                os.replace(target, rollback)
+            os.replace(staged, target)
+            installed = True
+            self._register_restored_workspace(descriptor, workspace)
+            shutil.rmtree(rollback, ignore_errors=True)
+            return restore_id
+        except BaseException:
+            if installed and target.exists():
+                failed = workspace / f".yy.failed.{restore_id}"
+                os.replace(target, failed)
+            if rollback.exists():
+                os.replace(rollback, target)
+            raise
+        finally:
+            shutil.rmtree(extracted, ignore_errors=True)
+            shutil.rmtree(staged, ignore_errors=True)
+            gateway_lock.close()
+            restore_lock.close()
+
+    def _register_restored_workspace(self, descriptor, workspace: Path) -> None:
+        path = self.home / "workspaces.json"
+        current = _read_json(path)
+        items = current.get("workspaces", [])
+        values = {
+            str(item.get("workspace_id")): item
+            for item in items if isinstance(item, dict) and item.get("workspace_id")
+        } if isinstance(items, list) else {}
+        previous = values.get(descriptor.workspace_id, {})
+        values[descriptor.workspace_id] = {
+            "workspace_id": descriptor.workspace_id,
+            "name": descriptor.name,
+            "path": str(workspace),
+            "version": descriptor.version,
+            "migration_version": descriptor.migration_version,
+            "created_at": previous.get("created_at") or _workspace_created_at(workspace),
+            "last_opened_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        _atomic_json(path, {
+            "version": 1,
+            "workspaces": sorted(
+                values.values(), key=lambda item: str(item["last_opened_at"]), reverse=True,
+            ),
+        })
 
     async def recover_interrupted_restore(self) -> RestoreState:
         restore_lock = ExternalControlLock(self.control_root / "locks" / "restore.lock")
@@ -296,6 +421,54 @@ class RestoreService:
         missing = [name for name in required if not (self.home / name).is_file()]
         if missing:
             raise RuntimeError(f"Restore后Agent Home缺少关键文件：{missing}")
+
+    def _restore_workspace_payloads(
+        self, manifest, restore_id: str, mappings: dict[str, str], journal: RestoreJournal,
+    ) -> list[tuple[Path, Path]]:
+        payload_root = self.home / "workspace-data"
+        restored: list[tuple[Path, Path]] = []
+        try:
+            for descriptor in manifest.workspaces:
+                payload = payload_root / descriptor.workspace_id
+                if not payload.is_dir():
+                    continue
+                workspace = Path(
+                    mappings.get(descriptor.path, descriptor.path),
+                ).expanduser().resolve()
+                if not workspace.is_dir():
+                    raise FileNotFoundError(
+                        f"Workspace restore target is unavailable: {descriptor.workspace_id}",
+                    )
+                target = workspace / ".yy"
+                staged = workspace / f".yy.restore.{restore_id}"
+                rollback = workspace / f".yy.rollback.{restore_id}"
+                if staged.exists() or rollback.exists():
+                    raise FileExistsError(staged if staged.exists() else rollback)
+                shutil.copytree(payload, staged)
+                restored.append((target, rollback))
+                if target.exists():
+                    self._rename_action(
+                        journal, f"workspace-{descriptor.workspace_id}-old", target, rollback,
+                    )
+                self._rename_action(
+                    journal, f"workspace-{descriptor.workspace_id}-install", staged, target,
+                )
+        except BaseException:
+            self._rollback_workspaces(restored)
+            raise
+        shutil.rmtree(payload_root, ignore_errors=True)
+        return restored
+
+    @staticmethod
+    def _rollback_workspaces(values: list[tuple[Path, Path]]) -> None:
+        for target, rollback in reversed(values):
+            if target.exists():
+                failed = target.with_name(f"{target.name}.failed")
+                if failed.exists():
+                    shutil.rmtree(failed, ignore_errors=True)
+                os.replace(target, failed)
+            if rollback.exists():
+                os.replace(rollback, target)
 
     def _mapped_dependency(self, dependency, mappings: dict[str, str]):
         if not dependency.path:
@@ -401,6 +574,33 @@ def _directory_size(path: Path) -> int:
     if not path.is_dir():
         return 0
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def _read_json(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _workspace_created_at(workspace: Path) -> str:
+    value = _read_json(workspace / ".yy" / "workspace.json").get("created_at")
+    return (
+        str(value) if isinstance(value, str) and value
+        else datetime.now().astimezone().isoformat(timespec="seconds")
+    )
+
+
+def _atomic_json(path: Path, value: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
 
 
 def _git(root: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:

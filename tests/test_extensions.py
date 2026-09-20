@@ -641,7 +641,7 @@ class CodeSessionControllerTests(unittest.TestCase):
 
         self.assertEqual(captured["coding_session_id"], "coding-memory-session")
 
-    def test_worktree_is_under_agent_home_and_no_change_finalize_cleans(self) -> None:
+    def test_worktree_is_under_workspace_and_no_change_finalize_cleans(self) -> None:
         from run_ui.harness_loader import load_harness_module
 
         harness = load_harness_module()
@@ -671,7 +671,7 @@ class CodeSessionControllerTests(unittest.TestCase):
 
             async def scenario():
                 record = await controller.start()
-                expected = home / ".yy" / "harness-evolution" / "worktrees"
+                expected = source / ".yy" / "harness-evolution" / "worktrees"
                 self.assertIn(expected.resolve(), record.worktree_path.parents)
                 result = await controller.finalize()
                 self.assertEqual(result.status, "no_changes")

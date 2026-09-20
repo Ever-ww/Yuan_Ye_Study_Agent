@@ -18,7 +18,7 @@ from pydantic import (
     model_validator,
 )
 
-from bootstrap import ensure_project_initialized
+from bootstrap import default_workspace_root, ensure_project_initialized
 
 
 _JSON_OBJECT = TypeAdapter(dict[str, Any])
@@ -216,12 +216,16 @@ class RuntimeConfig(BaseModel):
 
     @property
     def memory_dir(self) -> Path:
-        """返回唯一的项目本地记忆目录。"""
-        return self.agent_root / ".yy" / "memory"
+        """Return the current Workspace-owned memory and Profile directory."""
+        return self.workspace_state_dir / "memory"
+
+    @property
+    def workspace_state_dir(self) -> Path:
+        return self.workspace_root / ".yy"
 
     @property
     def reference_database_path(self) -> Path:
-        return self.agent_root / ".yy" / "reference" / "reference.sqlite3"
+        return self.workspace_state_dir / "reference" / "reference.sqlite3"
 
     @field_validator("tool_output_tail_ratio")
     @classmethod
@@ -351,7 +355,11 @@ def load_runtime_config(
     selected_workspace = (
         workspace_root.resolve()
         if workspace_root is not None
-        else (selected_agent_root if agent_root is not None else Path.cwd().resolve())
+        else (
+            selected_agent_root
+            if agent_root is not None
+            else default_workspace_root(selected_agent_root, Path.cwd())
+        )
     )
     from backup import assert_restore_inactive
 

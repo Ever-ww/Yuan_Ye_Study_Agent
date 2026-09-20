@@ -121,13 +121,15 @@ class SkillService:
             frozenset(allowed_names) if allowed_names is not None else None
         )
         self.read_only = read_only
-        self.state_root = self.agent_root / ".yy" / "skills"
-        self.skills_root = self.source_root / "skills"
+        # Skill content and its review/audit state belong to the Workspace.
+        # ``source_root`` is only a trusted source used to seed/update built-ins.
+        self.state_root = self.workspace_root / ".yy" / "skills"
+        self.skills_root = self.state_root / "installed"
         self.review_root = self.state_root / "review"
         self.audit_root = self.state_root / "audit"
         self.backup_root = self.state_root / "backups"
         self.index_path = self.state_root / "index.json"
-        self._locks = WorkspaceLockManager(self.source_root, state_root=self.agent_root)
+        self._locks = WorkspaceLockManager(self.workspace_root)
         self._session_snapshots: dict[str, SkillCatalogSnapshot] = {}
         if not read_only:
             self.initialize()
@@ -150,6 +152,19 @@ class SkillService:
             modified = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
             if modified < cutoff:
                 shutil.rmtree(path, ignore_errors=True)
+        self.sync_builtins()
+
+    def sync_builtins(self) -> tuple[SkillInstallResult, ...]:
+        """Copy trusted bundled Skills into this Workspace-owned catalog."""
+
+        source = self.source_root / "skills"
+        if not source.is_dir() or source.resolve() == self.skills_root.resolve():
+            return ()
+        return tuple(
+            self.install_builtin(path, repository_root=self.source_root)
+            for path in sorted(source.iterdir(), key=lambda item: item.name)
+            if path.is_dir() and not path.name.startswith(".")
+        )
 
     def install_builtin(self, source_root: Path, *, repository_root: Path) -> SkillInstallResult:
         """安装或安全更新随项目发布的受信任 Skill。
@@ -174,40 +189,6 @@ class SkillService:
         if report.status == "blocked" or report.skill is None:
             self._write_report(report)
             return self._result_from_report(report, "blocked", "内置 Skill 静态审核未通过")
-
-        # 内置 Skill 已经位于正式仓库目录，不再复制到 Agent Home；这里只登记审核结果。
-        target = self.skills_root / metadata.name
-        if target.resolve() == source_root:
-            index = self._read_index()
-            previous = index.skills.get(metadata.name)
-            index.skills[metadata.name] = InstalledSkillEntry(
-                name=metadata.name,
-                content_digest=metadata.content_digest,
-                description=metadata.description,
-                source=source,
-                review_id=review_id,
-                installed_at=(
-                    previous.installed_at
-                    if previous is not None
-                    else datetime.now().astimezone()
-                ),
-            )
-            self._write_index(index)
-            installed_report = report.model_copy(
-                update={"status": "installed", "skill": metadata},
-            )
-            self._write_report(installed_report)
-            return self._result_from_report(
-                installed_report,
-                "installed",
-                f"内置 Skill 已登记：{metadata.name}",
-            )
-
-        return self._result_from_report(
-            report,
-            "conflict",
-            "内置 Skill 必须直接位于源码仓库 skills 目录",
-        )
 
         target = self.skills_root / metadata.name
         index = self._read_index()

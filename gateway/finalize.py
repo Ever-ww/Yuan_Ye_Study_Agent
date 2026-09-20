@@ -367,10 +367,12 @@ class FinalizeCoordinator:
         if not state.session_id:
             raise FinalizeEvidenceConflict("Session-backed Run has no bound session_id")
         project = self.store.project(state.project_id)
+        workspace = Path(project.path).resolve()
         memory = MemoryStore(
-            self.agent_root / ".yy" / "memory",
-            workspace_root=Path(project.path),
+            workspace / ".yy" / "memory",
+            workspace_root=workspace,
             agent_root=self.agent_root,
+            partition_by_workspace=False,
         )
         if step is FinalizeStep.MEMORY:
             records = memory.sessions.find_records_strict(

@@ -351,10 +351,10 @@ class CodeFinalizeResult(BaseModel):
 
 
 class CodeAuditWriter:
-    """把 Coding 模式生命周期追加到 Agent Home，不污染普通 Session。"""
+    """把 Coding 模式生命周期追加到当前 Workspace。"""
 
-    def __init__(self, agent_root: Path) -> None:
-        self.directory = agent_root.resolve() / ".yy" / "harness-evolution" / "code"
+    def __init__(self, workspace_root: Path) -> None:
+        self.directory = workspace_root.resolve() / ".yy" / "harness-evolution" / "code"
         self.directory.mkdir(parents=True, exist_ok=True)
 
     def create(self, code_session_id: str, **data: Any) -> Path:
@@ -414,7 +414,7 @@ class CodeSessionController:
         self.config = config
         self.runtime_factory = runtime_factory
         self.memory_provider_factory = memory_provider_factory
-        self.audit = CodeAuditWriter(config.agent_root)
+        self.audit = CodeAuditWriter(config.workspace_root)
         self.record: CodeSessionRecord | None = None
         self.runtime: AgentRuntime | None = None
         self._requirements: list[str] = []
@@ -436,7 +436,7 @@ class CodeSessionController:
         code_id = uuid4().hex
         source_hash = hashlib.sha256(str(root).casefold().encode("utf-8")).hexdigest()[:16]
         worktree_parent = (
-            self.config.agent_root / ".yy" / "harness-evolution" / "worktrees" / source_hash
+            self.config.workspace_state_dir / "harness-evolution" / "worktrees" / source_hash
         ).resolve()
         worktree = (worktree_parent / code_id).resolve()
         if worktree_parent not in worktree.parents:
@@ -860,10 +860,10 @@ def create_coding_runtime(
         agent_root=isolated.agent_root,
         workspace_root=isolated.workspace_root,
     )
-    memory_root = isolated.agent_root / ".yy" / "harness-evolution" / "memory"
+    memory_root = config.workspace_state_dir / "harness-evolution" / "memory"
     long_term = HarnessLongTermMemory(
         memory_root / "profile",
-        agent_root=isolated.agent_root,
+        agent_root=config.workspace_root,
         source_root=config.coding_source_root or Path(__file__).resolve().parents[1],
     )
     long_term.ensure_project_initialized(isolated.workspace_root)
@@ -874,6 +874,9 @@ def create_coding_runtime(
         partition_by_workspace=False,
         profiles=long_term,
         memory_identity_root=config.coding_source_root or Path(__file__).resolve().parents[1],
+        # Code turns may run in different disposable worktrees, but their
+        # durable session belongs to the original user Workspace.
+        session_identity_root=config.workspace_root,
     )
     # Harness recall is shared by source repository identity, never by the
     # disposable worktree path of one invocation.
@@ -1083,8 +1086,8 @@ class HarnessEvolutionRunner:
     ) -> None:
         """仅在成功合并后维护四文件长期记忆，失败时使用确定性降级。"""
         long_term = HarnessLongTermMemory(
-            request.config.agent_root / ".yy" / "harness-evolution" / "memory" / "profile",
-            agent_root=request.config.agent_root,
+            request.config.workspace_state_dir / "harness-evolution" / "memory" / "profile",
+            agent_root=request.config.workspace_root,
             source_root=root,
         )
         long_term.ensure_project_initialized(root)
@@ -1271,10 +1274,10 @@ class HarnessEvolutionRunner:
 
 
 class HarnessInvocationAudit:
-    """Append-only invocation evidence kept under Agent Home, never inside the source repo."""
+    """Append-only invocation evidence kept in the Workspace, outside source."""
 
-    def __init__(self, agent_root: Path) -> None:
-        self.root = (agent_root / ".yy" / "harness-evolution" / "invocations").resolve()
+    def __init__(self, workspace_root: Path) -> None:
+        self.root = (workspace_root / ".yy" / "harness-evolution" / "invocations").resolve()
 
     def create(self, source_root: Path, invocation_id: str, **record: Any) -> Path:
         if not re.fullmatch(r"[0-9a-f]{32}", invocation_id):
@@ -1343,7 +1346,7 @@ class HarnessEvolutionEngine:
         self.runtime_factory = runtime_factory
         self.memory_provider_factory = memory_provider_factory
         self.runtime_resource_manager = runtime_resource_manager
-        self.audit = HarnessInvocationAudit(config.agent_root)
+        self.audit = HarnessInvocationAudit(config.workspace_root)
         self._tool_registry_baselines: dict[str, dict[str, Any]] = {}
 
     def _resource_snapshot(self, trigger: str) -> RuntimeResourceSnapshot | None:
@@ -1642,7 +1645,7 @@ class HarnessEvolutionEngine:
             return HarnessEvolutionResult(status="confirmed_failed", message="Detached HEAD cannot safely evolve Harness")
         base = (await HarnessEvolutionRunner._command(root, ["git", "rev-parse", "HEAD"])).stdout.strip()
         branch = f"harness-{request.trigger}/{invocation_id[:16]}"
-        worktree = request.resolved_agent_root() / ".yy" / "harness-evolution" / "worktrees" / source_identity / invocation_id
+        worktree = request.config.workspace_state_dir / "harness-evolution" / "worktrees" / source_identity / invocation_id
         worktree.parent.mkdir(parents=True, exist_ok=True)
         added = await HarnessEvolutionRunner._command(root, ["git", "worktree", "add", "-b", branch, str(worktree), base], check=False)
         if added.returncode != 0:
@@ -1935,8 +1938,8 @@ class HarnessEvolutionEngine:
         audit: Callable[..., None],
     ) -> None:
         long_term = HarnessLongTermMemory(
-            self.config.agent_root / ".yy" / "harness-evolution" / "memory" / "profile",
-            agent_root=self.config.agent_root,
+            self.config.workspace_state_dir / "harness-evolution" / "memory" / "profile",
+            agent_root=self.config.workspace_root,
             source_root=root,
         )
         long_term.ensure_project_initialized(root)

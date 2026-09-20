@@ -229,7 +229,7 @@ class DreamTests(unittest.TestCase):
             )
             await asyncio.wait_for(entered.wait(), 1)
             run_id = next(
-                run.run_id for run in app.store.list_runs("dream")
+                run.run_id for run in app.store.list_runs(app._default_dream_project_id)
                 if run.workload_kind == "dream"
             )
             task.cancel()
@@ -272,7 +272,12 @@ class DreamTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             config = load_runtime_config(root, dream_enabled=False, dream_timezone="Asia/Shanghai")
-            memory = MemoryStore(config.memory_dir, workspace_root=root / "workspace", agent_root=root)
+            memory = MemoryStore(
+                config.memory_dir,
+                workspace_root=config.workspace_root,
+                agent_root=root,
+                partition_by_workspace=False,
+            )
             session_id = "d" * 16
             memory.create_session("first", session_id)
             _append(memory, session_id, "user", "以后请用中文解释技术问题", "2026-08-03 09:00:00")
@@ -538,7 +543,12 @@ class DreamTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             config = load_runtime_config(root, dream_enabled=False, dream_timezone="Asia/Shanghai")
-            memory = MemoryStore(config.memory_dir, workspace_root=root / "workspace", agent_root=root)
+            memory = MemoryStore(
+                config.memory_dir,
+                workspace_root=config.workspace_root,
+                agent_root=root,
+                partition_by_workspace=False,
+            )
             session_id = "f" * 16
             memory.create_session("first", session_id)
             _append(memory, session_id, "user", "我偏好中文", "2026-08-03 10:00:00")
@@ -555,11 +565,42 @@ class DreamTests(unittest.TestCase):
                 self.assertEqual(response.json()["status"], "completed")
                 self.assertEqual(application.store.list_inbox(unread_only=True), [])
 
+    def test_gateway_dream_state_is_isolated_by_workspace(self) -> None:
+        async def check(root: Path) -> None:
+            workspace_a, workspace_b = root / "workspace-a", root / "workspace-b"
+            workspace_a.mkdir()
+            workspace_b.mkdir()
+            application = GatewayApplication(load_runtime_config(
+                root,
+                workspace_root=workspace_a,
+                dream_enabled=False,
+                harness_dream_enabled=False,
+                observer_enabled=False,
+            ))
+            project_a = application.register_project(workspace_a, "A")
+            project_b = application.register_project(workspace_b, "B")
+            service_a = application.dream_service_for_project(project_a.project_id)
+            service_b = application.dream_service_for_project(project_b.project_id)
+            self.assertNotEqual(service_a.root, service_b.root)
+            self.assertEqual(service_a.root, workspace_a / ".yy" / "dream")
+            self.assertEqual(service_b.root, workspace_b / ".yy" / "dream")
+
+            await service_a.record_external_failure(
+                date(2026, 9, 18), run_id="workspace-a-run", error="isolated failure",
+            )
+            self.assertEqual(service_a.status().last_run_id, "workspace-a-run")
+            self.assertIsNone(service_b.status().last_run_id)
+            await application.close()
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(check(Path(value)))
+
     def test_cli_bare_dream_command_displays_status(self) -> None:
         class Client:
             called = False
 
-            async def dream_status(self):
+            async def dream_status(self, project_id=None):
+                del project_id
                 self.called = True
                 return DreamStatus(
                     enabled=True,
@@ -570,7 +611,7 @@ class DreamTests(unittest.TestCase):
                 )
 
         client = Client()
-        asyncio.run(_handle_dream_command(client, "/dream"))
+        asyncio.run(_handle_dream_command(client, "workspace", "/dream"))
         self.assertTrue(client.called)
 
 

@@ -561,14 +561,22 @@ class ObserverStateStore:
                 for row in connection.execute(sql).fetchall()
             )
 
-    def coding_context_summary(self, *, limit: int = 12) -> str:
-        """Return a bounded, visible-only summary for a new isolated coding session."""
+    def coding_context_summary(
+        self, *, project_id: str | None = None, limit: int = 12,
+    ) -> str:
+        """Return visible-only coding context, optionally within one Workspace."""
+        where = "WHERE oe.runtime_profile LIKE 'harness:%'"
+        arguments: list[object] = []
+        if project_id is not None:
+            where += " AND runs.project_id=?"
+            arguments.append(project_id)
+        arguments.append(limit)
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT evidence_json FROM observer_evidence "
-                "WHERE runtime_profile LIKE 'harness:%' "
-                "ORDER BY finalized_at DESC LIMIT ?",
-                (limit,),
+                "SELECT oe.evidence_json FROM observer_evidence AS oe "
+                "JOIN runs ON runs.run_id=oe.run_id "
+                f"{where} ORDER BY oe.finalized_at DESC LIMIT ?",
+                tuple(arguments),
             ).fetchall()
         items: list[str] = []
         for row in reversed(rows):

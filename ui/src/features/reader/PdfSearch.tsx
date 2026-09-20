@@ -40,7 +40,7 @@ export function PdfSearchPanel(props: Props) {
     props.onProgress(found.length ? `${found.length} 页包含匹配内容` : "未找到匹配内容");
   }
   return <section className="pdf-search-panel" aria-label="PDF 全文搜索">
-    <header><form onSubmit={(event) => void search(event)}><Search aria-hidden="true" /><input autoFocus aria-label="搜索 PDF 全文" value={props.query} onChange={(event) => props.onQuery(event.target.value)} placeholder="搜索当前 PDF" /><button disabled={!props.query.trim() || !props.document} type="submit">搜索</button></form><button className="icon-button" aria-label="关闭全文搜索" onClick={props.onClose}><X aria-hidden="true" /></button></header>
+    <header><form onSubmit={(event) => void search(event)}><Search aria-hidden="true" /><input autoFocus aria-label="搜索 PDF 全文" value={props.query} onChange={(event) => props.onQuery(event.target.value)} placeholder="搜索当前 PDF" /><button disabled={!props.query.trim() || !props.document} type="submit">搜索</button></form><button className="icon-button" title="关闭全文搜索" aria-label="关闭全文搜索" onClick={props.onClose}><X aria-hidden="true" /></button></header>
     <p className="search-progress" role="status">{props.progress || "输入关键词后搜索 PDF 文本层。"}</p>
     <div className="pdf-search-results" ref={parent}><div style={{ height: virtual.getTotalSize(), position: "relative" }}>{virtual.getVirtualItems().map((row) => { const item = props.results[row.index]; return <button key={item.page} style={{ position: "absolute", transform: `translateY(${row.start}px)`, height: row.size, width: "100%" }} onClick={() => props.onPage(item.page)}><FileSearch aria-hidden="true" /><span><strong>第 {item.page} 页 · {item.matches} 处</strong><small>{item.snippet}</small></span></button>; })}</div></div>
   </section>;

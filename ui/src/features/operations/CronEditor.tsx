@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Save, X } from "lucide-react";
-import type { CronJobInput, JsonObject, Project } from "../../types";
+import type { CronJobInput, JsonObject } from "../../types";
 
 type Props = {
   job: JsonObject | null;
-  projects: Project[];
+  projectId: string;
   busy: boolean;
   onClose: () => void;
   onSave: (value: CronJobInput & { project_id: string }) => Promise<void>;
@@ -12,11 +12,11 @@ type Props = {
 
 const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 
-export function CronEditor({ job, projects, busy, onClose, onSave }: Props) {
+export function CronEditor({ job, projectId: selectedProjectId, busy, onClose, onSave }: Props) {
   const schedule = asObject(job?.schedule);
   const profile = asObject(job?.runtime_profile);
   const limits = asObject(profile.limits);
-  const [projectId, setProjectId] = useState(String(job?.project_id || projects[0]?.project_id || ""));
+  const [projectId, setProjectId] = useState(String(job?.project_id || selectedProjectId || ""));
   const [name, setName] = useState(String(job?.name || ""));
   const [prompt, setPrompt] = useState(String(job?.prompt || ""));
   const [kind, setKind] = useState<"interval" | "once" | "cron">((schedule.kind as "interval" | "once" | "cron") || "cron");
@@ -38,8 +38,8 @@ export function CronEditor({ job, projects, busy, onClose, onSave }: Props) {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (!projectId && projects[0]) setProjectId(projects[0].project_id);
-  }, [projectId, projects]);
+    if (!projectId && selectedProjectId) setProjectId(selectedProjectId);
+  }, [projectId, selectedProjectId]);
 
   const preapprovalError = useMemo(() => {
     const allowed = new Set(splitList(allowedTools));
@@ -50,7 +50,7 @@ export function CronEditor({ job, projects, busy, onClose, onSave }: Props) {
     event.preventDefault();
     setError("");
     if (!projectId || !name.trim() || !prompt.trim() || !scheduleValue.trim()) {
-      setError("请填写项目、名称、任务内容和调度值。");
+      setError("当前 Agent Workspace 不可用，或尚未填写名称、任务内容和调度值。");
       return;
     }
     if (preapprovalError) {
@@ -87,7 +87,6 @@ export function CronEditor({ job, projects, busy, onClose, onSave }: Props) {
       <form onSubmit={(event) => void submit(event)}>
         {error && <div className="form-error-summary" role="alert" tabIndex={-1}>{error}</div>}
         <div className="form-grid">
-          <label><span>项目</span><select value={projectId} onChange={(event) => setProjectId(event.target.value)} disabled={Boolean(job)}>{projects.map((project) => <option key={project.project_id} value={project.project_id}>{project.name}</option>)}</select></label>
           <label><span>名称</span><input required maxLength={120} value={name} onChange={(event) => setName(event.target.value)} /></label>
           <label className="wide"><span>任务内容</span><textarea required maxLength={20000} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
           <label><span>调度类型</span><select value={kind} onChange={(event) => { const next = event.target.value as typeof kind; setKind(next); setScheduleValue(next === "cron" ? "0 9 * * 1" : next === "interval" ? "3600" : ""); }}><option value="cron">Cron 表达式</option><option value="interval">固定间隔</option><option value="once">单次执行</option></select></label>

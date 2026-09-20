@@ -36,16 +36,22 @@ class MemoryStore:
         partition_by_workspace: bool = True,
         profiles: ProfileStore | None = None,
         memory_identity_root: Path | None = None,
+        session_identity_root: Path | None = None,
     ) -> None:
         self.root = root.resolve()
         self.agent_root = (agent_root or _infer_agent_root(self.root)).resolve()
         self.workspace_root = (workspace_root or self.agent_root).resolve()
         self.memory_identity_root = (memory_identity_root or self.workspace_root).resolve()
+        self.session_identity_root = (session_identity_root or self.workspace_root).resolve()
         session_directory = self.root / "session"
         self.partition_by_workspace = partition_by_workspace
-        if partition_by_workspace and self.workspace_root != self.agent_root:
+        workspace_owned = self.root == (self.workspace_root / ".yy" / "memory").resolve()
+        if partition_by_workspace and self.workspace_root != self.agent_root and not workspace_owned:
             session_directory /= _workspace_key(self.workspace_root)
-        self.sessions = SessionStore(session_directory)
+        self.sessions = SessionStore(
+            session_directory,
+            workspace_id=_workspace_key(self.session_identity_root),
+        )
         self.profiles = profiles or ProfileStore(self.root / "profile")
         if self.profiles.directory.resolve() != (self.root / "profile").resolve():
             raise ValueError("ProfileStore 必须位于 MemoryStore 的 profile 目录")

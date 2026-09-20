@@ -2,8 +2,11 @@ export type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "ma
 
 export type Project = {
   project_id: string;
+  workspace_id: string;
   name: string;
   path: string;
+  version: number;
+  migration_version: number;
   created_at: string;
   last_opened_at: string;
 };
@@ -141,6 +144,7 @@ export type RunCreate = {
   reasoningEffort: ReasoningEffort;
   uiContext?: {
     source: "agent" | "read" | "write";
+    translation?: boolean;
     resource?:
       | { kind: "paper"; paper_id: string; logical_path: null; content_hash: string }
       | { kind: "workspace_file"; paper_id?: null; logical_path: string; content_hash: string };
@@ -149,7 +153,10 @@ export type RunCreate = {
       page: number | null;
       start_line: number | null;
       end_line: number | null;
+      nearby_context?: string;
+      locator?: Record<string, unknown>;
     };
+    attachments?: TemporaryAttachment[];
   };
 };
 
@@ -222,7 +229,41 @@ export type PaperListItem = {
   status: "active" | "archived";
   has_pdf: boolean;
   content_hash: string | null;
+  summary_status: "missing" | "queued" | "running" | "completed" | "failed";
   updated_at: string;
+};
+
+export type TemporaryAttachment = {
+  attachment_id: string;
+  filename: string;
+  content_hash: string;
+  created_at: string;
+};
+
+export type PaperSummary = {
+  paper_id: string;
+  status: "missing" | "queued" | "running" | "completed" | "failed";
+  content: string;
+  run_id: string | null;
+  error: string | null;
+  updated_at: string | null;
+};
+
+export type PaperInlineAnswer = {
+  answer_id: string;
+  paper_id: string;
+  run_id: string;
+  page: number;
+  selected_text: string;
+  selected_text_hash: string;
+  nearby_context: string;
+  locator: Record<string, unknown>;
+  question: string;
+  answer: string;
+  status: "pending" | "completed" | "failed";
+  error: string | null;
+  created_at: string;
+  answered_at: string | null;
 };
 
 export type PaperNote = {

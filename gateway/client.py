@@ -65,10 +65,13 @@ class GatewayClient:
         port: int = 8765,
         client_id: str | None = None,
         auto_start: bool = True,
+        require_accepting_work: bool = True,
     ) -> None:
         self.manager = GatewayProcessManager(agent_root, port)
         if auto_start:
-            self.manager.ensure_running()
+            self.manager.ensure_running(
+                require_accepting_work=require_accepting_work,
+            )
         self.base_url = self.manager.base_url
         self.token = self.manager.token()
         self.client_id = client_id or f"client_{uuid4().hex}"
@@ -122,6 +125,9 @@ class GatewayClient:
 
     async def projects(self) -> list[dict[str, Any]]:
         return list(await self._request("GET", "/api/v1/projects"))
+
+    async def open_project(self, project_id: str) -> dict[str, Any]:
+        return dict(await self._request("POST", f"/api/v1/projects/{project_id}/open"))
 
     async def cron_jobs(self, project_id: str | None = None) -> tuple[CronJob, ...]:
         params = {"project_id": project_id} if project_id else None
@@ -189,25 +195,34 @@ class GatewayClient:
         value = await self._request("POST", f"/api/v1/cron/jobs/{job_id}/{action}")
         return CronJob.model_validate(value)
 
-    async def dream_status(self) -> DreamStatus:
-        return DreamStatus.model_validate(await self._request("GET", "/api/v1/dream/status"))
+    async def dream_status(self, project_id: str | None = None) -> DreamStatus:
+        return DreamStatus.model_validate(await self._request(
+            "GET", "/api/v1/dream/status",
+            params={"project_id": project_id} if project_id else None,
+        ))
 
-    async def run_dream(self, selected_date: str | None = None) -> DreamRunResult:
-        request = DreamRunRequest(date=selected_date)
+    async def run_dream(
+        self, selected_date: str | None = None, *, project_id: str | None = None,
+    ) -> DreamRunResult:
+        request = DreamRunRequest(date=selected_date, project_id=project_id)
         value = await self._request(
             "POST", "/api/v1/dream/run", json=request.model_dump(mode="json"),
         )
         return DreamRunResult.model_validate(value)
 
-    async def backfill_dream(self, start: str, end: str) -> tuple[DreamRunResult, ...]:
-        request = DreamBackfillRequest(start=start, end=end)
+    async def backfill_dream(
+        self, start: str, end: str, *, project_id: str | None = None,
+    ) -> tuple[DreamRunResult, ...]:
+        request = DreamBackfillRequest(start=start, end=end, project_id=project_id)
         values = await self._request(
             "POST", "/api/v1/dream/backfill", json=request.model_dump(mode="json"),
         )
         return tuple(DreamRunResult.model_validate(value) for value in values)
 
-    async def rollback_dream(self, run_id: str | None = None) -> DreamRollbackResult:
-        request = DreamRollbackRequest(run_id=run_id)
+    async def rollback_dream(
+        self, run_id: str | None = None, *, project_id: str | None = None,
+    ) -> DreamRollbackResult:
+        request = DreamRollbackRequest(run_id=run_id, project_id=project_id)
         value = await self._request(
             "POST", "/api/v1/dream/rollback", json=request.model_dump(mode="json"),
         )

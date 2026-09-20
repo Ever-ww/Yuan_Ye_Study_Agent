@@ -62,7 +62,7 @@ class SessionArchiveReader:
         sessions: set[str] = set()
         files: set[str] = set()
         if not self.session_root.exists():
-            return DreamDayArchive(date=selected_date.isoformat(), timezone=zone_name)
+            return DreamDayArchive(date=end_date.isoformat(), timezone=zone_name)
 
         for index_path in sorted(self.session_root.rglob("index.json")):
             try:
