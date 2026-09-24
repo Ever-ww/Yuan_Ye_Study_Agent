@@ -5,9 +5,10 @@ import { useSearchParams } from "react-router-dom";
 import { WorkbenchShell } from "../../app/WorkbenchShell";
 import { useTheme } from "../../app/ThemeProvider";
 import { terminalEventTypes } from "../../events";
-import type { GatewayEvent, ObserverStatus, PendingApproval, Project, ReasoningEffort, RunCreate, TemporaryAttachment } from "../../types";
+import type { GatewayEvent, ObserverStatus, PendingApproval, Project, ReasoningEffort, RunCreate, Session, TemporaryAttachment } from "../../types";
 import { useGatewayApi } from "../../shared/api/context";
 import { CommandPalette } from "../../shared/ui/CommandPalette";
+import { ConfirmDialog } from "../../shared/ui/ConfirmDialog";
 import { ProjectDialog } from "../../shared/ui/ProjectDialog";
 import { StatusMark } from "../../shared/ui/StatusMark";
 import { AgentComposer } from "./AgentComposer";
@@ -16,6 +17,7 @@ import { AgentTimeline } from "./AgentTimeline";
 import { ModelControls } from "./ModelControls";
 import { ObserverInspector } from "./ObserverInspector";
 import { useRunStream } from "./useRunStream";
+import { latestModelCallsFromRecords, modelCallsFromEvents, summarizeModelUsage } from "./agentUsage";
 
 export function AgentPage() {
   const api = useGatewayApi();
@@ -37,6 +39,8 @@ export function AgentPage() {
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<Session | null>(null);
+  const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
   const [profileId, setProfileId] = useState("default");
   const [effort, setEffortState] = useState<ReasoningEffort>(() => {
     const saved = window.localStorage.getItem("yyagent.web.reasoning-effort");
@@ -78,7 +82,6 @@ export function AgentPage() {
   const terminalCallback = useCallback(async (event: GatewayEvent) => {
     if (!event.run_id) return;
     setRunId(null);
-    setOptimisticQuestion("");
     if (event.session_id && selectedProject) {
       setSearchParams({ project: selectedProject.project_id, session: event.session_id }, { replace: true });
     }
@@ -205,17 +208,37 @@ export function AgentPage() {
     selectProject(project);
   }
 
-  async function beginAddProject() {
-    if ("__TAURI_INTERNALS__" in window) {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const selected = await open({ directory: true, multiple: false });
-      if (typeof selected === "string") await addProject(selected, "");
-      return;
-    }
+  function beginAddProject() {
     setProjectDialogOpen(true);
   }
 
+  function requestDeleteSession(targetSessionId: string) {
+    const session = sessionsQuery.data?.find((item) => item.session_id === targetSessionId);
+    if (session) setDeleteTarget(session);
+  }
+
+  async function deleteSession() {
+    if (!selectedProject || !deleteTarget) return;
+    const target = deleteTarget;
+    setDeletingSessionId(target.session_id);
+    try {
+      await api.deleteSession(selectedProject.project_id, target.session_id);
+      if (sessionId === target.session_id) selectSession();
+      await sessionsQuery.refetch();
+      setDeleteTarget(null);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setDeletingSessionId(null);
+    }
+  }
+
   const visibleHistory = (historyQuery.data || []).filter((record) => !displayRunId || record.run_id !== displayRunId);
+  const modelUsage = useMemo(() => summarizeModelUsage(
+    stream.events.length
+      ? modelCallsFromEvents(stream.events)
+      : latestModelCallsFromRecords(historyQuery.data || []),
+  ), [historyQuery.data, stream.events]);
   const status = statusQuery.data;
 
   return (
@@ -226,7 +249,7 @@ export function AgentPage() {
         onToggleInspector={() => setInspectorOpen((value) => !value)}
         onOpenCommands={() => setCommandsOpen(true)}
         modelControls={<ModelControls models={modelsQuery.data || []} profileId={profileId} effort={effort} disabled={Boolean(runId)} onProfile={setProfileId} onEffort={setEffort} />}
-        sidebar={<AgentSidebar projects={projectsQuery.data || []} sessions={sessionsQuery.data || []} projectId={selectedProject?.project_id} sessionId={sessionId} onProject={selectProject} onSession={selectSession} onNewSession={() => selectSession()} onAddProject={() => void beginAddProject()} />}
+        sidebar={<AgentSidebar projects={projectsQuery.data || []} sessions={sessionsQuery.data || []} projectId={selectedProject?.project_id} sessionId={sessionId} onProject={selectProject} onSession={selectSession} onNewSession={() => selectSession()} onAddProject={beginAddProject} onDeleteSession={requestDeleteSession} />}
         inspector={<ObserverInspector events={stream.events} observer={observer} />}
         footer={<><StatusMark state={status ? "ok" : "idle"} label={status ? "Gateway 已连接" : "正在连接 Gateway"} /><StatusMark state={status?.bash_available ? "ok" : status ? "warning" : "idle"} label={sandboxLabel(status?.sandbox_mode)} /><StatusMark state={stream.connection === "reconnecting" ? "warning" : "ok"} label={stream.connection === "reconnecting" ? "事件流重连中" : "事件流就绪"} /><span className="status-spacer" /><span className="generation-state"><PlugZap aria-hidden="true" />Local runtime</span></>}
       >
@@ -241,11 +264,20 @@ export function AgentPage() {
             return typeof value.content === "string" ? value.content : JSON.stringify(value, null, 2);
           }}
         />
-        <AgentComposer value={task} disabled={!selectedProject} running={Boolean(runId)} approval={approval} error={error || queryError(projectsQuery.error || statusQuery.error)} attachments={attachments} uploading={uploading} onChange={setTask} onSend={() => void send()} onCancel={() => runId && void api.cancelRun(runId).catch((reason) => setError(errorMessage(reason)))} onApproval={(id, approved) => void decideApproval(id, approved)} onFiles={(files) => void uploadAttachments(files)} onRemoveAttachment={(id) => setAttachments((current) => current.filter((item) => item.attachment_id !== id))} />
+        <AgentComposer value={task} disabled={!selectedProject} running={Boolean(runId)} approval={approval} error={error || queryError(projectsQuery.error || statusQuery.error)} attachments={attachments} uploading={uploading} usage={modelUsage} onChange={setTask} onSend={() => void send()} onCancel={() => runId && void api.cancelRun(runId).catch((reason) => setError(errorMessage(reason)))} onApproval={(id, approved) => void decideApproval(id, approved)} onFiles={(files) => void uploadAttachments(files)} onRemoveAttachment={(id) => setAttachments((current) => current.filter((item) => item.attachment_id !== id))} />
         {stream.connection === "reconnecting" && <div className="connection-banner"><CloudOff aria-hidden="true" />连接暂时中断。任务继续在 Gateway 运行，正在补齐事件。</div>}
       </WorkbenchShell>
       <CommandPalette open={commandsOpen} onClose={() => setCommandsOpen(false)} onNewSession={() => selectSession()} onAddProject={() => void beginAddProject()} onTheme={setPreference} />
       <ProjectDialog open={projectDialogOpen} onClose={() => setProjectDialogOpen(false)} onSubmit={addProject} />
+      <ConfirmDialog
+        open={Boolean(deleteTarget)}
+        title="删除会话"
+        message={deleteTarget ? `确定删除“${(deleteTarget.first_question || "未命名会话").trim().slice(0, 80)}”吗？会话记录将从当前 Workspace 中永久删除。` : ""}
+        confirmLabel="删除会话"
+        busy={Boolean(deletingSessionId)}
+        onClose={() => { if (!deletingSessionId) setDeleteTarget(null); }}
+        onConfirm={() => void deleteSession()}
+      />
     </>
   );
 }

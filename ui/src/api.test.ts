@@ -83,6 +83,43 @@ describe("GatewayApi", () => {
     });
   });
 
+  it("exchanges browser bootstrap and sends the returned CSRF token", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ csrf: "csrf-1" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ready: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new GatewayApi();
+
+    await api.initialize();
+    await api.status();
+
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(new Headers(init.headers).get("X-CSRF-Token")).toBe("csrf-1");
+    expect(init.credentials).toBe("include");
+  });
+
+  it("normalizes non-JSON Gateway failures without hiding the status", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("temporarily unavailable", {
+      status: 503,
+      statusText: "Service Unavailable",
+    })));
+    const api = new GatewayApi();
+
+    await expect(api.status()).rejects.toMatchObject({
+      name: "GatewayRequestError",
+      status: 503,
+      message: "Service Unavailable",
+      code: "gateway_error",
+      recoverable: false,
+    });
+  });
+
   it("deletes a Code session through the durable Gateway endpoint", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ deleted: true }), {
       status: 200,
@@ -95,6 +132,20 @@ describe("GatewayApi", () => {
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toContain("/api/v1/code/sessions/code-session?client_id=");
+    expect(init.method).toBe("DELETE");
+  });
+
+  it("deletes an Agent conversation through the project session endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ deleted: true, session_id: "session-1" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new GatewayApi();
+
+    await expect(api.deleteSession("project", "session-1")).resolves.toMatchObject({ deleted: true });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://gateway.test/api/v1/projects/project/sessions/session-1");
     expect(init.method).toBe("DELETE");
   });
 
@@ -115,5 +166,33 @@ describe("GatewayApi", () => {
     expect(url).toContain("/api/v1/projects/project/attachments?filename=context.pdf");
     expect(new Headers(init.headers).get("Content-Type")).toBe("application/pdf");
     expect(init.body).toBe(file);
+  });
+
+  it("streams Read LLM translation without creating an Agent run", async () => {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"text","content":"你"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"text","content":"好"}\n\ndata: {"type":"done"}\n\n'));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new GatewayApi();
+    const chunks: string[] = [];
+
+    await expect(api.translateLlm("project", "Selected sentence", (value) => chunks.push(value))).resolves.toBe("你好");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://gateway.test/api/v1/translate/llm");
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      project_id: "project",
+      text: "Selected sentence",
+      model_profile_id: "default",
+    });
+    expect(chunks).toEqual(["你", "你好"]);
   });
 });

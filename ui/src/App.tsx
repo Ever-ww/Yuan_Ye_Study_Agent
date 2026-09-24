@@ -7,6 +7,7 @@ const CodePage = lazy(() => import("./features/code/CodePage").then((module) => 
 const OperationsPage = lazy(() => import("./features/operations/OperationsPage").then((module) => ({ default: module.OperationsPage })));
 const ReaderPage = lazy(() => import("./features/reader/ReaderPage").then((module) => ({ default: module.ReaderPage })));
 const WritePage = lazy(() => import("./features/writer/WritePage").then((module) => ({ default: module.WritePage })));
+const NotePage = lazy(() => import("./features/notes/NotePage").then((module) => ({ default: module.NotePage })));
 
 export default function App() {
   return (
@@ -16,6 +17,7 @@ export default function App() {
         <Route path="/code" element={<CodePage />} />
         <Route path="/read" element={<ReaderPage />} />
         <Route path="/write" element={<WritePage />} />
+        <Route path="/note" element={<NotePage />} />
         <Route path="/operations" element={<OperationsPage />} />
         <Route path="/capabilities" element={<CapabilitiesPage />} />
         <Route path="*" element={<Navigate replace to="/agent" />} />

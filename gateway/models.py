@@ -212,7 +212,7 @@ class RunUIContext(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
-    source: Literal["agent", "read", "write"] = "agent"
+    source: Literal["agent", "read", "write", "note"] = "agent"
     translation: bool = False
     resource: UIResourceContext | None = None
     selection: UISelectionContext | None = None
@@ -239,6 +239,12 @@ class RunUIContext(BaseModel):
             self.resource is None or self.resource.kind != "workspace_file"
         ):
             raise ValueError("Write UI context requires a workspace_file resource")
+        if self.source == "note" and (
+            self.resource is None
+            or self.resource.kind != "workspace_file"
+            or self.selection is None
+        ):
+            raise ValueError("Note UI context requires a workspace_file resource and selection")
         if self.source != "agent" and self.attachments:
             raise ValueError("Temporary attachments are only valid for Agent UI context")
         return self
@@ -278,6 +284,15 @@ class TranslationRequest(BaseModel):
     text: str = Field(min_length=1, max_length=20_000)
     target_language: str = Field(default="zh-CN", min_length=2, max_length=16)
     engine: Literal["baidu", "google", "youdao", "360"] = "baidu"
+
+
+class LLMTranslationRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    project_id: str = Field(min_length=1)
+    text: str = Field(min_length=1, max_length=20_000)
+    target_language: str = Field(default="zh-CN", min_length=2, max_length=16)
+    model_profile_id: str = Field(default="default", min_length=1, max_length=80)
 
 
 class ModelOption(BaseModel):
@@ -324,6 +339,30 @@ class WorkspaceMoveRequest(BaseModel):
 
     source: str = Field(min_length=1, max_length=4096)
     destination: str = Field(min_length=1, max_length=4096)
+
+
+class NoteCreateRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    name: str = Field(default="未命名笔记", min_length=1, max_length=240)
+    kind: Literal["note", "folder"] = "note"
+    parent_id: str | None = None
+    content: str = Field(default="", max_length=2 * 1024 * 1024)
+
+
+class NoteUpdateRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=240)
+    content: str | None = Field(default=None, max_length=2 * 1024 * 1024)
+    tags: list[str] | None = Field(default=None, max_length=64)
+    expected_etag: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class NoteMoveRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    parent_id: str | None = None
 
 
 class LatexCompilationRequest(BaseModel):

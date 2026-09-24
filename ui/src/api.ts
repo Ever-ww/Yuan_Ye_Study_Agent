@@ -1,7 +1,7 @@
 import type {
   GatewayErrorBody, GatewayEvent, GatewayStatus, InboxItem, ModelOption,
   CodeSessionEvent, CodeSessionSummary, JsonObject, ObserverStatus, PendingApproval,
-  CronJobInput, PaperInlineAnswer, PaperListItem, PaperNote, PaperSummary, Project, ReasoningEffort, RunCreate, Session, SessionRecord, TemporaryAttachment, ToolResult,
+  CronJobInput, NoteNode, NoteTrashItem, PaperInlineAnswer, PaperListItem, PaperNote, PaperSummary, Project, ReasoningEffort, RunCreate, Session, SessionRecord, TemporaryAttachment, ToolResult,
   WorkspaceDocument, WorkspaceEntry, WorkspaceTree, LatexCompilation,
 } from "./types";
 
@@ -79,6 +79,9 @@ export class GatewayApi {
   }
   sessions(projectId: string): Promise<Session[]> {
     return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/sessions`);
+  }
+  deleteSession(projectId: string, sessionId: string): Promise<{ deleted: boolean; session_id: string }> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
   }
   session(projectId: string, sessionId: string): Promise<SessionRecord[]> {
     return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}`);
@@ -258,6 +261,58 @@ export class GatewayApi {
   papers(projectId: string): Promise<PaperListItem[]> {
     return this.request(`/api/v1/library/papers?${new URLSearchParams({ limit: "200", project_id: projectId })}`);
   }
+  notes(projectId: string, query = ""): Promise<NoteNode[]> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes?${new URLSearchParams({ query })}`);
+  }
+  reindexNotes(projectId: string): Promise<{ notes: number }> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes/reindex`, { method: "POST" });
+  }
+  createNote(projectId: string, name = "未命名笔记", parentId: string | null = null, content = ""): Promise<NoteNode> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes`, { method: "POST", body: JSON.stringify({ name, kind: "note", parent_id: parentId, content }) });
+  }
+  createNoteFolder(projectId: string, name: string, parentId: string | null = null): Promise<NoteNode> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes/folders`, { method: "POST", body: JSON.stringify({ name, kind: "folder", parent_id: parentId }) });
+  }
+  note(projectId: string, noteId: string): Promise<NoteNode> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes/${encodeURIComponent(noteId)}`);
+  }
+  updateNote(projectId: string, noteId: string, value: { name?: string; content?: string; tags?: string[]; expected_etag?: string }): Promise<NoteNode> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes/${encodeURIComponent(noteId)}`, { method: "PATCH", body: JSON.stringify(value) });
+  }
+  moveNote(projectId: string, noteId: string, parentId: string | null): Promise<NoteNode> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes/${encodeURIComponent(noteId)}/move`, { method: "POST", body: JSON.stringify({ parent_id: parentId }) });
+  }
+  deleteNote(projectId: string, noteId: string): Promise<{ deleted: boolean; trash_id: string }> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes/${encodeURIComponent(noteId)}`, { method: "DELETE" });
+  }
+  noteTrash(projectId: string): Promise<NoteTrashItem[]> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes-trash`);
+  }
+  restoreTrashedNote(projectId: string, trashId: string): Promise<NoteNode> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes-trash/${encodeURIComponent(trashId)}/restore`, { method: "POST" });
+  }
+  noteRevisions(projectId: string, noteId: string): Promise<Array<{ revision_id: string; created_at: string }>> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes/${encodeURIComponent(noteId)}/revisions`);
+  }
+  restoreNoteRevision(projectId: string, noteId: string, revisionId: string): Promise<NoteNode> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes/${encodeURIComponent(noteId)}/revisions/${encodeURIComponent(revisionId)}/restore`, { method: "POST" });
+  }
+  uploadNoteAsset(projectId: string, noteId: string, file: File, kind: "image" | "attachment"): Promise<{ name: string; path: string; markdown_path: string }> {
+    const query = new URLSearchParams({ filename: file.name, kind });
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes/${encodeURIComponent(noteId)}/assets?${query}`, { method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, body: file });
+  }
+  async noteAssetUrl(projectId: string, assetPath: string): Promise<string> {
+    const url = `${this.connection.baseUrl}/api/v1/projects/${encodeURIComponent(projectId)}/note-assets/${assetPath.split("/").map(encodeURIComponent).join("/")}`;
+    const response = await fetch(url, { headers: this.connection.token ? { Authorization: `Bearer ${this.connection.token}` } : undefined, credentials: "include" });
+    if (!response.ok) throw new GatewayRequestError("Note asset could not be loaded", response.status);
+    return URL.createObjectURL(await response.blob());
+  }
+  async noteRawUrl(projectId: string, noteId: string): Promise<string> {
+    const url = `${this.connection.baseUrl}/api/v1/projects/${encodeURIComponent(projectId)}/notes/${encodeURIComponent(noteId)}/raw`;
+    const response = await fetch(url, { headers: this.connection.token ? { Authorization: `Bearer ${this.connection.token}` } : undefined, credentials: "include" });
+    if (!response.ok) throw new GatewayRequestError("Note Markdown could not be exported", response.status);
+    return URL.createObjectURL(await response.blob());
+  }
   uploadAgentAttachment(projectId: string, file: File): Promise<TemporaryAttachment> {
     const query = new URLSearchParams({ filename: file.name });
     return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/attachments?${query}`, {
@@ -345,6 +400,67 @@ export class GatewayApi {
       method: "POST",
       body: JSON.stringify({ text, target_language: targetLanguage, engine }),
     });
+  }
+  async translateLlm(
+    projectId: string,
+    text: string,
+    onChunk: (value: string) => void,
+    targetLanguage = "zh-CN",
+    modelProfileId = "default",
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const headers = new Headers({ "Content-Type": "application/json" });
+    if (this.connection.token) headers.set("Authorization", `Bearer ${this.connection.token}`);
+    if (this.connection.csrf) headers.set("X-CSRF-Token", this.connection.csrf);
+    const response = await fetch(`${this.connection.baseUrl}/api/v1/translate/llm`, {
+      method: "POST",
+      headers,
+      credentials: "include",
+      signal,
+      body: JSON.stringify({
+        project_id: projectId,
+        text,
+        target_language: targetLanguage,
+        model_profile_id: modelProfileId,
+      }),
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({ detail: response.statusText })) as GatewayErrorBody;
+      throw new GatewayRequestError(
+        body.error?.message || body.detail || `Gateway HTTP ${response.status}`,
+        response.status,
+        body.error?.code,
+        body.error?.recoverable,
+        body.correlation_id,
+        body.error?.details,
+      );
+    }
+    if (!response.body) throw new Error("Translation stream is unavailable");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let output = "";
+    let done = false;
+    const consume = (line: string) => {
+      if (!line.startsWith("data:")) return;
+      const raw = line.slice(5).trim();
+      if (!raw) return;
+      const event = JSON.parse(raw) as { type?: string; content?: string; message?: string };
+      if (event.type === "error") throw new Error(event.message || "LLM 翻译失败");
+      if (event.type !== "text" || typeof event.content !== "string") return;
+      output += event.content;
+      onChunk(output);
+    };
+    while (!done) {
+      const chunk = await reader.read();
+      done = chunk.done;
+      buffer += decoder.decode(chunk.value || new Uint8Array(), { stream: !done });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) consume(line.replace(/\r$/, ""));
+    }
+    if (buffer.trim()) consume(buffer.trim());
+    return output.trim();
   }
   workspaceTree(projectId: string, path = "YYWorkspace:\\", cursor?: string): Promise<WorkspaceTree> {
     const query = new URLSearchParams({ path, limit: "300" });

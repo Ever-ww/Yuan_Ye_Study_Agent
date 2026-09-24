@@ -15,7 +15,6 @@ import { useTheme } from "../../app/ThemeProvider";
 import { useGatewayApi } from "../../shared/api/context";
 import { CommandPalette } from "../../shared/ui/CommandPalette";
 import { StatusMark } from "../../shared/ui/StatusMark";
-import { eventText } from "../../events";
 import type { PaperInlineAnswer, PaperListItem } from "../../types";
 import { PdfSearchPanel, type PdfSearchResult } from "./PdfSearch";
 import { PdfThumbnails } from "./PdfThumbnails";
@@ -51,7 +50,7 @@ export function ReaderPage() {
   const [sidebarOpen, setSidebarOpen] = useState(() => localStorage.getItem("yyagent.reader.sidebar") !== "closed");
   const [summaryOpen, setSummaryOpen] = useState(true), [askOpen, setAskOpen] = useState(false), [question, setQuestion] = useState(""), [askBusy, setAskBusy] = useState(false), [selectionMenuOpen, setSelectionMenuOpen] = useState(false);
   const [importBusy, setImportBusy] = useState(false), [autoSummary, setAutoSummary] = useState(() => localStorage.getItem("yyagent.reader.auto-summary") !== "false");
-  const pdfStageRef = useRef<HTMLDivElement>(null), pageRefs = useRef<Record<number, HTMLDivElement | null>>({}), importRef = useRef<HTMLInputElement>(null), translationRequest = useRef(0), pageNavigation = useRef(false);
+  const pdfStageRef = useRef<HTMLDivElement>(null), pageRefs = useRef<Record<number, HTMLDivElement | null>>({}), importRef = useRef<HTMLInputElement>(null), translationRequest = useRef(0), translationAbort = useRef<AbortController | null>(null), pageNavigation = useRef(false);
 
   function setPage(value: number | ((current: number) => number)) {
     pageNavigation.current = true;
@@ -78,7 +77,7 @@ export function ReaderPage() {
   useEffect(() => { if (!projectId) return; if (!params.get("project")) setParams({ project: projectId, ...(paperId ? { paper: paperId } : {}) }, { replace: true }); else if (!paperId && visible[0]) setParams({ project: projectId, paper: visible[0].paper_id }, { replace: true }); }, [paperId, params, projectId, setParams, visible]);
   useEffect(() => {
     const saved = paperId ? readReaderPosition(paperId) : null;
-    setPageState(saved?.page || 1); setScale(saved?.scale || 1.05); setPages(0); setPdfDocument(null); setSelection(null); setSelectionMenuOpen(false); setTranslation(null); translationRequest.current += 1; setSearchResults([]); setSearchProgress(""); setAskOpen(false);
+    setPageState(saved?.page || 1); setScale(saved?.scale || 1.05); setPages(0); setPdfDocument(null); setSelection(null); setSelectionMenuOpen(false); setTranslation(null); translationRequest.current += 1; translationAbort.current?.abort(); translationAbort.current = null; setSearchResults([]); setSearchProgress(""); setAskOpen(false);
     if (!projectId || !paperId || !current?.has_pdf) { setPdfUrl(""); return; }
     let revoked = "", active = true;
     api.paperPdfUrl(paperId, projectId).then((url) => { if (!active) { if (url.startsWith("blob:")) URL.revokeObjectURL(url); return; } setPdfUrl(url); if (url.startsWith("blob:")) revoked = url; }).catch((error) => setMessage(error.message));
@@ -134,6 +133,8 @@ export function ReaderPage() {
     const rect = selected.getRangeAt(0).getBoundingClientRect(), pageRect = pageElement.getBoundingClientRect(), pageText = pageElement.querySelector(".textLayer")?.textContent || "", index = pageText.indexOf(text);
     setPageState(pageNumber);
     translationRequest.current += 1;
+    translationAbort.current?.abort();
+    translationAbort.current = null;
     setSelection({ text, nearby: index >= 0 ? pageText.slice(Math.max(0, index - 1200), index + text.length + 1200) : pageText.slice(0, 2400), locator: { page: pageNumber, x: clamp((rect.left - pageRect.left) / pageRect.width), y: clamp((rect.top - pageRect.top) / pageRect.height), width: clamp(rect.width / pageRect.width), height: clamp(rect.height / pageRect.height) } });
     setSelectionMenuOpen(true); setTranslation(null); setAskOpen(false); setQuestion("");
   }
@@ -151,40 +152,22 @@ export function ReaderPage() {
   async function translateSelection(engine: TranslationEngine = translationEngine) {
     if (!projectId || !current?.content_hash || !selection?.text) return;
     const requestId = ++translationRequest.current;
+    translationAbort.current?.abort();
+    const abortController = new AbortController();
+    translationAbort.current = abortController;
     setTranslation({ status: "loading", engine, text: "" });
     localStorage.setItem("yyagent.reader.translation-engine", engine);
     try {
       const text = engine === "llm"
-        ? await llmTranslate(selection.text, (partial) => { if (requestId === translationRequest.current) setTranslation({ status: "loading", engine, text: partial }); })
+        ? await api.translateLlm(projectId, selection.text, (partial) => { if (requestId === translationRequest.current) setTranslation({ status: "loading", engine, text: partial }); }, "zh-CN", "default", abortController.signal)
         : (await api.translate(selection.text, engine)).text;
       if (requestId === translationRequest.current) setTranslation({ status: "completed", engine, text });
     } catch (error) {
+      if (abortController.signal.aborted) return;
       if (requestId === translationRequest.current) setTranslation({ status: "failed", engine, text: "", error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      if (translationAbort.current === abortController) translationAbort.current = null;
     }
-  }
-
-  async function llmTranslate(text: string, onChunk: (text: string) => void): Promise<string> {
-    const created = await api.startRun({
-      projectId: projectId!, task: `请将选中的论文原文翻译成简体中文，只输出译文，不要解释：\n\n${text}`,
-      modelProfileId: "default", reasoningEffort: "none",
-      uiContext: { source: "read", translation: true, resource: { kind: "paper", paper_id: current!.paper_id, logical_path: null, content_hash: current!.content_hash! }, selection: { selected_text: text, page: selection!.locator.page, start_line: null, end_line: null, nearby_context: "", locator: selection!.locator } },
-    });
-    return await new Promise<string>((resolve, reject) => {
-      let output = "", settled = false, socket: WebSocket | null = null, timer: number;
-      const finish = (error?: Error, value = "") => {
-        if (settled) return;
-        settled = true; window.clearTimeout(timer); socket?.close();
-        if (error) reject(error); else resolve(value.trim());
-      };
-      timer = window.setTimeout(() => finish(new Error("LLM 翻译超时，请稍后重试。")), 120_000);
-      socket = api.subscribe(created.run_id, 0, (event) => {
-        if (event.type === "text") { output += eventText(event); onChunk(output); return; }
-        if (event.type === "final" || event.type === "run_completed") { const value = eventText(event).trim() || output.trim(); if (value) onChunk(value); finish(undefined, value); return; }
-        if (["run_failed", "run_cancelled", "run_interrupted"].includes(event.type)) finish(new Error(eventText(event) || "LLM 翻译失败"));
-      });
-      socket.onerror = () => finish(new Error("LLM 翻译连接中断，请稍后重试。"));
-      socket.onclose = () => { if (!settled) finish(new Error("LLM 翻译连接已关闭，请稍后重试。")); };
-    });
   }
 
   async function importFiles(files: File[]) {

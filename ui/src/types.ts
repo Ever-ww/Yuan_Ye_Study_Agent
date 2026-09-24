@@ -14,6 +14,9 @@ export type Project = {
 export type Session = {
   session_id: string;
   created_at: string;
+  updated_at?: string;
+  first_question?: string | null;
+  first_question_at?: string | null;
   latest_file: string;
   message_count: number;
 };
@@ -25,11 +28,38 @@ export type SessionRecord = {
   tool_calls?: Array<Record<string, unknown>>;
   name?: string;
   status?: string;
+  arguments?: Record<string, unknown>;
   run_id?: string;
+  turn_id?: string;
   record_id?: string;
   tool_call_id?: string;
   origin?: string;
   reasoning?: string | null;
+  model?: Record<string, unknown>;
+  model_call?: ModelCallMetric;
+  model_calls?: ModelCallMetric[];
+  task_latency_ms?: number;
+};
+
+export type ModelCallMetric = {
+  latency_ms?: number;
+  input_tokens?: {
+    context_total?: number | null;
+    cached?: number | null;
+    cache_miss?: number | null;
+    cache_hit_ratio?: number | null;
+    [key: string]: unknown;
+  };
+  output_tokens?: number | null;
+  output_tokens_source?: string;
+  prefix_cache?: {
+    total_tokens?: number | null;
+    hit_tokens?: number | null;
+    miss_tokens?: number | null;
+    hit_ratio?: number | null;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
 };
 
 export type InboxItem = {
@@ -143,7 +173,7 @@ export type RunCreate = {
   modelProfileId: string;
   reasoningEffort: ReasoningEffort;
   uiContext?: {
-    source: "agent" | "read" | "write";
+    source: "agent" | "read" | "write" | "note";
     translation?: boolean;
     resource?:
       | { kind: "paper"; paper_id: string; logical_path: null; content_hash: string }
@@ -264,6 +294,31 @@ export type PaperInlineAnswer = {
   error: string | null;
   created_at: string;
   answered_at: string | null;
+};
+
+export type NoteNode = {
+  note_id: string;
+  kind: "note" | "folder";
+  name: string;
+  parent_id: string | null;
+  path: string;
+  content: string;
+  etag: string;
+  tags?: string[];
+  file_path?: string;
+  links?: Array<{ target: string; resolved: boolean; note_id?: string; name?: string }>;
+  backlinks?: Array<{ note_id: string; name: string; path: string }>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type NoteTrashItem = {
+  trash_id: string;
+  original_note_id: string;
+  name: string;
+  kind: "note" | "folder";
+  original_file_path: string;
+  deleted_at: string;
 };
 
 export type PaperNote = {

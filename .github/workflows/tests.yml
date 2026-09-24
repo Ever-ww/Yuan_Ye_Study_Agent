@@ -32,7 +32,7 @@ jobs:
       - name: 按锁文件安装开发依赖
         run: uv sync --frozen --extra dev
       - name: 运行 pytest
-        run: uv run --frozen --extra dev python -m pytest -q
+        run: uv run --frozen --extra dev python -m pytest -q -m "not external"
       - name: 运行 unittest
         run: uv run --frozen --extra dev python -m unittest discover -s tests -v
       - name: 编译检查

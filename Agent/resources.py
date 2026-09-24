@@ -1270,13 +1270,21 @@ class RuntimePluginManager:
             for member in descriptor.files
         }
         if target.is_dir():
+            # Profile views are derived caches, while the generation artifact
+            # remains canonical. A process interruption can leave a directory
+            # with only part of its files; repair that cache from the immutable
+            # generation instead of preventing Gateway startup forever.
+            complete = True
             for (root, path), (_, digest) in expected.items():
                 candidate = target / root / Path(*path.split("/"))
                 if not candidate.is_file() or _sha256(candidate.read_bytes()) != digest:
-                    raise RuntimeError(
-                        f"Runtime profile Snapshot is damaged: {profile.value}:{path}"
-                    )
-            return target
+                    complete = False
+                    break
+            if complete:
+                return target
+            shutil.rmtree(target, ignore_errors=True)
+        elif target.exists():
+            target.unlink()
         parent = target.parent
         parent.mkdir(parents=True, exist_ok=True)
         temporary = Path(mkdtemp(prefix=f".{profile_name[:8]}.", dir=parent))

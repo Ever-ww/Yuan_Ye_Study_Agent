@@ -324,6 +324,23 @@ class SessionStore:
             # record.  Their identity remains recoverable from the index.
             if message_count == 0:
                 continue
+            first_question: str | None = None
+            first_question_at: str | None = None
+            for path in existing:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict) and record.get("role") == "user" and isinstance(record.get("content"), str):
+                        first_question = record["content"]
+                        timestamp = record.get("timestamp")
+                        first_question_at = timestamp if isinstance(timestamp, str) else None
+                        break
+                if first_question is not None:
+                    break
             latest_activity = max(path.stat().st_mtime for path in existing)
             updated_at = datetime.fromtimestamp(latest_activity).astimezone().strftime(
                 "%Y-%m-%d %H:%M:%S.%f",
@@ -335,6 +352,8 @@ class SessionStore:
                 "latest_file": metadata["latest_file"],
                 "message_count": message_count,
                 "segment_count": len(metadata["files"]),
+                "first_question": first_question,
+                "first_question_at": first_question_at,
             })
         return sorted(
             sessions,
@@ -343,6 +362,31 @@ class SessionStore:
             ),
             reverse=True,
         )
+
+    def delete(self, session_id: str) -> dict[str, object]:
+        """Delete one conversation after validating every indexed file boundary."""
+        self.initialize()
+        index = self._read_index()
+        metadata = index["sessions"].get(session_id)
+        if metadata is None:
+            raise KeyError(f"Unknown session: {session_id}")
+        root = self.directory.resolve()
+        paths: list[Path] = []
+        for filename in metadata["files"]:
+            relative = Path(str(filename))
+            if relative.name != str(filename) or relative.is_absolute():
+                raise PermissionError("Session file boundary is invalid")
+            raw = self.directory / relative
+            candidate = raw.resolve()
+            if raw.is_symlink() or candidate.parent != root:
+                raise PermissionError("Session file boundary is invalid")
+            paths.append(candidate)
+        for path in paths:
+            if path.exists():
+                path.unlink()
+        index["sessions"].pop(session_id, None)
+        self._write_index(index)
+        return {"deleted": True, "session_id": session_id}
 
     def start_new_segment(self, session_id: str) -> Path:
         """为未来上下文压缩创建同哈希的新 JSONL 分段并更新最新索引。"""

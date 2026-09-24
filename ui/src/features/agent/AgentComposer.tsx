@@ -1,9 +1,11 @@
 import { ArrowUp, Paperclip, Square, X } from "lucide-react";
 import type { PendingApproval, TemporaryAttachment } from "../../types";
+import type { ModelUsageSummary } from "./agentUsage";
+import { formatCacheRatio } from "./agentUsage";
 
 export function AgentComposer({
   value, disabled, running, approval, error, attachments, uploading,
-  onChange, onSend, onCancel, onApproval, onFiles, onRemoveAttachment,
+  usage, onChange, onSend, onCancel, onApproval, onFiles, onRemoveAttachment,
 }: {
   value: string;
   disabled: boolean;
@@ -12,6 +14,7 @@ export function AgentComposer({
   error: string;
   attachments: TemporaryAttachment[];
   uploading: boolean;
+  usage: ModelUsageSummary;
   onChange: (value: string) => void;
   onSend: () => void;
   onCancel: () => void;
@@ -58,6 +61,7 @@ export function AgentComposer({
             <input type="file" accept="application/pdf,.pdf" multiple disabled={disabled || running || uploading} onChange={(event) => { acceptFiles(event.target.files); event.target.value = ""; }} />
           </label>
           <span className="composer-help">Enter 发送 · Shift Enter 换行 · Ctrl K 打开命令</span>
+          <span className="composer-usage" aria-label="前缀缓存命中率">Cache {formatCacheRatio(usage.cacheHitRatio)}</span>
           {running ? (
             <button className="send-button stop-button" type="button" onClick={onCancel} aria-label="停止当前运行"><Square aria-hidden="true" /></button>
           ) : (

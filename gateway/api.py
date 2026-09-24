@@ -32,6 +32,7 @@ from gateway.models import (
     HarnessDreamRunRequest,
     HarnessDreamRevertRequest,
     HarnessEvolutionDecision,
+    LLMTranslationRequest,
     ProjectCreateRequest,
     PaperPatchRequest,
     PaperSummaryRequest,
@@ -49,6 +50,9 @@ from gateway.models import (
     WorkspaceFileWriteRequest,
     WorkspaceMoveRequest,
     LatexCompilationRequest,
+    NoteCreateRequest,
+    NoteMoveRequest,
+    NoteUpdateRequest,
 )
 from gateway.security import GatewayCredentials, bearer_value
 from sandbox import probe_sandbox_status
@@ -62,6 +66,7 @@ from reference import (
 )
 from gateway.workspace_files import WorkspaceFileConflict
 from gateway.latex import LatexEngineUnavailable, LatexWorkspaceRevisionConflict
+from gateway.note_store import NoteConflict
 
 
 def translation_label(engine: str) -> str:
@@ -75,7 +80,7 @@ def create_gateway_api(
 ) -> Any:
     try:
         from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
-        from fastapi.responses import FileResponse
+        from fastapi.responses import FileResponse, StreamingResponse
     except ModuleNotFoundError as exc:
         raise RuntimeError("Gateway API 需要安装 fastapi") from exc
 
@@ -616,6 +621,91 @@ def create_gateway_api(
         })
         return {**result, "workspace_revision": event.stream_sequence}
 
+    @app.get("/api/v1/projects/{project_id}/notes", dependencies=[Depends(authorize)])
+    async def list_notes(project_id: str, query: str = ""):
+        return gateway.note_store_for_project(project_id).list(query)
+
+    @app.post("/api/v1/projects/{project_id}/notes/reindex", dependencies=[Depends(authorize_write)])
+    async def reindex_notes(project_id: str):
+        return gateway.note_store_for_project(project_id).reindex()
+
+    @app.post("/api/v1/projects/{project_id}/notes/folders", dependencies=[Depends(authorize_write)])
+    async def create_note_folder(project_id: str, payload: NoteCreateRequest):
+        if payload.kind != "folder":
+            raise HTTPException(400, "Folder endpoint requires kind=folder")
+        return gateway.note_store_for_project(project_id).create(
+            name=payload.name, kind="folder", parent_id=payload.parent_id,
+        )
+
+    @app.post("/api/v1/projects/{project_id}/notes", dependencies=[Depends(authorize_write)])
+    async def create_note(project_id: str, payload: NoteCreateRequest):
+        if payload.kind != "note":
+            raise HTTPException(400, "Note endpoint requires kind=note")
+        return gateway.note_store_for_project(project_id).create(
+            name=payload.name, kind="note", parent_id=payload.parent_id,
+            content=payload.content,
+        )
+
+    @app.get("/api/v1/projects/{project_id}/notes-trash", dependencies=[Depends(authorize)])
+    async def list_note_trash(project_id: str):
+        return gateway.note_store_for_project(project_id).trash()
+
+    @app.post("/api/v1/projects/{project_id}/notes-trash/{trash_id}/restore", dependencies=[Depends(authorize_write)])
+    async def restore_trashed_note(project_id: str, trash_id: str):
+        return gateway.note_store_for_project(project_id).restore_trash(trash_id)
+
+    @app.get("/api/v1/projects/{project_id}/notes/{note_id}", dependencies=[Depends(authorize)])
+    async def get_note(project_id: str, note_id: str):
+        return gateway.note_store_for_project(project_id).get(note_id)
+
+    @app.get("/api/v1/projects/{project_id}/notes/{note_id}/raw", dependencies=[Depends(authorize)])
+    async def raw_note(project_id: str, note_id: str):
+        path = gateway.note_store_for_project(project_id).raw_path(note_id)
+        return FileResponse(path, media_type="text/markdown", filename=path.name)
+
+    @app.get("/api/v1/projects/{project_id}/notes/{note_id}/revisions", dependencies=[Depends(authorize)])
+    async def note_revisions(project_id: str, note_id: str):
+        return gateway.note_store_for_project(project_id).revisions(note_id)
+
+    @app.post("/api/v1/projects/{project_id}/notes/{note_id}/revisions/{revision_id}/restore", dependencies=[Depends(authorize_write)])
+    async def restore_note_revision(project_id: str, note_id: str, revision_id: str):
+        return gateway.note_store_for_project(project_id).restore_revision(note_id, revision_id)
+
+    @app.post("/api/v1/projects/{project_id}/notes/{note_id}/assets", dependencies=[Depends(authorize_write)])
+    async def upload_note_asset(project_id: str, note_id: str, request: Request, filename: str, kind: str = "attachment"):
+        data = await request.body()
+        if not data:
+            raise HTTPException(400, "Asset is empty")
+        if len(data) > 25 * 1024 * 1024:
+            raise HTTPException(413, "Note assets are limited to 25 MiB")
+        return gateway.note_store_for_project(project_id).save_asset(note_id, filename, data, kind=kind)
+
+    @app.get("/api/v1/projects/{project_id}/note-assets/{asset_path:path}", dependencies=[Depends(authorize)])
+    async def note_asset(project_id: str, asset_path: str):
+        path = gateway.note_store_for_project(project_id).asset_path(asset_path)
+        return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+
+    @app.patch("/api/v1/projects/{project_id}/notes/{note_id}", dependencies=[Depends(authorize_write)])
+    async def update_note(project_id: str, note_id: str, payload: NoteUpdateRequest):
+        try:
+            return gateway.note_store_for_project(project_id).update(
+                note_id, name=payload.name, content=payload.content, tags=payload.tags,
+                expected_etag=payload.expected_etag,
+            )
+        except NoteConflict as exc:
+            return _json_response(error_body(
+                "note_conflict", str(exc), recoverable=True,
+                details={"current": exc.current},
+            ), 409)
+
+    @app.post("/api/v1/projects/{project_id}/notes/{note_id}/move", dependencies=[Depends(authorize_write)])
+    async def move_note(project_id: str, note_id: str, payload: NoteMoveRequest):
+        return gateway.note_store_for_project(project_id).move(note_id, payload.parent_id)
+
+    @app.delete("/api/v1/projects/{project_id}/notes/{note_id}", dependencies=[Depends(authorize_write)])
+    async def delete_note(project_id: str, note_id: str):
+        return gateway.note_store_for_project(project_id).delete(note_id)
+
     @app.post(
         "/api/v1/projects/{project_id}/latex/compilations",
         dependencies=[Depends(authorize_write)],
@@ -873,6 +963,34 @@ def create_gateway_api(
             raise HTTPException(502, f"{translation_label(payload.engine)}没有返回结果")
         return {"text": translated, "engine": payload.engine, "target_language": payload.target_language}
 
+    @app.post("/api/v1/translate/llm", dependencies=[Depends(authorize)])
+    async def translate_llm(payload: LLMTranslationRequest):
+        """Stateless streaming translation for Read selections.
+
+        This endpoint never calls start_run and therefore cannot create Agent
+        sessions or history records.
+        """
+        async def body():
+            try:
+                async for chunk in gateway.stream_llm_translation(
+                    project_id=payload.project_id,
+                    text=payload.text,
+                    target_language=payload.target_language,
+                    model_profile_id=payload.model_profile_id,
+                ):
+                    yield f"data: {json.dumps({'type': 'text', 'content': chunk}, ensure_ascii=False)}\n\n"
+                yield "data: {\"type\":\"done\"}\n\n"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(exc) or type(exc).__name__}, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
+
     @app.get("/api/v1/library/papers/{paper_id}/notes", dependencies=[Depends(authorize)])
     async def paper_notes(paper_id: str, project_id: str | None = None):
         return gateway.reference_store_for_project(project_id).list_notes(paper_id)
@@ -1043,6 +1161,10 @@ def create_gateway_api(
     @app.get("/api/v1/projects/{project_id}/sessions/{session_id}", dependencies=[Depends(authorize)])
     async def show_session(project_id: str, session_id: str):
         return gateway.session_records(project_id, session_id)
+
+    @app.delete("/api/v1/projects/{project_id}/sessions/{session_id}", dependencies=[Depends(authorize_write)])
+    async def delete_session(project_id: str, session_id: str):
+        return gateway.delete_session(project_id, session_id)
 
     @app.get("/api/v1/projects/{project_id}/sessions/{session_id}/tool-results", dependencies=[Depends(authorize)])
     async def session_tool_result(

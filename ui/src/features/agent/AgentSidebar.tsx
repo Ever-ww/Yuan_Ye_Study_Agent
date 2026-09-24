@@ -1,8 +1,16 @@
-import { MessageSquarePlus, Plus, Search } from "lucide-react";
+import { MessageSquarePlus, Plus, Search, Trash2 } from "lucide-react";
 import type { Project, Session } from "../../types";
 
 export function AgentSidebar({
-  projects, sessions, projectId, sessionId, onProject, onSession, onNewSession, onAddProject,
+  projects,
+  sessions,
+  projectId,
+  sessionId,
+  onProject,
+  onSession,
+  onNewSession,
+  onAddProject,
+  onDeleteSession,
 }: {
   projects: Project[];
   sessions: Session[];
@@ -12,6 +20,7 @@ export function AgentSidebar({
   onSession: (sessionId: string) => void;
   onNewSession: () => void;
   onAddProject: () => void;
+  onDeleteSession: (sessionId: string) => void;
 }) {
   return (
     <div className="sidebar-layout">
@@ -29,7 +38,7 @@ export function AgentSidebar({
           {!projects.length && <option value="">尚未添加项目</option>}
           {projects.map((project) => <option key={project.project_id} value={project.project_id}>{project.name}</option>)}
         </select>
-        <button type="button" className="icon-button" onClick={onAddProject} aria-label="添加项目"><Plus aria-hidden="true" /></button>
+        <button type="button" className="icon-button" onClick={onAddProject} aria-label="添加项目" title="添加项目"><Plus aria-hidden="true" /></button>
       </div>
 
       <div className="session-filter"><Search aria-hidden="true" /><span>最近会话</span></div>
@@ -37,24 +46,29 @@ export function AgentSidebar({
         <button type="button" className={!sessionId ? "session-item active" : "session-item"} onClick={onNewSession}>
           <strong>新会话</strong><small>从空白上下文开始</small>
         </button>
-        {sessions.map((session) => (
-          <button
-            type="button"
-            className={sessionId === session.session_id ? "session-item active" : "session-item"}
-            key={session.session_id}
-            onClick={() => onSession(session.session_id)}
-          >
-            <strong>{shortSession(session.session_id)}</strong>
-            <small>{formatSessionDate(session.created_at)} · {session.message_count} 条记录</small>
-          </button>
-        ))}
+        {sessions.map((session) => {
+          const question = session.first_question?.trim() || "未命名会话";
+          const label = shortQuestion(question);
+          return (
+            <div className={sessionId === session.session_id ? "session-row active" : "session-row"} key={session.session_id}>
+              <button type="button" className="session-item" title={question} onClick={() => onSession(session.session_id)}>
+                <strong>{label}</strong>
+                <small>{formatSessionDate(session.first_question_at || session.created_at)} · {session.message_count} 条记录</small>
+              </button>
+              <button type="button" className="session-delete" aria-label={`删除会话 ${label}`} title="删除会话" onClick={() => onDeleteSession(session.session_id)}>
+                <Trash2 aria-hidden="true" />
+              </button>
+            </div>
+          );
+        })}
       </nav>
     </div>
   );
 }
 
-function shortSession(value: string): string {
-  return value.length > 18 ? `${value.slice(0, 10)}…${value.slice(-5)}` : value;
+function shortQuestion(value: string): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact.length > 44 ? `${compact.slice(0, 43)}…` : compact;
 }
 
 function formatSessionDate(value: string): string {

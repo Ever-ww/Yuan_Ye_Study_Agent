@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import { BookOpen, Bot, Braces, Command, FilePenLine, PanelLeftClose, PanelLeftOpen, PanelRight, Search, Settings2 } from "lucide-react";
+import { BookOpen, Bot, Braces, Command, FilePenLine, NotebookPen, PanelLeftClose, PanelLeftOpen, PanelRight, Search, Settings2 } from "lucide-react";
 import { NavLink, useLocation } from "react-router-dom";
 
 type WorkbenchShellProps = {
@@ -109,6 +109,9 @@ export function WorkbenchShell(props: WorkbenchShellProps) {
         </NavLink>
         <NavLink className={({ isActive }) => `rail-item${isActive ? " active" : ""}`} to={modeTarget("/write")}>
           <FilePenLine aria-hidden="true" /><span>Write</span>
+        </NavLink>
+        <NavLink className={({ isActive }) => `rail-item${isActive ? " active" : ""}`} to={modeTarget("/note")}>
+          <NotebookPen aria-hidden="true" /><span>Note</span>
         </NavLink>
         <NavLink className={({ isActive }) => `rail-item${isActive ? " active" : ""}`} to={modeTarget("/operations")}>
           <Settings2 aria-hidden="true" /><span>运维</span>

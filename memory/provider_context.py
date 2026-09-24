@@ -78,7 +78,20 @@ def effective_contexts(records: list[dict[str, Any]]) -> dict[str, ProviderConte
         raw = record.get("provider_context")
         if raw is None:
             continue
-        packet = ProviderContextRecord.model_validate(raw)
+        # Older Session JSONL records could contain structured origin refs
+        # (notably ui_context) directly.  The canonical ProviderContextRecord
+        # keeps origin refs as strings, so normalize on read without rewriting
+        # the historical record.
+        normalized = dict(raw)
+        origin_refs = normalized.get("origin_refs")
+        if isinstance(origin_refs, dict):
+            normalized["origin_refs"] = {
+                str(key): value if isinstance(value, str) else json.dumps(
+                    value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+                for key, value in origin_refs.items()
+            }
+        packet = ProviderContextRecord.model_validate(normalized)
         target = str(record.get("context_target_record_id") or record.get("record_id"))
         user = users.get(target)
         if user is None:

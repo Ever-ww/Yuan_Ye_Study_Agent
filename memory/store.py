@@ -418,6 +418,11 @@ class MemoryStore:
         """返回供 CLI 展示的会话摘要。"""
         return self.sessions.list_sessions()
 
+    def delete_session(self, session_id: str) -> dict[str, object]:
+        """Delete a conversation and clear its in-memory projection."""
+        self._message_cache.pop(session_id, None)
+        return self.sessions.delete(session_id)
+
     def session_records(self, session_id: str) -> list[dict[str, object]]:
         """读取带时间戳的原始会话记录。"""
         return self.sessions.read_records(session_id)

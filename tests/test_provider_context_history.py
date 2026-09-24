@@ -12,7 +12,7 @@ from Agent.models.errors import ModelServiceError
 from context_process import ContextProcessor
 from memory import MemoryStore
 from memory.persistence import SessionPersistenceProjection
-from memory.provider_context import ProviderContextRecord, context_baseline
+from memory.provider_context import ProviderContextRecord, context_baseline, effective_contexts
 from prompt.runtime_context import AgentDynamicContextBuilder
 from tool import AsyncToolRegistry
 from tools.calculator import CalculatorTool
@@ -266,6 +266,18 @@ def test_provider_context_serializes_structured_origin_refs():
     assert packet.origin_refs["run_id"] == "run-1"
     assert packet.origin_refs["ui_context"] == '{"attachments":[],"source":"agent"}'
     assert ProviderContextRecord.model_validate(packet.model_dump(mode="json")) == packet
+
+
+def test_legacy_provider_context_normalizes_structured_origin_refs_on_read():
+    packet = ProviderContextRecord.create("current time", "epoch", {"agent": "runtime context"})
+    raw = packet.model_dump(mode="json")
+    raw["origin_refs"] = {"ui_context": {"attachments": [], "source": "agent"}}
+    records = [
+        {"role": "user", "record_id": "user-1", "content": "current time"},
+        {"role": "provider_context", "record_id": "provider-1", "context_target_record_id": "user-1", "provider_context": raw},
+    ]
+    resolved = effective_contexts(records)["user-1"]
+    assert resolved.origin_refs["ui_context"] == '{"attachments":[],"source":"agent"}'
 
 
 def test_emergency_compression_amendment_replays_and_does_not_leak(tmp_path):

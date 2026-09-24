@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import {
-  BookOpen, Bot, Braces, Command, FilePenLine, Moon, Plus,
+  BookOpen, Bot, Braces, Command, FilePenLine, Moon, NotebookPen, Plus,
   Search, Settings2, ShieldCheck, Sun, X,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
@@ -34,6 +34,7 @@ export function CommandPalette(props: CommandPaletteProps) {
     { id: "code", label: "Code", detail: "独立 Coding Session", keywords: "代码 coding worktree", icon: Braces, run: () => navigate("/code") },
     { id: "read", label: "Read", detail: "论文库与 PDF 阅读", keywords: "paper pdf 论文 阅读", icon: BookOpen, run: () => navigate("/read") },
     { id: "write", label: "Write", detail: "Workspace 文件与 LaTeX", keywords: "文件 编辑 latex workspace", icon: FilePenLine, run: () => navigate("/write") },
+    { id: "note", label: "Note", detail: "Workspace Markdown 笔记", keywords: "note markdown 笔记", icon: NotebookPen, run: () => navigate("/note") },
     { id: "operations", label: "运维", detail: "Inbox、Cron、Dream 与 Backup", keywords: "operations inbox cron dream backup 备份", icon: Settings2, run: () => navigate("/operations") },
     { id: "capabilities", label: "能力", detail: "Skill、Plugin 与 Runtime Generation", keywords: "capabilities skill plugin extension", icon: ShieldCheck, run: () => navigate("/capabilities") },
     { id: "new-session", label: "开始新会话", detail: "清除当前 Agent Session 选择", keywords: "new session 新建", icon: Plus, run: props.onNewSession },
@@ -61,6 +62,18 @@ export function CommandPalette(props: CommandPaletteProps) {
     if (!props.open && dialog.open) dialog.close();
   }, [props.open]);
 
+  useEffect(() => {
+    if (!props.open) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      props.onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape, true);
+    return () => window.removeEventListener("keydown", closeOnEscape, true);
+  }, [props.open, props.onClose]);
+
   function execute(command: PaletteCommand | undefined) {
     if (!command) return;
     command.run();
@@ -68,10 +81,21 @@ export function CommandPalette(props: CommandPaletteProps) {
   }
 
   return (
-    <dialog ref={dialogRef} className="command-dialog" onClose={props.onClose}>
+    <dialog
+      ref={dialogRef}
+      className="command-dialog"
+      aria-labelledby="command-dialog-title"
+      onClose={props.onClose}
+      onCancel={(event) => {
+        // Native dialog Escape emits `cancel`; prevent the browser from
+        // closing a stale dialog while the controlled `open` state catches up.
+        event.preventDefault();
+        props.onClose();
+      }}
+    >
       <header>
         <Command aria-hidden="true" />
-        <h2>搜索与命令</h2>
+        <h2 id="command-dialog-title">搜索与命令</h2>
         <button type="button" onClick={props.onClose} aria-label="关闭"><X aria-hidden="true" /></button>
       </header>
       <label className="command-search">

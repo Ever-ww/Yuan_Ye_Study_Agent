@@ -28,6 +28,7 @@ from Agent import (
     load_runtime_config,
     load_generation_tool_module,
 )
+from Agent.models.providers import build_provider
 from Agent.state import (
     AbandonOperationAttemptCommand,
     CompleteOperationAttemptCommand,
@@ -99,6 +100,7 @@ from gateway.runtime_pool import RuntimeFactory, RuntimePool
 from gateway.store import GatewayStore
 from gateway.workspace_files import WorkspaceFileConflict, WorkspaceFileService
 from gateway.paper_web import PaperWebService
+from gateway.note_store import NoteStore
 from gateway.latex import (
     LatexCompilationService,
     LatexExecutionError,
@@ -319,6 +321,7 @@ class GatewayApplication:
         self._reference_services: dict[str, ReferenceService] = {}
         self._reference_workers: dict[str, ReferenceEmbeddingWorker] = {}
         self._paper_web_services: dict[str, PaperWebService] = {}
+        self._note_stores: dict[str, NoteStore] = {}
         self.reference_service = self.reference_service_for_workspace(config.workspace_root)
         self.reference_store = self.reference_service.store
         self.reference_embedding_worker = self._reference_workers[
@@ -988,6 +991,8 @@ class GatewayApplication:
             if self.observer is not None:
                 await self.observer.close()
         finally:
+            for note_store in self._note_stores.values():
+                note_store.stop_watcher()
             for worker in self._memory_workers.values():
                 await worker.close()
             for worker in self._reference_workers.values():
@@ -1637,6 +1642,45 @@ class GatewayApplication:
     def reference_store_for_project(self, project_id: str | None) -> ReferenceStore:
         return self.reference_service_for_project(project_id).store
 
+    def note_store_for_workspace(self, workspace: Path) -> NoteStore:
+        selected = workspace.resolve()
+        key = self._workspace_cache_key(selected)
+        existing = self._note_stores.get(key)
+        if existing is None:
+            existing = NoteStore(selected)
+            # External Markdown edits are projected immediately and published
+            # through the same durable Workspace stream used by Write/Agent.
+            try:
+                event_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                event_loop = None
+
+            def notify(paths: tuple[str, ...]) -> None:
+                if event_loop is not None and event_loop.is_running():
+                    event_loop.call_soon_threadsafe(
+                        self._on_external_note_change, selected, paths,
+                    )
+                else:
+                    self._on_external_note_change(selected, paths)
+
+            existing.start_watcher(
+                notify,
+            )
+            self._note_stores[key] = existing
+        return existing
+
+    def note_store_for_project(self, project_id: str) -> NoteStore:
+        return self.note_store_for_workspace(Path(self.store.project(project_id).path))
+
+    def _on_external_note_change(self, workspace: Path, paths: tuple[str, ...]) -> None:
+        project_id = self._project_id_for_workspace(workspace)
+        for relative in paths:
+            logical = "YYWorkspace:\\notes\\" + relative.replace("/", "\\")
+            self.record_workspace_event(project_id, "workspace.file.changed", {
+                "path": logical,
+                "source": "external",
+            })
+
     def paper_web_for_project(self, project_id: str) -> PaperWebService:
         project = self.store.project(project_id)
         workspace = Path(project.path).resolve()
@@ -1659,6 +1703,49 @@ class GatewayApplication:
     ) -> dict[str, object]:
         self.store.project(project_id)
         return self.paper_web_for_project(project_id).upload_attachment(body, filename)
+
+    async def stream_llm_translation(
+        self,
+        *,
+        project_id: str,
+        text: str,
+        target_language: str = "zh-CN",
+        model_profile_id: str = "default",
+    ):
+        """Stream a stateless translation without creating an Agent Run.
+
+        Read selection translation is intentionally not an Agent task: it has
+        no tools, memory, hooks, observer, durable operation, or Session JSONL
+        record. The configured provider is reused only as a transport/model
+        adapter, with reasoning explicitly disabled.
+        """
+        self.store.project(project_id)
+        selected = self.config.select_model_profile(model_profile_id, "none")
+        provider = build_provider(
+            selected.provider,
+            selected.model,
+            base_url=selected.base_url,
+            api_key=selected.api_key,
+            stream=True,
+            reasoning_effort="none",
+            use_system_proxy=selected.use_system_proxy,
+            proxy_url=selected.proxy_url,
+        )
+        system_prompt = (
+            "You are a translation-only service. Translate the user's selected text "
+            f"into {target_language}. Output only the translation. Do not explain, "
+            "summarize, analyze, add notes, or reveal reasoning. Preserve line breaks, "
+            "punctuation, code, URLs, and LaTeX when present."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ]
+        async for reply in provider.stream(messages, []):
+            # Reasoning is deliberately ignored even if a provider violates the
+            # requested disabled-thinking configuration.
+            if reply.text:
+                yield reply.text
 
     async def start_paper_summary(
         self, paper_id: str, request: PaperSummaryRequest,
@@ -2841,7 +2928,7 @@ class GatewayApplication:
             })
         if (
             request.ui_context is not None
-            and request.ui_context.source == "write"
+            and request.ui_context.source in {"write", "note"}
             and request.ui_context.resource is not None
         ):
             document = await self.workspace_files.read(
@@ -3368,6 +3455,21 @@ class GatewayApplication:
         project = self.store.project(project_id)
         memory = self.memory_for_project(project_id)
         return memory.list_sessions()
+
+    @lifecycle_mutation
+    def delete_session(self, project_id: str, session_id: str) -> dict[str, object]:
+        self.store.project(project_id)
+        memory = self.memory_for_project(project_id)
+        if not memory.has_session(session_id):
+            raise KeyError(session_id)
+        active = [
+            run.run_id
+            for run in self.store.list_runs(project_id)
+            if run.session_id == session_id and self.pool.has_active_run(run.run_id)
+        ]
+        if active:
+            raise RuntimeError("Session has an active run and cannot be deleted")
+        return memory.delete_session(session_id)
 
     @lifecycle_mutation
     def session_records(self, project_id: str, session_id: str) -> list[dict[str, object]]:

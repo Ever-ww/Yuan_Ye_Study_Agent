@@ -6,6 +6,7 @@
   --space-5: 20px; --space-6: 24px; --space-8: 32px;
   --radius-sm: 3px; --radius-md: 6px; --radius-lg: 10px;
   --motion-fast: 120ms; --motion-normal: 180ms;
+  --motion-reduced-duration: 0ms;
   --focus: #0f766e; --selection: rgb(13 148 136 / 24%);
   --bg: #f3f5f4; --surface: #fbfcfb; --surface-raised: #ffffff;
   --surface-muted: #ecefed; --surface-active: #dcece8;
@@ -33,5 +34,6 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
+  :root { --motion-reduced-duration: 0.01ms; }
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: var(--motion-reduced-duration) !important; animation-duration: var(--motion-reduced-duration) !important; animation-iteration-count: 1 !important; }
 }

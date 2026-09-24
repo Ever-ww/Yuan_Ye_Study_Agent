@@ -27,6 +27,7 @@ dependencies = [
     "tzlocal>=5,<6",
     "uvicorn>=0.29,<1",
     "websockets>=14,<17",
+    "watchdog>=4,<7",
 ]
 
 [project.optional-dependencies]
@@ -80,3 +81,8 @@ sandbox = ["Dockerfile"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["error::starlette.exceptions.StarletteDeprecationWarning"]
+markers = [
+    "integration: deterministic local integration through real production layers",
+    "external: requires a configured third-party service or public network",
+    "native: requires a platform sandbox or operating-system facility",
+]

@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from pypdf import PdfWriter
 
 from Agent import EventType, RunEvent, load_runtime_config
+from Agent.contracts import ModelReply
 from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.state import RecordRuntimeEventCommand, TaskState, TransitionCommand, WorkloadKind
 from skill import SkillRefreshResult
@@ -252,6 +253,66 @@ class FakeCodeSessions:
 
 
 class GatewayTests(unittest.TestCase):
+    def test_llm_translation_stream_is_stateless_and_does_not_create_run(self) -> None:
+        async def fake_translation(**kwargs):
+            self.assertEqual(kwargs["text"], "Selected sentence")
+            self.assertEqual(kwargs["target_language"], "zh-CN")
+            yield "选"
+            yield "择句子"
+
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            application = GatewayApplication(load_runtime_config(root))
+            project = application.register_project(root)
+            application.stream_llm_translation = fake_translation  # type: ignore[method-assign]
+            with TestClient(create_gateway_api(application, access_token="test-token")) as client:
+                response = client.post(
+                    "/api/v1/translate/llm",
+                    headers={"Authorization": "Bearer test-token"},
+                    json={
+                        "project_id": project.project_id,
+                        "text": "Selected sentence",
+                    },
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIn('"content": "选"', response.text)
+            self.assertIn('"content": "择句子"', response.text)
+            self.assertIn('"type":"done"', response.text)
+            self.assertEqual(application.store.list_runs(project.project_id), [])
+
+    def test_llm_translation_disables_reasoning_and_ignores_reasoning_chunks(self) -> None:
+        captured: dict[str, object] = {}
+
+        class Provider:
+            async def stream(self, messages, tools):
+                captured["messages"] = messages
+                captured["tools"] = tools
+                yield ModelReply(reasoning="hidden reasoning", text="译文")
+
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            application = GatewayApplication(load_runtime_config(root))
+            project = application.register_project(root)
+            with patch("gateway.application.build_provider", return_value=Provider()) as build:
+                chunks = []
+                async def collect():
+                    async for item in application.stream_llm_translation(
+                        project_id=project.project_id,
+                        text="Selected sentence",
+                    ):
+                        chunks.append(item)
+                asyncio.run(collect())
+            build.assert_called_once()
+            self.assertEqual(build.call_args.kwargs["stream"], True)
+            self.assertEqual(build.call_args.kwargs["reasoning_effort"], "none")
+            self.assertEqual(build.call_args.args[0], application.config.provider)
+            self.assertEqual(build.call_args.args[1], application.config.model)
+            self.assertEqual(chunks, ["译文"])
+            self.assertEqual(captured["tools"], [])
+            messages = captured["messages"]
+            self.assertEqual(messages[1], {"role": "user", "content": "Selected sentence"})
+            self.assertIn("Output only the translation", messages[0]["content"])
+
     def test_agent_attachment_and_read_import_use_separate_storage_paths(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)

@@ -66,6 +66,19 @@ def test_generation_is_immutable_and_semantic_noop_ignores_comments(tmp_path: Pa
     assert (initial.artifact_root / "source" / "tools" / "__init__.py").read_bytes() == initial_bytes
 
 
+def test_damaged_profile_view_is_rebuilt_from_canonical_generation(tmp_path: Path) -> None:
+    manager, _source = _manager(tmp_path)
+    manager.ensure_initial_generation()
+    snapshot = manager.snapshot(RuntimeProfile.INTERACTIVE)
+    generated = snapshot.source_root / "tools" / "__init__.py"
+    generated.unlink()
+
+    repaired = manager.snapshot(RuntimeProfile.INTERACTIVE)
+
+    assert repaired.source_root == snapshot.source_root
+    assert generated.read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
 def test_reload_activates_atomically_and_rollback_publishes_new_generation(
     tmp_path: Path,
 ) -> None:

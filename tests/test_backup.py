@@ -177,6 +177,37 @@ class BackupTests(unittest.TestCase):
             ))
             self.assertEqual(profile.read_text(encoding="utf-8"), "workspace preference")
 
+    def test_restoring_one_workspace_does_not_change_another_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            root = base / "agent"
+            first = base / "first"
+            second = base / "second"
+            root.mkdir()
+            first.mkdir()
+            second.mkdir()
+            ensure_project_initialized(root)
+            ensure_workspace_initialized(first, agent_root=root, name="First")
+            ensure_workspace_initialized(second, agent_root=root, name="Second")
+            first_file = first / ".yy" / "memory" / "profile" / "USER.md"
+            second_file = second / ".yy" / "memory" / "profile" / "USER.md"
+            first_file.write_text("first baseline", encoding="utf-8")
+            second_file.write_text("second baseline", encoding="utf-8")
+            service = BackupService(root)
+            record = asyncio.run(service.create(passphrase="secret"))
+
+            first_file.write_text("first changed", encoding="utf-8")
+            second_file.write_text("second changed", encoding="utf-8")
+            asyncio.run(RestoreService(root, service).restore_workspace(
+                record.path,
+                "secret",
+                workspace_id=workspace_id(first),
+                confirmation=record.backup_id[:8],
+            ))
+
+            self.assertEqual(first_file.read_text(encoding="utf-8"), "first baseline")
+            self.assertEqual(second_file.read_text(encoding="utf-8"), "second changed")
+
     def test_catalog_paths_are_relative_to_dot_yy_root(self) -> None:
         catalog = AgentHomeDurabilityCatalog()
         self.assertEqual(

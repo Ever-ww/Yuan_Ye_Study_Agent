@@ -108,7 +108,10 @@ class ConversationTimeline(VerticalScroll):
             # This callback already runs after layout. Do not queue a second
             # unconditional scroll that could outlive a subsequent wheel event.
             self.scroll_end(animate=False, immediate=True)
-            self.refresh(layout=True)
+            # A tail scroll changes both layout and the compositor's paint
+            # cache.  Repaint explicitly so a freshly submitted prompt is
+            # visible in the same frame as the newly mounted Turn widgets.
+            self.refresh(layout=True, repaint=True)
 
     def _on_mouse_scroll_up(self, event: MouseScrollUp) -> None:
         # Suspend sticky-tail before Textual applies the wheel delta.  Waiting
@@ -1666,6 +1669,12 @@ class YuanYeChatApp(App[str | None]):
         timeline.return_to_live_edge()
         # Present the submitted question and compact activity row before the
         # provider call can block on network I/O.
+        await timeline.wait_for_refresh()
+        timeline.pin_to_tail()
+        # Mounting the turn performs a second layout pass.  Repaint and wait
+        # once more before starting the provider so the prompt cannot be
+        # hidden behind a stale compositor frame.
+        timeline.refresh(layout=True, repaint=True)
         await timeline.wait_for_refresh()
         timeline.pin_to_tail()
         try:
