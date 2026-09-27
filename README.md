@@ -18,7 +18,7 @@ Coding Agent 的记忆位于 Agent 根目录的 `.yy/harness-evolution/memory/`�
 
 `AGENT.md` 首次创建后只由用户维护；`PROJECT.md` 保存当前架构和 Tool/Hook 等开发规范；`CHANGES.md` 与 `LESSONS.md` 只追加已经通过测试并成功合并的事实。每个 Coding Session 都把 `AGENT.md`、`PROJECT.md` 全文和预算内的最新日志条目注入 System Prompt。合并成功后由无工具维护 Runtime 更新长期记忆，模型不可用时使用确定性项目扫描降级；失败、无变更或未合并的尝试只保留在 JSONL 和错误快照中。
 
-> 本文以 Windows PowerShell 为例。项目要求 Python 3.10+；由 uv 管理项目 Python、`.venv` 和依赖，不需要手动使用 `pip` 或激活虚拟环境。
+> 本文以 Windows PowerShell 为例。项目要求 Python 3.13；由 uv 管理项目 Python、`.venv` 和依赖，不需要手动使用 `pip` 或激活虚拟环境。
 
 ## 结构
 
@@ -103,13 +103,16 @@ cd Yuan_Ye_Study_Agent
 
 ### 3. 由 uv 安装 Python 并创建项目环境
 
-以下命令会安装项目可用的 Python 3.11、在项目根创建 `.venv`，并按照 `uv.lock`/`pyproject.toml` 同步依赖：
+以下命令会安装项目可用的 Python 3.13、在项目根创建 `.venv`，并按照 `uv.lock`/`pyproject.toml` 同步依赖：
 
 ```powershell
-uv python install 3.11
-uv venv --python 3.11
+uv python install 3.13
+uv venv --python 3.13
 uv sync
 ```
+
+如果旧的 `.venv` 仍被 Gateway 占用，先执行 `yy-agent gateway stop`，再运行
+`uv sync`；项目根目录的 `.python-version` 会让后续 `uv run` 固定使用 Python 3.13。
 
 `uv sync` 会把项目以可编辑模式安装到 `.venv`；代码改动不需要重新安装。以后只需在项目根执行 `uv sync` 即可更新依赖环境。 `uv run` 在运行前也会自动检查并同步环境。详见 [uv 的 lock 与 sync 说明](https://docs.astral.sh/uv/concepts/projects/sync/)。
 

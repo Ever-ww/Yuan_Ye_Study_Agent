@@ -1,6 +1,7 @@
 """受控异步工具的正式公共接口。"""
 
 from .bash import BashTool
+from .browser_use import BrowserUseTool, BrowserUseUnavailableError
 from .calculator import CalculatorTool
 from .current_time import CurrentTimeTool
 from .cronjob import CronJobTool
@@ -61,6 +62,8 @@ from .web_search import (
 
 __all__ = [
     "BashTool",
+    "BrowserUseTool",
+    "BrowserUseUnavailableError",
     "CalculatorTool",
     "CurrentTimeTool",
     "CronJobTool",

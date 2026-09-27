@@ -68,6 +68,7 @@ class SessionIndexEntry(BaseModel):
     state: Literal["pending", "active"] = "active"
     materialized_at: str | None = None
     skill_catalog: dict[str, Any] | None = None
+    display_name: str | None = Field(default=None, max_length=200)
 
     @model_validator(mode="after")
     def _latest_file_must_exist(self) -> "SessionIndexEntry":

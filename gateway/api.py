@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from pydantic import BaseModel
+
+from capability_switches import CapabilityRevisionConflict, load_switches, set_enabled, tool_catalog
+
 from Agent import load_runtime_config
 from cron import (
     CronJobCreateRequest,
@@ -34,6 +38,7 @@ from gateway.models import (
     HarnessEvolutionDecision,
     LLMTranslationRequest,
     ProjectCreateRequest,
+    SessionBranchRequest,
     PaperPatchRequest,
     PaperSummaryRequest,
     TranslationRequest,
@@ -43,6 +48,7 @@ from gateway.models import (
     ExtensionGrantRequest,
     ExtensionReenableRequest,
     RuntimeReloadRequest,
+    RuntimePluginSwitchRequest,
     RuntimePluginRollbackRequest,
     ObserverCorrectionDecisionRequest,
     ObserverSkillCandidateDecisionRequest,
@@ -101,6 +107,10 @@ def create_gateway_api(
 
     app = FastAPI(lifespan=lifespan)
     app.state.gateway = gateway
+
+    class CapabilityToggleRequest(BaseModel):
+        enabled: bool
+        expected_revision: int
 
     def error_body(code: str, message: str, *, recoverable: bool = False, details=None):
         return {
@@ -426,6 +436,13 @@ def create_gateway_api(
     async def runtime_plugin_status():
         return gateway.runtime_plugin_status()
 
+    @app.patch("/api/v1/runtime/plugins/{plugin_id}", dependencies=[Depends(authorize_write)])
+    async def switch_runtime_plugin(plugin_id: str, payload: RuntimePluginSwitchRequest):
+        return gateway.set_runtime_plugin_enabled(
+            plugin_id, enabled=payload.enabled,
+            expected_revision=payload.expected_revision, actor=payload.actor,
+        )
+
     @app.post("/api/v1/runtime/plugins/reload", dependencies=[Depends(authorize_write)])
     async def reload_runtime_plugins(payload: RuntimeReloadRequest):
         return gateway.reload_runtime_plugins(
@@ -628,6 +645,10 @@ def create_gateway_api(
     @app.post("/api/v1/projects/{project_id}/notes/reindex", dependencies=[Depends(authorize_write)])
     async def reindex_notes(project_id: str):
         return gateway.note_store_for_project(project_id).reindex()
+
+    @app.post("/api/v1/projects/{project_id}/notes/initialize-structure", dependencies=[Depends(authorize_write)])
+    async def initialize_note_structure(project_id: str):
+        return gateway.note_store_for_project(project_id).initialize_structure()
 
     @app.post("/api/v1/projects/{project_id}/notes/folders", dependencies=[Depends(authorize_write)])
     async def create_note_folder(project_id: str, payload: NoteCreateRequest):
@@ -1166,6 +1187,16 @@ def create_gateway_api(
     async def delete_session(project_id: str, session_id: str):
         return gateway.delete_session(project_id, session_id)
 
+    @app.post("/api/v1/projects/{project_id}/sessions/{session_id}/branch", dependencies=[Depends(authorize_write)])
+    async def branch_session(project_id: str, session_id: str, payload: SessionBranchRequest):
+        return gateway.branch_session(project_id, session_id,
+                                      cutoff_record_id=payload.cutoff_record_id,
+                                      display_name=payload.display_name)
+
+    @app.post("/api/v1/projects/{project_id}/sessions/{session_id}/replace-last-turn", dependencies=[Depends(authorize_write)])
+    async def replace_last_turn(project_id: str, session_id: str):
+        return gateway.replace_last_turn(project_id, session_id)
+
     @app.get("/api/v1/projects/{project_id}/sessions/{session_id}/tool-results", dependencies=[Depends(authorize)])
     async def session_tool_result(
         project_id: str, session_id: str, record_id: str | None = None,
@@ -1329,6 +1360,35 @@ def create_gateway_api(
     @app.get("/api/v1/projects/{project_id}/skills", dependencies=[Depends(authorize)])
     async def skills(project_id: str):
         return gateway.skills(project_id).catalog()
+
+    @app.get("/api/v1/projects/{project_id}/capabilities", dependencies=[Depends(authorize)])
+    async def workspace_capabilities(project_id: str):
+        project = gateway.store.project(project_id)
+        state = load_switches(Path(project.path))
+        skills = gateway.skills(project_id).catalog()
+        return {
+            "revision": state["revision"],
+            "skills": [dict(item.model_dump(mode="json"), enabled=item.name not in state["disabled_skills"])
+                       for item in skills],
+            "tools": [dict(item, enabled=item["name"] not in state["disabled_tools"])
+                      for item in tool_catalog()],
+        }
+
+    @app.patch("/api/v1/projects/{project_id}/capabilities/{kind}/{name}", dependencies=[Depends(authorize_write)])
+    async def toggle_workspace_capability(project_id: str, kind: str, name: str,
+                                          payload: CapabilityToggleRequest):
+        project = gateway.store.project(project_id)
+        try:
+            return set_enabled(
+                Path(project.path), kind, name, payload.enabled, payload.expected_revision,
+                skill_names={item.name for item in gateway.skills(project_id).catalog()},
+            )
+        except CapabilityRevisionConflict as exc:
+            return Response(
+                content=json.dumps(error_body("capability_conflict", str(exc), recoverable=True,
+                                              details={"current_revision": exc.current_revision})),
+                status_code=409, media_type="application/json",
+            )
 
     @app.post(
         "/api/v1/projects/{project_id}/sessions/{session_id}/skills/refresh",

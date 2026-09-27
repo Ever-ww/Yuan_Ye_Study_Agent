@@ -83,6 +83,14 @@ export class GatewayApi {
   deleteSession(projectId: string, sessionId: string): Promise<{ deleted: boolean; session_id: string }> {
     return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
   }
+  branchSession(projectId: string, sessionId: string, cutoffRecordId?: string | null): Promise<{ session_id: string; display_name?: string }> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/branch`, {
+      method: "POST", body: JSON.stringify({ cutoff_record_id: cutoffRecordId || null }),
+    });
+  }
+  replaceLastTurn(projectId: string, sessionId: string): Promise<{ session_id: string; removed_records: number }> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/replace-last-turn`, { method: "POST" });
+  }
   session(projectId: string, sessionId: string): Promise<SessionRecord[]> {
     return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}`);
   }
@@ -172,9 +180,23 @@ export class GatewayApi {
   }
   maintenanceStatus(): Promise<JsonObject> { return this.request("/api/v1/maintenance"); }
   runtimePluginStatus(): Promise<JsonObject> { return this.request("/api/v1/runtime/plugins/status"); }
+  toggleRuntimePlugin(pluginId: string, enabled: boolean, expectedRevision: number): Promise<JsonObject> {
+    return this.request(`/api/v1/runtime/plugins/${encodeURIComponent(pluginId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled, expected_revision: expectedRevision, actor: this.clientId }),
+    });
+  }
   extensionStatus(): Promise<JsonObject> { return this.request("/api/v1/extensions/status"); }
   skills(projectId: string): Promise<JsonObject[]> {
     return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/skills`);
+  }
+  capabilities(projectId: string): Promise<{ revision: number; skills: JsonObject[]; tools: JsonObject[] }> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/capabilities`);
+  }
+  toggleCapability(projectId: string, kind: "skills" | "tools", name: string, enabled: boolean, expectedRevision: number): Promise<JsonObject> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/capabilities/${kind}/${encodeURIComponent(name)}`, {
+      method: "PATCH", body: JSON.stringify({ enabled, expected_revision: expectedRevision }),
+    });
   }
   manageSkill(input: {
     project_id: string; action: "install" | "update"; source: string; ref?: string;
@@ -266,6 +288,9 @@ export class GatewayApi {
   }
   reindexNotes(projectId: string): Promise<{ notes: number }> {
     return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes/reindex`, { method: "POST" });
+  }
+  initializeNoteStructure(projectId: string): Promise<{ created: NoteNode[]; folders: NoteNode[] }> {
+    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes/initialize-structure`, { method: "POST" });
   }
   createNote(projectId: string, name = "未命名笔记", parentId: string | null = null, content = ""): Promise<NoteNode> {
     return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/notes`, { method: "POST", body: JSON.stringify({ name, kind: "note", parent_id: parentId, content }) });

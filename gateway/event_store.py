@@ -23,6 +23,7 @@ from uuid import uuid4
 from croniter import croniter
 
 from gateway.models import GatewayEventEnvelope, now_iso
+from gateway.sqlite import ClosingConnection
 
 
 LOGGER = logging.getLogger(__name__)
@@ -227,7 +228,7 @@ class EventStore:
         )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30)
+        connection = sqlite3.connect(self.database_path, timeout=30, factory=ClosingConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")
@@ -594,7 +595,7 @@ class GatewayEventArchiveService:
             )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30, isolation_level=None)
+        connection = sqlite3.connect(self.database_path, timeout=30, isolation_level=None, factory=ClosingConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")

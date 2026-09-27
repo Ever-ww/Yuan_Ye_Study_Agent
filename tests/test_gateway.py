@@ -253,6 +253,26 @@ class FakeCodeSessions:
 
 
 class GatewayTests(unittest.TestCase):
+    def test_runtime_plugin_switch_api_requires_auth_and_passes_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            application = GatewayApplication(load_runtime_config(Path(value)))
+            application.set_runtime_plugin_enabled = Mock(return_value={
+                "revision": 2, "reload": {"status": "activated"},
+            })
+            with TestClient(create_gateway_api(application, access_token="test-token")) as client:
+                path = "/api/v1/runtime/plugins/sample.skill"
+                payload = {"enabled": False, "expected_revision": 1, "actor": "web-test"}
+                self.assertEqual(client.patch(path, json=payload).status_code, 401)
+                response = client.patch(
+                    path, json=payload,
+                    headers={"Authorization": "Bearer test-token"},
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["reload"]["status"], "activated")
+            application.set_runtime_plugin_enabled.assert_called_once_with(
+                "sample.skill", enabled=False, expected_revision=1, actor="web-test",
+            )
+
     def test_llm_translation_stream_is_stateless_and_does_not_create_run(self) -> None:
         async def fake_translation(**kwargs):
             self.assertEqual(kwargs["text"], "Selected sentence")

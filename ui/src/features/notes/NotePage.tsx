@@ -103,6 +103,15 @@ export function NotePage() {
   });
   useEffect(() => {
     if (!projectId) return;
+    void api.initializeNoteStructure(projectId).then((result) => {
+      const created = Array.isArray(result?.created) ? result.created : [];
+      if (!created.length) return;
+      setMessage(`已建立 Note 文件夹结构（${created.length} 个文件夹）`);
+      void queryClient.invalidateQueries({ queryKey: ["notes", projectId] });
+    }).catch(() => undefined);
+  }, [api, projectId, queryClient]);
+  useEffect(() => {
+    if (!projectId) return;
     workspaceCursor.current = 0;
     const streamId = `project:${projectId}:workspace`;
     const socket = api.subscribeStreams({ [streamId]: workspaceCursor.current }, (event) => {

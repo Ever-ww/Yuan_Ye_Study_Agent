@@ -20,6 +20,21 @@ from uuid import uuid4
 NoteKind = Literal["note", "folder"]
 _WIKI_LINK_RE = re.compile(r"\[\[([^\]|#]+)(?:\|[^\]]+)?\]\]")
 
+# Deliberately flat top-level folders keep the vault portable while still
+# giving research notes a predictable home. Users can add nested folders later.
+DEFAULT_NOTE_FOLDERS = (
+    "00 Inbox",
+    "10 Daily",
+    "20 Research",
+    "30 Projects",
+    "40 Experiments",
+    "50 Literature",
+    "60 Meetings",
+    "70 Resources",
+    "90 Templates",
+    "99 Archive",
+)
+
 
 class NoteConflict(RuntimeError):
     def __init__(self, current: dict[str, Any]) -> None:
@@ -306,6 +321,23 @@ class NoteStore:
             })
         self._remember_disk_signature()
         return self.get(note_id)
+
+    def initialize_structure(self) -> dict[str, Any]:
+        """Create the standard research-vault folders idempotently."""
+        with self._index_lock:
+            with self._connect() as connection:
+                existing = {
+                    str(row["name"]).casefold()
+                    for row in connection.execute(
+                        "SELECT name FROM note_nodes WHERE kind='folder' AND parent_id IS NULL",
+                    ).fetchall()
+                }
+            created: list[dict[str, Any]] = []
+            for name in DEFAULT_NOTE_FOLDERS:
+                if name.casefold() not in existing:
+                    created.append(self.create(name=name, kind="folder"))
+                    existing.add(name.casefold())
+            return {"created": created, "folders": list(self.list())}
 
     def update(
         self, note_id: str, *, name: str | None = None, content: str | None = None,

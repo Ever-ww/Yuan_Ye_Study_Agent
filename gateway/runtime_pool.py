@@ -63,6 +63,7 @@ class RuntimeEntry:
     reference_owner_id: str | None = None
     model_profile_id: str = "default"
     reasoning_effort: str = "none"
+    capability_revision: int = 0
 
 
 class RuntimePool:
@@ -418,6 +419,7 @@ class RuntimePool:
                 entry = RuntimeEntry(
                     runtime, monotonic(), getattr(runtime, "resource_generation_id", None),
                     getattr(runtime, "runtime_generation_reference_owner", None),
+                    capability_revision=getattr(runtime, "capability_revision", 0),
                 )
                 self._runtimes[key] = entry
                 created = True
@@ -614,6 +616,7 @@ class RuntimePool:
                                 getattr(runtime, "runtime_generation_reference_owner", None),
                                 current.model_profile_id,
                                 current.reasoning_effort,
+                                getattr(runtime, "capability_revision", 0),
                             )
                         if event.type is EventType.FINAL:
                             answer = str(event.payload.get("answer", ""))
@@ -840,6 +843,9 @@ class RuntimePool:
             self.outbox.wake()
 
     async def _runtime_for(self, run: RunRecord, workspace: Path) -> AgentRuntime:
+        from capability_switches import load_switches
+
+        capability_state = load_switches(workspace)
         scheduled = run.client_id.startswith("cron:")
         resource_snapshot = None
         if self.runtime_resource_manager is not None:
@@ -866,6 +872,7 @@ class RuntimePool:
                     )
                     and entry.model_profile_id == run.model_profile_id
                     and entry.reasoning_effort == run.reasoning_effort
+                    and entry.capability_revision == capability_state["revision"]
                 ):
                     entry.last_used = monotonic()
                     return entry.runtime
@@ -883,6 +890,8 @@ class RuntimePool:
             runtime = self._default_runtime(
                 workspace, self.approvals, run, resource_snapshot=resource_snapshot,
             )
+        if not hasattr(runtime, "capability_revision"):
+            runtime.capability_revision = capability_state["revision"]
         if scheduled and self.cron_service is not None:
             # The dispatch snapshot, not today's editable CronJob, is the
             # authority for an already materialized unattended run.
@@ -922,6 +931,7 @@ class RuntimePool:
             and not run.client_id.startswith("cron:")
             and hasattr(runtime, "tools")
             and "harness_capability" not in runtime.tools.names()
+            and "harness_capability" not in capability_state["disabled_tools"]
         ):
             if getattr(runtime, "generation_tools", None) is None:
                 from tools import HarnessCapabilityTool

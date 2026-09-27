@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, CircleCheck, LoaderCircle, Wrench } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, GitBranch, LoaderCircle, Pencil, Wrench, X } from "lucide-react";
 import { eventText, terminalEventTypes } from "../../events";
 import type { GatewayEvent, SessionRecord } from "../../types";
 import { Markdown } from "../../shared/ui/Markdown";
@@ -13,13 +13,15 @@ import {
 } from "./agentUsage";
 
 export function AgentTimeline({
-  history, events, optimisticQuestion, running, onLoadToolResult,
+  history, events, optimisticQuestion, running, onLoadToolResult, onEditLastQuestion, onBranch,
 }: {
   history: SessionRecord[];
   events: GatewayEvent[];
   optimisticQuestion: string;
   running: boolean;
   onLoadToolResult: (recordId: string) => Promise<string>;
+  onEditLastQuestion: (question: string) => void;
+  onBranch: (recordId: string | null) => void;
 }) {
   const viewport = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
@@ -50,6 +52,14 @@ export function AgentTimeline({
       });
     });
   }, [history, run.answer, run.terminal, run.text]);
+  const lastTurnIndex = useMemo(() => {
+    if (optimisticQuestion) return -1;
+    let result = -1;
+    historyGroups.forEach((group, index) => {
+      if (group.isTurn && group.records.some((record) => record.role === "user")) result = index;
+    });
+    return result;
+  }, [historyGroups, optimisticQuestion]);
   const empty = !history.length && !events.length && !optimisticQuestion && !running;
 
   return (
@@ -71,12 +81,14 @@ export function AgentTimeline({
         )}
 
         {historyGroups.map((group, index) => group.runId || group.isTurn ? (
-          <HistoryTurn records={group.records} key={`${group.runId || "history"}-${index}`} />
+          <HistoryTurn3 records={group.records} key={`${group.runId || "history"}-${index}`} isLastTurn={index === lastTurnIndex} running={running} onEditLastQuestion={onEditLastQuestion} onBranch={onBranch} />
         ) : group.records.map((record, recordIndex) => (
-          <HistoryRecord record={record} key={record.record_id || `${record.timestamp}-${index}-${recordIndex}`} onLoadToolResult={onLoadToolResult} />
+          <HistoryRecord3 record={record} key={record.record_id || `${record.timestamp}-${index}-${recordIndex}`} onLoadToolResult={onLoadToolResult} />
         )))}
 
         {optimisticQuestion && <article className="message user-message"><div className="message-role">你</div><p>{optimisticQuestion}</p></article>}
+
+        {optimisticQuestion && <div className="message-actions message-actions-outside optimistic-message-actions"><CopyButton text={optimisticQuestion} />{!running && <button className="message-action" type="button" title="编辑最后一轮输入" aria-label="编辑最后一轮输入" onClick={() => onEditLastQuestion(optimisticQuestion)}><Pencil size={14} />编辑</button>}</div>}
 
         {(!!events.length || running) && (
           <section className="current-run" aria-live="polite">
@@ -92,9 +104,9 @@ export function AgentTimeline({
             {expandedProcess && <RunProcess events={events} running={running} />}
 
             {!run.terminal && run.text && !events.some((event) => toolEventTypes.has(event.type)) && (
-              <Markdown className="markdown assistant-live">{run.text}</Markdown>
+              <><Markdown className="markdown assistant-live">{run.text}</Markdown><div className="message-actions message-actions-outside"><CopyButton text={run.text} /></div></>
             )}
-            {run.terminal && <Markdown className="markdown final-answer">{run.answer || run.text || "任务已结束，但模型没有返回文字。"}</Markdown>}
+            {run.terminal && <><Markdown className="markdown final-answer">{run.answer || run.text || "任务已结束，但模型没有返回文字。"}</Markdown><div className="message-actions message-actions-outside"><CopyButton text={run.answer || run.text || ""} /><button className="message-action" type="button" title="分支到新聊天" aria-label="分支到新聊天" onClick={() => onBranch(null)}><GitBranch size={14} />分支</button></div></>}
           </section>
         )}
       </div>
@@ -124,6 +136,70 @@ function HistoryTurn({ records }: { records: SessionRecord[] }) {
       {answer && <article className="message assistant-message"><div className="message-role">YYAgent</div><Markdown>{answer.content || (answer.tool_calls?.length ? "模型请求了工具调用。" : "")}</Markdown>{answer.timestamp && <time>{formatTimestamp(answer.timestamp)}</time>}</article>}
     </section>
   );
+}
+
+function HistoryTurn2({ records, isLastTurn, running, onEditLastQuestion, onBranch }: {
+  records: SessionRecord[];
+  isLastTurn: boolean;
+  running: boolean;
+  onEditLastQuestion: (question: string) => void;
+  onBranch: (recordId: string | null) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const question = records.find((record) => record.role === "user")?.content;
+  const answer = [...records].reverse().find((record) => record.role === "assistant" && !record.tool_calls?.length && typeof record.content === "string" && record.content.trim());
+  const cutoff = [...records].reverse().find((record) => record.record_id)?.record_id || null;
+  const duration = [...records].reverse().find((record) => typeof record.task_latency_ms === "number")?.task_latency_ms ?? durationFromRecords(records);
+  return <section className="history-turn">
+    {question && <article className="message user-message"><div className="message-role">用户</div>
+      {editing ? <div className="message-edit"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus /><div className="message-edit-actions"><button type="button" onClick={() => setEditing(false)}><X size={14} />取消</button><button type="button" disabled={!draft.trim()} onClick={() => { onEditLastQuestion(draft.trim()); setEditing(false); }}><Check size={14} />重新发送</button></div></div> : <p>{question}</p>}
+      <div className="message-actions"><CopyButton text={question} />{isLastTurn && !running && !editing && <button className="message-action" type="button" title="编辑最后一轮输入" aria-label="编辑最后一轮输入" onClick={() => { setDraft(question); setEditing(true); }}><Pencil size={14} />编辑</button>}</div>
+    </article>}
+    <button className="process-toggle" type="button" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? <ChevronDown aria-hidden="true" /> : <ChevronRight aria-hidden="true" />}用时 {formatDuration(duration)} · {expanded ? "收起过程" : "查看过程"}</button>
+    {expanded && <HistoryProcess records={records} />}
+    {answer && <article className="message assistant-message"><div className="message-role">YYAgent</div><Markdown>{answer.content || ""}</Markdown><div className="message-actions"><CopyButton text={answer.content || ""} /><button className="message-action" type="button" title="分支到新聊天" aria-label="分支到新聊天" onClick={() => onBranch(cutoff)}><GitBranch size={14} />分支</button></div>{answer.timestamp && <time>{formatTimestamp(answer.timestamp)}</time>}</article>}
+  </section>;
+}
+
+function HistoryTurn3({ records, isLastTurn, running, onEditLastQuestion, onBranch }: {
+  records: SessionRecord[];
+  isLastTurn: boolean;
+  running: boolean;
+  onEditLastQuestion: (question: string) => void;
+  onBranch: (recordId: string | null) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const question = records.find((record) => record.role === "user")?.content;
+  const answer = [...records].reverse().find((record) => record.role === "assistant" && !record.tool_calls?.length && typeof record.content === "string" && record.content.trim());
+  const cutoff = [...records].reverse().find((record) => record.record_id)?.record_id || null;
+  const duration = [...records].reverse().find((record) => typeof record.task_latency_ms === "number")?.task_latency_ms ?? durationFromRecords(records);
+  return <section className="history-turn">
+    {question && <>
+      <article className="message user-message"><div className="message-role">用户</div>
+        {editing ? <div className="message-edit"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus /><div className="message-edit-actions"><button type="button" onClick={() => setEditing(false)}><X size={14} />取消</button><button type="button" disabled={!draft.trim()} onClick={() => { onEditLastQuestion(draft.trim()); setEditing(false); }}><Check size={14} />重新发送</button></div></div> : <p>{question}</p>}
+      </article>
+      <div className="message-actions message-actions-outside user-message-actions"><CopyButton text={question} />{isLastTurn && !running && !editing && <button className="message-action" type="button" title="编辑最后一轮输入" aria-label="编辑最后一轮输入" onClick={() => { setDraft(question); setEditing(true); }}><Pencil size={14} />编辑</button>}</div>
+    </>}
+    <button className="process-toggle" type="button" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? <ChevronDown aria-hidden="true" /> : <ChevronRight aria-hidden="true" />}用时 {formatDuration(duration)} · {expanded ? "收起过程" : "查看过程"}</button>
+    {expanded && <HistoryProcess records={records} />}
+    {answer && <>
+      <article className="message assistant-message"><div className="message-role">YYAgent</div><Markdown>{answer.content || ""}</Markdown>{answer.timestamp && <time>{formatTimestamp(answer.timestamp)}</time>}</article>
+      <div className="message-actions message-actions-outside assistant-message-actions"><CopyButton text={answer.content || ""} /><button className="message-action" type="button" title="分支到新聊天" aria-label="分支到新聊天" onClick={() => onBranch(cutoff)}><GitBranch size={14} />分支</button></div>
+    </>}
+  </section>;
+}
+
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return <button className="message-action" type="button" title="复制" aria-label="复制" onClick={() => {
+    const clipboard = navigator.clipboard;
+    if (!clipboard) return;
+    void clipboard.writeText(text).then(() => { setCopied(true); window.setTimeout(() => setCopied(false), 1200); });
+  }}>{copied ? <><Check size={14} />已复制</> : <><Copy size={14} />复制</>}</button>;
 }
 
 function HistoryProcess({ records }: { records: SessionRecord[] }) {
@@ -166,6 +242,30 @@ function HistoryRecord({ record, onLoadToolResult }: { record: SessionRecord; on
       {record.timestamp && <time>{formatTimestamp(record.timestamp)}</time>}
     </article>
   );
+}
+
+function HistoryRecord2({ record, onLoadToolResult }: { record: SessionRecord; onLoadToolResult: (recordId: string) => Promise<string> }) {
+  if (record.role !== "user" && record.role !== "assistant") return <HistoryRecord record={record} onLoadToolResult={onLoadToolResult} />;
+  return <article className={`message ${record.role === "user" ? "user-message" : "assistant-message"}`}>
+    <div className="message-role">{record.role === "user" ? "用户" : "YYAgent"}</div>
+    {record.reasoning && <details className="reasoning"><summary>思考过程</summary><pre>{record.reasoning}</pre></details>}
+    <Markdown>{record.content || ""}</Markdown>
+    {record.content && <div className="message-actions"><CopyButton text={record.content} /></div>}
+    {record.timestamp && <time>{formatTimestamp(record.timestamp)}</time>}
+  </article>;
+}
+
+function HistoryRecord3({ record, onLoadToolResult }: { record: SessionRecord; onLoadToolResult: (recordId: string) => Promise<string> }) {
+  if (record.role !== "user" && record.role !== "assistant") return <HistoryRecord record={record} onLoadToolResult={onLoadToolResult} />;
+  return <>
+    <article className={`message ${record.role === "user" ? "user-message" : "assistant-message"}`}>
+      <div className="message-role">{record.role === "user" ? "用户" : "YYAgent"}</div>
+      {record.reasoning && <details className="reasoning"><summary>思考过程</summary><pre>{record.reasoning}</pre></details>}
+      <Markdown>{record.content || ""}</Markdown>
+      {record.timestamp && <time>{formatTimestamp(record.timestamp)}</time>}
+    </article>
+    {record.content && <div className={`message-actions message-actions-outside ${record.role === "user" ? "user-message-actions" : "assistant-message-actions"}`}><CopyButton text={record.content} /></div>}
+  </>;
 }
 
 function RunProcess({ events, running }: { events: GatewayEvent[]; running: boolean }) {

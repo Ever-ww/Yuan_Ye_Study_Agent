@@ -19,6 +19,7 @@ export type Session = {
   first_question_at?: string | null;
   latest_file: string;
   message_count: number;
+  display_name?: string | null;
 };
 
 export type SessionRecord = {
@@ -121,6 +122,7 @@ export type ObserverState = {
 
 export type ObserverStatus = {
   run_id?: string;
+  status?: "active" | "finalized" | "failed" | string;
   progress_markdown?: string;
   state?: ObserverState;
   correction_proposal?: {

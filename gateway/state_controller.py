@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 from typing import Any
 from uuid import uuid4
 
+from gateway.sqlite import ClosingConnection
+
 if TYPE_CHECKING:
     from backup import AgentHomeWriteGate
 
@@ -1149,7 +1151,7 @@ class StateController:
     def _backup_before_state_migration(self) -> None:
         if not self.database_path.exists() or self.database_path.stat().st_size == 0:
             return
-        with sqlite3.connect(self.database_path, timeout=30) as source:
+        with sqlite3.connect(self.database_path, timeout=30, factory=ClosingConnection) as source:
             current = int(source.execute("PRAGMA user_version").fetchone()[0])
             has_state = source.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_states'",
@@ -1163,7 +1165,7 @@ class StateController:
                 self.migration_backup_path = (
                     directory / f"gateway-state-v{current}-to-v{self.SCHEMA_VERSION}-{stamp}.sqlite3"
                 )
-            with sqlite3.connect(self.migration_backup_path, timeout=30) as target:
+            with sqlite3.connect(self.migration_backup_path, timeout=30, factory=ClosingConnection) as target:
                 source.backup(target)
 
     def create_state(
@@ -4530,7 +4532,7 @@ class StateController:
         return DurableApproval.model_validate_json(row["approval_json"], strict=True)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30, isolation_level=None)
+        connection = sqlite3.connect(self.database_path, timeout=30, isolation_level=None, factory=ClosingConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")
@@ -5219,8 +5221,8 @@ class StateController:
                 connection.close()
 
     def _restore_backup(self, backup_path: Path) -> None:
-        with sqlite3.connect(backup_path, timeout=30) as source:
-            with sqlite3.connect(self.database_path, timeout=30) as target:
+        with sqlite3.connect(backup_path, timeout=30, factory=ClosingConnection) as source:
+            with sqlite3.connect(self.database_path, timeout=30, factory=ClosingConnection) as target:
                 source.backup(target)
 
 

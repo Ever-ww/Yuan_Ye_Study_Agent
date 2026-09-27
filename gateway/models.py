@@ -143,6 +143,13 @@ class ProjectCreateRequest(BaseModel):
     name: str | None = None
 
 
+class SessionBranchRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    cutoff_record_id: str | None = Field(default=None, min_length=1)
+    display_name: str | None = Field(default=None, min_length=1, max_length=200)
+
+
 class PaperPatchRequest(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
@@ -559,6 +566,14 @@ class RuntimeReloadRequest(BaseModel):
 
     actor: str = Field(min_length=1)
     approved_plan_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class RuntimePluginSwitchRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    enabled: bool
+    expected_revision: int = Field(ge=0)
+    actor: str = Field(min_length=1)
 
 
 class RuntimePluginRollbackRequest(BaseModel):

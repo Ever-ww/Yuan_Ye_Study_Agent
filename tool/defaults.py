@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from .contracts import AsyncTool
 from .registry import AsyncToolRegistry
 from tools.bash import BashTool
+from tools.browser_use import BrowserUseTool
 from tools.calculator import CalculatorTool
 from tools.cronjob import CronJobTool
 from tools.current_time import CurrentTimeTool
@@ -63,6 +64,11 @@ def default_tools(
     runtime_profile: str = "interactive",
     tool_module=None,
     skill_install_service: "SkillService | None" = None,
+    browser_use_enabled: bool = False,
+    browser_use_headless: bool = False,
+    browser_use_timeout_seconds: float = 60.0,
+    browser_use_allowed_domains: tuple[str, ...] = (),
+    browser_use_allow_private_urls: bool = False,
 ) -> AsyncToolRegistry:
     """装配首期默认工具；项目根目录由执行上下文统一传入。"""
     selected_agent_root = (agent_root or project_root).resolve()
@@ -82,6 +88,16 @@ def default_tools(
         selected("CurrentTimeTool", CurrentTimeTool)(),
         selected("ProfileReadTool", ProfileReadTool)(selected_agent_root),
     ]
+    if browser_use_enabled:
+        browser_use_type = getattr(tool_module, "BrowserUseTool", BrowserUseTool)
+        builtins.append(browser_use_type(
+            project_root,
+            agent_root=selected_agent_root,
+            headless=browser_use_headless,
+            timeout_seconds=browser_use_timeout_seconds,
+            allowed_domains=browser_use_allowed_domains,
+            allow_private_urls=browser_use_allow_private_urls,
+        ))
     if web_search_tool is not None:
         builtins.append(web_search_tool)
     if web_fetch_tool is not None:

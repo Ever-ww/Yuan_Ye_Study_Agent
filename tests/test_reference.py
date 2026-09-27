@@ -98,7 +98,7 @@ class ReferenceTests(unittest.TestCase):
     def test_v1_papers_schema_is_backed_up_and_migrated(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             database = Path(value) / "reference.sqlite3"
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.executescript("""
                     CREATE TABLE papers(
                         paper_id TEXT PRIMARY KEY,title TEXT NOT NULL,

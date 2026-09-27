@@ -1,4 +1,4 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import { AgentPage } from "./features/agent/AgentPage";
 
@@ -10,6 +10,27 @@ const WritePage = lazy(() => import("./features/writer/WritePage").then((module)
 const NotePage = lazy(() => import("./features/notes/NotePage").then((module) => ({ default: module.NotePage })));
 
 export default function App() {
+  useEffect(() => {
+    const labelButton = (event: Event) => {
+      if (!(event.target instanceof Element)) return;
+      const button = event.target.closest<HTMLElement>("button, [role='button']");
+      if (!button || (button.title && button.dataset.autoTooltip !== "true")) return;
+      const label = button.getAttribute("aria-label")?.trim()
+        || button.querySelector("strong")?.textContent?.trim()
+        || button.textContent?.replace(/\s+/g, " ").trim();
+      if (label) {
+        button.title = label;
+        button.dataset.autoTooltip = "true";
+      }
+    };
+    document.addEventListener("pointerover", labelButton);
+    document.addEventListener("focusin", labelButton);
+    return () => {
+      document.removeEventListener("pointerover", labelButton);
+      document.removeEventListener("focusin", labelButton);
+    };
+  }, []);
+
   return (
     <Suspense fallback={<div className="boot-state"><div className="boot-mark">YY</div><h1>正在加载工作区</h1></div>}>
       <Routes>

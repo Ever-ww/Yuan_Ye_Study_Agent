@@ -75,6 +75,17 @@ class AsyncToolRegistry:
         self._frozen = True
         return self
 
+    async def close(self) -> None:
+        """Close tools that own external resources (for example a browser)."""
+        for tool in reversed(tuple(self._tools.values())):
+            closer = getattr(tool, "close", None)
+            if callable(closer):
+                try:
+                    await closer()
+                except Exception:
+                    # Tool cleanup must not replace the Runtime result.
+                    continue
+
     @property
     def frozen(self) -> bool:
         return self._frozen
@@ -167,6 +178,11 @@ class AsyncToolRegistry:
             if tool not in selected:
                 selected.append(tool)
         return AsyncToolRegistry(selected)
+
+    def excluding(self, names: Iterable[str]) -> "AsyncToolRegistry":
+        """Create a new registry without Workspace-disabled tools."""
+        excluded = set(names)
+        return AsyncToolRegistry(tool for name, tool in self._tools.items() if name not in excluded)
 
     def ends_turn(self, name: str, result: str) -> bool:
         """Return whether a successful Tool result must end the current model turn."""

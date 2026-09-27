@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "plugins": [
+    {"plugin_id":"builtin.observer","display_name":"任务观察","description":"跟踪任务进度、完成状态与纠偏建议。","root":"source","path":"observer_plugins","kind":"observer","profiles":["interactive","cron","dream","harness:manual","harness:error","harness:capability","harness:dream"]},
+    {"plugin_id":"builtin.tools","display_name":"内置工具","description":"提供文件、搜索、浏览器及其他 Agent 工具。属于核心能力，不能单独关闭。","root":"source","path":"tools","kind":"tool","profiles":["interactive","cron","subagent"]},
+    {"plugin_id":"builtin.skills","display_name":"内置技能","description":"为 Agent 提供经过审核的工作流程。","root":"source","path":"skills","kind":"skill","profiles":["interactive","cron","dream"]},
+    {"plugin_id":"runtime.skills.interactive","display_name":"交互任务技能","description":"只在普通对话中加载的附加技能。","root":"source","path":"runtime-resources/interactive/skills","kind":"skill","profiles":["interactive"],"requires_plugins":["builtin.skills"],"toggleable":true},
+    {"plugin_id":"runtime.skills.cron","display_name":"定时任务技能","description":"只在 Cron 任务中加载的附加技能。","root":"source","path":"runtime-resources/cron/skills","kind":"skill","profiles":["cron"],"requires_plugins":["builtin.skills"],"toggleable":true},
+    {"plugin_id":"runtime.skills.dream","display_name":"Dream 技能","description":"只在 Dream 任务中加载的附加技能。","root":"source","path":"runtime-resources/dream/skills","kind":"skill","profiles":["dream"],"requires_plugins":["builtin.skills"],"toggleable":true},
+    {"plugin_id":"builtin.prompts","display_name":"Agent 提示词","description":"管理 Agent 使用的稳定提示词资源。","root":"agent","path":".yy/agents","kind":"stable_prompt","profiles":["interactive","cron","subagent"]},
+    {"plugin_id":"builtin.extensions","display_name":"扩展 Hook","description":"在受控生命周期节点运行已授权的扩展逻辑。","root":"source","path":"extension","kind":"extension","profiles":["interactive"],"requires_plugins":["builtin.tools"],"toggleable":true},
+    {"plugin_id":"harness.tools.common","display_name":"Code 通用工具","description":"供所有 Code 工作负载使用的共同工具。","root":"source","path":"harness-evolution/runtime/tools/common","kind":"tool","profiles":["harness:manual","harness:error","harness:capability","harness:dream"]},
+    {"plugin_id":"harness.tools.manual","display_name":"手动 Code 工具","description":"供手动 Coding Session 使用的工具。","root":"source","path":"harness-evolution/runtime/tools/manual","kind":"tool","profiles":["harness:manual"],"requires_plugins":["harness.tools.common"],"toggleable":true},
+    {"plugin_id":"harness.tools.error","display_name":"故障修复工具","description":"供自动故障修复流程使用的 Code 工具。","root":"source","path":"harness-evolution/runtime/tools/error","kind":"tool","profiles":["harness:error"],"requires_plugins":["harness.tools.common"],"toggleable":true},
+    {"plugin_id":"harness.tools.capability","display_name":"能力演进工具","description":"供能力演进任务使用的 Code 工具。","root":"source","path":"harness-evolution/runtime/tools/capability","kind":"tool","profiles":["harness:capability"],"requires_plugins":["harness.tools.common"],"toggleable":true},
+    {"plugin_id":"harness.tools.dream","display_name":"Dream Code 工具","description":"供 Dream 中的代码任务使用的工具。","root":"source","path":"harness-evolution/runtime/tools/dream","kind":"tool","profiles":["harness:dream"],"requires_plugins":["harness.tools.common"],"toggleable":true},
+    {"plugin_id":"harness.skills.common","display_name":"Code 通用技能","description":"供所有 Code 工作负载使用的共同技能。","root":"source","path":"harness-evolution/runtime/skills/common","kind":"skill","profiles":["harness:manual","harness:error","harness:capability","harness:dream"]},
+    {"plugin_id":"harness.skills.manual","display_name":"手动 Code 技能","description":"供手动 Coding Session 使用的技能。","root":"source","path":"harness-evolution/runtime/skills/manual","kind":"skill","profiles":["harness:manual"],"requires_plugins":["harness.skills.common"],"toggleable":true},
+    {"plugin_id":"harness.skills.error","display_name":"故障修复技能","description":"供自动故障修复流程使用的技能。","root":"source","path":"harness-evolution/runtime/skills/error","kind":"skill","profiles":["harness:error"],"requires_plugins":["harness.skills.common"],"toggleable":true},
+    {"plugin_id":"harness.skills.capability","display_name":"能力演进技能","description":"供能力演进任务使用的技能。","root":"source","path":"harness-evolution/runtime/skills/capability","kind":"skill","profiles":["harness:capability"],"requires_plugins":["harness.skills.common"],"toggleable":true},
+    {"plugin_id":"harness.skills.dream","display_name":"Dream Code 技能","description":"供 Dream 中的代码任务使用的技能。","root":"source","path":"harness-evolution/runtime/skills/dream","kind":"skill","profiles":["harness:dream"],"requires_plugins":["harness.skills.common"],"toggleable":true}
+  ]
+}

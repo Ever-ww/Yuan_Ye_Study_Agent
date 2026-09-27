@@ -36,6 +36,25 @@ def _make_skill(
 
 
 class SkillTests(unittest.TestCase):
+    def test_runtime_catalog_excludes_other_profile_builtins(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            agent_root, workspace = base / "home", base / "workspace"
+            interactive_source, dream_source = base / "interactive", base / "dream"
+            _make_skill(interactive_source / "skills", "chat-only")
+            _make_skill(dream_source / "skills", "dream-only")
+
+            interactive = SkillService(
+                agent_root, workspace, interactive_source,
+                restrict_builtins_to_source=True,
+            )
+            dream = SkillService(
+                agent_root, workspace, dream_source,
+                restrict_builtins_to_source=True,
+            )
+            self.assertEqual([item.name for item in interactive.catalog()], ["chat-only"])
+            self.assertEqual([item.name for item in dream.catalog()], ["dream-only"])
+
     def test_catalog_uses_workspace_install_and_ignores_agent_home_legacy(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             base = Path(value)

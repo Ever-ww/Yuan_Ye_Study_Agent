@@ -6,9 +6,11 @@ export function AgentSidebar({
   sessions,
   projectId,
   sessionId,
+  draftSessionOpen,
   onProject,
   onSession,
   onNewSession,
+  onDiscardDraft,
   onAddProject,
   onDeleteSession,
 }: {
@@ -16,9 +18,11 @@ export function AgentSidebar({
   sessions: Session[];
   projectId?: string;
   sessionId?: string;
+  draftSessionOpen: boolean;
   onProject: (project: Project) => void;
   onSession: (sessionId: string) => void;
   onNewSession: () => void;
+  onDiscardDraft: () => void;
   onAddProject: () => void;
   onDeleteSession: (sessionId: string) => void;
 }) {
@@ -43,17 +47,20 @@ export function AgentSidebar({
 
       <div className="session-filter"><Search aria-hidden="true" /><span>最近会话</span></div>
       <nav className="session-list" aria-label="最近会话">
-        <button type="button" className={!sessionId ? "session-item active" : "session-item"} onClick={onNewSession}>
-          <strong>新会话</strong><small>从空白上下文开始</small>
-        </button>
+        {draftSessionOpen && !sessionId && <div className="session-row active">
+          <button type="button" className="session-item" title="新会话草稿" onClick={onNewSession}>
+            <strong>新会话</strong><small>尚未发送消息</small>
+          </button>
+          <button type="button" className="session-delete" aria-label="删除空白会话" title="删除空白会话" onClick={onDiscardDraft}><Trash2 aria-hidden="true" /></button>
+        </div>}
         {sessions.map((session) => {
           const question = session.first_question?.trim() || "未命名会话";
-          const label = shortQuestion(question);
+          const label = session.display_name?.trim() || shortQuestion(question);
           return (
             <div className={sessionId === session.session_id ? "session-row active" : "session-row"} key={session.session_id}>
               <button type="button" className="session-item" title={question} onClick={() => onSession(session.session_id)}>
                 <strong>{label}</strong>
-                <small>{formatSessionDate(session.first_question_at || session.created_at)} · {session.message_count} 条记录</small>
+                <small>{session.display_name ? `${shortQuestion(question)} · ` : ""}{formatSessionDate(session.first_question_at || session.created_at)} · {session.message_count} 条记录</small>
               </button>
               <button type="button" className="session-delete" aria-label={`删除会话 ${label}`} title="删除会话" onClick={() => onDeleteSession(session.session_id)}>
                 <Trash2 aria-hidden="true" />

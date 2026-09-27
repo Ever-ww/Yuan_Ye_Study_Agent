@@ -12,6 +12,7 @@ import { StatusMark } from "../../shared/ui/StatusMark";
 import type { LatexCompilation, LatexDiagnostic, WorkspaceDocument, WorkspaceEntry } from "../../types";
 import { CodeEditor } from "./CodeEditor";
 import { WorkspaceTree } from "./WorkspaceTree";
+import { isNoteWorkspacePath, writeChanges } from "./workspaceScope";
 
 type OpenDocument = WorkspaceDocument & { draft: string; dirty: boolean };
 
@@ -30,7 +31,7 @@ export function WritePage() {
   const projects = useQuery({ queryKey: ["projects"], queryFn: () => api.projects() });
   const projectId = params.get("project") || window.localStorage.getItem("yyagent.web.selected-project") || projects.data?.[0]?.project_id;
   const filePath = params.get("file") || "";
-  const changes = useQuery({ queryKey: ["workspace", "changes", projectId, treeRevision], queryFn: () => api.workspaceChanges(projectId!), enabled: Boolean(projectId) });
+  const changes = useQuery({ queryKey: ["workspace", "changes", projectId, treeRevision], queryFn: async () => { const value = await api.workspaceChanges(projectId!); return { ...value, changes: writeChanges(value.changes) }; }, enabled: Boolean(projectId) });
   const compilation = useQuery({
     queryKey: ["latex", projectId, compilationId],
     queryFn: () => api.latexCompilation(projectId!, compilationId),
@@ -40,7 +41,20 @@ export function WritePage() {
   const active = documents.find((item) => item.path === activePath);
 
   useEffect(() => {
-    if (!projectId || !filePath) return;
+    if (!isNoteWorkspacePath(filePath)) return;
+    setDocuments((items) => items.filter((item) => !isNoteWorkspacePath(item.path)));
+    setActivePath("");
+    setSelected(null);
+    setMessage("Note 内容请在 Note 模式打开，Write 只显示论文和项目文件。");
+    setParams((current) => {
+      const next = new URLSearchParams(current);
+      next.delete("file");
+      return next;
+    });
+  }, [filePath, setParams]);
+
+  useEffect(() => {
+    if (!projectId || !filePath || isNoteWorkspacePath(filePath)) return;
     const existing = documents.find((item) => item.path === filePath);
     if (existing) { if (activePath !== existing.path) setActivePath(existing.path); return; }
     let stale = false;
@@ -86,6 +100,10 @@ export function WritePage() {
     return () => socket.close();
   }, [api, projectId, queryClient, refreshTree]);
   async function open(entry: WorkspaceEntry) {
+    if (isNoteWorkspacePath(entry.path)) {
+      setMessage("Note 内容请在 Note 模式打开，Write 只显示论文和项目文件。");
+      return;
+    }
     setSelected(entry); setMovePath(entry.path); setInspectorOpen(true);
     if (!projectId || entry.kind !== "file") return;
     setParams((current) => {
@@ -121,6 +139,10 @@ export function WritePage() {
 
   async function createEntry() {
     if (!projectId || !entryName.trim()) return;
+    if (selected && isNoteWorkspacePath(selected.path)) {
+      setMessage("Write 不能在 Note 目录中创建文件。");
+      return;
+    }
     const parent = selected?.kind === "directory" ? selected.path : selected?.path.includes("\\") ? selected.path.slice(0, selected.path.lastIndexOf("\\")) : "YYWorkspace:\\";
     const path = `${(parent || "YYWorkspace:\\").replace(/\\?$/, "\\")}${entryName.trim()}`;
     setBusy(true); setMessage("");
@@ -129,6 +151,10 @@ export function WritePage() {
     finally { setBusy(false); }
   }
   async function removeSelected() {
+    if (selected && isNoteWorkspacePath(selected.path)) {
+      setMessage("Write 不能删除 Note 内容，请切换到 Note 模式操作。");
+      return;
+    }
     if (!projectId || !selected || !window.confirm(`删除 ${selected.path}？将先创建可恢复 Checkpoint。`)) return;
     setBusy(true);
     try { const result = await api.deleteWorkspaceEntry(projectId, selected.path); setDocuments((items) => items.filter((item) => item.path !== selected.path && !item.path.startsWith(`${selected.path}\\`))); if (activePath === selected.path || activePath.startsWith(`${selected.path}\\`)) { setActivePath(""); setParams((current) => { const next = new URLSearchParams(current); next.delete("file"); return next; }); } setSelected(null); setMessage(`已删除；Checkpoint ${String(result.checkpoint_id || "已记录")}`); refreshTree(); }
@@ -136,6 +162,10 @@ export function WritePage() {
     finally { setBusy(false); }
   }
   async function moveSelected() {
+    if (selected && isNoteWorkspacePath(selected.path)) {
+      setMessage("Write 不能移动 Note 内容，请切换到 Note 模式操作。");
+      return;
+    }
     if (!projectId || !selected || !movePath.trim() || movePath.trim() === selected.path) return;
     setBusy(true); setMessage("");
     try {
@@ -185,7 +215,7 @@ export function WritePage() {
   async function revealDiagnostic(diagnostic: LatexDiagnostic) {
     if (!projectId) return;
     const requestedPath = diagnostic.file || compilation.data?.main_path;
-    if (!requestedPath) return;
+    if (!requestedPath || isNoteWorkspacePath(requestedPath)) return;
     setBusy(true); setMessage("");
     try {
       let document = documents.find((item) => item.path === requestedPath);
@@ -208,7 +238,7 @@ export function WritePage() {
 
   return <WorkbenchShell projectName="Write" modelControls={<span className="mode-chip">YYWorkspace:\</span>} inspectorOpen={inspectorOpen} onToggleInspector={() => setInspectorOpen((value) => !value)} onOpenCommands={() => setCommandsOpen(true)} sidebarLabel="Workspace 文件" inspectorLabel="文件与变更" sidebar={<div className="sidebar-layout"><div className="sidebar-heading"><div><span>逻辑工作区</span><h2>Write</h2></div></div>{projectId && <WorkspaceTree projectId={projectId} selected={selected?.path} revision={treeRevision} onSelect={(entry) => void open(entry)} />}</div>} inspector={<WriterInspector selected={selected} changes={changes.data?.changes || []} entryName={entryName} entryKind={entryKind} movePath={movePath} busy={busy} onName={setEntryName} onKind={setEntryKind} onMovePath={setMovePath} onCreate={() => void createEntry()} onMove={() => void moveSelected()} onDelete={() => void removeSelected()} onSend={() => active && handoffToAgent(active, navigate)} />} footer={<><StatusMark state={message && conflict ? "warning" : "ok"} label={conflict ? "保存冲突" : "Workspace CAS"} /><span className="status-spacer" /><span>{changes.data?.changes.length || 0} 项 Git 变更</span></>}>
     <div className="writer-workspace">
-      <div className="editor-tabs" role="tablist">{documents.map((document) => <button role="tab" aria-selected={document.path === activePath} className={document.path === activePath ? "active" : ""} key={document.path} onClick={() => setActivePath(document.path)}><FileText aria-hidden="true" /><span>{document.name}</span>{document.dirty && <i aria-label="未保存">●</i>}<span className="tab-close" role="button" aria-label={`关闭 ${document.name}`} onClick={(event) => { event.stopPropagation(); close(document.path); }}><X aria-hidden="true" /></span></button>)}</div>
+      <div className="editor-tabs" role="tablist">{documents.map((document) => <button role="tab" aria-selected={document.path === activePath} className={document.path === activePath ? "active" : ""} key={document.path} onClick={() => setActivePath(document.path)}><FileText aria-hidden="true" /><span>{document.name}</span>{document.dirty && <i aria-label="未保存">●</i>}<span className="tab-close" role="button" aria-label={`关闭 ${document.name}`} title={`关闭 ${document.name}`} onClick={(event) => { event.stopPropagation(); close(document.path); }}><X aria-hidden="true" /></span></button>)}</div>
       {message && <div className={`operation-message ${conflict ? "conflict" : ""}`} role="status">{message}{conflict && <span className="conflict-actions"><button onClick={() => void reloadConflict()}>重新加载</button><button onClick={() => setConflict(null)}>保留草稿</button></span>}</div>}
       {active ? <Group className="writer-panels" orientation="vertical"><Panel id="editor" minSize="40%" defaultSize="70%"><div className="editor-pane"><header><code>{active.path}</code><div className="editor-actions">{active.path.toLocaleLowerCase().endsWith(".tex") && <button disabled={busy || ["queued", "running"].includes(compilation.data?.status || "")} onClick={() => void compileLatex()}><Play aria-hidden="true" />编译 PDF</button>}<button disabled={!active.dirty || busy} onClick={() => void save()}><Save aria-hidden="true" />{busy ? "保存中…" : "保存"}</button></div></header><CodeEditor path={active.path} value={active.draft} readOnly={busy} focusLine={focusLine} onChange={updateDraft} /></div></Panel><Separator className="panel-separator" /><Panel id="changes" minSize="18%" defaultSize="30%" collapsible><div className="writer-output-grid"><WorkspaceChanges changes={changes.data?.changes || []} />{active.path.toLocaleLowerCase().endsWith(".tex") && <LatexPanel compilation={compilation.data} pdfUrl={pdfUrl} log={compileLog} onDiagnostic={(diagnostic) => void revealDiagnostic(diagnostic)} onCancel={() => projectId && compilationId && void api.cancelLatexCompilation(projectId, compilationId).then(() => compilation.refetch())} />}</div></Panel></Group> : <div className="agent-empty"><p className="eyebrow">WRITE WORKSPACE</p><h1>从文件树打开一个文本文件。</h1><p>浏览器只使用逻辑路径。保存通过 ETag 比较和原子替换完成，不会静默覆盖 Agent 或其他窗口的修改。</p></div>}
     </div>

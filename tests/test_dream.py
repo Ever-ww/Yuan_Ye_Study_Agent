@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from fastapi.testclient import TestClient
 
 from Agent import load_runtime_config
+from Agent.contracts import ModelReply, ToolCall
 from dream import DreamScheduler, DreamService, DreamStatus, SessionArchiveReader
 from gateway.api import create_gateway_api
 from gateway.application import GatewayApplication
@@ -57,6 +58,51 @@ class _DreamModel:
 
 
 class DreamTests(unittest.TestCase):
+    def test_dream_reads_workspace_skill_without_other_tools_or_session_history(self) -> None:
+        async def check(root: Path) -> None:
+            source = root / "source"
+            skill = source / "skills" / "dream-guidance"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\nname: dream-guidance\ndescription: Dream memory guidance\n---\n\n"
+                "Keep only evidenced facts.\n",
+                encoding="utf-8",
+            )
+            workspace = root / "workspace"
+            config = load_runtime_config(root, workspace_root=workspace, dream_enabled=False)
+
+            class Provider:
+                def __init__(self) -> None:
+                    self.calls: list[tuple[list[dict], list[dict]]] = []
+
+                async def complete(self, messages, tools):
+                    self.calls.append((list(messages), list(tools)))
+                    if not any(message["role"] == "tool" for message in messages):
+                        return ModelReply(tool_calls=(ToolCall(
+                            name="skill_read", arguments={"name": "dream-guidance"},
+                        ),), finished=False)
+                    return ModelReply(text='{"candidates":[]}')
+
+            provider = Provider()
+            service = DreamService(
+                config,
+                provider_factory=lambda: provider,
+                skill_source_root=lambda: source,
+            )
+            result = await service.run_stateless_model([
+                {"role": "system", "content": "Return JSON"},
+                {"role": "user", "content": "Dream task"},
+            ])
+            self.assertEqual(result, '{"candidates":[]}')
+            self.assertEqual(len(provider.calls), 2)
+            self.assertIn("dream-guidance", provider.calls[0][0][0]["content"])
+            self.assertEqual([tool["name"] for tool in provider.calls[0][1]], ["skill_read"])
+            self.assertIn("Keep only evidenced facts", provider.calls[1][0][-1]["content"])
+            self.assertFalse(any(config.memory_dir.glob("session/*.jsonl")))
+
+        with tempfile.TemporaryDirectory() as value:
+            asyncio.run(check(Path(value)))
+
     def test_model_attempt_timeout_becomes_failed_result(self) -> None:
         async def check(root: Path) -> None:
             config = load_runtime_config(
@@ -303,6 +349,54 @@ class DreamTests(unittest.TestCase):
             rollback = asyncio.run(service.rollback(result.run_id))
             self.assertTrue(rollback.restored)
             self.assertEqual(profile.read_text(encoding="utf-8"), "# 用户手写\n不要覆盖\n")
+
+    def test_dream_backup_uses_workspace_when_agent_home_is_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            agent_root = Path(value) / "agent"
+            workspace = Path(value) / "research"
+            agent_root.mkdir()
+            workspace.mkdir()
+            config = load_runtime_config(
+                agent_root, workspace_root=workspace,
+                dream_enabled=False, dream_timezone="Asia/Shanghai",
+            )
+            memory = MemoryStore(
+                config.memory_dir, workspace_root=workspace, agent_root=agent_root,
+                partition_by_workspace=False,
+            )
+            session_id = "b" * 16
+            memory.create_session("first", session_id)
+            _append(memory, session_id, "user", "以后请用中文解释技术问题", "2026-08-03 09:00:00")
+            profile = config.memory_dir / "profile" / "USER.md"
+            before = profile.read_text(encoding="utf-8")
+            service = DreamService(config, model_runner=_DreamModel())
+
+            result = asyncio.run(service.process_day(date(2026, 8, 3)))
+            self.assertEqual(result.status, "completed", result.message)
+            manifest = json.loads((service.backups_root / result.run_id / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["root"], "workspace")
+            self.assertTrue(all(item["path"].startswith(".yy/") for item in manifest["files"]))
+            self.assertTrue(asyncio.run(service.rollback(result.run_id)).restored)
+            self.assertEqual(profile.read_text(encoding="utf-8"), before)
+
+    def test_migrated_legacy_dream_backup_restores_into_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            agent_root = Path(value) / "agent"
+            workspace = Path(value) / "research"
+            agent_root.mkdir()
+            workspace.mkdir()
+            config = load_runtime_config(agent_root, workspace_root=workspace, dream_enabled=False)
+            service = DreamService(config, model_runner=_DreamModel())
+            legacy = service.backups_root / "legacy"
+            legacy.mkdir()
+            (legacy / "000.bin").write_text("before", encoding="utf-8")
+            (legacy / "manifest.json").write_text(json.dumps({
+                "run_id": "legacy",
+                "files": [{"path": ".yy/memory/profile/USER.md", "existed": True, "stored": "000.bin"}],
+            }), encoding="utf-8")
+            service._restore_backup(legacy)
+            self.assertEqual((workspace / ".yy/memory/profile/USER.md").read_text(encoding="utf-8"), "before")
+            self.assertFalse((agent_root / ".yy/memory/profile/USER.md").exists())
 
     def test_invalid_model_output_never_changes_profile(self) -> None:
         async def invalid(messages):

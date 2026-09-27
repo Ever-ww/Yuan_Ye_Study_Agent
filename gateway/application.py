@@ -1079,8 +1079,20 @@ class GatewayApplication:
     def runtime_plugin_status(self) -> dict[str, object]:
         return {
             **self.state_controller.runtime_resource_status(),
+            **self.runtime_plugins.catalog_status(),
             "watcher": self.runtime_plugin_watcher.status(),
         }
+
+    def set_runtime_plugin_enabled(
+        self, plugin_id: str, *, enabled: bool, expected_revision: int, actor: str,
+    ) -> dict[str, object]:
+        settings = self.runtime_plugins.set_enabled(
+            plugin_id, enabled, expected_revision=expected_revision,
+        )
+        result = self.runtime_plugins.reload(actor=actor)
+        if result.status == "activated":
+            self.extensions = self._active_extension_catalog()
+        return {"revision": settings["revision"], "reload": result.model_dump(mode="json")}
 
     def observer_status(self, run_id: str) -> dict[str, object]:
         if self.observer is None:
@@ -1313,6 +1325,11 @@ class GatewayApplication:
             agent_root=self.config.agent_root,
             runtime_profile="interactive",
             tool_module=load_generation_tool_module(snapshot),
+            browser_use_enabled=self.config.browser_use_enabled,
+            browser_use_headless=self.config.browser_use_headless,
+            browser_use_timeout_seconds=self.config.browser_use_timeout_seconds,
+            browser_use_allowed_domains=self.config.browser_use_allowed_domains,
+            browser_use_allow_private_urls=self.config.browser_use_allow_private_urls,
         )
 
     @lifecycle_work("request")
@@ -1555,6 +1572,9 @@ class GatewayApplication:
         service = DreamService(
             config,
             excluded_sessions=self.store.automated_session_ids,
+            skill_source_root=lambda: self.runtime_plugins.snapshot(
+                RuntimeProfile.DREAM,
+            ).source_root,
         )
         checkpoint = CheckpointDreamCoordinator(
             selected,
@@ -3470,6 +3490,27 @@ class GatewayApplication:
         if active:
             raise RuntimeError("Session has an active run and cannot be deleted")
         return memory.delete_session(session_id)
+
+    @lifecycle_mutation
+    def branch_session(self, project_id: str, session_id: str, *, cutoff_record_id: str | None = None,
+                       display_name: str | None = None) -> dict[str, object]:
+        self.store.project(project_id)
+        memory = self.memory_for_project(project_id)
+        if not memory.has_session(session_id):
+            raise KeyError(session_id)
+        return memory.branch_session(session_id, cutoff_record_id=cutoff_record_id, display_name=display_name)
+
+    @lifecycle_mutation
+    def replace_last_turn(self, project_id: str, session_id: str) -> dict[str, object]:
+        self.store.project(project_id)
+        memory = self.memory_for_project(project_id)
+        if not memory.has_session(session_id):
+            raise KeyError(session_id)
+        active = [run.run_id for run in self.store.list_runs(project_id)
+                  if run.session_id == session_id and self.pool.has_active_run(run.run_id)]
+        if active:
+            raise RuntimeError("Session has an active run and cannot replace its last turn")
+        return memory.replace_last_turn(session_id)
 
     @lifecycle_mutation
     def session_records(self, project_id: str, session_id: str) -> list[dict[str, object]]:

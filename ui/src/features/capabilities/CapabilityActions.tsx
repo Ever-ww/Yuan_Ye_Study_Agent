@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { RotateCcw, Save, ShieldCheck } from "lucide-react";
 import type { JsonObject } from "../../types";
+import { extensionCapabilityLabel } from "./extensionLabels";
 
 type Props = {
-  view: "skills" | "plugins" | "extensions";
+  view: "skills" | "tools" | "plugins" | "extensions";
   projectId?: string;
   selected: JsonObject | null;
   busy: boolean;
@@ -14,6 +15,7 @@ type Props = {
 
 export function CapabilityActions(props: Props) {
   if (props.view === "skills") return <SkillForm {...props} />;
+  if (props.view === "tools") return null;
   if (props.view === "plugins") return <PluginForm {...props} />;
   return <ExtensionForm {...props} />;
 }
@@ -31,7 +33,7 @@ function SkillForm(props: Props) {
 function PluginForm(props: Props) {
   const pluginId = String(props.selected?.plugin_id || props.selected?.name || "");
   const generationId = String(props.selected?.generation_id || props.selected?.from_generation_id || "");
-  return <section className="capability-action"><header><div><span>Immutable generation</span><h2>成员级回滚</h2></div><RotateCcw aria-hidden="true" /></header>{props.selected ? <><p>回滚只替换所选插件成员，并发布一个新的完整 Generation；历史版本不会被修改。</p><dl className="inline-metadata"><div><dt>Plugin</dt><dd>{pluginId || "当前记录没有插件标识"}</dd></div><div><dt>来源 Generation</dt><dd>{generationId || "当前记录没有 Generation 标识"}</dd></div></dl><button className="danger-outline" disabled={props.busy || !pluginId || !generationId} onClick={() => void props.onRollback(pluginId, generationId)}>生成回滚版本</button></> : <p className="quiet-empty">选择包含 plugin_id 与 generation_id 的隔离记录后才能回滚。</p>}</section>;
+  return <section className="capability-action"><header><div><span>Runtime generation</span><h2>生效规则</h2></div><RotateCcw aria-hidden="true" /></header><p>插件开关会创建经过校验的新版本。已经开始的任务继续使用原版本；新任务使用发布后的版本。涉及新工具或代码变化时仍需审批。</p>{generationId && pluginId && <button className="danger-outline" disabled={props.busy} onClick={() => void props.onRollback(pluginId, generationId)}>回滚到所选版本</button>}</section>;
 }
 
 function ExtensionForm(props: Props) {
@@ -64,7 +66,7 @@ function ExtensionForm(props: Props) {
 }
 
 function ChoiceGroup({ label, values, selected, onChange }: { label: string; values: string[]; selected: string[]; onChange: (value: string[]) => void }) {
-  return <fieldset className="choice-group"><legend>{label}</legend>{values.length ? values.map((value) => <label key={value}><input type="checkbox" checked={selected.includes(value)} onChange={(event) => onChange(event.target.checked ? [...selected, value] : selected.filter((item) => item !== value))} /><span>{value}</span></label>) : <p>Manifest 未申请此类权限。</p>}</fieldset>;
+  return <fieldset className="choice-group"><legend>{label}</legend>{values.length ? values.map((value) => <label key={value}><input type="checkbox" checked={selected.includes(value)} onChange={(event) => onChange(event.target.checked ? [...selected, value] : selected.filter((item) => item !== value))} /><span>{label === "Capabilities" ? extensionCapabilityLabel(value) : value}</span></label>) : <p>Manifest 未申请此类权限。</p>}</fieldset>;
 }
 function stringList(value: unknown): string[] { return Array.isArray(value) ? value.map(String) : []; }
 function asObject(value: unknown): JsonObject { return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : {}; }

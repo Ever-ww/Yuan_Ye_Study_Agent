@@ -70,6 +70,11 @@ class RuntimeConfig(BaseModel):
     web_fetch_timeout_seconds: StrictInt = Field(default=20, ge=5, le=60)
     web_fetch_max_bytes: StrictInt = Field(default=2_000_000, ge=100_000, le=5_000_000)
     web_fetch_max_chars: StrictInt = Field(default=30_000, ge=1_000, le=30_000)
+    browser_use_enabled: StrictBool = True
+    browser_use_headless: StrictBool = False
+    browser_use_timeout_seconds: float = Field(default=60.0, ge=5.0, le=600.0)
+    browser_use_allowed_domains: tuple[str, ...] = ()
+    browser_use_allow_private_urls: StrictBool = False
     paper_download_timeout_seconds: StrictInt = Field(default=60, ge=5, le=180)
     paper_download_max_bytes: StrictInt = Field(
         default=50_000_000,

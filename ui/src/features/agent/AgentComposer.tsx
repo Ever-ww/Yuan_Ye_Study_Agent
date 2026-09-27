@@ -44,7 +44,7 @@ export function AgentComposer({
         <textarea
           id="agent-prompt"
           value={value}
-          disabled={disabled || running}
+          disabled={disabled}
           placeholder={disabled ? "请先添加或选择一个项目" : "给 YYAgent 一项任务…"}
           rows={2}
           onChange={(event) => onChange(event.target.value)}
@@ -62,7 +62,7 @@ export function AgentComposer({
           </label>
           <span className="composer-help">Enter 发送 · Shift Enter 换行 · Ctrl K 打开命令</span>
           <span className="composer-usage" aria-label="前缀缓存命中率">Cache {formatCacheRatio(usage.cacheHitRatio)}</span>
-          {running ? (
+          {running && !value.trim() ? (
             <button className="send-button stop-button" type="button" onClick={onCancel} aria-label="停止当前运行"><Square aria-hidden="true" /></button>
           ) : (
             <button className="send-button" type="button" disabled={disabled || !value.trim()} onClick={onSend} aria-label="发送"><ArrowUp aria-hidden="true" /></button>

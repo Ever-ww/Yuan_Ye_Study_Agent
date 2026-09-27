@@ -125,6 +125,17 @@ class MemoryStore:
         SessionPersistenceProjection.assert_persistable(first_message)
         return self.sessions.create(first_message, session_id)
 
+    def branch_session(self, session_id: str, *, cutoff_record_id: str | None = None,
+                       display_name: str | None = None) -> dict[str, object]:
+        self._message_cache.pop(session_id, None)
+        result = self.sessions.branch(session_id, cutoff_record_id=cutoff_record_id, display_name=display_name)
+        self._message_cache.pop(str(result["session_id"]), None)
+        return result
+
+    def replace_last_turn(self, session_id: str) -> dict[str, object]:
+        self._message_cache.pop(session_id, None)
+        return self.sessions.truncate_last_turn(session_id)
+
     def record_user(
         self,
         session_id: str,

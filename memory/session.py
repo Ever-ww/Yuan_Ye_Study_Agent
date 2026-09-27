@@ -46,7 +46,7 @@ class SessionStore:
             if changed:
                 self._write_index(index)
 
-    def create(self, first_message: str, session_id: str | None = None) -> str:
+    def create(self, first_message: str, session_id: str | None = None, *, display_name: str | None = None) -> str:
         """预登记会话；第一条真实记录写入时才物化 JSONL。"""
         self.initialize()
         now = datetime.now().astimezone()
@@ -64,6 +64,7 @@ class SessionStore:
             "files": [filename],
             "state": "pending",
             "materialized_at": None,
+            "display_name": display_name,
         }
         self._write_index(index)
         return session_id
@@ -354,6 +355,7 @@ class SessionStore:
                 "segment_count": len(metadata["files"]),
                 "first_question": first_question,
                 "first_question_at": first_question_at,
+                "display_name": metadata.get("display_name"),
             })
         return sorted(
             sessions,
@@ -362,6 +364,69 @@ class SessionStore:
             ),
             reverse=True,
         )
+
+    def branch(self, session_id: str, *, cutoff_record_id: str | None = None,
+               display_name: str | None = None) -> dict[str, object]:
+        """Create an independent session containing records through a cutoff."""
+        records = self.read_all_records_strict(session_id)
+        if cutoff_record_id:
+            end = next((index for index, (_, record) in enumerate(records)
+                        if record.record_id == cutoff_record_id), None)
+            if end is None:
+                raise KeyError(f"Unknown Session record: {cutoff_record_id}")
+            records = records[: end + 1]
+        if not records:
+            raise ValueError("Cannot branch an empty session")
+        first = next((record.content for _, record in records
+                      if record.role == "user" and isinstance(record.content, str)), "")
+        now = datetime.now().astimezone()
+        name = display_name or f"原会话副本 · {now:%H:%M}"
+        new_id = self.create(first, display_name=name)
+        for _, record in records:
+            value = record.model_dump(mode="python", exclude_unset=True)
+            value.pop("record_id", None)
+            value.pop("session_file", None)
+            self.append_once(new_id, value)
+        return {"session_id": new_id, "display_name": name}
+
+    def truncate_last_turn(self, session_id: str) -> dict[str, object]:
+        """Remove the latest user turn and everything after it, atomically."""
+        all_records = self.read_all_records_strict(session_id)
+        last_user = next((index for index in range(len(all_records) - 1, -1, -1)
+                          if all_records[index][1].role == "user"), None)
+        if last_user is None:
+            raise ValueError("Session has no user turn")
+        retained = [record.model_dump(mode="python", exclude_unset=True)
+                    for _, record in all_records[:last_user]]
+        index = self._read_index()
+        metadata = index["sessions"].get(session_id)
+        if metadata is None:
+            raise KeyError(f"Unknown session: {session_id}")
+        old_files = [str(name) for name in metadata["files"]]
+        if retained:
+            date = old_files[0].split("_", 1)[0]
+            filename = f"{date}_{session_id}_edit-{uuid4().hex[:8]}.jsonl"
+            path = self.directory / filename
+            self._publish_segment(path, retained)
+            metadata["files"] = [filename]
+            metadata["latest_file"] = filename
+            metadata["state"] = "active"
+            metadata["materialized_at"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            date = old_files[0].split("_", 1)[0]
+            filename = f"{date}_{session_id}_edit-{uuid4().hex[:8]}.jsonl"
+            metadata["files"] = [filename]
+            metadata["latest_file"] = filename
+            metadata["state"] = "pending"
+            metadata["materialized_at"] = None
+        self._write_index(index)
+        for old in old_files:
+            if old == filename:
+                continue
+            path = self.directory / old
+            if path.exists() and path.is_file() and not path.is_symlink() and path.resolve().parent == self.directory.resolve():
+                path.unlink()
+        return {"session_id": session_id, "removed_records": len(all_records) - len(retained)}
 
     def delete(self, session_id: str) -> dict[str, object]:
         """Delete one conversation after validating every indexed file boundary."""

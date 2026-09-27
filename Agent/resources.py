@@ -20,10 +20,13 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from tempfile import mkdtemp
+from threading import RLock
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Protocol
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from Agent.hook import HookPoint
 
 
 def _canonical_json(value: Any) -> str:
@@ -128,6 +131,8 @@ class RuntimePluginDescriptor(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
     plugin_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
+    display_name: str = Field(default="", max_length=100)
+    description: str = Field(default="", max_length=500)
     plugin_version: str = Field(default="1", min_length=1, max_length=64)
     source_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     semantic_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -396,6 +401,8 @@ class FileTreeRuntimeResourceProvider:
         profiles: tuple[RuntimeProfile, ...],
         relative_to: Path,
         requires_plugins: tuple[str, ...] = (),
+        display_name: str = "",
+        description: str = "",
     ) -> None:
         self.provider_id = provider_id
         self.root = root.resolve()
@@ -404,6 +411,8 @@ class FileTreeRuntimeResourceProvider:
         self.profiles = profiles
         self.relative_to = relative_to.resolve()
         self.requires_plugins = requires_plugins
+        self.display_name = display_name
+        self.description = description
 
     def discover(self) -> tuple[RuntimePluginDescriptor, ...]:
         if not self.root.exists():
@@ -443,6 +452,8 @@ class FileTreeRuntimeResourceProvider:
         semantic_hash = _sha256("\n".join(semantic_identity))
         descriptor = RuntimePluginDescriptor(
             plugin_id=self.provider_id,
+            display_name=self.display_name,
+            description=self.description,
             source_hash=source_hash,
             semantic_hash=semantic_hash,
             requires_plugins=self.requires_plugins,
@@ -456,19 +467,124 @@ class FileTreeRuntimeResourceProvider:
         return (descriptor,)
 
 
+class DeclarativeRuntimeResourceProvider:
+    """Discover file-tree plugins from a validated, human-readable catalog."""
+
+    provider_id = "runtime.declarative-catalog"
+
+    def __init__(self, source_root: Path, agent_root: Path) -> None:
+        self.source_root = source_root.resolve()
+        self.agent_root = agent_root.resolve()
+        self.catalog_path = self.source_root / "runtime-plugins" / "catalog.json"
+
+    def discover(self) -> tuple[RuntimePluginDescriptor, ...]:
+        catalog = self.declarations()
+        descriptors: list[RuntimePluginDescriptor] = []
+        for declaration in catalog:
+            self._validate_resource_location(declaration)
+            base = self.source_root if declaration.root == "source" else self.agent_root
+            path = base / Path(*declaration.path.split("/"))
+            if path.is_symlink() or not path.resolve().is_relative_to(base):
+                raise ValueError("Runtime plugin path escaped its root")
+            provider = FileTreeRuntimeResourceProvider(
+                declaration.plugin_id, path, root_kind=declaration.root,
+                contribution_kind=declaration.kind,
+                profiles=declaration.profiles, relative_to=base,
+                requires_plugins=declaration.requires_plugins,
+                display_name=declaration.display_name,
+                description=declaration.description,
+            )
+            descriptors.extend(provider.discover())
+        return tuple(descriptors)
+
+    @staticmethod
+    def _validate_resource_location(item: "RuntimePluginDeclaration") -> None:
+        parts = item.path.split("/")
+        if parts[0] == "runtime-plugins":
+            if item.root != "source" or len(parts) < 5 or parts[1] != item.plugin_id:
+                raise ValueError("Invalid standalone Runtime plugin location")
+            standalone_skill = (
+                item.kind is RuntimeContributionKind.SKILL and len(parts) >= 6
+                and parts[2] == "runtime-resources"
+                and parts[3] in {"interactive", "cron", "dream"}
+                and parts[4] == "skills"
+                and item.profiles == (RuntimeProfile(parts[3]),)
+            )
+            standalone_extension = (
+                item.kind is RuntimeContributionKind.EXTENSION and len(parts) == 5
+                and parts[2:4] == ["extension", "hook"]
+                and parts[4] in {point.value for point in HookPoint}
+                and item.profiles == (RuntimeProfile.INTERACTIVE,)
+            )
+            if not (standalone_skill or standalone_extension):
+                raise ValueError("Unsupported standalone Runtime plugin location")
+            return
+        prefix = {
+            RuntimeContributionKind.TOOL: ("tools/", "harness-evolution/runtime/tools/"),
+            RuntimeContributionKind.SKILL: ("skills/", "runtime-resources/", "harness-evolution/runtime/skills/"),
+            RuntimeContributionKind.EXTENSION: ("extension/",),
+            RuntimeContributionKind.OBSERVER: ("observer_plugins/",),
+            RuntimeContributionKind.STABLE_PROMPT: (".yy/agents/",),
+        }
+        allowed = prefix.get(item.kind)
+        if allowed is None:
+            raise ValueError(f"Unsupported declarative resource kind: {item.kind.value}")
+        roots = {value[:-1] for value in allowed}
+        if not (item.path in roots or any(item.path.startswith(value) for value in allowed)):
+            raise ValueError(f"Runtime plugin {item.plugin_id} is outside its resource loader")
+        if (item.kind is RuntimeContributionKind.STABLE_PROMPT) != (item.root == "agent"):
+            raise ValueError("Runtime plugin resource root does not match its kind")
+
+    def declarations(self) -> tuple["RuntimePluginDeclaration", ...]:
+        if not self.catalog_path.is_file():
+            return ()
+        catalog = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+        if not isinstance(catalog, dict) or catalog.get("version") != 1 or not isinstance(catalog.get("plugins"), list):
+            raise ValueError("Invalid Runtime plugin catalog")
+        declarations = tuple(RuntimePluginDeclaration.model_validate_json(_canonical_json(raw), strict=True)
+                             for raw in catalog["plugins"])
+        ids = [item.plugin_id for item in declarations]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Duplicate declarative Runtime plugin id")
+        return declarations
+
+
+class RuntimePluginDeclaration(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    plugin_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
+    display_name: str = Field(min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=500)
+    root: str = Field(pattern=r"^(source|agent)$")
+    path: str = Field(min_length=1)
+    kind: RuntimeContributionKind
+    profiles: tuple[RuntimeProfile, ...]
+    requires_plugins: tuple[str, ...] = ()
+    toggleable: bool = False
+
+    @field_validator("profiles", "requires_plugins", mode="before")
+    @classmethod
+    def _tuple_list(cls, value: Any) -> Any:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("path")
+    @classmethod
+    def _safe_path(cls, value: str) -> str:
+        if "\\" in value or value.startswith("/") or any(part in {"", ".", ".."} for part in value.split("/")):
+            raise ValueError("Runtime plugin path must be a relative POSIX path")
+        return value
+
+
 def default_runtime_resource_providers(
     source_root: Path, agent_root: Path,
 ) -> tuple[RuntimeResourceProvider, ...]:
     source = source_root.resolve()
     agent = agent_root.resolve()
-    interactive = (RuntimeProfile.INTERACTIVE, RuntimeProfile.CRON, RuntimeProfile.SUBAGENT)
-    harness_profiles = {
-        "manual": RuntimeProfile.HARNESS_MANUAL,
-        "error": RuntimeProfile.HARNESS_ERROR,
-        "capability": RuntimeProfile.HARNESS_CAPABILITY,
-        "dream": RuntimeProfile.HARNESS_DREAM,
-    }
-    providers: list[RuntimeResourceProvider] = [
+    harness_profiles = (
+        RuntimeProfile.HARNESS_MANUAL, RuntimeProfile.HARNESS_ERROR,
+        RuntimeProfile.HARNESS_CAPABILITY, RuntimeProfile.HARNESS_DREAM,
+    )
+    return (
         StaticRuntimeResourceProvider(
             "runtime.adapter.memory",
             (RuntimePluginContribution(
@@ -476,7 +592,7 @@ def default_runtime_resource_providers(
                 name="memory-retrieval-projection-adapter",
                 profiles=(
                     RuntimeProfile.INTERACTIVE, RuntimeProfile.CRON,
-                    RuntimeProfile.MAINTENANCE, *tuple(harness_profiles.values()),
+                    RuntimeProfile.MAINTENANCE, *harness_profiles,
                 ),
                 contract={"adapter": "memory", "contract_version": 1},
             ),),
@@ -488,7 +604,7 @@ def default_runtime_resource_providers(
                 name="provider-context-adapter",
                 profiles=(
                     RuntimeProfile.INTERACTIVE, RuntimeProfile.CRON,
-                    RuntimeProfile.MAINTENANCE, *tuple(harness_profiles.values()),
+                    RuntimeProfile.MAINTENANCE, *harness_profiles,
                 ),
                 contract={"adapter": "dynamic_context", "contract_version": 1},
             ),),
@@ -501,88 +617,13 @@ def default_runtime_resource_providers(
                 name="sandbox-policy-context-adapter",
                 profiles=(
                     RuntimeProfile.INTERACTIVE, RuntimeProfile.CRON,
-                    *tuple(harness_profiles.values()),
+                    *harness_profiles,
                 ),
                 contract={"adapter": "sandbox", "contract_version": 1},
             ),),
         ),
-        FileTreeRuntimeResourceProvider(
-            "builtin.observer", source / "observer_plugins", root_kind="source",
-            contribution_kind=RuntimeContributionKind.OBSERVER,
-            profiles=(
-                RuntimeProfile.INTERACTIVE, RuntimeProfile.CRON, RuntimeProfile.DREAM,
-                RuntimeProfile.HARNESS_MANUAL, RuntimeProfile.HARNESS_ERROR,
-                RuntimeProfile.HARNESS_CAPABILITY, RuntimeProfile.HARNESS_DREAM,
-            ),
-            relative_to=source,
-        ),
-        FileTreeRuntimeResourceProvider(
-            "builtin.tools", source / "tools", root_kind="source",
-            contribution_kind=RuntimeContributionKind.TOOL, profiles=interactive,
-            relative_to=source,
-        ),
-        FileTreeRuntimeResourceProvider(
-            "builtin.skills", source / "skills", root_kind="source",
-            contribution_kind=RuntimeContributionKind.SKILL,
-            profiles=(RuntimeProfile.INTERACTIVE, RuntimeProfile.CRON), relative_to=source,
-        ),
-        FileTreeRuntimeResourceProvider(
-            "runtime.skills.interactive",
-            source / "runtime-resources" / "interactive" / "skills",
-            root_kind="source", contribution_kind=RuntimeContributionKind.SKILL,
-            profiles=(RuntimeProfile.INTERACTIVE,), relative_to=source,
-            requires_plugins=("builtin.skills",),
-        ),
-        FileTreeRuntimeResourceProvider(
-            "runtime.skills.cron", source / "runtime-resources" / "cron" / "skills",
-            root_kind="source", contribution_kind=RuntimeContributionKind.SKILL,
-            profiles=(RuntimeProfile.CRON,), relative_to=source,
-            requires_plugins=("builtin.skills",),
-        ),
-        FileTreeRuntimeResourceProvider(
-            "runtime.skills.dream", source / "runtime-resources" / "dream" / "skills",
-            root_kind="source", contribution_kind=RuntimeContributionKind.SKILL,
-            profiles=(RuntimeProfile.DREAM,), relative_to=source,
-        ),
-        FileTreeRuntimeResourceProvider(
-            "builtin.prompts", agent / ".yy" / "agents", root_kind="agent",
-            contribution_kind=RuntimeContributionKind.STABLE_PROMPT,
-            profiles=(RuntimeProfile.INTERACTIVE, RuntimeProfile.CRON, RuntimeProfile.SUBAGENT),
-            relative_to=agent,
-        ),
-        FileTreeRuntimeResourceProvider(
-            "builtin.extensions", source / "extension", root_kind="source",
-            contribution_kind=RuntimeContributionKind.EXTENSION,
-            profiles=(RuntimeProfile.INTERACTIVE,), relative_to=source,
-            requires_plugins=("builtin.tools",),
-        ),
-    ]
-    harness_root = source / "harness-evolution" / "runtime"
-    all_harness_profiles = tuple(harness_profiles.values())
-    for kind, directory in (
-        (RuntimeContributionKind.TOOL, "tools"),
-        (RuntimeContributionKind.SKILL, "skills"),
-    ):
-        common_id = f"harness.{directory}.common"
-        providers.append(FileTreeRuntimeResourceProvider(
-            common_id,
-            harness_root / directory / "common",
-            root_kind="source",
-            contribution_kind=kind,
-            profiles=all_harness_profiles,
-            relative_to=source,
-        ))
-        for trigger, profile in harness_profiles.items():
-            providers.append(FileTreeRuntimeResourceProvider(
-                f"harness.{directory}.{trigger}",
-                harness_root / directory / trigger,
-                root_kind="source",
-                contribution_kind=kind,
-                profiles=(profile,),
-                relative_to=source,
-                requires_plugins=(common_id,),
-            ))
-    return tuple(providers)
+        DeclarativeRuntimeResourceProvider(source, agent),
+    )
 
 
 class RuntimePluginManager:
@@ -605,6 +646,108 @@ class RuntimePluginManager:
         self.providers = tuple(
             providers or default_runtime_resource_providers(self.source_root, self.agent_root)
         )
+        self.settings_path = self.agent_root / ".yy" / "runtime-plugins" / "settings.json"
+        self._settings_lock = RLock()
+
+    def _settings(self) -> dict[str, Any]:
+        path = self.settings_path
+        if path.is_symlink() or not path.parent.resolve().is_relative_to(self.agent_root):
+            raise PermissionError("Runtime plugin settings escaped the Agent root")
+        if not path.exists():
+            return {"revision": 0, "disabled": []}
+        if path.stat().st_size > 128 * 1024:
+            raise ValueError("Runtime plugin settings are too large")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(data, dict) or type(data.get("revision")) is not int
+                or data["revision"] < 0 or not isinstance(data.get("disabled"), list)
+                or any(not isinstance(item, str) for item in data["disabled"])):
+            raise ValueError("Invalid Runtime plugin settings")
+        return data
+
+    def _declarations(self) -> tuple[RuntimePluginDeclaration, ...]:
+        return tuple(item for provider in self.providers
+                     if isinstance(provider, DeclarativeRuntimeResourceProvider)
+                     for item in provider.declarations())
+
+    def set_enabled(self, plugin_id: str, enabled: bool, *, expected_revision: int) -> dict[str, Any]:
+        with self._settings_lock:
+            declarations = {item.plugin_id: item for item in self._declarations()}
+            declaration = declarations.get(plugin_id)
+            if declaration is None or not declaration.toggleable:
+                raise ValueError("This Runtime plugin cannot be switched")
+            base = self.source_root if declaration.root == "source" else self.agent_root
+            if not (base / Path(*declaration.path.split("/"))).is_dir():
+                raise ValueError("Runtime plugin resource is not installed")
+            state = self._settings()
+            if state["revision"] != expected_revision:
+                raise ValueError("Runtime plugin settings changed; refresh before retrying")
+            disabled = set(state["disabled"])
+            if enabled:
+                if set(declaration.requires_plugins) & disabled:
+                    raise ValueError("Enable the required Runtime plugin first")
+                disabled.discard(plugin_id)
+            else:
+                for dependent in declarations.values():
+                    dependent_base = self.source_root if dependent.root == "source" else self.agent_root
+                    if (dependent.plugin_id not in disabled
+                            and plugin_id in dependent.requires_plugins
+                            and (dependent_base / Path(*dependent.path.split("/"))).is_dir()):
+                        raise ValueError(f"Disable dependent plugin first: {dependent.plugin_id}")
+                disabled.add(plugin_id)
+            if disabled == set(state["disabled"]):
+                return state
+            state = {"revision": state["revision"] + 1, "disabled": sorted(disabled)}
+            path = self.settings_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.parent.resolve().is_relative_to(self.agent_root):
+                raise PermissionError("Runtime plugin settings escaped the Agent root")
+            temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+            try:
+                with temporary.open("w", encoding="utf-8") as stream:
+                    json.dump(state, stream, ensure_ascii=False, sort_keys=True)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+            return state
+
+    def catalog_status(self) -> dict[str, Any]:
+        state = self._settings()
+        active = self.state_controller.active_runtime_generation()
+        generation = (RuntimeResourceGeneration.model_validate_json(active["generation_json"], strict=True)
+                      if active else None)
+        active_ids = {item.plugin_id for item in generation.descriptors} if generation else set()
+        disabled = set(state["disabled"])
+        rows = []
+        for item in self._declarations():
+            base = self.source_root if item.root == "source" else self.agent_root
+            available = (base / Path(*item.path.split("/"))).is_dir()
+            rows.append({
+                "plugin_id": item.plugin_id,
+                "display_name": item.display_name,
+                "description": item.description,
+                "kind": item.kind.value,
+                "profiles": [profile.value for profile in item.profiles],
+                "requires_plugins": list(item.requires_plugins),
+                "configurable": item.toggleable,
+                "toggleable": item.toggleable and available,
+                "available": available,
+                "enabled": item.plugin_id in active_ids,
+                "desired_enabled": available and item.plugin_id not in disabled,
+            })
+        for plugin_id, name, description in (
+            ("runtime.adapter.memory", "记忆上下文", "读取当前 Workspace 的记忆，并在任务中提供相关背景。"),
+            ("runtime.adapter.dynamic-context", "动态上下文", "按当前任务准备模型所需上下文。"),
+            ("runtime.adapter.sandbox", "沙箱策略", "为工具和代码执行提供隔离与安全约束。"),
+        ):
+            rows.append({
+                "plugin_id": plugin_id, "display_name": name, "description": description,
+                "kind": "core_adapter", "profiles": [], "requires_plugins": [],
+                "configurable": False, "toggleable": False, "available": True,
+                "enabled": plugin_id in active_ids, "desired_enabled": True,
+            })
+        return {"revision": state["revision"], "plugins": rows}
 
     def _artifact_root(self, generation_id: str) -> Path:
         # Keep Windows workspaces below MAX_PATH while the manifest and SQLite
@@ -612,7 +755,9 @@ class RuntimePluginManager:
         return self.storage_root / generation_id[:24]
 
     def discover(self) -> tuple[RuntimePluginDescriptor, ...]:
-        values = [descriptor for provider in self.providers for descriptor in provider.discover()]
+        disabled = set(self._settings()["disabled"])
+        values = [descriptor for provider in self.providers for descriptor in provider.discover()
+                  if descriptor.plugin_id not in disabled]
         values.sort(key=lambda item: item.plugin_id)
         identities = [item.plugin_id for item in values]
         if len(identities) != len(set(identities)):
@@ -620,6 +765,7 @@ class RuntimePluginManager:
         by_id = {item.plugin_id: item for item in values}
         contribution_names: set[tuple[RuntimeProfile, RuntimeContributionKind, str]] = set()
         member_owners: dict[tuple[str, str], tuple[str, str]] = {}
+        mounted_owners: dict[tuple[RuntimeProfile, str, str], str] = {}
         for item in values:
             if item.core_api_version != self.CORE_API_VERSION:
                 raise ValueError(f"Unsupported core API for plugin {item.plugin_id}")
@@ -659,12 +805,20 @@ class RuntimePluginManager:
                 self._validate_hot_resource_member(member)
                 identity = (member.root, member.path)
                 owner = member_owners.get(identity)
-                if owner is not None and owner[1] != member.source_hash:
+                if owner is not None:
                     raise ValueError(
-                        f"Runtime plugins {owner[0]} and {item.plugin_id} provide conflicting "
+                        f"Runtime plugins {owner[0]} and {item.plugin_id} overlap on "
                         f"member {member.root}:{member.path}"
                     )
                 member_owners[identity] = (item.plugin_id, member.source_hash)
+                for profile in exposed_profiles:
+                    mounted = (profile, member.root, self._profile_member_path(profile, member))
+                    if mounted in mounted_owners:
+                        raise ValueError(
+                            f"Runtime plugins {mounted_owners[mounted]} and {item.plugin_id} "
+                            f"mount the same resource: {mounted[2]}"
+                        )
+                    mounted_owners[mounted] = item.plugin_id
         return tuple(values)
 
     @staticmethod
@@ -1322,20 +1476,24 @@ class RuntimePluginManager:
     def _profile_member_path(
         profile: RuntimeProfile, member: RuntimeResourceFile,
     ) -> str:
+        path = member.path
+        if member.root == "source" and path.startswith("runtime-plugins/"):
+            parts = path.split("/", 2)
+            if len(parts) == 3:
+                path = parts[2]
         if profile.value.startswith("harness:"):
             prefix = "harness-evolution/runtime/"
-            if member.root == "source" and member.path.startswith(prefix):
-                return member.path[len(prefix):]
+            if member.root == "source" and path.startswith(prefix):
+                return path[len(prefix):]
         if profile in {
             RuntimeProfile.INTERACTIVE, RuntimeProfile.CRON, RuntimeProfile.DREAM,
         }:
             prefix = f"runtime-resources/{profile.value}/"
-            if member.root == "source" and member.path.startswith(prefix):
-                return member.path[len(prefix):]
-        return member.path
+            if member.root == "source" and path.startswith(prefix):
+                return path[len(prefix):]
+        return path
 
-    @staticmethod
-    def _smoke_test(generation: RuntimeResourceGeneration) -> None:
+    def _smoke_test(self, generation: RuntimeResourceGeneration) -> None:
         manifest = generation.artifact_root / "generation.json"
         if not manifest.is_file():
             raise RuntimeError("Runtime generation manifest is missing")
@@ -1388,7 +1546,15 @@ class RuntimePluginManager:
         if RuntimeContributionKind.EXTENSION in contribution_kinds:
             from Agent.extensions import ExtensionLoader
 
-            catalog = ExtensionLoader(generation.artifact_root / "source").scan()
+            interactive = tuple(
+                descriptor for descriptor in generation.descriptors
+                if any(RuntimeProfile.INTERACTIVE in contribution.profiles
+                       for contribution in descriptor.contributions)
+            )
+            view = self._materialize_profile_view(
+                generation, RuntimeProfile.INTERACTIVE, interactive,
+            )
+            catalog = ExtensionLoader(view / "source").scan()
             if catalog.rejections:
                 first = catalog.rejections[0]
                 raise RuntimeError(

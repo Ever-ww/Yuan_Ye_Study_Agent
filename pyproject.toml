@@ -7,7 +7,7 @@ name = "yy-agent"
 version = "1.0.0"
 description = "Local-first asynchronous study agent"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "croniter>=6.2,<7",
     "cryptography>=43,<47",
@@ -28,6 +28,7 @@ dependencies = [
     "uvicorn>=0.29,<1",
     "websockets>=14,<17",
     "watchdog>=4,<7",
+    "browser-use==0.13.10",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +36,9 @@ dev = ["pytest>=8,<9", "pyinstaller>=6.10,<7"]
 
 [project.scripts]
 yy-agent = "run_ui.cli:main"
+
+[tool.setuptools]
+py-modules = ["capability_switches"]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -46,6 +50,7 @@ run_ui = ["templates/*.html", "static/*.css", "static/*.js"]
 sandbox = ["Dockerfile"]
 
 [tool.setuptools.data-files]
+"runtime-plugins" = ["runtime-plugins/catalog.json", "runtime-plugins/README.md"]
 "harness-evolution" = ["harness-evolution/harness.py"]
 "harness-evolution/runtime/tools/common" = ["harness-evolution/runtime/tools/common/__init__.py"]
 "harness-evolution/runtime/tools/manual" = ["harness-evolution/runtime/tools/manual/__init__.py"]

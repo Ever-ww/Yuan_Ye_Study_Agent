@@ -491,10 +491,7 @@ def test_harness_snapshot_file_view_excludes_other_triggers(tmp_path: Path) -> N
     root = Path(__file__).resolve().parents[1]
     agent = tmp_path / "agent"
     agent.mkdir()
-    providers = tuple(
-        provider for provider in default_runtime_resource_providers(root, agent)
-        if provider.provider_id.startswith("harness.")
-    )
+    providers = default_runtime_resource_providers(root, agent)
     controller = StateController(
         GatewayStore(agent).database_path,
         gateway_epoch="harness-resource-test",
@@ -512,6 +509,175 @@ def test_harness_snapshot_file_view_excludes_other_triggers(tmp_path: Path) -> N
     assert (manual.source_root / "tools" / "manual").is_dir()
     assert not (manual.source_root / "tools" / "capability").exists()
     assert not (manual.source_root / "skills" / "error").exists()
+
+    dream = manager.snapshot(RuntimeProfile.DREAM)
+    assert (dream.source_root / "skills" / "search-summary-paper" / "SKILL.md").is_file()
+
+
+def test_plugin_catalog_lists_uninstalled_optional_location_and_running_generation(tmp_path: Path) -> None:
+    import json
+
+    source = tmp_path / "source"
+    agent = tmp_path / "agent"
+    (source / "runtime-plugins").mkdir(parents=True)
+    agent.mkdir()
+    catalog = source / "runtime-plugins" / "catalog.json"
+    catalog.write_text(json.dumps({"version": 1, "plugins": [{
+        "plugin_id": "sample.skill", "display_name": "示例技能",
+        "description": "可选的任务技能。", "root": "source",
+        "path": "runtime-resources/interactive/skills/sample", "kind": "skill",
+        "profiles": ["interactive"], "toggleable": True,
+    }]}), encoding="utf-8")
+    controller = StateController(GatewayStore(agent).database_path, gateway_epoch="plugin-catalog")
+    manager = RuntimePluginManager(source_root=source, agent_root=agent, state_controller=controller)
+    manager.ensure_initial_generation()
+    uninstalled = next(row for row in manager.catalog_status()["plugins"] if row["plugin_id"] == "sample.skill")
+    assert uninstalled["available"] is False and uninstalled["enabled"] is False
+    assert uninstalled["configurable"] is True and uninstalled["toggleable"] is False
+
+    plugin_dir = source / "runtime-resources" / "interactive" / "skills" / "sample"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "SKILL.md").write_text("---\nname: sample\ndescription: Sample\n---\n", encoding="utf-8")
+    available = next(row for row in manager.catalog_status()["plugins"] if row["plugin_id"] == "sample.skill")
+    assert available["configurable"] is True and available["toggleable"] is True
+    assert manager.reload(actor="test").status == "activated"
+
+    plugin_dir.rename(source / "parked-skills")
+    running = next(row for row in manager.catalog_status()["plugins"] if row["plugin_id"] == "sample.skill")
+    assert running["enabled"] is True and running["available"] is False
+    assert running["configurable"] is True and running["toggleable"] is False
+    assert all(row["configurable"] is False for row in manager.catalog_status()["plugins"] if row["kind"] == "core_adapter")
+
+
+def test_declarative_plugin_switch_persists_and_freezes_existing_snapshot(tmp_path: Path) -> None:
+    import json
+
+    source = tmp_path / "source"
+    agent = tmp_path / "agent"
+    plugin_dir = source / "runtime-plugins" / "sample.skill" / "runtime-resources" / "interactive" / "skills" / "sample"
+    plugin_dir.mkdir(parents=True)
+    agent.mkdir()
+    (plugin_dir / "SKILL.md").write_text(
+        "---\nname: sample\ndescription: Sample workflow\n---\n\nDo the sample task.\n",
+        encoding="utf-8",
+    )
+    catalog = source / "runtime-plugins" / "catalog.json"
+    catalog.parent.mkdir(exist_ok=True)
+    catalog.write_text(json.dumps({"version": 1, "plugins": [{
+        "plugin_id": "sample.skill", "display_name": "示例技能",
+        "description": "演示声明式安装与停用。", "root": "source",
+        "path": "runtime-plugins/sample.skill/runtime-resources/interactive/skills/sample", "kind": "skill",
+        "profiles": ["interactive"], "toggleable": True,
+    }]}), encoding="utf-8")
+    controller = StateController(GatewayStore(agent).database_path, gateway_epoch="plugin-switch")
+    manager = RuntimePluginManager(source_root=source, agent_root=agent, state_controller=controller)
+    manager.ensure_initial_generation()
+    old = manager.snapshot(RuntimeProfile.INTERACTIVE)
+    assert "sample.skill" in old.descriptor_ids
+    assert manager.catalog_status()["plugins"][0]["display_name"] == "示例技能"
+    with pytest.raises(ValueError, match="cannot be switched"):
+        manager.set_enabled("runtime.adapter.memory", False, expected_revision=0)
+
+    settings = manager.set_enabled("sample.skill", False, expected_revision=0)
+    assert settings["revision"] == 1
+    assert manager.reload(actor="test").status == "activated"
+    assert "sample.skill" not in manager.snapshot(RuntimeProfile.INTERACTIVE).descriptor_ids
+    assert (old.source_root / "skills" / "sample" / "SKILL.md").is_file()
+
+    restarted = RuntimePluginManager(source_root=source, agent_root=agent, state_controller=controller)
+    assert restarted.catalog_status()["plugins"][0]["desired_enabled"] is False
+    with pytest.raises(ValueError, match="refresh"):
+        restarted.set_enabled("sample.skill", True, expected_revision=0)
+    restarted.set_enabled("sample.skill", True, expected_revision=1)
+    assert restarted.reload(actor="test").status == "activated"
+    assert "sample.skill" in restarted.snapshot(RuntimeProfile.INTERACTIVE).descriptor_ids
+
+    extra = source / "runtime-plugins" / "extra.skill" / "runtime-resources" / "interactive" / "skills" / "extra"
+    extra.mkdir(parents=True)
+    (extra / "SKILL.md").write_text(
+        "---\nname: extra\ndescription: Extra workflow\n---\n\nDo the extra task.\n",
+        encoding="utf-8",
+    )
+    manifest = json.loads(catalog.read_text(encoding="utf-8"))
+    manifest["plugins"].append({
+        "plugin_id": "extra.skill", "display_name": "额外技能",
+        "description": "运行时加入的新插件。", "root": "source",
+        "path": "runtime-plugins/extra.skill/runtime-resources/interactive/skills/extra", "kind": "skill",
+        "profiles": ["interactive"], "toggleable": True,
+    })
+    catalog.write_text(json.dumps(manifest), encoding="utf-8")
+    assert restarted.reload(actor="test").status == "activated"
+    assert "extra.skill" in restarted.snapshot(RuntimeProfile.INTERACTIVE).descriptor_ids
+
+
+def test_declared_executable_switch_keeps_old_generation_until_approval(tmp_path: Path) -> None:
+    import json
+
+    source = tmp_path / "source"
+    agent = tmp_path / "agent"
+    tools = source / "tools"
+    tools.mkdir(parents=True)
+    agent.mkdir()
+    (tools / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+    catalog = source / "runtime-plugins" / "catalog.json"
+    catalog.parent.mkdir()
+    catalog.write_text(json.dumps({"version": 1, "plugins": [{
+        "plugin_id": "sample.tools", "display_name": "示例工具",
+        "description": "测试工具停用审批。", "root": "source", "path": "tools",
+        "kind": "tool", "profiles": ["interactive"], "toggleable": True,
+    }]}), encoding="utf-8")
+    controller = StateController(GatewayStore(agent).database_path, gateway_epoch="plugin-approval")
+    manager = RuntimePluginManager(source_root=source, agent_root=agent, state_controller=controller)
+    first = manager.ensure_initial_generation()
+
+    manager.set_enabled("sample.tools", False, expected_revision=0)
+    pending = manager.reload(actor="test")
+    assert pending.status == "awaiting_approval"
+    status = manager.catalog_status()["plugins"][0]
+    assert status["enabled"] is True and status["desired_enabled"] is False
+    assert manager.snapshot(RuntimeProfile.INTERACTIVE).generation_id == first.generation_id
+
+    activated = manager.reload(actor="test", approved_plan_hash=pending.plan_hash)
+    assert activated.status == "activated"
+    assert "sample.tools" not in manager.snapshot(RuntimeProfile.INTERACTIVE).descriptor_ids
+
+
+def test_standalone_extension_is_mounted_and_requires_approval_when_reenabled(tmp_path: Path) -> None:
+    import json
+
+    source = tmp_path / "source"
+    agent = tmp_path / "agent"
+    stage = source / "runtime-plugins" / "sample.extension" / "extension" / "hook" / "model_before"
+    stage.mkdir(parents=True)
+    agent.mkdir()
+    (stage / "sample.py").write_text(
+        "EXTENSION_NAME = 'sample'\n"
+        "PRIORITY = 0\n"
+        "EXTENSION_MANIFEST = {'schema_version': 1, 'capabilities': [], "
+        "'allowed_tools': [], 'timeout_seconds': 5.0}\n"
+        "async def handle(event, context):\n    pass\n",
+        encoding="utf-8",
+    )
+    (source / "runtime-plugins" / "catalog.json").write_text(json.dumps({
+        "version": 1, "plugins": [{
+            "plugin_id": "sample.extension", "display_name": "示例扩展",
+            "description": "在模型请求前运行。", "root": "source",
+            "path": "runtime-plugins/sample.extension/extension/hook/model_before",
+            "kind": "extension", "profiles": ["interactive"], "toggleable": True,
+        }],
+    }), encoding="utf-8")
+    controller = StateController(GatewayStore(agent).database_path, gateway_epoch="plugin-extension")
+    manager = RuntimePluginManager(source_root=source, agent_root=agent, state_controller=controller)
+    manager.ensure_initial_generation()
+    snapshot = manager.snapshot(RuntimeProfile.INTERACTIVE)
+    assert (snapshot.source_root / "extension" / "hook" / "model_before" / "sample.py").is_file()
+
+    manager.set_enabled("sample.extension", False, expected_revision=0)
+    assert manager.reload(actor="test").status == "activated"
+    manager.set_enabled("sample.extension", True, expected_revision=1)
+    pending = manager.reload(actor="test")
+    assert pending.status == "awaiting_approval"
+    assert "sample.extension" not in manager.snapshot(RuntimeProfile.INTERACTIVE).descriptor_ids
 
 
 def test_hook_bus_mounts_and_unmounts_frozen_bundle() -> None:

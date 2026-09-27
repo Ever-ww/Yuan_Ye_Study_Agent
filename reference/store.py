@@ -163,7 +163,7 @@ class ReferenceStore:
         """在修改旧 Reference 库前创建 SQLite 一致性备份。"""
         if not self.database_path.is_file() or self.database_path.stat().st_size == 0:
             return
-        with sqlite3.connect(self.database_path, timeout=30) as source:
+        with sqlite3.connect(self.database_path, timeout=30, factory=_ClosingConnection) as source:
             tables = source.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
             ).fetchall()
@@ -191,7 +191,7 @@ class ReferenceStore:
             backup = self.backups_directory / (
                 f"reference-v{version}-to-v{SCHEMA_VERSION}-{stamp}-{uuid4().hex[:8]}.sqlite3"
             )
-            with sqlite3.connect(backup) as target:
+            with sqlite3.connect(backup, factory=_ClosingConnection) as target:
                 source.backup(target)
             self.migration_backup_path = backup
 

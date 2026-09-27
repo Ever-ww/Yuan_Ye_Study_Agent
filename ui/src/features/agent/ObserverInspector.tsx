@@ -1,9 +1,11 @@
 import { CheckCircle2, CircleAlert, Eye, ListChecks } from "lucide-react";
 import type { GatewayEvent, ObserverStatus } from "../../types";
+import { Markdown } from "../../shared/ui/Markdown";
 
 export function ObserverInspector({ events, observer }: { events: GatewayEvent[]; observer: ObserverStatus | null }) {
   const state = observer?.state;
-  const terminal = events.some((event) => ["run_completed", "run_failed", "run_cancelled", "run_interrupted"].includes(event.type));
+  const terminal = observer?.status === "finalized" || observer?.status === "failed"
+    || events.some((event) => ["run_completed", "run_failed", "run_cancelled", "run_interrupted"].includes(event.type));
   const progress = observer?.progress_markdown || latestProgress(events);
   const alignment = state?.intent_alignment.status;
   return (
@@ -17,9 +19,11 @@ export function ObserverInspector({ events, observer }: { events: GatewayEvent[]
         <section className="observer-current"><span className="observer-pulse" aria-hidden="true" /><div><h3>{state?.current_agent_action || "等待可见事件"}</h3><p>{state?.in_progress_task || "发送任务后开始本轮监控。"}</p></div></section>
       )}
 
-      {state?.user_problem && <InspectorSection title="用户问题" items={[state.user_problem]} />}
-      {!!state?.completed_tasks?.length && <InspectorSection title="已完成" items={state.completed_tasks} />}
-      {!state && progress && <section className="observer-markdown"><ListChecks aria-hidden="true" /><pre>{progress}</pre></section>}
+      {terminal && progress ? <section className="observer-markdown"><ListChecks aria-hidden="true" /><Markdown>{progress}</Markdown></section> : <>
+        {state?.user_problem && <InspectorSection title="用户问题" items={[state.user_problem]} />}
+        {!!state?.completed_tasks?.length && <InspectorSection title="已完成" items={state.completed_tasks} />}
+        {!state && progress && <section className="observer-markdown"><ListChecks aria-hidden="true" /><Markdown>{progress}</Markdown></section>}
+      </>}
       {!events.length && !progress && <p className="quiet-empty">Observer 只处理本轮可见事件，不读取隐藏推理或系统提示。</p>}
     </div>
   );

@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 from gateway.models import InboxItem, ProjectRecord, RunRecord, now_iso
+from gateway.sqlite import ClosingConnection
 
 
 class GatewayStore:
@@ -31,7 +32,7 @@ class GatewayStore:
         if not self.database_path.exists() or self.database_path.stat().st_size == 0:
             # journal_mode=WAL makes auto_vacuum immutable without a full VACUUM,
             # so select the reclaim strategy before the normal connection setup.
-            with sqlite3.connect(self.database_path, timeout=30) as connection:
+            with sqlite3.connect(self.database_path, timeout=30, factory=ClosingConnection) as connection:
                 connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
         self._backup_before_migration()
         self.initialize()
@@ -374,7 +375,7 @@ class GatewayStore:
             )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30)
+        connection = sqlite3.connect(self.database_path, timeout=30, factory=ClosingConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")
@@ -384,17 +385,16 @@ class GatewayStore:
     def _backup_before_migration(self, target_version: int = 3) -> None:
         if not self.database_path.exists() or self.database_path.stat().st_size == 0:
             return
-        with sqlite3.connect(self.database_path, timeout=30) as source:
+        with sqlite3.connect(self.database_path, timeout=30, factory=ClosingConnection) as source:
             current = int(source.execute("PRAGMA user_version").fetchone()[0])
             if current >= target_version:
                 return
             self.backups_directory.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
             backup = self.backups_directory / f"gateway-v{current}-to-v{target_version}-{stamp}.sqlite3"
-            with sqlite3.connect(backup) as target:
+            with sqlite3.connect(backup, factory=ClosingConnection) as target:
                 source.backup(target)
             self.migration_backup_path = backup
-
     @staticmethod
     def _ensure_run_columns(connection: sqlite3.Connection) -> None:
         columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(runs)").fetchall()}

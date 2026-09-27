@@ -35,6 +35,7 @@ from Agent.resources import RuntimeContributionKind, RuntimeProfile
 from tool import AsyncToolRegistry
 from gateway.event_store import EventStore, canonical_json
 from gateway.models import GatewayEventEnvelope, RunRecord, now_iso
+from gateway.sqlite import ClosingConnection
 
 
 _OBSERVER_OUTPUT_TYPES = {
@@ -877,7 +878,7 @@ class ObserverStateStore:
         ).fetchall())
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30)
+        connection = sqlite3.connect(self.database_path, timeout=30, factory=ClosingConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")

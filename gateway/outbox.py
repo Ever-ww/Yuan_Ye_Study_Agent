@@ -22,6 +22,7 @@ from backup import QuiesceResult
 from gateway.audit import AuditSanitizer
 from gateway.event_store import ProjectionConflict, parse_canonical_event, sha256_text
 from gateway.models import GatewayEventEnvelope, now_iso
+from gateway.sqlite import ClosingConnection
 
 
 DeliverEvent = Callable[[GatewayEventEnvelope], Awaitable[None]]
@@ -430,7 +431,7 @@ class OutboxDispatcher:
         return {"interrupted": len(active), "completed_outbox": int(completed)}
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30, isolation_level=None)
+        connection = sqlite3.connect(self.database_path, timeout=30, isolation_level=None, factory=ClosingConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")

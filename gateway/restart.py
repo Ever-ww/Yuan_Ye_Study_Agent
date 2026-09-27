@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from backup import AgentHomeMaintenanceCoordinator, SensitiveEnvSanitizer, external_control_root
 from gateway.process import GatewayProcessManager, _pid_alive, _windows_background_creationflags
+from gateway.sqlite import ClosingConnection
 
 if TYPE_CHECKING:
     from gateway.state_controller import StateController
@@ -188,7 +189,7 @@ def _update_restart_row(agent_root: Path, request_id: str, status: str) -> None:
     if not database.exists():
         return
     try:
-        with sqlite3.connect(database, timeout=30) as connection:
+        with sqlite3.connect(database, timeout=30, factory=ClosingConnection) as connection:
             connection.execute(
                 "UPDATE gateway_restart_requests SET status=?,updated_at=datetime('now') "
                 "WHERE request_id=?", (status, request_id),

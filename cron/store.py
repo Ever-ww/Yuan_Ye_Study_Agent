@@ -12,6 +12,14 @@ from typing import Any
 from .models import CronDispatch, CronJob, HeartbeatState, utc_iso, utc_now
 
 
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
+
+
 class CronStore:
     """Cron repository sharing the Gateway SQLite database.
 
@@ -32,7 +40,7 @@ class CronStore:
         self.heartbeat_seconds = heartbeat_seconds
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30)
+        connection = sqlite3.connect(self.database_path, timeout=30, factory=_ClosingConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")

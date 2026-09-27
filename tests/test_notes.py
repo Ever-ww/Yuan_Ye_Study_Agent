@@ -64,6 +64,23 @@ class NoteStoreTests(unittest.TestCase):
                 {"Research", "Experiment Results"},
             )
 
+    def test_initialize_research_vault_structure_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            store = NoteStore(Path(value))
+            first = store.initialize_structure()
+            second = store.initialize_structure()
+
+            self.assertEqual(len(first["created"]), 10)
+            self.assertEqual(second["created"], [])
+            self.assertEqual(
+                {item["name"] for item in first["folders"] if item["kind"] == "folder"},
+                {
+                    "00 Inbox", "10 Daily", "20 Research", "30 Projects",
+                    "40 Experiments", "50 Literature", "60 Meetings",
+                    "70 Resources", "90 Templates", "99 Archive",
+                },
+            )
+
     def test_frontmatter_reindex_and_wiki_backlinks(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)

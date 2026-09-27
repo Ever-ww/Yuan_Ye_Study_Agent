@@ -21,6 +21,40 @@ beforeEach(() => {
 });
 
 describe("GatewayApi", () => {
+  it("switches Runtime plugins with an exact settings revision", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      revision: 3, reload: { status: "activated" },
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new GatewayApi();
+
+    await api.toggleRuntimePlugin("sample.skill", false, 2);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://gateway.test/api/v1/runtime/plugins/sample.skill");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(String(init.body))).toEqual({
+      enabled: false, expected_revision: 2, actor: api.clientId,
+    });
+  });
+
+  it("loads workspace capability switches and sends revision-checked changes", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ revision: 2, skills: [], tools: [] }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new GatewayApi();
+
+    await api.capabilities("project-1");
+    await api.toggleCapability("project-1", "tools", "read_file", false, 2);
+
+    expect(fetchMock.mock.calls[0][0]).toBe("http://gateway.test/api/v1/projects/project-1/capabilities");
+    const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(url).toBe("http://gateway.test/api/v1/projects/project-1/capabilities/tools/read_file");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(String(init.body))).toEqual({ enabled: false, expected_revision: 2 });
+  });
+
   it("persists a stable browser client id for approval recovery", () => {
     const first = new GatewayApi();
     const second = new GatewayApi();

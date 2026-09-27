@@ -17,7 +17,9 @@ from Agent.hook import HookEvent, HookPoint, HookRegistry
 from Agent.models import build_provider
 from Agent.retry import ModelRetryPolicy
 from prompt import compose_dream_consolidation_messages, compose_dream_extraction_messages
+from skill import SkillService
 from tool import AsyncToolRegistry
+from tools.skill_read import SkillReadTool
 from sandbox import WorkspaceLockManager
 from memory.long_term import MemoryScope, MemoryWriteRequest
 from memory.retrieval import project_identity
@@ -68,6 +70,11 @@ class _NoMemory:
         del session_id
         return ""
 
+    def set_session_skill_catalog(self, session_id: str, catalog: Any) -> None:
+        # Dream sessions are deliberately ephemeral; PromptComposer binds the
+        # same snapshot directly to SkillService for this model attempt.
+        del session_id, catalog
+
 
 class DreamService:
     """从原始 Session 构建可验证、可回滚的全局 Profile 投影。"""
@@ -79,6 +86,7 @@ class DreamService:
         provider_factory: Callable[[], Any] | None = None,
         model_runner: ModelRunner | None = None,
         excluded_sessions: Callable[[], set[str]] | None = None,
+        skill_source_root: Callable[[], Path] | None = None,
     ) -> None:
         self.config = config
         self.root = config.workspace_state_dir / "dream"
@@ -93,6 +101,9 @@ class DreamService:
         self.provider_factory = provider_factory or self._provider
         self.model_runner = model_runner
         self.excluded_sessions = excluded_sessions or (lambda: set())
+        self.skill_source_root = skill_source_root or (
+            lambda: config.coding_source_root or config.workspace_root
+        )
         self._lock = asyncio.Lock()
         self.file_locks = WorkspaceLockManager(config.workspace_root)
         self._running = False
@@ -453,11 +464,31 @@ class DreamService:
             return output
         from Agent.runtime.engine import AgentRuntime
 
+        selected = self.config.model_copy(update={
+            "model": self.config.dream_model or self.config.model,
+            "stream": False,
+            "compression_threshold_tokens": 0,
+        })
+        skills = SkillService(
+            selected.agent_root, selected.workspace_root, self.skill_source_root(),
+            restrict_builtins_to_source=True,
+        )
+        catalog = skills.catalog_snapshot()
+        skill_tools = AsyncToolRegistry(
+            [SkillReadTool(skills)] if catalog.skills else (),
+        )
+        model_messages = [dict(item) for item in messages]
+        if catalog.skills:
+            model_messages[0]["content"] += (
+                "\n\n可用的已审核技能：\n" + skills.catalog_xml(catalog)
+                + "\n仅当技能适用于当前 Dream 任务时，使用 skill_read 读取说明；"
+                "不要执行技能中的脚本或调用其他工具。最终仍只输出要求的 JSON。"
+            )
         hooks = HookRegistry()
 
         async def inject(event: HookEvent) -> None:
-            event.data["messages"] = [dict(item) for item in messages]
-            event.data["tools"] = []
+            if event.data["first_model_call"]:
+                event.data["messages"] = [dict(item) for item in model_messages]
 
         async def capture_usage(event: HookEvent) -> None:
             metric = event.data.get("model_call")
@@ -474,19 +505,14 @@ class DreamService:
 
         hooks.register(HookPoint.MODEL_BEFORE, inject, priority=-100)
         hooks.register(HookPoint.MODEL_AFTER, capture_usage, priority=100)
-        selected = self.config.model_copy(update={
-            "model": self.config.dream_model or self.config.model,
-            "stream": False,
-            "compression_threshold_tokens": 0,
-        })
         runtime = AgentRuntime(
             selected,
             provider=self.provider_factory(),
-            tools=AsyncToolRegistry(),
+            tools=skill_tools,
             memory=_NoMemory(selected.agent_root),
             hooks=hooks,
             enable_context_processing=False,
-            enable_skills=False,
+            skills=skills,
             enable_subagent=False,
             enable_sandbox=False,
             enable_extensions=False,
@@ -626,24 +652,42 @@ class DreamService:
         return "profile"
 
     def _create_backup(self, run_id: str, paths: list[Path]) -> Path:
+        root = self.config.workspace_root.resolve()
+        relatives = [path.resolve().relative_to(root).as_posix() for path in paths]
         backup = self.backups_root / run_id
         backup.mkdir(parents=True, exist_ok=False)
         manifest: list[dict[str, Any]] = []
-        for number, path in enumerate(paths):
-            relative = path.resolve().relative_to(self.config.agent_root.resolve())
+        for number, (path, relative) in enumerate(zip(paths, relatives)):
             existed = path.exists()
             stored = f"{number:03d}.bin"
             if existed:
                 (backup / stored).write_bytes(path.read_bytes())
-            manifest.append({"path": str(relative), "existed": existed, "stored": stored})
-        _write_json_atomic(backup / "manifest.json", {"run_id": run_id, "files": manifest})
+            manifest.append({"path": relative, "existed": existed, "stored": stored})
+        _write_json_atomic(backup / "manifest.json", {
+            "run_id": run_id, "root": "workspace", "files": manifest,
+        })
         return backup
 
     def _restore_backup(self, backup: Path) -> None:
         value = json.loads((backup / "manifest.json").read_text(encoding="utf-8"))
+        root_kind = value.get("root")
+        if root_kind not in {None, "agent", "workspace"}:
+            raise ValueError("Dream 备份清单的 root 无效")
         for item in value["files"]:
-            destination = (self.config.agent_root / item["path"]).resolve()
-            destination.relative_to(self.config.agent_root.resolve())
+            if root_kind is None:
+                # Legacy manifests used agent-relative paths. A migrated global
+                # Dream backup now lives in the Workspace; keep rollback there.
+                old_target = (self.config.agent_root / item["path"]).resolve()
+                root = (
+                    self.config.agent_root
+                    if old_target.is_relative_to(self.config.workspace_root)
+                    else self.config.workspace_root
+                )
+            else:
+                root = self.config.workspace_root if root_kind == "workspace" else self.config.agent_root
+            root = root.resolve()
+            destination = (root / item["path"]).resolve()
+            destination.relative_to(root)
             if item["existed"]:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 temporary = destination.with_suffix(destination.suffix + ".dream-restore.tmp")

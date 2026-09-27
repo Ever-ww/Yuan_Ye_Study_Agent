@@ -254,6 +254,7 @@ class AgentRuntime:
                     self.config.workspace_root,
                     resource_source_root,
                     approval=self.approval,
+                    restrict_builtins_to_source=resource_snapshot is not None,
                 )
                 if resource_snapshot is not None:
                     self.skill_management = SkillService(
@@ -328,7 +329,17 @@ class AgentRuntime:
                 runtime_profile=runtime_profile or session_origin,
                 tool_module=generation_tools,
                 skill_install_service=self.skill_management,
+                browser_use_enabled=self.config.browser_use_enabled,
+                browser_use_headless=self.config.browser_use_headless,
+                browser_use_timeout_seconds=self.config.browser_use_timeout_seconds,
+                browser_use_allowed_domains=self.config.browser_use_allowed_domains,
+                browser_use_allow_private_urls=self.config.browser_use_allow_private_urls,
             )
+            from capability_switches import load_switches
+
+            capability_state = load_switches(self.config.workspace_root)
+            self.capability_revision = capability_state["revision"]
+            base_tools = base_tools.excluding(capability_state["disabled_tools"])
             if enable_subagent:
                 runner = subagent_runner or RuntimeSubagentRunner(
                     self.config,
@@ -351,6 +362,8 @@ class AgentRuntime:
 
             self.tools.register(SessionHistoryTool(self.memory))
             self.tools.register(SessionReadTool(self.memory))
+        if tools is None:
+            self.tools = self.tools.excluding(capability_state["disabled_tools"])
         self.context_processor = None
         if enable_context_processing:
             self.context_processor = context_processor or ContextProcessor(
@@ -874,6 +887,9 @@ class AgentRuntime:
             await self.hooks.emit(HookEvent(point=HookPoint.TRACE_END, session_id=session_id, data={"error": error}))
         finally:
             self.prompts.close(session_id)
+            close_tools = getattr(self.tools, "close", None)
+            if callable(close_tools):
+                await close_tools()
             if self._owns_sandbox and self.sandbox is not None:
                 await self.sandbox.close()
             self._session_open = False

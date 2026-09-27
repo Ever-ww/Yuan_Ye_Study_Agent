@@ -112,6 +112,7 @@ class SkillService:
         approval: Approval | None = None,
         allowed_names: tuple[str, ...] | None = None,
         read_only: bool = False,
+        restrict_builtins_to_source: bool = False,
     ) -> None:
         self.agent_root = agent_root.resolve()
         self.workspace_root = workspace_root.resolve()
@@ -121,6 +122,7 @@ class SkillService:
             frozenset(allowed_names) if allowed_names is not None else None
         )
         self.read_only = read_only
+        self.restrict_builtins_to_source = restrict_builtins_to_source
         # Skill content and its review/audit state belong to the Workspace.
         # ``source_root`` is only a trusted source used to seed/update built-ins.
         self.state_root = self.workspace_root / ".yy" / "skills"
@@ -262,10 +264,17 @@ class SkillService:
         values: list[SkillMetadata] = []
         if not self.skills_root.is_dir():
             return ()
+        installed = self._read_index().skills if self.restrict_builtins_to_source else {}
         for root in sorted(self.skills_root.iterdir(), key=lambda item: item.name):
             if root.name.startswith(".") or not root.is_dir():
                 continue
             if self._allowed_names is not None and root.name not in self._allowed_names:
+                continue
+            entry = installed.get(root.name)
+            if (
+                entry is not None and entry.source.kind == "builtin"
+                and not (self.source_root / "skills" / root.name / "SKILL.md").is_file()
+            ):
                 continue
             if root.is_symlink():
                 raise ValueError(f"正式 Skill 目录不允许符号链接：{root.name}")
@@ -287,7 +296,10 @@ class SkillService:
 
     def catalog_snapshot(self) -> SkillCatalogSnapshot:
         """生成可绑定到单个 Session 的不可变目录快照。"""
-        skills = self.catalog()
+        from capability_switches import load_switches
+
+        disabled = set(load_switches(self.workspace_root)["disabled_skills"])
+        skills = tuple(item for item in self.catalog() if item.name not in disabled)
         payload = "\n".join(f"{item.name}:{item.content_digest}" for item in skills)
         return SkillCatalogSnapshot(
             digest=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
@@ -308,7 +320,7 @@ class SkillService:
 
     def catalog_xml(self, snapshot: SkillCatalogSnapshot | None = None) -> str:
         """返回 System Prompt 使用的完整发现层 XML。"""
-        value = catalog_xml(snapshot.skills if snapshot is not None else self.catalog())
+        value = catalog_xml(snapshot.skills if snapshot is not None else self.catalog_snapshot().skills)
         if len(value.encode("utf-8")) > _MAX_CATALOG_CHARS:
             raise RuntimeError("Skill XML 目录超过 64 KiB，请移除部分 Skill")
         return value
